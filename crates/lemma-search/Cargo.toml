@@ -1,0 +1,19 @@
+[package]
+name = "lemma-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# GUI-free (WP3.6): no GTK. The app drives it from the Search page of the sidebar.
+[dependencies]
+regex = { workspace = true }
+memchr = { workspace = true }
+async-channel = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

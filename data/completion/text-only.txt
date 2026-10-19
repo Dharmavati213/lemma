@@ -1,0 +1,19 @@
+# Commands that are invalid (or pointless) in math mode, so the completer hides them in math.
+# The word lists rarely say so (`#n`). Sectioning commands (`#L0`-`#L6`) and argument-less
+# `\text…` symbols such as \textbackslash are text-only without being listed here.
+# Whitespace-separated names without the backslash; `#` starts a comment.
+
+item maketitle tableofcontents listoffigures listoftables appendix
+newpage clearpage cleardoublepage pagebreak nopagebreak enlargethispage
+noindent indent par smallskip medskip bigskip vfill
+footnote footnotemark footnotetext marginpar thanks
+caption centering raggedright raggedleft centerline
+includegraphics documentclass usepackage RequirePackage
+title author date
+input include includeonly subfile subfileinclude import subimport
+bibliography bibliographystyle printbibliography addbibresource
+newtheorem theoremstyle
+# Size and font switches: "Command \small invalid in math mode" (use \text, \mathbf, … there).
+tiny scriptsize footnotesize small normalsize large Large LARGE huge Huge
+bfseries mdseries itshape slshape scshape upshape rmfamily sffamily ttfamily normalfont
+fontencoding fontfamily fontseries fontshape fontsize selectfont usefont linespread

@@ -1,0 +1,49 @@
+{
+  "_description": "Performance: exactly 200 agent message chunks and 30 edits. It first writes long-scenario.tex (30 lines) in the project, then streams 20 chunks, then 30 times streams 6 chunks and edits one line of that file (20 + 30 * 6 = 200 chunks, 1 write + 30 edits). Chunks are sent without delay.",
+  "default": [
+    {
+      "tool": {
+        "name": "write",
+        "args": {
+          "file_path": "long-scenario.tex",
+          "content": "Line 1 of the long scenario.\nLine 2 of the long scenario.\nLine 3 of the long scenario.\nLine 4 of the long scenario.\nLine 5 of the long scenario.\nLine 6 of the long scenario.\nLine 7 of the long scenario.\nLine 8 of the long scenario.\nLine 9 of the long scenario.\nLine 10 of the long scenario.\nLine 11 of the long scenario.\nLine 12 of the long scenario.\nLine 13 of the long scenario.\nLine 14 of the long scenario.\nLine 15 of the long scenario.\nLine 16 of the long scenario.\nLine 17 of the long scenario.\nLine 18 of the long scenario.\nLine 19 of the long scenario.\nLine 20 of the long scenario.\nLine 21 of the long scenario.\nLine 22 of the long scenario.\nLine 23 of the long scenario.\nLine 24 of the long scenario.\nLine 25 of the long scenario.\nLine 26 of the long scenario.\nLine 27 of the long scenario.\nLine 28 of the long scenario.\nLine 29 of the long scenario.\nLine 30 of the long scenario.\n"
+        }
+      }
+    },
+    {
+      "stream": {
+        "count": 20,
+        "text": "Preparing chunk {{i}} of the introduction. "
+      }
+    },
+    {
+      "repeat": {
+        "times": 30,
+        "steps": [
+          {
+            "stream": {
+              "count": 6,
+              "text": "Line {{i}}: reasoning about the wording. "
+            }
+          },
+          {
+            "tool": {
+              "name": "edit",
+              "args": {
+                "file_path": "long-scenario.tex",
+                "old_string": "Line {{i}} of the long scenario.",
+                "new_string": "Line {{i}} (revised) of the long scenario."
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "usage": {
+        "used": 120000,
+        "size": 200000
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+[package]
+name = "lemma-pdf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lemma-core = { workspace = true }
+lemma-synctex = { workspace = true }
+poppler = { workspace = true }
+cairo = { workspace = true }
+glib = { workspace = true }
+async-channel = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,107 @@
+Rc files read:
+  NONE
+Latexmk: This is Latexmk, John Collins, 15 June 2025. Version 4.87.
+Force everything to be remade.
+Latexmk: applying rule 'biber main'...
+Rule 'biber main':  Reasons for rerun
+Category 'other':
+  Rerun of 'biber main' forced or previously required:
+    Reason or flag: 'go_mode'
+
+------------
+Run number 1 of rule 'biber main'
+------------
+------------
+Running 'biber  "main.bcf"'
+------------
+INFO - This is Biber 2.22
+INFO - Logfile is 'main.blg'
+INFO - Reading 'main.bcf'
+INFO - Found 4 citekeys in bib section 0
+INFO - Processing section 0
+INFO - Looking for bibtex file 'refs.bib' for section 0
+INFO - LaTeX decoding ...
+INFO - Found BibTeX data source 'refs.bib'
+INFO - Overriding locale 'en-US' defaults 'variable = shifted' with 'variable = non-ignorable'
+INFO - Overriding locale 'en-US' defaults 'normalization = NFD' with 'normalization = prenormalized'
+INFO - Sorting list 'anyt/global//global/global/global' of type 'entry' with template 'anyt' and locale 'en-US'
+INFO - No sort tailoring available for locale 'en-US'
+INFO - Writing 'main.bbl' with encoding 'UTF-8'
+INFO - Output to main.bbl
+Latexmk: Found biber source file(s) [main.bcf, refs.bib]
+Latexmk: applying rule 'pdflatex'...
+Rule 'pdflatex':  Reasons for rerun
+Category 'other':
+  Rerun of 'pdflatex' forced or previously required:
+    Reason or flag: 'go_mode'
+
+------------
+Run number 1 of rule 'pdflatex'
+------------
+------------
+Running 'pdflatex  -synctex=1 -interaction=nonstopmode -file-line-error -recorder  "main.tex"'
+------------
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026/Arch Linux) (preloaded format=pdflatex)
+ restricted \write18 enabled.
+entering extended mode
+(./main.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(/usr/share/texmf-dist/tex/latex/amscls/amsart.cls
+Document Class: amsart 2020/05/29 v2.20.6
+(/usr/share/texmf-dist/tex/latex/amsmath/amsmath.sty
+For additional information on amsmath, use the `?' option.
+(/usr/share/texmf-dist/tex/latex/amsmath/amstext.sty (/usr/share/texmf-dist/tex/latex/amsmath/amsgen.sty)) (/usr/share/texmf-dist/tex/latex/amsmath/amsbsy.sty) (/usr/share/texmf-dist/tex/latex/amsmath/amsopn.sty)) (/usr/share/texmf-dist/tex/latex/amsfonts/umsa.fd) (/usr/share/texmf-dist/tex/latex/amsfonts/amsfonts.sty)) (/usr/share/texmf-dist/tex/latex/amsfonts/amssymb.sty) (/usr/share/texmf-dist/tex/latex/mathtools/mathtools.sty (/usr/share/texmf-dist/tex/latex/graphics/keyval.sty) (/usr/share/texmf-dist/tex/latex/tools/calc.sty) (/usr/share/texmf-dist/tex/latex/mathtools/mhsetup.sty)) (/usr/share/texmf-dist/tex/latex/tikz-cd/tikz-cd.sty (/usr/share/texmf-dist/tex/latex/pgf/frontendlayer/tikz.sty (/usr/share/texmf-dist/tex/latex/pgf/basiclayer/pgf.sty (/usr/share/texmf-dist/tex/latex/pgf/utilities/pgfrcs.sty (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfutil-common.tex) (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfutil-latex.def) (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfrcs.code.tex (/usr/share/texmf-dist/tex/generic/pgf/pgf.revision.tex))) (/usr/share/texmf-dist/tex/latex/pgf/basiclayer/pgfcore.sty (/usr/share/texmf-dist/tex/latex/graphics/graphicx.sty (/usr/share/texmf-dist/tex/latex/graphics/graphics.sty (/usr/share/texmf-dist/tex/latex/graphics/trig.sty) (/usr/share/texmf-dist/tex/latex/graphics-cfg/graphics.cfg) (/usr/share/texmf-dist/tex/latex/graphics-def/pdftex.def))) (/usr/share/texmf-dist/tex/latex/pgf/systemlayer/pgfsys.sty (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgfsys.code.tex (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfkeys.code.tex (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfkeyslibraryfiltered.code.tex)) (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgf.cfg) (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgfsys-pdftex.def (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgfsys-common-pdf.def))) (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgfsyssoftpath.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/systemlayer/pgfsysprotocol.code.tex)) (/usr/share/texmf-dist/tex/latex/xcolor/xcolor.sty (/usr/share/texmf-dist/tex/latex/graphics-cfg/color.cfg) (/usr/share/texmf-dist/tex/latex/graphics/mathcolor.ltx)) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcore.code.tex (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmath.code.tex (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathutil.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathparser.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.basic.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.trigonometric.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.random.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.comparison.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.base.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.round.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.misc.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.integerarithmetics.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathcalc.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmathfloat.code.tex)) (/usr/share/texmf-dist/tex/generic/pgf/math/pgfint.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepoints.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathconstruct.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathusage.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorescopes.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoregraphicstate.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoretransformations.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorequick.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreobjects.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathprocessing.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorearrows.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreshade.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreimage.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreexternal.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorelayers.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcoretransparency.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepatterns.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/basiclayer/pgfcorerdf.code.tex))) (/usr/share/texmf-dist/tex/generic/pgf/modules/pgfmoduleshapes.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/modules/pgfmoduleplot.code.tex) (/usr/share/texmf-dist/tex/latex/pgf/compatibility/pgfcomp-version-0-65.sty) (/usr/share/texmf-dist/tex/latex/pgf/compatibility/pgfcomp-version-1-18.sty)) (/usr/share/texmf-dist/tex/latex/pgf/utilities/pgffor.sty (/usr/share/texmf-dist/tex/latex/pgf/utilities/pgfkeys.sty (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgfkeys.code.tex)) (/usr/share/texmf-dist/tex/latex/pgf/math/pgfmath.sty (/usr/share/texmf-dist/tex/generic/pgf/math/pgfmath.code.tex)) (/usr/share/texmf-dist/tex/generic/pgf/utilities/pgffor.code.tex)) (/usr/share/texmf-dist/tex/generic/pgf/frontendlayer/tikz/tikz.code.tex (/usr/share/texmf-dist/tex/generic/pgf/libraries/pgflibraryplothandlers.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/modules/pgfmodulematrix.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/frontendlayer/tikz/libraries/tikzlibrarytopaths.code.tex))) (/usr/share/texmf-dist/tex/generic/tikz-cd/tikzlibrarycd.code.tex (/usr/share/texmf-dist/tex/generic/pgf/frontendlayer/tikz/libraries/tikzlibrarymatrix.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/frontendlayer/tikz/libraries/tikzlibraryquotes.code.tex) (/usr/share/texmf-dist/tex/generic/pgf/libraries/pgflibraryarrows.meta.code.tex))) (/usr/share/texmf-dist/tex/latex/biblatex/biblatex.sty (/usr/share/texmf-dist/tex/generic/pdftexcmds/pdftexcmds.sty (/usr/share/texmf-dist/tex/generic/infwarerr/infwarerr.sty) (/usr/share/texmf-dist/tex/generic/iftex/iftex.sty) (/usr/share/texmf-dist/tex/generic/ltxcmds/ltxcmds.sty)) (/usr/share/texmf-dist/tex/latex/etoolbox/etoolbox.sty) (/usr/share/texmf-dist/tex/latex/kvoptions/kvoptions.sty (/usr/share/texmf-dist/tex/latex/kvsetkeys/kvsetkeys.sty)) (/usr/share/texmf-dist/tex/latex/logreq/logreq.sty (/usr/share/texmf-dist/tex/latex/logreq/logreq.def)) (/usr/share/texmf-dist/tex/latex/base/ifthen.sty) (/usr/share/texmf-dist/tex/latex/url/url.sty) (/usr/share/texmf-dist/tex/latex/biblatex/blx-dm.def) (/usr/share/texmf-dist/tex/latex/biblatex/blx-compat.def) (/usr/share/texmf-dist/tex/latex/biblatex/biblatex.def) (/usr/share/texmf-dist/tex/latex/biblatex/bbx/alphabetic.bbx (/usr/share/texmf-dist/tex/latex/biblatex/bbx/standard.bbx)) (/usr/share/texmf-dist/tex/latex/biblatex/cbx/alphabetic.cbx) (/usr/share/texmf-dist/tex/latex/biblatex/biblatex.cfg) (/usr/share/texmf-dist/tex/latex/l3kernel/expl3.sty (/usr/share/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def)) (/usr/share/texmf-dist/tex/latex/biblatex/blx-case-expl3.sty (/usr/share/texmf-dist/tex/latex/l3packages/xparse/xparse.sty))) (/usr/share/texmf-dist/tex/latex/hyperref/hyperref.sty (/usr/share/texmf-dist/tex/generic/kvdefinekeys/kvdefinekeys.sty) (/usr/share/texmf-dist/tex/generic/pdfescape/pdfescape.sty) (/usr/share/texmf-dist/tex/latex/hycolor/hycolor.sty) (/usr/share/texmf-dist/tex/latex/hyperref/nameref.sty (/usr/share/texmf-dist/tex/latex/refcount/refcount.sty) (/usr/share/texmf-dist/tex/generic/gettitlestring/gettitlestring.sty)) (/usr/share/texmf-dist/tex/generic/stringenc/stringenc.sty) (/usr/share/texmf-dist/tex/latex/hyperref/pd1enc.def) (/usr/share/texmf-dist/tex/generic/intcalc/intcalc.sty) (/usr/share/texmf-dist/tex/latex/hyperref/puenc.def) (/usr/share/texmf-dist/tex/generic/bitset/bitset.sty (/usr/share/texmf-dist/tex/generic/bigintcalc/bigintcalc.sty))) (/usr/share/texmf-dist/tex/latex/hyperref/hpdftex.def (/usr/share/texmf-dist/tex/latex/rerunfilecheck/rerunfilecheck.sty (/usr/share/texmf-dist/tex/generic/uniquecounter/uniquecounter.sty))) (./main.aux) (/usr/share/texmf-dist/tex/latex/amsfonts/umsa.fd) (/usr/share/texmf-dist/tex/latex/amsfonts/umsb.fd) (/usr/share/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
+[Loading MPS to PDF converter (version 2006.09.02).]
+) (/usr/share/texmf-dist/tex/latex/epstopdf-pkg/epstopdf-base.sty (/usr/share/texmf-dist/tex/latex/latexconfig/epstopdf-sys.cfg)) (/usr/share/texmf-dist/tex/latex/biblatex/lbx/english.lbx) (./main.bbl) (./main.out) (./main.out)
+
+Class amsart Warning: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+
+(./main.toc) (./chapters/yoneda.tex [1{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}])
+./main.tex:66: Undefined control sequence.
+l.66 is an \equivalnce
+                       of categories.
+[2] [3] [4] [5] (./main.aux)
+
+LaTeX Warning: There were undefined references.
+
+
+LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.
+
+
+Package rerunfilecheck Warning: File `main.out' has changed.
+(rerunfilecheck)                Rerun to get outlines right
+(rerunfilecheck)                or use package `bookmark'.
+
+
+Package biblatex Warning: Please rerun LaTeX.
+
+ )
+(see the transcript file for additional information)</usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmcsc10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmti10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/symbols/msam10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
+Output written on main.pdf (5 pages, 222988 bytes).
+SyncTeX written on main.synctex.gz.
+Transcript written on main.log.
+Latexmk: Getting log file 'main.log'
+Latexmk: Examining 'main.fls'
+Latexmk: Examining 'main.log'
+Latexmk: Found input bbl file 'main.bbl'
+Latexmk: References changed.
+Latexmk: References changed.
+Latexmk: Log file says output to 'main.pdf'
+Latexmk: Using biber to make bibliography file(s).
+Latexmk: Bibliography file(s) from .bcf file:
+  refs.bib
+Sources for biber
+  refs.bib
+  main.bcf
+Latexmk: Errors, so I did not complete making targets
+Collected error summary (may duplicate other messages):
+  pdflatex: Command for 'pdflatex' gave return code 1
+      Refer to 'main.log' and/or above output for details
+
+Latexmk: Sometimes, the -f option can be used to get latexmk
+  to try to force complete processing.
+  But normally, you will need to correct the file(s) that caused the
+  error, and then rerun latexmk.
+  In some cases, it is best to clean out generated files before rerunning
+  latexmk after you've corrected the files.

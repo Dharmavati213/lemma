@@ -1,0 +1,39 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: true
+fatal: false
+output: main.pdf (5 pages)
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Warning main.tex:41 Citation 'SGA1' on page 1 undefined on input line 41.
+Warning main.tex:41 Citation 'Vistoli' on page 1 undefined on input line 41.
+Warning main.tex:42 Citation 'Stacks' on page 1 undefined on input line 42.
+Warning main.tex:42 Reference `sec:yoneda' on page 1 undefined on input line 42.
+Warning main.tex:43 Reference `lem:yoneda' on page 1 undefined on input line 43.
+Warning main.tex:44 Reference `sec:descent' on page 1 undefined on input line 44.
+Warning main.tex:44 Reference `thm:fpqc' on page 1 undefined on input line 44.
+Warning chapters/yoneda.tex:29 Citation 'MacLane' on page 1 undefined on input line 29.
+Warning main.tex:70 Citation 'Stacks' on page 2 undefined on input line 70.
+Warning main.tex:78 Reference `eq:cocycle' on page 2 undefined on input line 78.
+Error main.tex:110 Missing $ inserted.
+    | Exactness \alpha <HERE> _n follows since filtered colimits commute with finite...
+Error main.tex:111 Command \end{proof} invalid in math mode.
+    | \end{proof} <HERE>
+Error main.tex:111 Missing $ inserted.
+    | \end{proof} <HERE>
+Warning main.tex:130 Reference `eq:adj1' on page 3 undefined on input line 130.
+Warning main.tex:130 Reference `eq:adj3' on page 3 undefined on input line 130.
+Warning main.tex:143 Reference `thm:fpqc' on page 3 undefined on input line 143.
+Warning main.tex:143 Citation 'Vistoli' on page 3 undefined on input line 143.
+Warning main.tex:160 Reference `thm:fpqc' on page 3 undefined on input line 160.
+Warning main.tex:160 Citation 'Vistoli' on page 3 undefined on input line 160.
+Warning main.tex:177 Reference `thm:fpqc' on page 4 undefined on input line 177.
+Warning main.tex:177 Citation 'Vistoli' on page 4 undefined on input line 177.
+Warning main.tex:194 Reference `thm:fpqc' on page 4 undefined on input line 194.
+Warning main.tex:194 Citation 'Vistoli' on page 4 undefined on input line 194.
+Warning main.tex:211 Reference `thm:fpqc' on page 4 undefined on input line 211.
+Warning main.tex:211 Citation 'Vistoli' on page 4 undefined on input line 211.
+Warning main.tex:228 Reference `thm:fpqc' on page 5 undefined on input line 228.
+Warning main.tex:228 Citation 'Vistoli' on page 5 undefined on input line 228.
+Warning main.tex:234 Empty bibliography on input line 234.

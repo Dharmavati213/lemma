@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/lemma-fake-agent", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+# GTK stack: exact pins; resolves to a single glib 0.22.10 (verified 2026-10-10)
+gtk          = { package = "gtk4",       version = "=0.11.5", features = ["gnome_50"] }
+gdk          = { package = "gdk4",       version = "=0.11.5", features = ["v4_22"] }
+adw          = { package = "libadwaita", version = "=0.9.2",  features = ["v1_9"] }
+sourceview5  = { version = "=0.11.2", features = ["v5_18"] }
+libspelling  = "=0.5.0"
+poppler      = { package = "poppler-rs", version = "=0.26.0", features = ["v26_1"] }
+cairo        = { package = "cairo-rs",   version = "=0.22.9", features = ["v1_18", "png"] }
+glib         = { version = "=0.22.10", features = ["v2_88"] }
+gio          = { version = "=0.22.10", features = ["v2_88"] }
+pango        = { version = "=0.22.9",  features = ["v1_58"] }
+# agent
+agent-client-protocol        = { version = "=3.3.0", features = ["process"] }
+agent-client-protocol-schema = "=1.11.0"
+futures-executor = "0.3.34"
+# the Sink trait for lemma-agent's ACP line transport (already in the tree through ACP)
+futures-sink     = "0.3.34"
+# the Stream trait for the same transport's incoming lines (already in the tree through ACP)
+futures-core     = "0.3.34"
+async-channel    = "2.5.0"
+# blocking HTTP for the API-key backend (WP5.1): rustls + ring + webpki roots, no tokio, no gzip
+ureq             = { version = "=3.4.2", default-features = false, features = ["rustls"] }
+# pure crates
+similar        = { version = "3.2.0", features = ["inline"] }
+frizbee        = "0.13.0"
+ruzstd         = "0.9.0"
+regex          = "1.13.1"
+memchr         = "2.8.3"
+serde          = { version = "1.0.229", features = ["derive"] }
+serde_json     = "1.0.152"
+toml           = "1.1.8"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+libc           = "0.2.190"
+tracing        = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# build / tools / tests
+pkg-config = "0.3.34"
+zstd       = "0.14.2"
+proptest   = "1.11.0"
+insta      = "1.49.0"
+tempfile   = "3.27.0"
+# internal
+lemma-core     = { path = "crates/lemma-core" }
+lemma-syntax   = { path = "crates/lemma-syntax" }
+lemma-snippets = { path = "crates/lemma-snippets" }
+lemma-complete = { path = "crates/lemma-complete" }
+lemma-review   = { path = "crates/lemma-review" }
+lemma-build    = { path = "crates/lemma-build" }
+lemma-synctex  = { path = "crates/lemma-synctex" }
+lemma-pdf      = { path = "crates/lemma-pdf" }
+lemma-agent    = { path = "crates/lemma-agent" }
+lemma-config   = { path = "crates/lemma-config" }
+# M3 (stubs created by WP3.0; WP3.3 and WP3.6 own them)
+lemma-preview  = { path = "crates/lemma-preview" }
+lemma-search   = { path = "crates/lemma-search" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# panic = "unwind" (default) on purpose: worker panics are caught and the worker restarted
+[profile.dev.package."*"]
+opt-level = 2

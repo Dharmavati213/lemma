@@ -1,0 +1,58 @@
+# Memory budgets from docs/ARCHITECTURE.md §7, checked by scripts/rss.sh, and the timing budgets
+# of scripts/perf-wayland.sh ([perf], at the end).
+#
+# Each table is a scenario: rss.sh runs
+#     lemma <args...> --mem-report --quit-after-ms <quit_after_ms>
+# and compares the reported Rss/Pss with the budget. MB here means MiB (1024 kB, as in smaps).
+# A run fails when a value exceeds budget × tolerance; budgets are asserted only on real Wayland
+# (LEMMA_RSS_WAYLAND=1), and Broadway runs just print the numbers.
+# Paths are relative to the repository root; target/fixtures/* comes from scripts/build-fixtures.sh.
+#
+# Set from real-Wayland measurements of the release build with the default renderer, cairo: idle 99.3–100.0 / 76.3–76.5 MB, pdf50
+# 146.2–147.1 / 122.5–123.5 MB, large 103.7–115.1 / 91.1–91.6 MB. PSS is the figure with no other
+# GTK process running: each one that maps the same libraries and fonts takes a share of them (with
+# the other agents' GTK tests running, PSS measured 62–63 / 109 / 78 MB). With `[editor] renderer
+# = "vulkan"` RSS is about 27 MB higher (idle 127 MB).
+
+tolerance = 1.10
+
+[idle]
+# Idle: 1k-line document, spell check on, no PDF.
+args = ["target/fixtures/doc1k.tex"]
+quit_after_ms = 3000
+rss_mb = 100
+pss_mb = 76
+
+[pdf50]
+# Plus a 50-page PDF with a full page cache (48 MiB). WP1.6 defines how `--demo pdf` fills the cache.
+args = ["--demo", "pdf", "target/fixtures/pdf50.tex"]
+quit_after_ms = 5000
+rss_mb = 148
+pss_mb = 123
+
+[large]
+# A 60k-line (2.2 MB) file.
+args = ["tests/fixtures/large.tex"]
+quit_after_ms = 4000
+rss_mb = 115
+pss_mb = 91
+
+[perf]
+# scripts/perf-wayland.sh on real Wayland (release, renderer from the settings: cairo), measured
+# 2026-10-12 on an idle machine (1920x1080 at 60 Hz): first frame 165–180 ms, document shown
+# 237–255 ms; keystroke work p99 2.0–3.0 ms, to frame p99 5.0–18.5 ms; PDF scroll 60 fps with a
+# paint p99 of 13.1–17.8 ms (Vulkan: 1.9–2.6 ms). Values above budget × tolerance fail; frame
+# rates below the budget fail.
+tolerance = 1.15
+# Process start to the first frame, and to the first frame showing the open document (medians of
+# three runs on doc1k.tex).
+first_frame_ms = 180
+ready_ms = 260
+# Per keystroke on doc1k.tex and large.tex (200 keys each): the insert plus the paint of the
+# frame that shows it, and the insert to the end of that frame (which includes waiting for the
+# compositor's next frame, up to one refresh period).
+keystroke_work_p99_ms = 4
+keystroke_to_frame_p99_ms = 20
+# Scrolling the PDF at 2400 px/s, three pages high and at fit width.
+pdf_paint_p99_ms = 18
+pdf_fps = 58

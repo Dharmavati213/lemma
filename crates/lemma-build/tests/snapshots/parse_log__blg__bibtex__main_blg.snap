@@ -1,0 +1,9 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+Bibtex Error refs.bib:36 Illegal end of database file
+Bibtex Warning refs.bib:? I didn't find a database entry for "Nope"
+Bibtex Warning refs.bib:? empty title in Broken
+Bibtex Warning refs.bib:? empty publisher in Broken
+Bibtex Warning refs.bib:? empty year in Broken

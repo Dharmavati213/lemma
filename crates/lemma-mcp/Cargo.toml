@@ -1,0 +1,13 @@
+[package]
+name = "lemma-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# std only: spawned by the Claude CLI as a stdio MCP server, bridges to the editor's unix socket
+[dependencies]

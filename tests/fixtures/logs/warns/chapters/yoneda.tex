@@ -1,0 +1,29 @@
+\section{The Yoneda lemma}\label{sec:yoneda}
+Let $\cC$ be a locally small category and write $h_X=\Hom_{\cC}(-,X)$.
+
+\begin{lemma}[Yoneda]\label{lem:yoneda}
+For every presheaf $F\colon\cC^{\mathrm{op}}\to\mathrm{Set}$ and every object
+$X$ of $\cC$ there is a bijection, natural in $X$ and $F$,
+\[
+\Hom_{\mathrm{PSh}(\cC)}(h_X,F)\xrightarrow{\ \sim\ }F(X),\qquad
+\eta\longmapsto\eta_X(\mathrm{id}_X).
+\]
+\end{lemma}
+
+\begin{proof}
+Given $a\in F(X)$ define $\eta^a_Y(g)=F(g)(a)$ for $g\colon Y\to X$.
+Naturality of $\eta$ forces the commutative square
+\[
+\begin{tikzcd}
+h_X(X) \arrow[r, "\eta_X"] \arrow[d, "g^*"'] & F(X) \arrow[d, "F(g)"] \\
+h_X(Y) \arrow[r, "\eta_Y"'] & F(Y)
+\end{tikzcd}
+\]
+and chasing $\mathrm{id}_X$ gives $\eta_Y(g)=F(g)(\eta_X(\mathrm{id}_X))$.
+\end{proof}
+
+\begin{corollary}\label{cor:ff}
+The Yoneda embedding $h\colon\cC\to\mathrm{PSh}(\cC)$ is fully faithful.
+\end{corollary}
+
+This is used throughout; see~\cite{MacLane,Lurie}.

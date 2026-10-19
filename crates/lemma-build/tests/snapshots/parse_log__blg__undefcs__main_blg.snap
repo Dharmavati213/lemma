@@ -1,0 +1,5 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+

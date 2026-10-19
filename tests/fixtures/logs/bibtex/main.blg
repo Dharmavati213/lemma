@@ -1,0 +1,55 @@
+This is BibTeX, Version 0.99e (TeX Live 2026/Arch Linux)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: main.aux
+The style file: plain.bst
+Database file #1: refs.bib
+Illegal end of database file---line 36 of file refs.bib
+ : }
+ :  
+I'm skipping whatever remains of this entry
+Warning--I didn't find a database entry for "Nope"
+Warning--empty title in Broken
+Warning--empty publisher in Broken
+Warning--empty year in Broken
+You've used 2 entries,
+            2118 wiz_defined-function locations,
+            508 strings with 4090 characters,
+and the built_in function-call counts, 449 in all, are:
+= -- 35
+> -- 14
+< -- 0
++ -- 6
+- -- 4
+* -- 26
+:= -- 81
+add.period$ -- 4
+call.type$ -- 2
+change.case$ -- 7
+chr.to.int$ -- 0
+cite$ -- 5
+duplicate$ -- 24
+empty$ -- 45
+format.name$ -- 4
+if$ -- 90
+int.to.chr$ -- 0
+int.to.str$ -- 2
+missing$ -- 4
+newline$ -- 11
+num.names$ -- 4
+pop$ -- 21
+preamble$ -- 1
+purify$ -- 6
+quote$ -- 0
+skip$ -- 10
+stack$ -- 0
+substring$ -- 10
+swap$ -- 1
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 4
+warning$ -- 3
+while$ -- 4
+width$ -- 3
+write$ -- 18
+(There was 1 error message)

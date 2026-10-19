@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Data generation: `cargo run -p xtask -- gen-completion [--check]` turns data/raw/cwl/*.cwl,
+# data/raw/umath_map.tsv and data/completion/* into crates/lemma-complete/src/generated.rs and
+# packages.zst. The inputs are line-based text files; the packed tables are zstd frames (ruzstd,
+# which lemma-complete decodes them with).
+[dependencies]
+ruzstd = { workspace = true }

@@ -1,0 +1,28 @@
+{
+  "_description": "A Bash permission request (options allow-once 'Yes', allow-with-updates 'Yes, and don't ask again for latexmk commands', reject 'No', as the real adapter sends them). The default accepts any answer; prompts containing 'once', 'always' or 'reject' fail the turn unless that option is chosen. 'plan' sends the adapter's ExitPlanMode options (Lemma offers only exit-plan-default and reject).",
+  "default": [
+    {"say": "I need to run latexmk to see the full bibliography warnings."},
+    {"permission": {"title": "latexmk -pdf -interaction=nonstopmode main.tex", "kind": "execute", "expect": "any", "report": true}},
+    {"say": "Thanks. Nothing else to do."}
+  ],
+  "once": [
+    {"say": "I need to run latexmk once."},
+    {"permission": {"title": "latexmk -pdf -interaction=nonstopmode main.tex", "kind": "execute", "expect": "allow-once", "report": true}},
+    {"say": "Ran it once."}
+  ],
+  "always": [
+    {"say": "I need to run latexmk, possibly several times."},
+    {"permission": {"title": "latexmk -pdf -interaction=nonstopmode main.tex", "kind": "execute", "expect": "allow-with-updates", "report": true}},
+    {"say": "Allowed for the rest of the session."}
+  ],
+  "reject": [
+    {"say": "I would like to delete the build directory."},
+    {"permission": {"title": "rm -rf .build", "kind": "delete", "expect": "reject", "report": true}},
+    {"say": "Understood, I will not delete anything."}
+  ],
+  "plan": [
+    {"say": "Here is my plan: tighten the abstract, then compile."},
+    {"permission": {"title": "Ready to code?", "kind": "switch_mode", "options": "exit_plan", "expect": "any", "report": true}},
+    {"say": "Leaving plan mode."}
+  ]
+}

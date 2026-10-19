@@ -1,0 +1,15 @@
+{
+  "_description": "Turns that run until they are cancelled. The default streams a little, then sleeps 30 s (cancellable at any moment; session/cancel ends the turn with stopReason 'cancelled'). A prompt containing 'permission' first asks for a Bash permission and leaves it pending, so cancelling must answer it with the Cancelled outcome.",
+  "default": [
+    {"think": "This will take a while."},
+    {"say": "Starting a long task. "},
+    {"sleep_ms": 30000},
+    {"say": "This text is only shown if nobody cancels the turn."}
+  ],
+  "permission": [
+    {"say": "I need to run a long command first."},
+    {"permission": {"title": "sleep 600", "kind": "execute", "expect": "cancelled"}},
+    {"sleep_ms": 30000},
+    {"say": "This text is only shown if nobody cancels the turn."}
+  ]
+}

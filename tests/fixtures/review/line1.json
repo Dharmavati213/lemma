@@ -1,0 +1,9 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "\\documentclass{article}",
+  "new_string": "\\documentclass[11pt]{amsart}",
+  "replace_all": false
+ }
+]

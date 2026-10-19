@@ -1,0 +1,17 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: false
+fatal: true
+output: none
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Warning main.tex:41 Citation 'SGA1' on page 1 undefined on input line 41.
+Warning main.tex:41 Citation 'Vistoli' on page 1 undefined on input line 41.
+Warning main.tex:42 Citation 'Stacks' on page 1 undefined on input line 42.
+Warning main.tex:42 Reference `sec:yoneda' on page 1 undefined on input line 42.
+Warning main.tex:43 Reference `lem:yoneda' on page 1 undefined on input line 43.
+Warning main.tex:44 Reference `sec:descent' on page 1 undefined on input line 44.
+Warning main.tex:44 Reference `thm:fpqc' on page 1 undefined on input line 44.
+Error main.tex:46 File `chapters/yonedaa.tex' not found.
+    | \input{chapters/yonedaa} <HERE>

@@ -1,0 +1,217 @@
+[
+  {
+    "name": "read_file",
+    "title": "Read file",
+    "description": "Reads a file of the LaTeX project as it is in the editor right now: the live buffer, including the user's unsaved typing and your pending changes. The user reviews every change you make as red/green hunks and may have accepted, rejected or modified some since you last looked. Use this instead of the built-in Read for project files.\n\nUsage:\n- file_path is an absolute path or a path relative to the project root. Paths outside the project root are refused.\n- By default it reads up to 2000 lines from the start of the file. For a long file you can pass offset (the 1-based line to start from) and limit (the number of lines), but reading the whole file is usually better.\n- Lines longer than 2000 characters are truncated.\n- Results use cat -n format: spaces, the line number and a tab, then the text of the line. The prefix is not part of the file.\n- Re-read a region before editing it again: the user may have changed it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "The path of the file to read: absolute, or relative to the project root"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The line number to start reading from (1-based). Only provide if the file is too large to read at once"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The number of lines to read (default 2000). Only provide if the file is too large to read at once"
+        }
+      },
+      "required": [
+        "file_path"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "edit",
+    "title": "Edit file",
+    "description": "Performs an exact string replacement in a file of the LaTeX project. The change goes into the editor buffer and to disk at once, and the user reviews it as red/green hunks that they accept or reject one by one.\n\nUsage:\n- Read the file with read_file first. When you copy text from read_file output, preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix (spaces + line number + tab); never include any part of the prefix in old_string or new_string.\n- The edit FAILS if old_string does not occur in the file (the user may have edited that region: call read_file again) or occurs more than once. Add surrounding context to make it unique, or set replace_all to change every occurrence, e.g. to rename a label or macro.\n- Prefer small, focused edits over rewriting large regions: every change becomes a hunk the user has to review.\n- Tool results may carry a <review_feedback> block with the user's decisions on earlier hunks. Do not re-apply a change the user rejected unless they ask for it.\n- Paths outside the project root are refused.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "The path of the file to modify: absolute, or relative to the project root"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "The text to replace"
+        },
+        "new_string": {
+          "type": "string",
+          "description": "The text to replace it with (must be different from old_string)"
+        },
+        "replace_all": {
+          "type": "boolean",
+          "default": false,
+          "description": "Replace all occurrences of old_string (default false)"
+        }
+      },
+      "required": [
+        "file_path",
+        "old_string",
+        "new_string"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "write",
+    "title": "Write file",
+    "description": "Writes a whole file of the LaTeX project, creating it and its directories if needed. The new content goes into the editor buffer and to disk at once, and the user reviews the difference from the previous content as red/green hunks (a new file is a single hunk they can reject).\n\nUsage:\n- This overwrites an existing file. Read it with read_file first, and prefer edit for changes to an existing file: it is cheaper and gives smaller hunks.\n- Only create files the task needs.\n- file_path is an absolute path or a path relative to the project root. Paths outside the project root are refused.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "The path of the file to write: absolute, or relative to the project root"
+        },
+        "content": {
+          "type": "string",
+          "description": "The content to write to the file"
+        }
+      },
+      "required": [
+        "file_path",
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "list_files",
+    "title": "List project files",
+    "description": "Lists the files of the LaTeX project: first the files of the document (the root document, then the files it includes), then the other files under the project root, at most 500 in all. Build output, files TeX generates, .git and hidden directories are left out. This tool changes nothing: files change only through edit and write, and the user reviews every change you make as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "outline",
+    "title": "Document outline",
+    "description": "Returns the structure of the document from the editor's live text: sectioning commands, theorem-like environments, labels and included files, with 1-based line numbers. Without file_path it covers every file of the document, starting at the root document. This tool changes nothing: files change only through edit and write, and the user reviews every change you make as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Only outline this file (absolute, or relative to the project root)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "compile",
+    "title": "Compile",
+    "description": "Compiles the project with the editor's own latexmk build (the build the user runs), waits until it finishes, and returns the status, up to 20 errors as file:line: message, the number of warnings and the page count. Use this instead of running latexmk or pdflatex in a shell, and get_diagnostics for the full list. The build writes only into its output directory; the user reviews every change you make to project files as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "get_diagnostics",
+    "title": "Build diagnostics",
+    "description": "Returns the errors and warnings of the last build as file:line: message, for the whole project or only for file_path. Run compile first if you changed files since the last build. This tool changes nothing: files change only through edit and write, and the user reviews every change you make as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Only report the diagnostics of this file (absolute, or relative to the project root)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "get_selection",
+    "title": "Editor selection",
+    "description": "Returns where the user is in the editor: the current file, the cursor's line and column, and the selected text (at most 20000 characters). Use it when the user says \"this\", \"here\" or \"the selection\". This tool changes nothing: files change only through edit and write, and the user reviews every change you make as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "render_page",
+    "title": "Render PDF page",
+    "description": "Renders one page of the compiled PDF as a PNG image (1.5x scale, at most 1600 px tall) so you can check the typeset result: a formula, table, figure or page layout. The reply also names a PNG copy of the image on disk. Compile first if the PDF is out of date. This tool changes nothing: files change only through edit and write, and the user reviews every change you make as red/green hunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "page": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The page number (1-based)"
+        }
+      },
+      "required": [
+        "page"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "get_review_state",
+    "title": "Review state",
+    "description": "Returns the changes still waiting for the user's review, as a unified diff per file, plus the user's recent decisions (hunks accepted, rejected or edited). The user reviews every change you make as red/green hunks; check this before redoing work, and do not re-apply rejected changes unless asked. This tool changes nothing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  }
+]

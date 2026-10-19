@@ -1,0 +1,10 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: false
+fatal: true
+output: none
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Error main.tex:41 File ended while scanning use of \blx@citeargs@iii.
+    | Runaway argument? {SGA1, is treated at length in~\cite {Vistoli}. We follow the convent\ETC.

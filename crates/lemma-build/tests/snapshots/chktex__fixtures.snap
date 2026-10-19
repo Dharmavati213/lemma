@@ -1,0 +1,206 @@
+---
+source: crates/lemma-build/tests/chktex.rs
+expression: out
+---
+logs/bibtex/main.tex:3:4 W2 " " Non-breaking space (`~') should have been used.
+logs/bibtex/main.tex:3:20 W2 " " Non-breaking space (`~') should have been used.
+logs/bibtex/main.tex:3:33 W2 " " Non-breaking space (`~') should have been used.
+logs/errininput/chapters/yoneda.tex:18:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:18:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:18:38 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:18:42 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:18:63 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:18:68 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:19:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:19:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/chapters/yoneda.tex:26:74 W1 (silenced) " " Command terminated with space.
+logs/errininput/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/errininput/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/errininput/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/missingbrace/chapters/yoneda.tex:18:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:18:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:18:38 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:18:42 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:18:63 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:18:68 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:19:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/chapters/yoneda.tex:19:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:66:12 W15 "{" No match found for `{'.
+logs/missingbrace/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingbrace/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingbrace/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/missingbrace/main.tex:235:1 W17 (silenced) (file) Number of `{' doesn't match the number of `}'!
+logs/missingdollar/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missingdollar/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missingdollar/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/missinginput/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/missinginput/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/missinginput/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/overfull/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/overfull/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/overfull/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/runaway/main.tex:41:32 W15 "{" No match found for `{'.
+logs/runaway/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/runaway/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/runaway/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/runaway/main.tex:235:1 W17 (silenced) (file) Number of `{' doesn't match the number of `}'!
+logs/undefcite/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcite/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcite/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/undefcs/main.tex:66:18 W1 (silenced) " " Command terminated with space.
+logs/undefcs/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefcs/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefcs/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/undefref/main.tex:86:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:86:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:86:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:86:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:86:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:86:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/undefref/main.tex:94:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:106:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:128:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:136:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:153:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:170:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:187:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:204:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:221:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/undefref/main.tex:234:19 W1 (silenced) "" Command terminated with space.
+logs/warns/chapters/yoneda.tex:18:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:18:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:18:38 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:18:42 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:18:63 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:18:68 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:19:18 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/chapters/yoneda.tex:19:25 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:37 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:41 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:67 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:71 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:90 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:87:92 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+logs/warns/main.tex:97:6 W1 (silenced) " " Command terminated with space.
+logs/warns/main.tex:97:26 W1 (silenced) " " Command terminated with space.
+logs/warns/main.tex:98:6 W1 (silenced) " " Command terminated with space.
+logs/warns/main.tex:98:20 W1 (silenced) " " Command terminated with space.
+logs/warns/main.tex:100:21 W3 (silenced) "\\}" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:112:52 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:134:35 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:142:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:159:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:176:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:193:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:210:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:227:43 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+logs/warns/main.tex:240:19 W1 (silenced) "" Command terminated with space.
+pdf/test.tex:15:28 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+pdf/test.tex:15:33 W18 (silenced) "\"" Use either `` or '' as an alternative to `"'.
+pdf/test.tex:15:47 W3 (silenced) ")" You should enclose the previous parenthesis with `{}'.
+pdf/test.tex:18:10 W8 "-" Wrong length of dash may have been used.
+-- 201 warnings; silenced by default: {1: 16, 3: 91, 17: 2, 18: 86}

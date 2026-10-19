@@ -1,0 +1,9 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "Let $k$ be a field and let $A$ be a finitely generated $k$-algebra; we write $\\dim A$ for the Krull dimension of $A$.\n",
+  "new_string": "Let $A$ be a finitely generated algebra over a field $k$.\n",
+  "replace_all": false
+ }
+]

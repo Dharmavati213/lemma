@@ -1,0 +1,14 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: true
+fatal: false
+output: main.pdf (5 pages)
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Error main.tex:110 Missing $ inserted.
+    | Exactness \alpha <HERE> _n follows since filtered colimits commute with finite...
+Error main.tex:111 Command \end{proof} invalid in math mode.
+    | \end{proof} <HERE>
+Error main.tex:111 Missing $ inserted.
+    | \end{proof} <HERE>

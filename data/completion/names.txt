@@ -1,0 +1,29 @@
+# Names offered in `\usepackage{…}`, `\documentclass{…}` and `\usetikzlibrary{…}`, besides the
+# packages and classes that have word lists (data/raw/cwl, data/completion/cwl). Whitespace-
+# separated; `#` starts a comment.
+
+[packages]
+amsfonts amsmath amssymb amsthm mathtools thmtools mathrsfs stmaryrd bm dsfont bbm
+tikz tikz-cd pgfplots xypic quiver
+hyperref cleveref nameref url xr
+biblatex natbib csquotes
+graphicx xcolor color float caption subcaption wrapfig
+geometry fancyhdr titlesec titling setspace parskip microtype
+enumitem booktabs array tabularx longtable multirow
+babel fontenc inputenc lmodern newtxtext newtxmath libertine fontspec unicode-math
+lipsum blindtext todonotes comment verbatim fancyvrb listings minted
+xparse etoolbox ifthen calc xspace kvoptions
+import subfiles standalone
+mathpartir proof bussproofs prftree
+tcolorbox mdframed framed
+siunitx physics braket cancel
+appendix footmisc
+
+[classes]
+article amsart book amsbook report memoir scrartcl scrbook scrreprt beamer standalone
+letter amsproc
+
+[tikzlibraries]
+cd arrows arrows.meta calc positioning decorations.pathmorphing decorations.markings
+decorations.pathreplacing shapes shapes.geometric matrix patterns intersections fit
+backgrounds knots braids babel

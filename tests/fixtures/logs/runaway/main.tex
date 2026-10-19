@@ -1,0 +1,235 @@
+\documentclass[11pt]{amsart}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{mathtools}
+\usepackage{tikz-cd}
+\usepackage[backend=biber,style=alphabetic]{biblatex}
+\usepackage{hyperref}
+\addbibresource{refs.bib}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\Hom}{\operatorname{Hom}}
+\newcommand{\Spec}{\operatorname{Spec}}
+\newcommand{\cO}{\mathcal{O}}
+\newcommand{\cC}{\mathcal{C}}
+\newcommand{\cF}{\mathcal{F}}
+\newcommand{\Sh}{\operatorname{Sh}}
+
+\title{Notes on Sheaves and Descent}
+\author{A. Mathematician}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We collect some basic facts on sheaves on sites, descent for quasi-coherent
+modules, and the Yoneda lemma. These notes serve as a test document.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}\label{sec:intro}
+Let $X$ be a scheme and $\cO_X$ its structure sheaf. The theory of descent,
+initiated by Grothendieck~\cite{SGA1, is treated at length in~\cite{Vistoli}.
+We follow the conventions of~\cite{Stacks}. In Section~\ref{sec:yoneda} we
+recall the Yoneda lemma (Lemma~\ref{lem:yoneda}), and in
+Section~\ref{sec:descent} we prove Theorem~\ref{thm:fpqc}.
+
+\input{chapters/yoneda}
+
+\section{Descent}\label{sec:descent}
+\begin{definition}\label{def:descent-datum}
+Let $f\colon S'\to S$ be a morphism of schemes. A \emph{descent datum} for a
+quasi-coherent $\cO_{S'}$-module $\cF'$ is an isomorphism
+$\varphi\colon p_1^*\cF'\xrightarrow{\sim}p_2^*\cF'$ on $S''=S'\times_S S'$
+satisfying the cocycle condition
+\begin{equation}\label{eq:cocycle}
+p_{13}^*\varphi = p_{23}^*\varphi\circ p_{12}^*\varphi
+\quad\text{on } S'\times_S S'\times_S S'.
+\end{equation}
+\end{definition}
+
+\begin{theorem}[fpqc descent]\label{thm:fpqc}
+Let $f\colon S'\to S$ be faithfully flat and quasi-compact. Then the functor
+\[
+\mathrm{QCoh}(S)\longrightarrow \mathrm{QCoh}(S'\to S),\qquad
+\cF\longmapsto (f^*\cF,\mathrm{can})
+\]
+is an equivalence of categories.
+\end{theorem}
+
+\begin{proof}
+By~\cite[Tag 023N]{Stacks} it suffices to treat the affine case
+$S=\Spec A$, $S'=\Spec B$ with $A\to B$ faithfully flat. Consider the
+Amitsur complex
+\begin{equation}\label{eq:amitsur}
+0\to M\to M\otimes_A B\rightrightarrows M\otimes_A B\otimes_A B
+\to\cdots
+\end{equation}
+which is exact since it becomes split exact after the faithfully flat base
+change $-\otimes_A B$. The cocycle condition~\eqref{eq:cocycle} is exactly
+what is needed to descend $\cF'$.
+\end{proof}
+
+\begin{remark}
+The diagram
+\[
+\begin{tikzcd}
+S'\times_S S' \arrow[r, shift left, "p_1"] \arrow[r, shift right, "p_2"'] & S' \arrow[r, "f"] & S
+\end{tikzcd}
+\]
+is a coequalizer in the category of schemes when $f$ is fpqc.
+\end{remark}
+
+\section{Sheaves on sites}\label{sec:sites}
+Let $\cC$ be a site. A presheaf $\cF$ on $\cC$ is a sheaf if for every
+covering $\{U_i\to U\}_{i\in I}$ the sequence
+\[
+\cF(U)\to\prod_{i\in I}\cF(U_i)\rightrightarrows\prod_{i,j\in I}\cF(U_i\times_U U_j)
+\]
+is an equalizer. The category $\Sh(\cC)$ is a Grothendieck topos.
+
+\begin{proposition}\label{prop:sheafification}
+The inclusion $\Sh(\cC)\hookrightarrow\mathrm{PSh}(\cC)$ admits an exact left
+adjoint $\cF\mapsto\cF^{\#}$.
+\end{proposition}
+
+\begin{proof}
+Apply the plus construction twice: $\cF^{\#}=(\cF^+)^+$, where
+\[
+\cF^+(U)=\operatorname*{colim}_{\mathcal{U}\in J(U)}\check{H}^0(\mathcal{U},\cF).
+\]
+Exactness follows since filtered colimits commute with finite limits.
+\end{proof}
+
+\begin{example}
+For $X$ a topological space, the small site $\mathrm{Open}(X)$ gives the
+usual notion. For a scheme $X$ the étale site $X_{\text{ét}}$ gives
+étale sheaves, and
+\[
+H^i_{\text{ét}}(X,\mu_n)\cong H^i(X(\mathbb{C}),\mathbb{Z}/n)
+\]
+for $X$ smooth over $\mathbb{C}$ by Artin's comparison theorem.
+\end{example}
+
+\subsection{Long computation}
+\begin{align}
+\Hom_{\Sh(\cC)}(\cF^{\#},\mathcal{G})
+&\cong \Hom_{\mathrm{PSh}(\cC)}(\cF,\mathcal{G}) \label{eq:adj1}\\
+&\cong \lim_{U\in\cC}\Hom_{\mathrm{Set}}(\cF(U),\mathcal{G}(U)) \label{eq:adj2}\\
+&\cong \int_{U\in\cC}\mathcal{G}(U)^{\cF(U)}. \label{eq:adj3}
+\end{align}
+Equations~\eqref{eq:adj1}--\eqref{eq:adj3} combine to give the end formula.
+
+\subsection{Filler subsection 1}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 1$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{1}\,dt=\frac{1}{2}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\subsection{Filler subsection 2}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 2$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{2}\,dt=\frac{1}{3}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\subsection{Filler subsection 3}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 3$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{3}\,dt=\frac{1}{4}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\subsection{Filler subsection 4}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 4$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{4}\,dt=\frac{1}{5}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\subsection{Filler subsection 5}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 5$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{5}\,dt=\frac{1}{6}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\subsection{Filler subsection 6}
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. For every $n\ge 6$ we have
+\[
+\sum_{k=0}^{n}\binom{n}{k}x^k y^{n-k}=(x+y)^n,\qquad
+\int_0^1 t^{6}\,dt=\frac{1}{7}.
+\]
+Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut
+aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in
+voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit
+anim id est laborum. See Theorem~\ref{thm:fpqc} and~\cite{Vistoli}.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam,
+quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo
+consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse.
+
+\printbibliography
+\end{document}

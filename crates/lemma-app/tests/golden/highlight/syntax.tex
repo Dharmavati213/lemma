@@ -1,0 +1,43 @@
+% !TEX program = lualatex
+\documentclass[a4paper,11pt]{scrartcl}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amsthm}
+\hypersetup{colorlinks=true}
+\newcommand{\R}{\mathbb{R}}
+\begin{document}
+\section*{Star and \emph{emphasis}}\label{sec:one}
+\addsec{KOMA heading}
+Text with \emph{emphasis}, 50\% off, \$5, a~tie, x\_y and \\ a break.
+Refs \ref{sec:one}, \eqref{eq:a} and \cref{a,b}; cites \cite[p.~3]{Key1,Key2}
+and \citep{a,
+  b} across lines; \url{https://example.org/a%20b} and \href{https://x.y}{link text}.
+Inline $a^2 + \alpha_{i} = \sqrt{b}$, \(x\), and $\text{if } x \in \R$ here.
+$$ \sum_{n} a_n $$ then \ensuremath{\beta} and $x$~$y$.
+\[
+  \int_X f \, d\mu % a comment in math
+\]
+\begin{align*}
+  a &= b + c \\
+  &\leq \frac{1}{2} \text{ for all } n.
+\end{align*}
+\begin{equation}\label{eq:a}
+  e^{i\pi} + 1 = 0
+\end{equation}
+Unclosed $x + y
+continues here
+
+until the blank line ended it.
+\begin{tikzcd}
+  A \arrow[r] & B
+\end{tikzcd}
+\begin{verbatim}
+\begin{equation} $not math$ % not a comment
+\end{verbatim}
+\verb|\raw{x}| and \lstinline!y_1! inline.
+\begin{comment}
+skipped \textbf{bold}
+\end{comment}
+\input{chapters/one}\include{two}
+\includegraphics[width=.5\linewidth]{img/plot.pdf}
+\bibliography{refs}
+\end{document}

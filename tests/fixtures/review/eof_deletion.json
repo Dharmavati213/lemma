@@ -1,0 +1,9 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "\\end{document}\n% Notes for later.\n% TODO: add the graded version.",
+  "new_string": "\\end{document}\n",
+  "replace_all": false
+ }
+]

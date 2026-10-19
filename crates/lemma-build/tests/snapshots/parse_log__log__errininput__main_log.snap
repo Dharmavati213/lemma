@@ -1,0 +1,10 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: true
+fatal: false
+output: main.pdf (5 pages)
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Error chapters/yoneda.tex:26 Undefined control sequence.
+    | ...C\to\mathrm{PSh}(\cC)$ is fully \faithfull <HERE> faithful.

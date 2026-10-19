@@ -1,0 +1,22 @@
+{
+  "_description": "Three tool calls the editor must refuse, with the exact texts of ARCHITECTURE section 4.2 and 10.4 (tests/fixtures/proj): an old_string that is not in main.tex, one that occurs twice (\\begin{proof}), and a path outside the project root. The turn fails (a JSON-RPC error) if any reply is not an error containing that text.",
+  "default": [
+    {"say": "Trying three edits that should all be refused."},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "This sentence does not occur anywhere in the document.",
+      "new_string": "Replacement."
+    }, "expect_error": "old_string not found — the user may have edited this region; call read_file"}},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "\\begin{proof}",
+      "new_string": "\\begin{proof}[Proof sketch]"
+    }, "expect_error": "old_string matches 2 times; add context or set replace_all"}},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "../outside.tex",
+      "old_string": "a",
+      "new_string": "b"
+    }, "expect_error": "path outside project root"}},
+    {"say": "All three edits were refused, as expected."}
+  ]
+}

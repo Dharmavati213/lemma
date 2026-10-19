@@ -1,0 +1,13 @@
+[0] Config.pm:329> INFO - This is Biber 2.22
+[0] Config.pm:332> INFO - Logfile is 'main.blg'
+[47] biber:342> INFO - === Sat Oct 10, 2026, 19:43:54
+[56] Biber.pm:421> INFO - Reading 'main.bcf'
+[98] Biber.pm:1002> INFO - Found 5 citekeys in bib section 0
+[108] Biber.pm:4487> INFO - Processing section 0
+[114] Biber.pm:4680> INFO - Looking for bibtex file 'refs.bib' for section 0
+[114] bibtex.pm:1713> INFO - LaTeX decoding ...
+[117] bibtex.pm:1519> INFO - Found BibTeX data source 'refs.bib'
+[139] Utils.pm:480> ERROR - BibTeX subsystem: /tmp/biber_tmp_aW4R/8fe4c9854184545302f21ebf0d47516c_39057.utf8, line 37, syntax error: at end of input, expected end of entry ("}" or ")") (skipping to next "@")
+[140] Biber.pm:132> WARN - BibTeX subsystem: /tmp/biber_tmp_aW4R/8fe4c9854184545302f21ebf0d47516c_39057.utf8, line 35, warning: possible runaway string started at line 34
+[140] Biber.pm:134> INFO - WARNINGS: 1
+[140] Biber.pm:137> INFO - ERRORS: 1

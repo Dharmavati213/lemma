@@ -1,0 +1,88 @@
+# Lemma's default agent quick actions (QoL P1).
+#
+# They are offered in the editor's context menu (on a selection), in the agent panel's
+# "Quick actions" menu and as `:Agent <name>`; "Fix this error" also from the Problems list.
+# Put your own in ~/.config/lemma/prompts.toml: a template with the same name replaces one of
+# these, one with `prompt = ""` removes it.
+#
+# Placeholders: {selection}, {file} (relative to the project root), {line} (1-based) and
+# {diagnostic}. Any other {…} (such as \begin{align}) is kept as written.
+# Fields: name, prompt, context ("selection" | "diagnostic" | "file"), needs_selection, key
+# (an optional GTK accelerator such as "<Control><Alt>p").
+
+[[prompt]]
+name = "Fix this error"
+context = "diagnostic"
+prompt = '''
+Fix this LaTeX build error in {file} at line {line}:
+
+{diagnostic}
+
+The lines around it, numbered (the error's line is marked with >):
+
+{selection}
+
+Make the smallest change that fixes the error, with mcp__lemma__edit, and leave unrelated
+text alone. If the cause is elsewhere (a missing package, a macro defined in another file,
+an unclosed group further up), fix it there and say in one sentence what it was.
+'''
+
+[[prompt]]
+name = "Explain"
+context = "selection"
+needs_selection = true
+prompt = '''
+Explain the following passage from {file} (from line {line}): what it says mathematically,
+and how the LaTeX produces it where that is not obvious. Do not edit any file.
+
+{selection}
+'''
+
+[[prompt]]
+name = "Proofread"
+context = "selection"
+needs_selection = true
+prompt = '''
+Proofread the following passage from {file} (from line {line}) for spelling, grammar,
+punctuation and style. Change the language only: keep every formula, macro, label, reference
+and citation exactly as it is. Edit only this passage, with mcp__lemma__edit.
+
+{selection}
+'''
+
+[[prompt]]
+name = "Make this proof more detailed"
+context = "selection"
+needs_selection = true
+prompt = '''
+Rewrite the following proof from {file} (from line {line}) in more detail: justify every
+step, name the results that are used and spell out the computations. Keep the document's
+notation, macros and labels. Edit only this passage, with mcp__lemma__edit.
+
+{selection}
+'''
+
+[[prompt]]
+name = "Convert to align"
+context = "selection"
+needs_selection = true
+prompt = '''
+Convert the displayed equations in the following passage from {file} (from line {line}) into
+one align environment (align* when no line is numbered or labelled), aligned at the relation
+signs. Keep every label and the content of the formulas. Edit only this passage, with
+mcp__lemma__edit.
+
+{selection}
+'''
+
+[[prompt]]
+name = "Translate to English"
+context = "selection"
+needs_selection = true
+prompt = '''
+Translate the text of the following passage from {file} (from line {line}) into English.
+Keep all LaTeX commands, formulas, labels, references and citations unchanged. Edit only this
+passage, with mcp__lemma__edit.
+
+{selection}
+'''

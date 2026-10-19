@@ -1,0 +1,19 @@
+\documentclass{amsart}
+\usepackage{amsmath,amssymb,tikz-cd}
+\usepackage{lipsum}
+\newtheorem{theorem}{Theorem}
+\begin{document}
+\title{Probe document}
+\maketitle
+\section{Sheaves}
+Let $X$ be a scheme and $\mathcal{F}$ a quasi-coherent $\mathcal{O}_X$-module.
+\begin{theorem}
+For an affine scheme $X=\operatorname{Spec}A$, $H^i(X,\mathcal F)=0$ for $i>0$.
+\end{theorem}
+\[
+\begin{tikzcd}
+f^*g^*\mathcal{F} \arrow[r,"\sim"] & (g\circ f)^*\mathcal{F}
+\end{tikzcd}
+\]
+\lipsum[1-12]
+\end{document}

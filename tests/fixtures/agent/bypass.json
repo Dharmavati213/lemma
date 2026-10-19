@@ -1,0 +1,27 @@
+{
+  "_description": "Edits that bypass the MCP tools, as Bash 'sed -i' would (write to a temporary file, then rename over the original): one change in chapters/yoneda.tex and one in main.tex (tests/fixtures/proj). The editor's file watcher must turn them into hunks. 'inplace' rewrites chapters/yoneda.tex in place instead of renaming.",
+  "default": [
+    {"say": "I'll fix the wording with sed."},
+    {"disk_write": {
+      "path": "chapters/yoneda.tex",
+      "old_string": "is fully faithful.",
+      "new_string": "is fully faithful, hence an embedding."
+    }},
+    {"disk_write": {
+      "path": "main.tex",
+      "old_string": "by Artin's comparison theorem.",
+      "new_string": "by Artin's comparison theorem~\\cite{SGA1}."
+    }},
+    {"say": "Both files are updated."}
+  ],
+  "inplace": [
+    {"say": "Rewriting the corollary in place."},
+    {"disk_write": {
+      "path": "chapters/yoneda.tex",
+      "old_string": "is fully faithful.",
+      "new_string": "is fully faithful, hence an embedding.",
+      "in_place": true
+    }},
+    {"say": "Done."}
+  ]
+}

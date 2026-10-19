@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 05e2f025908dfaf120e61be13f7e81677f725adfb787ec448ee12af1d9f7f6ff # shrinks to base = "l0 alpha alpha\nl1 alpha alpha\nl2 alpha alpha\nl3 alpha alpha", ops = [Lines { at: Index(3689348814741910324), len: 1, new: 0 }], op = DeleteLine { gap: Index(0), line: Index(0) }, recompute_between = false

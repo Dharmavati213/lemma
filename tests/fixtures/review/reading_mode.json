@@ -1,0 +1,23 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "We study $\\dim A$ through Noether normalization.\n",
+  "new_string": "We study $\\dim A$ through Noether normalization.\nThroughout, rings are commutative with $1$.\n",
+  "replace_all": false
+ },
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "\\begin{proof}\n  Induction on the number of generators of $A$.\n\\end{proof}\n\n",
+  "new_string": "",
+  "replace_all": false
+ },
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "The Krull dimension of $A$ equals $d$.",
+  "new_string": "The Krull dimension of $A$ is exactly $d$.",
+  "replace_all": false
+ }
+]

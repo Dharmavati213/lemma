@@ -1,0 +1,12 @@
+1. Introduction -> page 1 y 513
+2. The Yoneda lemma -> page 1 y 610
+3. Descent -> page 2 y 277
+4. Sheaves on sites -> page 2 y 603
+  4.1. Long computation -> page 3 y 280
+  4.2. Filler subsection 1 -> page 3 y 389
+  4.3. Filler subsection 2 -> page 3 y 594
+  4.4. Filler subsection 3 -> page 4 y 214
+  4.5. Filler subsection 4 -> page 4 y 419
+  4.6. Filler subsection 5 -> page 4 y 624
+  4.7. Filler subsection 6 -> page 5 y 238
+References -> page 5 y 441

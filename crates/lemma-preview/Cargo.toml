@@ -1,0 +1,26 @@
+[package]
+name = "lemma-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# GUI-free: no GTK here. poppler and cairo (already in the tree through lemma-pdf) rasterize the
+# formula's PDF on the jobs thread; the app turns the pixels into a texture.
+[dependencies]
+lemma-core = { workspace = true }
+lemma-syntax = { workspace = true }
+lemma-build = { workspace = true }
+poppler = { workspace = true }
+cairo = { workspace = true }
+glib = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

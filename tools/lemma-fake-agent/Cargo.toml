@@ -1,0 +1,20 @@
+[package]
+name = "lemma-fake-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Scripted ACP agent + MCP client for tests (no model, no network). The agent side is written
+# with serde_json only, so it is an independent peer of the ACP client; the schema crate only
+# checks in unit tests that its messages parse as the ACP types.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+agent-client-protocol-schema = { workspace = true }

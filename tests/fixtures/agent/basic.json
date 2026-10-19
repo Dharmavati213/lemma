@@ -1,0 +1,55 @@
+{
+  "_description": "Two edits in main.tex and one in chapters/yoneda.tex (tests/fixtures/proj), then compile. Prompts containing 'inline' or 'region' make exactly one edit, inside the abstract of main.tex (line 34: 'These notes serve as a test document.'), for the Ctrl+K test: select that line or the abstract.",
+  "default": [
+    {"think": "The notes are fine; I will polish the abstract, the introduction and the Yoneda chapter."},
+    {"plan": [
+      {"content": "Polish the abstract", "status": "in_progress"},
+      "Tighten the introduction",
+      "Clarify the setting of the Yoneda lemma",
+      "Compile the document"
+    ]},
+    {"say": "I'll make three small edits and then compile the document."},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "These notes serve as a test document.",
+      "new_string": "These notes serve as a test document for Lemma."
+    }}},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "is treated at length in~\\cite{Vistoli}.",
+      "new_string": "is treated in detail in~\\cite{Vistoli}."
+    }}},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "chapters/yoneda.tex",
+      "old_string": "Let $\\cC$ be a locally small category and write",
+      "new_string": "Throughout, let $\\cC$ be a locally small category and write"
+    }}},
+    {"plan": [
+      {"content": "Polish the abstract", "status": "completed"},
+      {"content": "Tighten the introduction", "status": "completed"},
+      {"content": "Clarify the setting of the Yoneda lemma", "status": "completed"},
+      {"content": "Compile the document", "status": "in_progress"}
+    ]},
+    {"tool": {"name": "compile", "args": {}, "expect_error": "any"}},
+    {"usage": {"used": 41250, "size": 200000}},
+    {"say": "Done: two edits in `main.tex` and one in `chapters/yoneda.tex`. The document compiles."}
+  ],
+  "inline": [
+    {"say": "Rewording the selected sentence."},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "These notes serve as a test document.",
+      "new_string": "These notes are a short test document."
+    }}},
+    {"say": "Done."}
+  ],
+  "region": [
+    {"say": "Rewording the selected sentence."},
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "These notes serve as a test document.",
+      "new_string": "These notes are a short test document."
+    }}},
+    {"say": "Done."}
+  ]
+}

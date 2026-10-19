@@ -1,0 +1,94 @@
+Rc files read:
+  NONE
+Latexmk: This is Latexmk, John Collins, 15 June 2025. Version 4.87.
+No existing .aux file, so I'll make a simple one, and require run of *latex.
+Latexmk: applying rule 'pdflatex'...
+Rule 'pdflatex':  Reasons for rerun
+Category 'other':
+  Rerun of 'pdflatex' forced or previously required:
+    Reason or flag: 'Initial setup'
+
+------------
+Run number 1 of rule 'pdflatex'
+------------
+------------
+Running 'pdflatex  -interaction=nonstopmode -file-line-error -recorder  "main.tex"'
+------------
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026/Arch Linux) (preloaded format=pdflatex)
+ restricted \write18 enabled.
+entering extended mode
+(./main.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(/usr/share/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2025/01/22 v1.4n Standard LaTeX document class
+(/usr/share/texmf-dist/tex/latex/base/size10.clo)) (/usr/share/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def) (./main.aux)
+
+LaTeX Warning: Citation `MacLane' on page 1 undefined on input line 3.
+
+
+LaTeX Warning: Citation `Nope' on page 1 undefined on input line 3.
+
+
+LaTeX Warning: Citation `Broken' on page 1 undefined on input line 3.
+
+No file main.bbl.
+[1{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}] (./main.aux)
+
+LaTeX Warning: There were undefined references.
+
+ )</usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb>
+Output written on main.pdf (1 page, 21600 bytes).
+Transcript written on main.log.
+Latexmk: Getting log file 'main.log'
+Latexmk: Examining 'main.fls'
+Latexmk: Examining 'main.log'
+Latexmk: Missing bbl file 'main.bbl' in following:
+ No file main.bbl.
+Latexmk: Log file says output to 'main.pdf'
+Latexmk: Using bibtex to make bibliography file(s).
+  ===Source file 'main.bbl' for 'pdflatex'
+Create bibtex main
+Latexmk: Found bibliography file(s):
+  ./refs.bib
+Latexmk: applying rule 'bibtex main'...
+Rule 'bibtex main':  Reasons for rerun
+Category 'other':
+  Rerun of 'bibtex main' forced or previously required:
+    Reason or flag: 'Initial set up of rule'
+
+------------
+Run number 1 of rule 'bibtex main'
+------------
+------------
+Running 'bibtex  "main.aux"'
+------------
+This is BibTeX, Version 0.99e (TeX Live 2026/Arch Linux)
+The top-level auxiliary file: main.aux
+The style file: plain.bst
+Database file #1: refs.bib
+Illegal end of database file---line 36 of file refs.bib
+ : }
+ :  
+I'm skipping whatever remains of this entry
+Warning--I didn't find a database entry for "Nope"
+Warning--empty title in Broken
+Warning--empty publisher in Broken
+Warning--empty year in Broken
+(There was 1 error message)
+Latexmk: Summary of warnings from last run of *latex:
+  Latex failed to resolve 3 citation(s)
+Latexmk: ====Undefined refs and citations with line #s in .tex file:
+  Citation `MacLane' on page 1 undefined on input line 3
+  Citation `Nope' on page 1 undefined on input line 3
+  Citation `Broken' on page 1 undefined on input line 3
+Latexmk: Errors, so I did not complete making targets
+Collected error summary (may duplicate other messages):
+  bibtex main: Bibtex errors: See file 'main.blg'
+
+Latexmk: Sometimes, the -f option can be used to get latexmk
+  to try to force complete processing.
+  But normally, you will need to correct the file(s) that caused the
+  error, and then rerun latexmk.
+  In some cases, it is best to clean out generated files before rerunning
+  latexmk after you've corrected the files.

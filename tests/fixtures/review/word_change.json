@@ -1,0 +1,9 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "The Krull dimension of $A$ equals $d$.",
+  "new_string": "The Krull dimension of $A$ is exactly $d$.",
+  "replace_all": false
+ }
+]

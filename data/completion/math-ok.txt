@@ -1,0 +1,23 @@
+# Commands (`\name`) and environments (`{name}`) that the word lists offer in text and math alike
+# (no `#m`/`#n`) and that belong in formulas too. In math the completer ranks the other such
+# entries far down (`\frame`, `\framebox`, `\footref`, `\figurename` after `\fr`), unless they
+# come from a math package, have a glyph, or take a formula argument (see xtask `generate.rs`).
+# Whitespace-separated; `#` starts a comment.
+
+# Text and boxes inside formulas.
+\mbox \hbox \makebox \fbox \raisebox \underline
+# Spacing.
+\quad \qquad \hspace \hspace* \hskip \kern \mkern \mskip \thinspace \negthinspace \medspace
+\negmedspace \thickspace \negthickspace \enspace \enskip \phantom \hphantom \vphantom \smash
+\rule \strut \mathstrut
+# Numbering and references in displays.
+\label \ref \ref* \eqref \nonumber \notag \tag \tag*
+# Styles and limits.
+\displaystyle \textstyle \scriptstyle \scriptscriptstyle \limits \nolimits \displaylimits
+\ensuremath \lefteqn
+# Colour.
+\color \textcolor \colorbox
+# Arrays and the matrix environments.
+\begin \end \hline \cline \vline \multicolumn \hdotsfor
+# Environments used inside formulas.
+{array} {tikzcd} {CD} {tabular}

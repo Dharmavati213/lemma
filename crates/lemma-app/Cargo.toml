@@ -1,0 +1,245 @@
+[package]
+name = "lemma-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lemma"
+path = "src/main.rs"
+
+[dependencies]
+lemma-core = { workspace = true }
+lemma-syntax = { workspace = true }
+lemma-snippets = { workspace = true }
+lemma-complete = { workspace = true }
+lemma-review = { workspace = true }
+lemma-build = { workspace = true }
+lemma-pdf = { workspace = true }
+lemma-agent = { workspace = true }
+lemma-config = { workspace = true }
+# M3 (WP3.3 and WP3.6)
+lemma-preview = { workspace = true }
+lemma-search = { workspace = true }
+gtk = { workspace = true }
+gdk = { workspace = true }
+adw = { workspace = true }
+sourceview5 = { workspace = true }
+libspelling = { workspace = true }
+glib = { workspace = true }
+gio = { workspace = true }
+pango = { workspace = true }
+cairo = { workspace = true }
+async-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pulldown-cmark = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# M2: render_page (poppler on a jobs thread), local history (zstd objects), fuzzy file mentions
+poppler = { workspace = true }
+ruzstd = { workspace = true }
+frizbee = { workspace = true }
+# M3 (WP3.8): the git gutter's line diff
+similar = { workspace = true }
+# M5 (WP5.5): BibTeX import from doi.org and the arXiv API, only on the user's action
+ureq = { workspace = true }
+# M5 review: latexindent's private working directory (format.rs)
+tempfile = { workspace = true }
+
+# GTK integration tests run on the main thread with their own `main` (ARCHITECTURE §10.1).
+[[test]]
+name = "gtk_document"
+harness = false
+
+[[test]]
+name = "gtk_vim"
+harness = false
+
+[[test]]
+name = "gtk_app"
+harness = false
+
+[[test]]
+name = "gtk_window"
+harness = false
+
+[[test]]
+name = "gtk_snippets"
+harness = false
+
+[[test]]
+name = "gtk_pdf"
+harness = false
+
+[[test]]
+name = "gtk_review"
+harness = false
+
+[[test]]
+name = "gtk_regress_d"
+harness = false
+
+[[test]]
+name = "gtk_regress_a"
+harness = false
+
+[[test]]
+name = "gtk_regress_b"
+harness = false
+
+[[test]]
+name = "gtk_regress_c"
+harness = false
+
+# M2 (WP2.0): scanner line states, shell hooks
+[[test]]
+name = "gtk_line_states"
+harness = false
+
+[[test]]
+name = "gtk_shell_m2"
+harness = false
+
+# M2 work packages (placeholders created by WP2.0; each WP fills its file)
+[[test]]
+name = "gtk_agent_tools"
+harness = false
+
+[[test]]
+name = "gtk_agent_panel"
+harness = false
+
+[[test]]
+name = "gtk_agent_backends"
+harness = false
+
+[[test]]
+name = "gtk_review_persist"
+harness = false
+
+[[test]]
+name = "gtk_highlight"
+harness = false
+
+[[test]]
+name = "gtk_completion"
+harness = false
+
+[[test]]
+name = "gtk_autosnippets"
+harness = false
+
+[[test]]
+name = "gtk_typing"
+harness = false
+
+[[test]]
+name = "gtk_spell"
+harness = false
+
+[[test]]
+name = "gtk_keys"
+harness = false
+
+[[test]]
+name = "gtk_e2e_agent"
+harness = false
+
+# Second review round, area F (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_f"
+harness = false
+
+# Second review round, area E2 (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_e2"
+harness = false
+
+# Second review round, area B (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_b"
+harness = false
+
+# Second review round, area C (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_c"
+harness = false
+
+# Second review round, area E1 (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_e1"
+harness = false
+
+# Second review round, area D (regression tests that fail until fixed)
+[[test]]
+name = "gtk_regress2_d"
+harness = false
+
+# M3 (WP3.0): the shell hooks
+[[test]]
+name = "gtk_shell_m3"
+harness = false
+
+# M3 work packages (placeholders created by WP3.0; each WP fills its file)
+[[test]]
+name = "gtk_outline"
+harness = false
+
+[[test]]
+name = "gtk_goto"
+harness = false
+
+[[test]]
+name = "gtk_labels"
+harness = false
+
+[[test]]
+name = "gtk_math_preview"
+harness = false
+
+[[test]]
+name = "gtk_pdf_m3"
+harness = false
+
+[[test]]
+name = "gtk_palette"
+harness = false
+
+[[test]]
+name = "gtk_prefs"
+harness = false
+
+[[test]]
+name = "gtk_search"
+harness = false
+
+[[test]]
+name = "gtk_lint"
+harness = false
+
+[[test]]
+name = "gtk_session"
+harness = false
+
+[[test]]
+name = "gtk_git_gutter"
+harness = false
+
+[[test]]
+name = "gtk_pairs"
+harness = false
+
+[[test]]
+name = "gtk_qol"
+harness = false
+
+[[test]]
+name = "gtk_envtools"
+harness = false

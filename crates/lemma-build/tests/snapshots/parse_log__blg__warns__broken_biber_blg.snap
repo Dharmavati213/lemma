@@ -1,0 +1,6 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+Biber Error refs.bib:37 syntax error: at end of input, expected end of entry ("}" or ")") (skipping to next "@")
+Biber Warning refs.bib:35 possible runaway string started at line 34

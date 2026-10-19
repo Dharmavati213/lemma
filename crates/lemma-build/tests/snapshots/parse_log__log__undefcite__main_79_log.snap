@@ -1,0 +1,10 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: false
+fatal: false
+output: main.pdf (5 pages)
+Warning main.bbl:? Package biblatex: The following entry could not be found in the database: SGA2 Please verify the spelling and rerun LaTeX afterwards.
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Warning main.tex:41 Citation 'SGA2' on page 1 undefined on input line 41.

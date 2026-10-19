@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.build/
+
+# Editor and OS files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local secrets (API keys)
+.env

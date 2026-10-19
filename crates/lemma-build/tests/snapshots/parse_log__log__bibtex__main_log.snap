@@ -1,0 +1,10 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: false
+fatal: false
+output: main.pdf (1 pages)
+Warning main.tex:3 Citation `MacLane' on page 1 undefined on input line 3.
+Warning main.tex:3 Citation `Nope' on page 1 undefined on input line 3.
+Warning main.tex:3 Citation `Broken' on page 1 undefined on input line 3.

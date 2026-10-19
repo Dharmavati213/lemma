@@ -1,0 +1,29 @@
+[package]
+name = "lemma-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lemma-core = { workspace = true }
+agent-client-protocol = { workspace = true }
+futures-executor = { workspace = true }
+futures-sink = { workspace = true }
+futures-core = { workspace = true }
+async-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# process groups and signals for the agent process (WP2.1)
+libc = { workspace = true }
+# the API-key backend's HTTP client (WP5.1, messages.rs)
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

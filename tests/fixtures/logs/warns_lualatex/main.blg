@@ -1,0 +1,17 @@
+[0] Config.pm:329> INFO - This is Biber 2.22
+[0] Config.pm:332> INFO - Logfile is 'main.blg'
+[63] biber:342> INFO - === Sat Oct 10, 2026, 19:41:53
+[76] Biber.pm:421> INFO - Reading 'main.bcf'
+[132] Biber.pm:1002> INFO - Found 5 citekeys in bib section 0
+[146] Biber.pm:4487> INFO - Processing section 0
+[154] Biber.pm:4680> INFO - Looking for bibtex file 'refs.bib' for section 0
+[155] bibtex.pm:1713> INFO - LaTeX decoding ...
+[158] bibtex.pm:1519> INFO - Found BibTeX data source 'refs.bib'
+[199] UCollate.pm:68> INFO - Overriding locale 'en-US' defaults 'normalization = NFD' with 'normalization = prenormalized'
+[199] UCollate.pm:68> INFO - Overriding locale 'en-US' defaults 'variable = shifted' with 'variable = non-ignorable'
+[199] Biber.pm:4307> INFO - Sorting list 'anyt/global//global/global/global' of type 'entry' with template 'anyt' and locale 'en-US'
+[200] Biber.pm:4313> INFO - No sort tailoring available for locale 'en-US'
+[203] bbl.pm:676> INFO - Writing 'main.bbl' with encoding 'UTF-8'
+[204] bbl.pm:779> INFO - Output to main.bbl
+[204] Biber.pm:132> WARN - I didn't find a database entry for 'Lurie' (section 0)
+[204] Biber.pm:134> INFO - WARNINGS: 1

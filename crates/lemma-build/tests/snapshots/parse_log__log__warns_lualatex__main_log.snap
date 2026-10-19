@@ -1,0 +1,16 @@
+---
+source: crates/lemma-build/tests/parse_log.rs
+expression: rendered
+---
+rerun: false
+fatal: false
+output: main.pdf (6 pages)
+Warning main.aux:? Label `sec:intro' multiply defined.
+Warning main.bbl:? Package biblatex: The following entry could not be found in the database: Lurie Please verify the spelling and rerun LaTeX afterwards.
+Warning main.tex:32 Class amsart: Abstract should precede \maketitle in AMS document classes; reported on input line 32.
+Warning chapters/yoneda.tex:29 Citation 'Lurie' on page 2 undefined on input line 29.
+Warning main.tex:93 Package hyperref: Token not allowed in a PDF string (Unicode): removing `math shift' on input line 93.
+Warning main.tex:93 Package hyperref: Token not allowed in a PDF string (Unicode): removing `\alpha' on input line 93.
+Warning main.tex:94 Font shape `TU/lmr/bx/sc' undefined using `TU/lmr/bx/n' instead on input line 94.
+BadBox main.tex:95 Underfull \hbox (badness 10000) in paragraph at lines 95--95
+BadBox main.tex:98 Overfull \vbox (10.0pt too high) detected at line 98

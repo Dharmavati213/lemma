@@ -1,0 +1,9 @@
+[
+ {
+  "tool": "edit",
+  "file_path": "main.tex",
+  "old_string": "\\begin{proof}\n  Induction on the number of generators of $A$.\n\\end{proof}\n\n",
+  "new_string": "",
+  "replace_all": false
+ }
+]
