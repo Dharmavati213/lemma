@@ -969,10 +969,7 @@ impl WindowState {
         if let Some(pdf) = self.pdf.get() {
             pdf.view().trim_cache();
         }
-        // SAFETY: malloc_trim only returns free heap pages to the system.
-        unsafe {
-            libc::malloc_trim(0);
-        }
+        crate::heap::trim();
     }
 
     /// Gives the heap's free pages back to the system a moment from now (once for any number of
@@ -987,10 +984,7 @@ impl WindowState {
             if let Some(state) = state.upgrade() {
                 state.heap_trim.take();
             }
-            // SAFETY: malloc_trim only returns free heap pages to the system.
-            unsafe {
-                libc::malloc_trim(0);
-            }
+            crate::heap::trim();
         });
         self.heap_trim.replace(Some(timer));
     }

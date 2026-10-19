@@ -1,6 +1,6 @@
 # Lemma
 
-Lemma is a LaTeX editor for Linux (GTK 4 / libadwaita) built around reviewing an AI agent's
+Lemma is a LaTeX editor for Linux and macOS (GTK 4 / libadwaita) built around reviewing an AI agent's
 edits. When the agent changes your document, every change shows up inline as a red/green hunk
 that you accept or reject on its own, like a code review, before anything is final.
 
@@ -56,7 +56,8 @@ count), `mylatexformat` (faster math previews) and `git` (the git gutter). The C
 and Pi backends need `node` and `npm`, plus the agent itself, logged in (the `claude` or
 `codex` CLI). The other agents only need their own command line tool.
 
-Arch Linux ships all of these. Other distributions may not have libraries this new yet.
+Arch Linux ships all of these. Other distributions may not have libraries this new yet. On
+macOS, Homebrew has them all (see [macOS](#macos) below).
 
 ## Installation
 
@@ -80,6 +81,32 @@ xdg-mime default io.github.lemma_editor.Lemma.desktop text/x-tex
 
 If you installed Rust with rustup, see [`packaging/README.md`](packaging/README.md). It also
 covers updating.
+
+### macOS
+
+Lemma runs on Macs with Apple silicon and macOS 15 (Sequoia) or later. Download
+`Lemma-…-macos-arm64.dmg` from the [releases](https://github.com/dharmavati213/lemma/releases),
+open it and drag Lemma to Applications. The app brings GTK and everything else it needs.
+
+The app is not notarized by Apple, so the first start is blocked: open **System Settings →
+Privacy & Security**, scroll down and click **Open Anyway** next to the message about Lemma (or run
+`xattr -dr com.apple.quarantine /Applications/Lemma.app` once).
+
+For building documents, install a TeX distribution with `latexmk`, for example
+[MacTeX](https://tug.org/mactex/) (`brew install --cask mactex-no-gui`). Lemma finds it in
+`/Library/TeX/texbin`, and finds Homebrew's tools and the ones on your login shell's `PATH` even
+when started from Finder. The API key is kept in the macOS Keychain. Shortcuts use Ctrl, as on
+Linux.
+
+To build the app yourself (Xcode's command line tools, Rust and Homebrew):
+
+```sh
+brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg
+packaging/macos/bundle.sh        # dist/Lemma.app and dist/Lemma-<version>-macos-arm64.dmg
+```
+
+`cargo build --release -p lemma-app -p lemma-mcp` works too and runs against Homebrew's libraries.
+See [`packaging/macos/README.md`](packaging/macos/README.md).
 
 ### From source (any distribution)
 

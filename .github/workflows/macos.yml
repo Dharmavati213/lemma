@@ -1,0 +1,86 @@
+# Builds Lemma.app and its DMG on Apple silicon, starts the app with Homebrew moved aside and
+# snapshots its window (packaging/macos/). The DMG and the snapshots are the run's artifacts; for
+# a published release the DMG is attached to it as well. A second job runs the tests that need no
+# GTK display (the GTK tests run on Linux under Broadway, scripts/ci.sh).
+name: macOS
+
+on:
+  push:
+    branches: [main, macos-port]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # gh release upload
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: Lemma.app (arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Homebrew dependencies
+        run: brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg pkgconf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Lemma.app and the DMG
+        env:
+          LEMMA_DMG_NAME: ${{ github.event_name == 'release' && format('Lemma-{0}-macos-arm64', github.event.release.tag_name) || '' }}
+        run: packaging/macos/bundle.sh
+
+      - name: Start the app without Homebrew
+        run: packaging/macos/smoke-test.sh dist/Lemma.app dist/smoke
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: Lemma-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/smoke/
+          if-no-files-found: warn
+
+      - name: Attach the DMG to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.dmg --clobber
+
+  tests:
+    name: Tests (macOS, without the GTK tests)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Homebrew dependencies
+        run: brew install gtk4 libadwaita gtksourceview5 libspelling poppler pkgconf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Every crate but the app
+        run: cargo test --locked --workspace --exclude lemma-app
+
+      - name: The app's unit tests
+        run: cargo test --locked -p lemma-app --lib

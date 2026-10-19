@@ -819,10 +819,7 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
             && let Some(inner) = weak.upgrade()
         {
             inner.view.trim_cache();
-            // SAFETY: malloc_trim only returns free heap pages to the OS.
-            unsafe {
-                libc::malloc_trim(0);
-            }
+            crate::heap::trim();
         }
     });
     inner.refresh_toolbar();

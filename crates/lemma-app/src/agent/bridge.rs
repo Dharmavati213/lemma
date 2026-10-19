@@ -945,7 +945,7 @@ pub fn remove_stale_sockets(dir: &Path) {
         let Some(pid) = name.to_str().and_then(socket_pid) else {
             continue;
         };
-        let alive = pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists();
+        let alive = pid == std::process::id() || process_exists(pid);
         if alive || !entry.file_type().is_ok_and(|t| t.is_socket()) {
             continue;
         }
@@ -954,6 +954,21 @@ pub fn remove_stale_sockets(dir: &Path) {
             Err(e) => tracing::debug!("cannot remove {}: {e}", entry.path().display()),
         }
     }
+}
+
+/// True if process `pid` exists (`kill(pid, 0)`; works where there is no `/proc`, as on macOS).
+/// Ids that `kill` would read as a process group (0, or too large for a `pid_t`) never do.
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    let r = unsafe { libc::kill(pid, 0) };
+    // EPERM: it exists but belongs to another user.
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The process id in an MCP socket name `mcp-<pid>-<n>.sock`.
@@ -1847,14 +1862,23 @@ mod tests {
             drop(UnixListener::bind(dir.join(name)).unwrap());
             dir.join(name)
         };
+        // Another live process (another Lemma instance).
+        let mut running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let stale = socket(&format!("mcp-{dead}-3.sock"));
         let ours = socket(&format!("mcp-{}-1.sock", std::process::id()));
+        let live = socket(&format!("mcp-{}-5.sock", running.id()));
         let other = socket("other-1-2.sock");
         // Named like a socket, but a plain file: not ours to remove.
         let plain = dir.join(format!("mcp-{dead}-4.sock"));
         std::fs::write(&plain, "").unwrap();
         remove_stale_sockets(&dir);
+        running.kill().unwrap();
+        running.wait().unwrap();
         assert!(!stale.exists(), "the dead process's socket goes");
+        assert!(live.exists(), "a live process's socket stays");
         assert!(ours.exists() && other.exists() && plain.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

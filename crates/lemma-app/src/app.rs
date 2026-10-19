@@ -348,9 +348,16 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
     // Read before the main loop starts, so the synchronous reads cannot stall a frame.
     let (settings, settings_errors) = settings::load(files.as_ref());
     choose_renderer(settings.config.editor.renderer);
+    // On macOS, Finder and the Dock hand documents to the running app, which GTK passes on as
+    // `open` (only with HANDLES_OPEN). Elsewhere files come from Lemma's own command line.
+    let flags = if cfg!(target_os = "macos") {
+        gio::ApplicationFlags::NON_UNIQUE | gio::ApplicationFlags::HANDLES_OPEN
+    } else {
+        gio::ApplicationFlags::NON_UNIQUE
+    };
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .flags(flags)
         .build();
     let shared = Rc::new(Shared {
         settings: RefCell::new(settings),
@@ -367,6 +374,11 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
     app.connect_startup(move |app| startup(app, &s));
     let s = shared.clone();
     app.connect_activate(move |app| activate(app, &s));
+    #[cfg(target_os = "macos")]
+    {
+        let s = shared.clone();
+        app.connect_open(move |app, files, _hint| open_handed_files(app, &s, files));
+    }
     let status = app.run_with_args(&["lemma"]);
     // The callbacks hold `shared`; drop the windows explicitly before reporting.
     shared.windows.borrow_mut().clear();
@@ -420,6 +432,12 @@ fn forget_renderer_choice() {
     if !RENDERER_SET.with(|set| set.replace(false)) {
         return;
     }
+    // Other C libraries (macOS's among them) may free the removed string, which a concurrent
+    // `getenv` could still be reading: there the variable stays. It is harmless where it does:
+    // apps opened through Launch Services do not inherit Lemma's environment.
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return;
+    }
     // SAFETY: GTK's threads may be running. Rust's own environment accesses take std's lock;
     // glibc's unsetenv only removes the entry from `environ` (no string is freed), so a
     // concurrent C `getenv` cannot read freed memory, and nothing reads this variable again.
@@ -440,14 +458,12 @@ fn renderer_for(renderer: Renderer, env_set: bool, backend: Option<&str>) -> Opt
 /// checking's set-up and the first index have run, and their temporary buffers are free.
 const TRIM_AFTER: Duration = Duration::from_millis(2000);
 
-/// Returns the free memory of glibc's heaps to the system once start-up has settled (M5). With
-/// `M_MMAP_THRESHOLD` fixed (see `main.rs`), only the top of a heap is returned by itself; start-up
-/// leaves free pages in the middle (file reading, layout, the first highlighting pass).
+/// Returns the heap's free memory to the system once start-up has settled (M5). With glibc's
+/// `M_MMAP_THRESHOLD` fixed (see [`crate::heap::tune`]), only the top of a heap is returned by
+/// itself; start-up leaves free pages in the middle (file reading, layout, the first highlighting
+/// pass).
 fn trim_heap_later() {
-    glib::timeout_add_local_once(TRIM_AFTER, || {
-        // SAFETY: malloc_trim only releases free pages of glibc's own heaps.
-        unsafe { libc::malloc_trim(0) };
-    });
+    glib::timeout_add_local_once(TRIM_AFTER, crate::heap::trim);
 }
 
 fn startup(app: &adw::Application, shared: &Rc<Shared>) {
@@ -657,6 +673,31 @@ fn install_actions(app: &adw::Application, shared: &Rc<Shared>) {
         }
     });
     app.add_action(&quit);
+}
+
+/// Documents macOS hands over (Finder's Open With, a drop on the Dock icon, `open -a Lemma
+/// main.tex`): each opens in the active window, as if chosen in the Open dialog.
+#[cfg(target_os = "macos")]
+fn open_handed_files(app: &adw::Application, shared: &Rc<Shared>, files: &[gio::File]) {
+    if shared.windows.borrow().is_empty() {
+        activate(app, shared);
+    }
+    let Some(state) = active_window(app, shared) else {
+        return;
+    };
+    state.window.present();
+    let paths: Vec<PathBuf> = files.iter().filter_map(gio::File::path).collect();
+    glib::spawn_future_local(async move {
+        for path in paths {
+            if is_directory(&path) {
+                state.toast("A folder opens as a project from the command line: lemma DIR");
+                continue;
+            }
+            if let Err(e) = state.open_file(&path).await {
+                state.toast(&e);
+            }
+        }
+    });
 }
 
 /// The state of the focused window, else of the first one.

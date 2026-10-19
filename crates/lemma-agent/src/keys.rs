@@ -9,14 +9,24 @@
 //! [`Keyring::store`] runs `secret-tool store --label="Lemma Anthropic API key" service lemma kind
 //! anthropic-api-key` with the key on **stdin**, never in argv; [`Keyring::clear`] removes it.
 //!
+//! # macOS
+//!
+//! On macOS the key is a generic password in the login keychain (service `lemma`, account
+//! `anthropic-api-key`), through `/usr/bin/security` ([`Keyring::macos_keychain`]):
+//! `find-generic-password -w` reads it and `delete-generic-password` removes it. `security` takes a
+//! new password only as an argument, so [`Keyring::store`] runs `security -i` and writes the
+//! `add-generic-password` command to its **stdin**, again keeping the key out of argv; it reads the
+//! key back to confirm, since `security -i` does not report a failed command in its exit status.
+//! Items `security` created are readable by `security` without a prompt.
+//!
 //! # Secrecy
 //!
 //! The key lives only in an [`ApiKey`], whose `Debug` and `Display` print `<redacted>`: it is
 //! never written to `config.toml`, logs, raw logs, events or error messages. Error messages from
 //! `secret-tool` are passed through [`ApiKey::redact`] as well.
 //!
-//! Every call here blocks until `secret-tool` ends (the keyring may first ask the user to unlock
-//! it), at most [`SECRET_TOOL_TIMEOUT`]: call it off the GTK main thread.
+//! Every call here blocks until `secret-tool` (or `security`) ends (the keyring may first ask the
+//! user to unlock it), at most [`SECRET_TOOL_TIMEOUT`]: call it off the GTK main thread.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -32,6 +42,17 @@ pub const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 pub const LABEL: &str = "Lemma Anthropic API key";
 /// The keyring item's attributes, as `secret-tool` arguments.
 pub const ATTRIBUTES: [&str; 4] = ["service", "lemma", "kind", "anthropic-api-key"];
+/// The macOS keychain item's service and account (`security -s … -a …`).
+pub const KEYCHAIN_ITEM: [&str; 4] = ["-s", "lemma", "-a", "anthropic-api-key"];
+/// `security`'s exit status when no item matches (`errSecItemNotFound`).
+const SECURITY_NOT_FOUND: i32 = 44;
+/// Where the key is kept, for messages: "the GNOME keyring (secret-tool)" or "the macOS
+/// Keychain".
+pub const KEYRING_DESCRIPTION: &str = if cfg!(target_os = "macos") {
+    "the macOS Keychain"
+} else {
+    "the GNOME keyring (secret-tool)"
+};
 /// How long one `secret-tool` run may take (an unlock prompt included) before it is killed.
 pub const SECRET_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Keys longer than this are refused (a real key is about 100 bytes).
@@ -52,7 +73,7 @@ impl ApiKey {
         valid.then(|| Self(key.to_owned()))
     }
 
-    /// The key itself, for the `x-api-key` header and `secret-tool`'s stdin only.
+    /// The key itself, for the `x-api-key` header and the keyring program's stdin only.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -80,40 +101,63 @@ impl fmt::Display for ApiKey {
 pub enum KeySource {
     /// [`ENV_VAR`].
     Env,
-    /// The GNOME keyring.
+    /// The GNOME keyring (the macOS Keychain on macOS).
     Keyring,
 }
 
 impl KeySource {
-    /// "from ANTHROPIC_API_KEY" / "from GNOME keyring".
+    /// "from ANTHROPIC_API_KEY" / "from GNOME keyring" ("from macOS Keychain").
     pub fn describe(self) -> &'static str {
         match self {
             Self::Env => "from ANTHROPIC_API_KEY",
+            Self::Keyring if cfg!(target_os = "macos") => "from macOS Keychain",
             Self::Keyring => "from GNOME keyring",
         }
     }
 }
 
-/// The `secret-tool` program to run.
+/// How the keyring program is spoken to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    /// libsecret's `secret-tool`.
+    SecretTool,
+    /// macOS's `security`.
+    MacSecurity,
+}
+
+/// The keyring program to run: `secret-tool`, or `security` on macOS.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keyring {
     program: PathBuf,
+    protocol: Protocol,
 }
 
 impl Default for Keyring {
-    /// `secret-tool`, found on `PATH`.
+    /// `secret-tool`, found on `PATH`; on macOS `/usr/bin/security`.
     fn default() -> Self {
-        Self {
-            program: PathBuf::from("secret-tool"),
+        if cfg!(target_os = "macos") {
+            Self::macos_keychain("/usr/bin/security")
+        } else {
+            Self::with_program("secret-tool")
         }
     }
 }
 
 impl Keyring {
-    /// Runs this program instead of `secret-tool`.
+    /// Runs this program instead of `secret-tool` (it must take `secret-tool`'s arguments).
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            protocol: Protocol::SecretTool,
+        }
+    }
+
+    /// The macOS login keychain through `program`, which takes the arguments of macOS's
+    /// `/usr/bin/security` (see the module docs).
+    pub fn macos_keychain(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            protocol: Protocol::MacSecurity,
         }
     }
 
@@ -138,6 +182,9 @@ impl Keyring {
 
     /// The stored key: `Ok(None)` when there is none (or the keyring has none for us).
     pub fn lookup(&self) -> io::Result<Option<ApiKey>> {
+        if self.protocol == Protocol::MacSecurity {
+            return self.lookup_macos();
+        }
         let mut args = vec!["lookup"];
         args.extend(ATTRIBUTES);
         let out = self.run(&args, None)?;
@@ -154,12 +201,15 @@ impl Keyring {
         Ok(ApiKey::new(&out.stdout))
     }
 
-    /// Stores `key` (replacing an earlier one); the key goes to `secret-tool`'s stdin.
+    /// Stores `key` (replacing an earlier one); the key goes to the program's stdin.
     pub fn store(&self, key: &ApiKey) -> io::Result<()> {
+        if self.protocol == Protocol::MacSecurity {
+            return self.store_macos(key);
+        }
         let label = format!("--label={LABEL}");
         let mut args = vec!["store", label.as_str()];
         args.extend(ATTRIBUTES);
-        let out = self.run(&args, Some(key))?;
+        let out = self.run(&args, Some(key.expose()))?;
         if out.status.success() {
             Ok(())
         } else {
@@ -172,6 +222,9 @@ impl Keyring {
 
     /// Removes the stored key (nothing stored is not an error).
     pub fn clear(&self) -> io::Result<()> {
+        if self.protocol == Protocol::MacSecurity {
+            return self.clear_macos();
+        }
         let mut args = vec!["clear"];
         args.extend(ATTRIBUTES);
         let out = self.run(&args, None)?;
@@ -185,7 +238,68 @@ impl Keyring {
         }
     }
 
-    fn run(&self, args: &[&str], stdin: Option<&ApiKey>) -> io::Result<Output> {
+    /// [`Keyring::lookup`] in the macOS keychain: `security find-generic-password -w` prints the
+    /// password alone.
+    fn lookup_macos(&self) -> io::Result<Option<ApiKey>> {
+        let mut args = vec!["find-generic-password"];
+        args.extend(KEYCHAIN_ITEM);
+        args.push("-w");
+        let out = self.run(&args, None)?;
+        if out.status.success() {
+            return Ok(ApiKey::new(&out.stdout));
+        }
+        if out.status.code() == Some(SECURITY_NOT_FOUND) {
+            return Ok(None);
+        }
+        Err(io::Error::other(format!(
+            "security find-generic-password failed: {}",
+            out.stderr.trim()
+        )))
+    }
+
+    /// [`Keyring::store`] in the macOS keychain: `add-generic-password -U` (replacing an earlier
+    /// item) written to `security -i`'s stdin, then read back.
+    fn store_macos(&self, key: &ApiKey) -> io::Result<()> {
+        // The command is parsed by `security` itself: the key goes inside double quotes, which a
+        // quote or a backslash in it would break. Real keys are letters, digits, `-` and `_`.
+        if key.expose().contains(['"', '\\']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the key contains a quote or a backslash, which the macOS keychain tool cannot take",
+            ));
+        }
+        let [s, service, a, account] = KEYCHAIN_ITEM;
+        let command = format!(
+            "add-generic-password -U {s} {service} {a} {account} -l \"{LABEL}\" -w \"{}\"\n",
+            key.expose()
+        );
+        let out = self.run(&["-i"], Some(&command))?;
+        match self.lookup_macos() {
+            Ok(Some(stored)) if stored == *key => Ok(()),
+            Ok(_) => Err(io::Error::other(format!(
+                "security add-generic-password failed: {}",
+                key.redact(out.stderr.trim())
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Keyring::clear`] in the macOS keychain.
+    fn clear_macos(&self) -> io::Result<()> {
+        let mut args = vec!["delete-generic-password"];
+        args.extend(KEYCHAIN_ITEM);
+        let out = self.run(&args, None)?;
+        if out.status.success() || out.status.code() == Some(SECURITY_NOT_FOUND) {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "security delete-generic-password failed: {}",
+                out.stderr.trim()
+            )))
+        }
+    }
+
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> io::Result<Output> {
         let mut child = Command::new(&self.program)
             .args(args)
             .stdin(if stdin.is_some() {
@@ -202,13 +316,13 @@ impl Keyring {
                     format!("cannot run {}: {e}", self.program.display()),
                 )
             })?;
-        if let (Some(key), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            // A failed write shows up as secret-tool's own failure.
-            let _ = pipe.write_all(key.expose().as_bytes());
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            // A failed write shows up as the program's own failure.
+            let _ = pipe.write_all(input.as_bytes());
         }
         let stdout = child.stdout.take().map(reader_thread);
         let stderr = child.stderr.take().map(reader_thread);
-        let status = wait_with_timeout(&mut child, SECRET_TOOL_TIMEOUT)?;
+        let status = wait_with_timeout(&mut child, &self.program, SECRET_TOOL_TIMEOUT)?;
         let collect = |h: Option<thread::JoinHandle<Vec<u8>>>| {
             h.and_then(|h| h.join().ok())
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -236,7 +350,11 @@ fn reader_thread(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec
     })
 }
 
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+fn wait_with_timeout(
+    child: &mut Child,
+    program: &Path,
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -245,9 +363,10 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> io::Result<ExitSta
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let name = program.file_name().unwrap_or(program.as_os_str());
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "secret-tool did not answer in time",
+                format!("{} did not answer in time", name.to_string_lossy()),
             ));
         }
         thread::sleep(Duration::from_millis(10));
@@ -275,17 +394,17 @@ pub fn lookup_with(env_value: Option<&OsStr>, keyring: &Keyring) -> Option<(ApiK
     }
 }
 
-/// [`lookup_with`] for this process: `ANTHROPIC_API_KEY`, then `secret-tool` on `PATH`.
+/// [`lookup_with`] for this process: `ANTHROPIC_API_KEY`, then [`Keyring::default`].
 pub fn lookup() -> Option<(ApiKey, KeySource)> {
     lookup_with(std::env::var_os(ENV_VAR).as_deref(), &Keyring::default())
 }
 
-/// Stores `key` in the GNOME keyring (`secret-tool` on `PATH`).
+/// Stores `key` in the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS).
 pub fn store(key: &ApiKey) -> io::Result<()> {
     Keyring::default().store(key)
 }
 
-/// Removes the key from the GNOME keyring (`secret-tool` on `PATH`).
+/// Removes the key from the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS).
 pub fn clear() -> io::Result<()> {
     Keyring::default().clear()
 }

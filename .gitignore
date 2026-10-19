@@ -11,3 +11,6 @@
 
 # Local secrets (API keys)
 .env
+
+# macOS packaging output (packaging/macos/bundle.sh)
+/dist

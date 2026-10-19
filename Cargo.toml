@@ -47,6 +47,8 @@ tracing        = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # build / tools / tests
 pkg-config = "0.3.34"
+# compiles the bundled SyncTeX parser (lemma-synctex, macOS); already in the tree through ring
+cc         = "1.7.0"
 zstd       = "0.14.2"
 proptest   = "1.11.0"
 insta      = "1.49.0"

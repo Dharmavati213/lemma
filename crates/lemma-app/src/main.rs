@@ -5,7 +5,11 @@ use std::time::Instant;
 
 fn main() -> ExitCode {
     let started = Instant::now();
-    tune_malloc();
+    lemma_app::heap::tune();
+    // An app started from Finder gets launchd's environment: the bundle's own libraries and data
+    // must be named, and PATH lacks Homebrew, MacTeX and the user's own tools.
+    #[cfg(target_os = "macos")]
+    lemma_app::macos::prepare_environment();
     init_tracing();
     quiet_environment_noise();
 
@@ -25,16 +29,6 @@ fn main() -> ExitCode {
         }
     };
     lemma_app::app::run(options, started)
-}
-
-/// Fewer glibc arenas and an mmap threshold of 1 MiB keep freed memory returnable to the OS
-/// (ARCHITECTURE §7).
-fn tune_malloc() {
-    // SAFETY: mallopt only changes allocator tunables; it is called before any other thread exists.
-    unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
-        libc::mallopt(libc::M_ARENA_MAX, 2);
-    }
 }
 
 /// Logs to stderr, filtered by `LEMMA_LOG` (an `EnvFilter` directive such as `lemma_app=debug`);

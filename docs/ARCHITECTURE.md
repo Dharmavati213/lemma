@@ -350,7 +350,7 @@ Rules:
 **Techniques:**
 - System GTK, linked dynamically. No tokio, webview, JS engine or bundled C libraries.
 - Lazy loading: spell check after the first frame, cwl per package, SyncTeX on the first sync, the preview format on the first hover, the agent when its panel opens.
-- `mallopt(M_MMAP_THRESHOLD, 1 MiB)` and `mallopt(M_ARENA_MAX, 2)` at startup. When the PDF pane is hidden, or the window has been inactive for 60 s, shrink the cache to the visible pages and call `malloc_trim(0)`.
+- `mallopt(M_MMAP_THRESHOLD, 1 MiB)` and `mallopt(M_ARENA_MAX, 2)` at startup. When the PDF pane is hidden, or the window has been inactive for 60 s, shrink the cache to the visible pages and call `malloc_trim(0)`. (`lemma-app/src/heap.rs`: glibc only; on macOS `heap::trim` is `malloc_zone_pressure_relief`, see §12.)
 - Keep GTK's default Vulkan renderer: `GSK_RENDERER=gl` measured about +75 MB [V]. `cairo` measured −30 MB and is documented as a low-memory option. M5: `[editor] renderer = "auto"|"cairo"|"vulkan"|"gl"` sets `GSK_RENDERER` at start-up unless the environment has it; `auto` (the default) is cairo: measured on the user's machine it saves about 27 MB and 140 ms to the first frame, types as fast, and still scrolls the PDF at 60 fps (docs/STATUS.md, "M5 performance").
 - Closed documents are kept as `String`s; baselines exist only while hunks exist.
 - **Measurement:**
@@ -519,6 +519,8 @@ The synctex build script:
 // crates/lemma-synctex/build.rs
 fn main() { pkg_config::Config::new().atleast_version("2.0").probe("synctex").expect("libsynctex not found"); }
 ```
+(Since the macOS port, §12: on macOS, or with `LEMMA_SYNCTEX_BUNDLED=1`, it compiles the parser in
+`crates/lemma-synctex/vendor/synctex/` instead.)
 
 ### 10.3 Public API of the GUI-free crates (frozen in M0)
 
@@ -1079,3 +1081,39 @@ they conflict with the sections above, this section wins.
   - Vim mode is off by default.
   - The default renderer is cairo (`[editor] renderer`).
   - The memory budgets are re-based on real-Wayland measurements (`scripts/budgets.toml`).
+
+## 12. macOS (2026-10-19)
+
+Lemma builds and runs on macOS (Apple silicon, macOS 15 or later) against Homebrew's GTK stack,
+which has every library at the pinned versions or newer. Linux stays the primary platform and
+its behaviour is unchanged. The differences:
+
+- **Allocator** (`lemma-app/src/heap.rs`): `heap::tune` is glibc's `mallopt` (nothing elsewhere);
+  `heap::trim` is `malloc_trim(0)` on glibc and `malloc_zone_pressure_relief(NULL, 0)` on macOS.
+  `forget_renderer_choice` leaves `GSK_RENDERER` set outside glibc, whose `unsetenv` alone is
+  known not to free the string.
+- **Processes**: `acp.rs`'s `group_has_members` asks libproc on macOS (`proc_listpids` with
+  `PROC_PGRP_ONLY`, then `PROC_PIDTBSDINFO` to skip zombies) instead of reading `/proc`.
+  `bridge::remove_stale_sockets` checks other instances with `kill(pid, 0)` on every platform
+  (without `/proc`, macOS would have deleted the sockets of live instances).
+- **API key** (`lemma-agent/src/keys.rs`): the login keychain through `/usr/bin/security`
+  (service `lemma`, account `anthropic-api-key`). `security` takes a new password only in argv,
+  so the store command goes to `security -i`'s stdin and the key is read back to confirm.
+- **SyncTeX**: no package manager ships libsynctex alone on macOS, so `lemma-synctex/build.rs`
+  compiles TeX Live's parser (`vendor/synctex/`, API 2.0.0, the same headers as the system
+  library; MIT-style licence) with `cc` and links zlib.
+- **Process environment** (`lemma-app/src/macos.rs`, first thing in `main`): inside `Lemma.app`
+  the GLib/GTK/gdk-pixbuf variables point at the bundle (`GSETTINGS_SCHEMA_DIR`,
+  `XDG_DATA_DIRS`, `GIO_MODULE_DIR`, `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE` written from a
+  template for the bundle's current location), so no module of a Homebrew installation (with
+  its own GLib) is loaded. PATH gets the login shell's PATH (when not started from a terminal)
+  and Homebrew's, MacTeX's and MacPorts' directories.
+- **Finder**: on macOS the application has `HANDLES_OPEN`; files from Finder, the Dock or
+  `open -a Lemma` open in the active window.
+- **Not ported**: shortcuts stay on Ctrl (not Cmd); `--mem-report` reads `/proc` and reports
+  that it cannot on macOS; the GTK integration tests run on Linux only (Broadway).
+- **Packaging** (`packaging/macos/`, `.github/workflows/macos.yml`): `bundle.sh` builds
+  `Lemma.app` with the libraries in `Contents/Resources/lib` (a directory named `lib`, because
+  enchant relocates itself by replacing a trailing `lib`) rewritten to
+  `@executable_path/../Resources/lib/` by `bundle_dylibs.py`, signs it ad hoc and makes the DMG.
+  CI starts the app with Homebrew renamed (`smoke-test.sh`) and keeps snapshots of its window.

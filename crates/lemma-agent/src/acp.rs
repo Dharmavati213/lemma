@@ -2257,6 +2257,7 @@ fn reap(pid: libc::pid_t) {
 }
 
 /// True if a live (non-zombie) process is in process group `pgid`. Reads `/proc/*/stat`.
+#[cfg(not(target_os = "macos"))]
 fn group_has_members(pgid: libc::pid_t) -> bool {
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return false;
@@ -2281,6 +2282,56 @@ fn group_has_members(pgid: libc::pid_t) -> bool {
         }
     }
     false
+}
+
+/// True if a live (non-zombie) process is in process group `pgid`. Asks libproc: the group's
+/// members (`proc_listpids(PROC_PGRP_ONLY)`), then each one's state (`PROC_PIDTBSDINFO`, which
+/// also answers for zombies).
+#[cfg(target_os = "macos")]
+fn group_has_members(pgid: libc::pid_t) -> bool {
+    /// `PROC_PGRP_ONLY` from `<sys/proc_info.h>`: list the members of one process group.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let Ok(group) = u32::try_from(pgid) else {
+        return false;
+    };
+    let mut pids: Vec<libc::pid_t> = vec![0; 64];
+    let count = loop {
+        let bytes = std::mem::size_of_val(pids.as_slice());
+        let Ok(size) = libc::c_int::try_from(bytes) else {
+            return false;
+        };
+        // SAFETY: proc_listpids writes at most `size` bytes into `pids`; it returns the number of
+        // bytes written.
+        let filled =
+            unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, pids.as_mut_ptr().cast(), size) };
+        let Ok(filled) = usize::try_from(filled) else {
+            return false;
+        };
+        let count = filled / std::mem::size_of::<libc::pid_t>();
+        // A full buffer may have cut the list short: ask again with a larger one.
+        if count < pids.len() {
+            break count;
+        }
+        pids.resize(pids.len() * 2, 0);
+    };
+    pids[..count]
+        .iter()
+        .any(|&pid| pid > 0 && is_live_process(pid))
+}
+
+/// True if `pid` exists and is not a zombie.
+#[cfg(target_os = "macos")]
+fn is_live_process(pid: libc::pid_t) -> bool {
+    // SAFETY: an all-zero proc_bsdinfo is a valid value for proc_pidinfo to fill in.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+        return false;
+    };
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let filled =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    // Anything short of a full answer: the process is gone.
+    filled == size && info.pbi_status != libc::SZOMB
 }
 
 #[cfg(test)]

@@ -2759,12 +2759,7 @@ impl Inner {
         // The rows' widgets go once the list view has caught up; then give the freed heap back
         // (a long session's transcript is many megabytes).
         if had_rows {
-            glib::timeout_add_local_once(Duration::from_millis(500), || {
-                // SAFETY: malloc_trim only returns free heap pages to the OS.
-                unsafe {
-                    libc::malloc_trim(0);
-                }
-            });
+            glib::timeout_add_local_once(Duration::from_millis(500), crate::heap::trim);
         }
     }
 
@@ -5569,10 +5564,11 @@ impl Inner {
         entry.set_widget_name("api-key-entry");
         let dialog = adw::AlertDialog::builder()
             .heading("Anthropic API key")
-            .body(
-                "Lemma keeps the key in the GNOME keyring (secret-tool), never in config.toml. \
+            .body(format!(
+                "Lemma keeps the key in {}, never in config.toml. \
                  ANTHROPIC_API_KEY, when set, is used first.",
-            )
+                lemma_agent::keys::KEYRING_DESCRIPTION
+            ))
             .extra_child(&entry)
             .close_response("cancel")
             .default_response("save")

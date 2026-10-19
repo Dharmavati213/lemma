@@ -13,7 +13,10 @@ pub mod cli;
 pub mod diagnostics_panel;
 pub mod document;
 pub mod editor;
+pub mod heap;
 pub mod hooks;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod memreport;
 pub mod pdf;
 pub mod review_persist;
