@@ -1,12 +1,13 @@
 # Builds Lemma.app and its DMG on Apple silicon, starts the app with Homebrew moved aside and
 # snapshots its window (packaging/macos/). The DMG and the snapshots are the run's artifacts; for
-# a published release the DMG is attached to it as well. A second job runs the tests that need no
-# GTK display (the GTK tests run on Linux under Broadway, scripts/ci.sh).
+# a published release the DMG is attached to it twice: as Lemma-<tag>-macos-arm64.dmg, and as
+# Lemma-macos-arm64.dmg for packaging/macos/install.sh (releases/latest/download/…). The tests run
+# on Linux (scripts/ci.sh).
 name: macOS
 
 on:
   push:
-    branches: [main, macos-port]
+    branches: [main]
   pull_request:
   workflow_dispatch:
   release:
@@ -59,28 +60,7 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.dmg --clobber
-
-  tests:
-    name: Tests (macOS, without the GTK tests)
-    runs-on: macos-15
-    timeout-minutes: 60
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_INSTALL_CLEANUP: "1"
-      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Homebrew dependencies
-        run: brew install gtk4 libadwaita gtksourceview5 libspelling poppler pkgconf
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Every crate but the app
-        run: cargo test --locked --workspace --exclude lemma-app
-
-      - name: The app's unit tests
-        run: cargo test --locked -p lemma-app --lib
+        run: |
+          dmg="dist/Lemma-${{ github.event.release.tag_name }}-macos-arm64.dmg"
+          cp "$dmg" dist/Lemma-macos-arm64.dmg
+          gh release upload "${{ github.event.release.tag_name }}" "$dmg" dist/Lemma-macos-arm64.dmg --clobber

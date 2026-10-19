@@ -1,7 +1,9 @@
 # Packaging Lemma for macOS
 
 `bundle.sh` builds a self-contained `Lemma.app` and a DMG from Homebrew's GTK stack. CI does the
-same on every push (`.github/workflows/macos.yml`), and attaches the DMG to published releases.
+same on every push to `main` (`.github/workflows/macos.yml`), and attaches the DMG to published
+releases. `install.sh` is the one-command installer of the main README: it installs the latest
+release's DMG (or builds with `bundle.sh` when there is none), a `lemma` command and TeX.
 
 ```sh
 brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg
@@ -47,6 +49,28 @@ Lemma sets up the environment for these files itself when it runs from a bundle
 
 ## Releases
 
-A published GitHub release triggers the workflow, which uploads
-`Lemma-<tag>-macos-arm64.dmg` to it. Every other run keeps the DMG and the smoke test's window
+A published GitHub release triggers the workflow, which uploads the DMG to it twice:
+`Lemma-<tag>-macos-arm64.dmg`, and `Lemma-macos-arm64.dmg`, the name `install.sh` downloads
+through `releases/latest/download/`. Every other run keeps the DMG and the smoke test's window
 snapshots (`dist/smoke/*.png`) as the run's artifact.
+
+## install.sh
+
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dharmavati213/lemma/main/packaging/macos/install.sh)"
+```
+
+1. Lemma: the release's DMG (`--release TAG`, `--dmg FILE`), or a build from source in
+   `~/Library/Caches/lemma-install/src` (`--from-source`, or when no release has a DMG), which
+   installs Xcode's command line tools, Homebrew and Rust when they are missing. The app goes to
+   `/Applications` (else `~/Applications`), a `lemma` wrapper script to `/usr/local/bin` (a
+   wrapper, not a symlink: Lemma finds `lemma-mcp` next to the path it was started from).
+2. TeX (`--tex`): `recommended` downloads BasicTeX from CTAN, checks its Apple developer
+   signature, installs it and adds `TEX_TOOLS` and `TEX_COMMON` with `tlmgr` (only the missing
+   ones); `full` installs MacTeX; `none` skips it. An installed TeX Live only gets the missing
+   packages; another TeX (Homebrew's, MacPorts') is left alone.
+3. latexindent: macOS's Perl lacks YAML::Tiny and File::HomeDir, which it installs from CPAN.
+
+Everything runs from `main` at the end of the file, so a partly downloaded script does nothing.
+`--uninstall` removes the app and the command. `LEMMA_TEX_BIN`, `LEMMA_COMMAND_PATH` and
+`LEMMA_APP_DIR` move the TeX, command and app locations (for testing the script).

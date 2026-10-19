@@ -1111,9 +1111,12 @@ its behaviour is unchanged. The differences:
 - **Finder**: on macOS the application has `HANDLES_OPEN`; files from Finder, the Dock or
   `open -a Lemma` open in the active window.
 - **Not ported**: shortcuts stay on Ctrl (not Cmd); `--mem-report` reads `/proc` and reports
-  that it cannot on macOS; the GTK integration tests run on Linux only (Broadway).
+  that it cannot on macOS. The tests run on Linux only (`scripts/ci.sh`); some of them read
+  `/proc`.
 - **Packaging** (`packaging/macos/`, `.github/workflows/macos.yml`): `bundle.sh` builds
   `Lemma.app` with the libraries in `Contents/Resources/lib` (a directory named `lib`, because
   enchant relocates itself by replacing a trailing `lib`) rewritten to
   `@executable_path/../Resources/lib/` by `bundle_dylibs.py`, signs it ad hoc and makes the DMG.
   CI starts the app with Homebrew renamed (`smoke-test.sh`) and keeps snapshots of its window.
+  `install.sh` is the one-command installer: the release's DMG (or a build from source), a
+  `lemma` command and TeX (BasicTeX plus Lemma's tools and common packages, or MacTeX).
