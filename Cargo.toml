@@ -20,7 +20,8 @@ poppler      = { package = "poppler-rs", version = "=0.26.0", features = ["v26_1
 cairo        = { package = "cairo-rs",   version = "=0.22.9", features = ["v1_18", "png"] }
 glib         = { version = "=0.22.10", features = ["v2_88"] }
 gio          = { version = "=0.22.10", features = ["v2_88"] }
-pango        = { version = "=0.22.9",  features = ["v1_58"] }
+# v1_52, as GTK's gnome_50 asks: Lemma uses nothing newer, and Fedora 44 and Ubuntu 26.04 ship 1.57
+pango        = { version = "=0.22.9",  features = ["v1_52"] }
 # agent
 agent-client-protocol        = { version = "=3.3.0", features = ["process"] }
 agent-client-protocol-schema = "=1.11.0"
