@@ -5,6 +5,7 @@
 //! [`SyncBox::page`], which keeps SyncTeX's 1-based numbering. PDF coordinates are big points (bp) with
 //! the origin at the page's top-left corner and y growing downward.
 
+pub mod dark;
 mod layout;
 mod links;
 mod lru;
@@ -24,7 +25,8 @@ pub use worker::{PdfHandle, spawn};
 
 use std::path::PathBuf;
 
-/// Identifies one bitmap: a page (or a tile of it) of one document generation at one scale.
+/// Identifies one bitmap: a page (or a tile of it) of one document generation at one scale, light
+/// or dark.
 ///
 /// zoom * device_scale quantized to 1/8 steps: scale_q = round(zoom * scale * 8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,15 +40,15 @@ pub struct PageKey {
     /// `(column, row)` of a [`TILE_SIZE`]² tile, used when a page bitmap would exceed
     /// [`TILE_THRESHOLD_BYTES`] (see [`tile_grid`] and [`tile_rect`]); `None` for the whole page.
     pub tile: Option<(u16, u16)>,
+    /// True for the page in dark mode: the worker colours the bitmap with [`dark::darken_bgra`],
+    /// so the view draws it without a colour matrix.
+    pub dark: bool,
 }
 
 /// A request to render one page or tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderReq {
     pub key: PageKey,
-    /// Reserved. The worker always renders the light page: dark mode is a colour matrix applied by the
-    /// view (§6), so it needs no re-render and is not part of the cache key.
-    pub dark: bool,
 }
 
 /// A hyperlink on a page.

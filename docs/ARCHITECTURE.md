@@ -324,7 +324,7 @@ Rules:
   - **Textures:** `glib::Bytes::from_owned` → `MemoryTexture` (B8g8r8a8Premultiplied), with no copy [V].
   - **Cache:** a `ByteLru` capped at 48 MiB.
   - **Reload:** old textures stay on screen until new ones arrive; the `Anchor{page, frac, x}` is preserved and clamped if the page count changes.
-  - **Dark mode:** `Snapshot::push_color_matrix` applies invert(1) followed by hue-rotate(180°) as one matrix plus offset. No re-render is needed. It follows `adw::StyleManager`; Ctrl+Shift+I toggles it per document.
+  - **Dark mode:** invert(1) followed by hue-rotate(180°), mapped into a soft paper..ink grey range (`lemma_pdf::dark`). The PDF thread applies it to the bitmaps of dark requests (`PageKey::dark`), so the view draws them as plain textures. A `Snapshot::push_color_matrix` over the view would be free on the GPU renderers, but GTK's cairo renderer (the default) runs it per pixel on the CPU on every frame: 12 ms for a 384×956 pane and 30 ms for 940×1000 [V], so scrolling missed frames. After a toggle, the textures of the other mode stand in through that colour matrix (or its inverse) until the pages are re-rendered, so the switch shows at once. It follows `adw::StyleManager`; Ctrl+Shift+I toggles it per document.
 - **SyncTeX:**
   - **Forward** (Ctrl+Alt+J, optional follow-cursor debounced 200 ms) draws `(h, v−H, W, H)` in bp scaled by zoom × scale, scrolled to one third of the view and faded over 600 ms.
   - **Inverse** (Ctrl+click on the PDF) calls `to_page`, then `Scanner::inverse`, then opens the file at that line. Sync is per line only, because pdfTeX records column −1.
@@ -693,8 +693,8 @@ impl Scanner { pub fn open(pdf: &Path) -> Option<Self>;
     pub fn inverse(&mut self, page: u32, x_bp: f32, y_bp: f32) -> Option<SyncTarget>; }
 
 // ===== lemma-pdf =====
-pub struct PageKey { pub generation: u64, pub page: u32, pub scale_q: u16 /* round(zoom*scale*8) */, pub tile: Option<(u16, u16)> }
-pub struct RenderReq { pub key: PageKey, pub dark: bool }
+pub struct PageKey { pub generation: u64, pub page: u32, pub scale_q: u16 /* round(zoom*scale*8) */, pub tile: Option<(u16, u16)>, pub dark: bool }
+pub struct RenderReq { pub key: PageKey }
 pub struct Link { pub area: (f64, f64, f64, f64), pub dest: LinkDest }  pub enum LinkDest { Page { page: u32, y_bp: Option<f64> }, Uri(String), Other }
 pub struct Rendered { pub key: PageKey, pub width: i32, pub height: i32, pub stride: i32, pub data: cairo::ImageSurfaceDataOwned }
 pub enum PdfEvent { Opened { generation: u64, page_sizes: Vec<(f64, f64)> }, OpenFailed { generation: u64, error: String },

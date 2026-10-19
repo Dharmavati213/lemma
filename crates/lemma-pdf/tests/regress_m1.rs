@@ -187,8 +187,8 @@ fn regress_synctex_ignores_page_rotation() {
             page: 0,
             scale_q: 8,
             tile: None,
+            dark: false,
         },
-        dark: false,
     }]));
     let page = match next(&rx) {
         PdfEvent::Rendered(r) => r,
@@ -351,8 +351,8 @@ fn turned_text_pages_map_both_ways() {
                 page: 0,
                 scale_q: 8,
                 tile: None,
+                dark: false,
             },
-            dark: false,
         }]));
         let page = match next(&rx) {
             PdfEvent::Rendered(r) => r,

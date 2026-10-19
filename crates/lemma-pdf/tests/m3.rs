@@ -374,8 +374,8 @@ fn renders_and_searches_take_turns() {
                     page,
                     scale_q: 8,
                     tile: None,
+                    dark: false,
                 },
-                dark: false,
             })
             .collect(),
     ));

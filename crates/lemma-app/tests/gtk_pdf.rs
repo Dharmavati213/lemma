@@ -392,7 +392,8 @@ fn anchored_zoom() {
     state.window.destroy();
 }
 
-/// Acceptance: the dark-mode toggle (Ctrl+Shift+I) inverts the pages.
+/// Acceptance: the dark-mode toggle (Ctrl+Shift+I) inverts the pages, at once and then from
+/// pages rendered dark.
 fn dark_toggle() {
     let dir = copy_proj("dark", true);
     let state = window(&dir, config());
@@ -421,12 +422,47 @@ fn dark_toggle() {
         (before, after)
     };
     assert!(light > 240.0 && dark < 60.0, "light {light}, dark {dark}");
+    // That was the other mode's pages, recoloured. Once the pages are rendered in the new mode
+    // they look the same and are drawn as they are: a colour matrix over the pages costs GTK's
+    // cairo renderer a per-pixel pass on every scrolled frame.
+    wait_for_pages(&state);
+    let settled = paper(&view);
+    assert!((settled - after).abs() <= 2.0, "{after} -> {settled}");
+    assert!(!has_color_matrix(&next_frame_node(&view)));
     let state_value =
         gio::prelude::ActionGroupExt::action_state(&state.window, "pdf-invert").unwrap();
     assert_eq!(state_value.get::<bool>(), Some(!initial));
     activate(&state, "win.pdf-invert");
     assert_eq!(view.is_dark(), initial);
+    wait_for_pages(&state);
+    let back = paper(&view);
+    assert!((back - before).abs() <= 2.0, "{before} -> {back}");
+    assert!(!has_color_matrix(&next_frame_node(&view)));
     state.window.destroy();
+}
+
+/// True when `node` or a node under it is a colour matrix.
+fn has_color_matrix(node: &gtk::gsk::RenderNode) -> bool {
+    use gtk::gsk::*;
+    if node.downcast_ref::<ColorMatrixNode>().is_some() {
+        return true;
+    }
+    let children: Vec<RenderNode> = if let Some(n) = node.downcast_ref::<ContainerNode>() {
+        (0..n.n_children()).map(|i| n.child(i)).collect()
+    } else if let Some(n) = node.downcast_ref::<TransformNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<ClipNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<RoundedClipNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<OpacityNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<DebugNode>() {
+        vec![n.child()]
+    } else {
+        Vec::new()
+    };
+    children.iter().any(has_color_matrix)
 }
 
 /// Acceptance: Ctrl+Alt+J scrolls the line's box to a third of the view and flashes it.

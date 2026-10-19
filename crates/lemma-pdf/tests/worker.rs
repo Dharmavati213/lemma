@@ -50,15 +50,12 @@ fn key(generation: u64, page: u32, scale_q: u16) -> PageKey {
         page,
         scale_q,
         tile: None,
+        dark: false,
     }
 }
 
 fn want(keys: impl IntoIterator<Item = PageKey>) -> PdfCmd {
-    PdfCmd::Want(
-        keys.into_iter()
-            .map(|key| RenderReq { key, dark: false })
-            .collect(),
-    )
+    PdfCmd::Want(keys.into_iter().map(|key| RenderReq { key }).collect())
 }
 
 /// Spawns a worker and opens `pdf` as `generation`, returning the page sizes.
@@ -110,6 +107,30 @@ fn renders_three_stress_pages_at_2x() {
         assert_eq!(&r.data[..4], &[255, 255, 255, 255]);
         assert!(r.data.as_chunks::<4>().0.iter().any(|px| px[0] < 128));
     }
+    assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
+}
+
+#[test]
+fn dark_requests_come_back_coloured_for_dark_mode() {
+    let (pdf, rx, _) = open("pdf/stress.pdf", 1);
+    let dark = PageKey {
+        dark: true,
+        ..key(1, 0, 8)
+    };
+    pdf.send(want([key(1, 0, 8), dark]));
+    let light = rendered(&rx);
+    let darkened = rendered(&rx);
+    assert_eq!(darkened.key, dark);
+    assert_eq!(
+        (darkened.width, darkened.height),
+        (light.width, light.height)
+    );
+    // Exactly the light bitmap through the dark-mode transform.
+    let mut expected = light.data.to_vec();
+    lemma_pdf::dark::darken_bgra(&mut expected);
+    assert!(expected[..] == darkened.data[..]);
+    let paper = (lemma_pdf::dark::PAPER * 255.0).round() as u8;
+    assert_eq!(&darkened.data[..4], &[paper, paper, paper, 255]);
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
 }
 

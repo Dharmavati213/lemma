@@ -693,7 +693,6 @@ fn push_tiles(queue: &mut VecDeque<RenderReq>, req: RenderReq, (cols, rows): (u1
                     tile: Some((col, row)),
                     ..req.key
                 },
-                ..req
             });
         }
     }
@@ -730,8 +729,8 @@ mod tests {
                 page,
                 scale_q,
                 tile: None,
+                dark: false,
             },
-            dark: false,
         }
     }
 

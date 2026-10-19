@@ -95,7 +95,7 @@ impl std::fmt::Display for RenderError {
 }
 
 /// Renders `key` (the whole page, or the tile `key.tile`) of `page` on a white background into an
-/// ARGB32 image (B8g8r8a8 premultiplied on little-endian).
+/// ARGB32 image (B8g8r8a8 premultiplied on little-endian), coloured for dark mode when `key.dark`.
 pub(crate) fn render(page: &poppler::Page, key: PageKey) -> Result<Rendered, RenderError> {
     let size = page.size();
     let (x, y, width, height) = match key.tile {
@@ -108,7 +108,7 @@ pub(crate) fn render(page: &poppler::Page, key: PageKey) -> Result<Rendered, Ren
     if width == 0 || height == 0 {
         return Err(RenderError::EmptyTile);
     }
-    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
     {
         let cr = cairo::Context::new(&surface)?;
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -120,7 +120,11 @@ pub(crate) fn render(page: &poppler::Page, key: PageKey) -> Result<Rendered, Ren
         cr.status()?;
     }
     let stride = surface.stride();
-    // The context is gone, so the surface is uniquely owned and take_data cannot fail with NonExclusive.
+    // The context is gone, so the surface is uniquely owned and neither data nor take_data can fail
+    // with NonExclusive.
+    if key.dark {
+        crate::dark::darken_bgra(&mut surface.data()?);
+    }
     let data = surface.take_data()?;
     Ok(Rendered {
         key,

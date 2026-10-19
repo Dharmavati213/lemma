@@ -2,7 +2,8 @@
 //! aspect ratio (height for width). The thumbnails of the PDF strip and the link previews use it.
 //!
 //! Until a texture is set the page is drawn white, so a list of thumbnails has its final layout
-//! at once. In dark mode the same colour matrix as the PDF view is applied (no re-render).
+//! at once. In dark mode the PDF view's dark-mode colour matrix is applied to light textures (no
+//! re-render); a texture that is dark already (the view's, for a link preview) is drawn as it is.
 //! CSS node: `pagepicture` (the strip and the link popover style it).
 
 use super::geometry;
@@ -26,6 +27,8 @@ mod imp {
         /// The region shown (the whole page when `None`).
         pub(super) region: Cell<Option<Region>>,
         pub(super) texture: RefCell<Option<gdk::Texture>>,
+        /// True when `texture` is a dark page already ([`lemma_pdf::PageKey::dark`]).
+        pub(super) texture_dark: Cell<bool>,
         pub(super) dark: Cell<bool>,
         /// A fixed width in logical pixels (link previews); `None` fills the width given.
         pub(super) fixed_width: Cell<Option<i32>>,
@@ -39,6 +42,7 @@ mod imp {
                 page_size: Cell::new((612.0, 792.0)),
                 region: Cell::new(None),
                 texture: RefCell::new(None),
+                texture_dark: Cell::new(false),
                 dark: Cell::new(false),
                 fixed_width: Cell::new(None),
                 resized: RefCell::new(None),
@@ -114,14 +118,27 @@ mod imp {
             }
             let bounds = graphene::Rect::new(0.0, 0.0, w as f32, h as f32);
             let dark = self.dark.get();
-            if dark {
-                let (matrix, offset) = geometry::dark_color_transform();
+            let paper = if dark {
+                let paper = lemma_pdf::dark::PAPER;
+                gdk::RGBA::new(paper, paper, paper, 1.0)
+            } else {
+                gdk::RGBA::WHITE
+            };
+            snapshot.append_color(&paper, &bounds);
+            // A texture of the other mode than the one shown is recoloured.
+            let recolour = (dark != self.texture_dark.get()).then(|| {
+                if dark {
+                    geometry::dark_color_transform()
+                } else {
+                    geometry::light_color_transform()
+                }
+            });
+            if let Some((matrix, offset)) = recolour {
                 snapshot.push_color_matrix(
                     &graphene::Matrix::from_float(matrix),
                     &graphene::Vec4::from_float(offset),
                 );
             }
-            snapshot.append_color(&gdk::RGBA::WHITE, &bounds);
             if let Some(texture) = self.texture.borrow().as_ref() {
                 let (pw, ph) = self.page_size.get();
                 let (rx, ry, rw, _) = self.region.get().unwrap_or((0.0, 0.0, pw, ph));
@@ -148,7 +165,7 @@ mod imp {
                     snapshot.pop();
                 }
             }
-            if dark {
+            if recolour.is_some() {
                 snapshot.pop();
             }
         }
@@ -201,9 +218,17 @@ impl PagePicture {
         }
     }
 
-    /// The texture of the whole page (any resolution), or `None` for a white page.
+    /// The texture of the whole light page (any resolution), or `None` for a blank page.
     pub fn set_texture(&self, texture: Option<&gdk::Texture>) {
-        self.imp().texture.replace(texture.cloned());
+        self.set_page_texture(texture, false);
+    }
+
+    /// The texture of the whole page (any resolution), and whether it is the dark page (see
+    /// [`PagePicture::set_dark`]), or `None` for a blank page.
+    pub fn set_page_texture(&self, texture: Option<&gdk::Texture>, dark: bool) {
+        let imp = self.imp();
+        imp.texture.replace(texture.cloned());
+        imp.texture_dark.set(dark);
         self.queue_draw();
     }
 
@@ -211,7 +236,7 @@ impl PagePicture {
         self.imp().texture.borrow().clone()
     }
 
-    /// Draws the page with the PDF view's dark-mode colour matrix.
+    /// Shows the page in dark mode, as the PDF view does.
     pub fn set_dark(&self, dark: bool) {
         if self.imp().dark.replace(dark) != dark {
             self.queue_draw();

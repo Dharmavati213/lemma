@@ -1,6 +1,7 @@
 //! Pure geometry and colour helpers of the PDF view: render order, zoom anchoring, tile
-//! visibility and the dark-mode colour transform. No GTK here, so everything is unit-tested.
+//! visibility and the dark-mode colour transforms. No GTK here, so everything is unit-tested.
 
+use lemma_pdf::dark::{HUE_180, INK as DARK_INK, PAPER as DARK_PAPER};
 use lemma_pdf::{PageLayout, TILE_SIZE, scale_of, tile_grid, tile_rect};
 use std::ops::Range;
 
@@ -202,26 +203,14 @@ pub fn visible_tiles(
     tiles.into_iter().map(|(tile, _)| tile).collect()
 }
 
-/// Lightness of white paper in dark mode (a soft dark grey instead of pure black).
-const DARK_PAPER: f32 = 0.16;
-/// Lightness of black ink in dark mode (a soft light grey instead of pure white).
-const DARK_INK: f32 = 0.92;
-
-/// The 3×3 hue rotation by 180° of CSS `hue-rotate(180deg)` (Filter Effects spec), row-major:
-/// `out[i] = Σ_j HUE_180[i][j] · in[j]`. Its rows sum to 1, so grey stays grey.
-const HUE_180: [[f32; 3]; 3] = [
-    [-0.574, 1.430, 0.144],
-    [0.426, 0.430, 0.144],
-    [0.426, 1.430, -0.856],
-];
-
-/// The colour transform of dark mode, as the `(matrix, offset)` arguments of
+/// The colour transform of dark mode ([`lemma_pdf::dark`]), as the `(matrix, offset)` arguments of
 /// `gtk::Snapshot::push_color_matrix` (GTK computes `pixel = transpose(matrix) · pixel + offset`
 /// on unpremultiplied RGBA; graphene matrices are row-major).
 ///
 /// It is CSS `invert(1) hue-rotate(180deg)`, which swaps light and dark but keeps hues (a red
 /// link stays red), with the result mapped into [`DARK_PAPER`]..[`DARK_INK`] so paper becomes a
-/// soft dark grey and text a soft light grey. Alpha is unchanged.
+/// soft dark grey and text a soft light grey. Alpha is unchanged. The PDF thread colours the dark
+/// bitmaps of the view the same way; the matrix is for what is drawn from light bitmaps.
 pub fn dark_color_transform() -> ([f32; 16], [f32; 4]) {
     let contrast = DARK_INK - DARK_PAPER;
     let mut matrix = [0.0; 16];
@@ -233,6 +222,24 @@ pub fn dark_color_transform() -> ([f32; 16], [f32; 4]) {
     }
     matrix[15] = 1.0;
     (matrix, [DARK_INK, DARK_INK, DARK_INK, 0.0])
+}
+
+/// The inverse of [`dark_color_transform`] (same conventions): draws a dark bitmap as the light
+/// page, while the view waits for the light bitmap after dark mode was turned off.
+///
+/// `in = (DARK_INK − H · out) / contrast`, because the hue rotation `H` by 180° is its own inverse
+/// and its rows sum to 1.
+pub fn light_color_transform() -> ([f32; 16], [f32; 4]) {
+    let contrast = DARK_INK - DARK_PAPER;
+    let mut matrix = [0.0; 16];
+    for (i, row) in HUE_180.iter().enumerate() {
+        for (j, h) in row.iter().enumerate() {
+            matrix[4 * j + i] = -h / contrast;
+        }
+    }
+    matrix[15] = 1.0;
+    let offset = DARK_INK / contrast;
+    (matrix, [offset, offset, offset, 0.0])
 }
 
 #[cfg(test)]
@@ -405,6 +412,31 @@ mod tests {
         // A blue link stays bluish.
         let blue = apply(&t, [0.1, 0.1, 0.8, 1.0]);
         assert!(blue[2] > blue[0] && blue[2] > blue[1], "{blue:?}");
+    }
+
+    #[test]
+    fn the_light_transform_undoes_the_dark_one() {
+        let (dark, light) = (dark_color_transform(), light_color_transform());
+        for c in [
+            [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.8, 0.1, 0.1, 1.0],
+            [0.1, 0.3, 0.9, 0.5],
+            [0.5, 0.5, 0.5, 1.0],
+        ] {
+            let back = apply(&light, apply(&dark, c));
+            for i in 0..4 {
+                assert!((back[i] - c[i]).abs() < 2e-3, "{c:?} -> {back:?}");
+            }
+        }
+        // Matches the bitmaps the PDF thread colours (both clamp to the colour range).
+        for c in [[0.8, 0.1, 0.1], [0.2, 0.6, 0.3], [1.0, 1.0, 1.0]] {
+            let rgb = lemma_pdf::dark::darken_rgb(c);
+            let m = apply(&dark, [c[0], c[1], c[2], 1.0]);
+            for i in 0..3 {
+                assert!((rgb[i] - m[i].clamp(0.0, 1.0)).abs() < 1e-6, "{c:?}");
+            }
+        }
     }
 
     #[test]

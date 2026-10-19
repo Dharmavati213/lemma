@@ -16,7 +16,12 @@
 //!   ones are stretched in its place, so zooming and rebuilding never flash white pages.
 //! - **Reload:** a new generation of the same PDF keeps the scroll [`Anchor`] (page and
 //!   fraction), clamped when the page count changes; another PDF starts at the top.
-//! - **Dark mode:** a colour matrix over the pages (invert, then hue-rotate 180°); no re-render.
+//! - **Dark mode:** the pages are requested dark ([`PageKey::dark`]) and the PDF thread colours
+//!   the bitmaps (invert, then hue-rotate 180°, [`lemma_pdf::dark`]), so they are drawn as they
+//!   are. (A colour matrix over the view would cost GTK's cairo renderer, the default, a per-pixel
+//!   pass over the whole view on every scrolled frame: 12–30 ms, so scrolling missed frames.)
+//!   After a toggle, the textures of the other mode stand in through a colour matrix until the
+//!   pages are re-rendered, so the switch is immediate.
 //! - **SyncTeX:** forward-search boxes are scrolled to a third of the view and flashed for
 //!   [`FLASH_DURATION`]; Ctrl+click reports the page point under the pointer for inverse search.
 //! - **Search (M3):** the matches of the pages on screen are drawn over them, the current one
@@ -161,6 +166,7 @@ impl Model {
             page,
             scale_q: self.target_q,
             tile,
+            dark: self.dark,
         };
         let Some(size) = doc.layout.page_size(page) else {
             return false;
@@ -207,6 +213,7 @@ impl Model {
                 page,
                 scale_q: self.target_q,
                 tile,
+                dark: self.dark,
             };
             if tile_grid(size, self.target_q).is_some() {
                 // Tiled pages: only the visible tiles of the visible pages.
@@ -235,17 +242,19 @@ impl Model {
         self.working_set(view, scroll, extra)
             .into_iter()
             .filter(|key| !self.cache.contains(key))
-            .map(|key| RenderReq { key, dark: false })
+            .map(|key| RenderReq { key })
             .collect()
     }
 
-    /// How well a texture of `key`'s generation and scale stands in for the page wanted
+    /// How well a texture of `key`'s generation, scale and mode stands in for the page wanted
     /// (smaller is better): the current generation before older ones, then the scale nearest
-    /// the target, then the newest generation.
-    fn stand_in_rank(&self, key: &PageKey, generation: u64) -> (bool, u16, u64) {
+    /// the target, then the current mode (the other one needs a colour matrix), then the newest
+    /// generation.
+    fn stand_in_rank(&self, key: &PageKey, generation: u64) -> (bool, u16, bool, u64) {
         (
             key.generation != generation,
             key.scale_q.abs_diff(self.target_q),
+            key.dark != self.dark,
             u64::MAX - key.generation,
         )
     }
@@ -260,25 +269,42 @@ impl Model {
             .copied()
     }
 
-    /// The cached tiles of `page` of the generation and scale that stand in best for it (see
-    /// [`Model::stand_in_rank`]), other than the current generation at the target scale.
+    /// The cached tiles of `page` of the generation, scale and mode that stand in best for it
+    /// (see [`Model::stand_in_rank`]), other than the current generation at the target scale in
+    /// the current mode.
     fn fallback_tiles(&self, page: u32, generation: u64) -> Vec<PageKey> {
         let keys = self.cache.keys_of_page(page);
         let best = keys
             .iter()
-            .filter(|k| {
-                k.tile.is_some() && !(k.generation == generation && k.scale_q == self.target_q)
-            })
+            .filter(|k| k.tile.is_some() && !self.is_current(k, generation))
             .min_by_key(|k| self.stand_in_rank(k, generation));
         let Some(best) = best.copied() else {
             return Vec::new();
         };
         keys.iter()
             .filter(|k| {
-                k.tile.is_some() && k.generation == best.generation && k.scale_q == best.scale_q
+                k.tile.is_some()
+                    && k.generation == best.generation
+                    && k.scale_q == best.scale_q
+                    && k.dark == best.dark
             })
             .copied()
             .collect()
+    }
+
+    /// True when `key` is of the current generation, scale and mode (what the view requests).
+    fn is_current(&self, key: &PageKey, generation: u64) -> bool {
+        key.generation == generation && key.scale_q == self.target_q && key.dark == self.dark
+    }
+
+    /// The colour of a page without any texture yet: white paper, or dark paper in dark mode.
+    fn paper(&self) -> gdk::RGBA {
+        if self.dark {
+            let paper = lemma_pdf::dark::PAPER;
+            gdk::RGBA::new(paper, paper, paper, 1.0)
+        } else {
+            gdk::RGBA::WHITE
+        }
     }
 }
 
@@ -541,15 +567,15 @@ mod imp {
                     .as_ref()
                     .map_or((0.0, 0.0), |d| d.layout.content_size(model.zoom))
             };
+            // At fit width the content is as wide as the view up to rounding: no horizontal
+            // range for that, or a touchpad scroll moves (and overshoots) sideways.
+            let content_w = if content_w < width + 0.5 {
+                width
+            } else {
+                content_w
+            };
             if let Some(h) = self.hadj() {
-                h.configure(
-                    x,
-                    0.0,
-                    content_w.max(width),
-                    SCROLL_STEP,
-                    width * 0.9,
-                    width,
-                );
+                h.configure(x, 0.0, content_w, SCROLL_STEP, width * 0.9, width);
             }
             if let Some(v) = self.vadj() {
                 v.configure(
@@ -771,16 +797,9 @@ mod imp {
                 snapshot.append_outset_shadow(&outline, &shadow, 0.0, 1.0, 0.0, 4.0);
             }
 
-            if model.dark {
-                let (matrix, offset) = geometry::dark_color_transform();
-                snapshot.push_color_matrix(
-                    &graphene::Matrix::from_float(matrix),
-                    &graphene::Vec4::from_float(offset),
-                );
-            }
             let generation = doc.generation;
             let viewport = Rect::new(sx, sy, width, height);
-            let white = gdk::RGBA::WHITE;
+            let paper = model.paper();
             for &(page, rect) in &pages {
                 let size = doc.layout.page_size(page).unwrap_or((1.0, 1.0));
                 let tiled = tile_grid(size, model.target_q).is_some();
@@ -796,7 +815,7 @@ mod imp {
                     });
                     match whole {
                         Some(key) => layers.push(key),
-                        None => snapshot.append_color(&white, &graphene_rect(rect)),
+                        None => snapshot.append_color(&paper, &graphene_rect(rect)),
                     }
                     if tiles_better {
                         layers.extend(tiles);
@@ -805,11 +824,14 @@ mod imp {
                     layers.extend(model.fallback_key(page, generation));
                 }
                 if tiled {
-                    layers.extend(model.cache.keys_of_page(page).iter().copied().filter(|k| {
-                        k.generation == generation
-                            && k.scale_q == model.target_q
-                            && k.tile.is_some()
-                    }));
+                    layers.extend(
+                        model
+                            .cache
+                            .keys_of_page(page)
+                            .iter()
+                            .copied()
+                            .filter(|k| k.tile.is_some() && model.is_current(k, generation)),
+                    );
                 }
                 for key in layers {
                     let Some(texture) = model.cache.get(&key) else {
@@ -822,11 +844,26 @@ mod imp {
                             Rect::new(snap(r.x), snap(r.y), r.width, r.height)
                         }
                     };
+                    // A texture of the other mode (just after a toggle) is recoloured; the
+                    // others are drawn as they are.
+                    let recolour = (key.dark != model.dark).then(|| {
+                        if model.dark {
+                            geometry::dark_color_transform()
+                        } else {
+                            geometry::light_color_transform()
+                        }
+                    });
+                    if let Some((matrix, offset)) = recolour {
+                        snapshot.push_color_matrix(
+                            &graphene::Matrix::from_float(matrix),
+                            &graphene::Vec4::from_float(offset),
+                        );
+                    }
                     append_texture(snapshot, &texture, r, scale);
+                    if recolour.is_some() {
+                        snapshot.pop();
+                    }
                 }
-            }
-            if model.dark {
-                snapshot.pop();
             }
 
             // Search matches, over the pages (and not inverted in dark mode).
@@ -1046,7 +1083,8 @@ impl PdfView {
             model
                 .cache
                 .insert_keeping(key, texture.upcast(), size, |k| needed.contains(k));
-            // Once every visible page of this generation is there, older generations go.
+            // Once every visible page of this generation is there in the current mode, older
+            // generations and the other mode go.
             let viewport = Rect::new(sx, sy, width_px, height_px);
             let visible = model.visible(sy, height_px);
             if model.cache.len() > 0
@@ -1054,7 +1092,10 @@ impl PdfView {
                     .clone()
                     .all(|p| model.page_complete(p, width_px, viewport))
             {
-                model.cache.retain(|k| k.generation == generation);
+                let dark = model.dark;
+                model
+                    .cache
+                    .retain(|k| k.generation == generation && k.dark == dark);
             }
         }
         self.queue_draw();
@@ -1209,11 +1250,13 @@ impl PdfView {
         imp.emit_changed();
     }
 
-    /// Turns the dark-mode colour matrix on or off (no re-render needed).
+    /// Turns dark mode on or off. The pages are re-rendered in the new mode; until they arrive,
+    /// the textures of the other mode are drawn recoloured, so the switch shows at once.
     pub fn set_dark(&self, dark: bool) {
         let imp = self.imp();
         let changed = std::mem::replace(&mut imp.model.borrow_mut().dark, dark) != dark;
         if changed {
+            imp.schedule_update();
             self.queue_draw();
             imp.emit_changed();
         }
@@ -1310,7 +1353,7 @@ impl PdfView {
     }
 
     /// True when `page` is drawn from a bitmap of the current generation at the current render
-    /// scale (for a tiled page: every visible tile).
+    /// scale in the current mode (for a tiled page: every visible tile).
     pub fn is_page_rendered(&self, page: u32) -> bool {
         let imp = self.imp();
         let (width, height) = imp.view_size();
@@ -1361,9 +1404,16 @@ impl PdfView {
         {
             let mut model = imp.model.borrow_mut();
             let visible = model.visible(sy, height);
-            let (generation, target) = (model.doc.as_ref().map(|d| d.generation), model.target_q);
+            let (generation, target, dark) = (
+                model.doc.as_ref().map(|d| d.generation),
+                model.target_q,
+                model.dark,
+            );
             model.cache.retain(|k| {
-                Some(k.generation) == generation && k.scale_q == target && visible.contains(&k.page)
+                Some(k.generation) == generation
+                    && k.scale_q == target
+                    && k.dark == dark
+                    && visible.contains(&k.page)
             });
         }
         imp.cancel_requests();
@@ -1540,17 +1590,22 @@ impl PdfView {
     }
 
     /// The texture of the whole 0-based `page` of the shown generation at the current render
-    /// scale, if it is cached (the link preview borrows it).
-    pub fn page_texture(&self, page: u32) -> Option<gdk::Texture> {
+    /// scale, if it is cached (the link preview borrows it), and whether it is the dark page:
+    /// the one of the current mode if there is one, else the other.
+    pub fn page_texture(&self, page: u32) -> Option<(gdk::Texture, bool)> {
         let mut model = self.imp().model.borrow_mut();
         let generation = model.doc.as_ref()?.generation;
-        let key = PageKey {
-            generation,
-            page,
-            scale_q: model.target_q,
-            tile: None,
-        };
-        model.cache.get(&key)
+        let current = model.dark;
+        [current, !current].into_iter().find_map(|dark| {
+            let key = PageKey {
+                generation,
+                page,
+                scale_q: model.target_q,
+                tile: None,
+                dark,
+            };
+            model.cache.get(&key).map(|texture| (texture, dark))
+        })
     }
 
     /// Changes the texture cache's cap (the PDF strip's thumbnails take a share of the budget

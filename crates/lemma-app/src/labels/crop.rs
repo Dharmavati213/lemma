@@ -41,15 +41,6 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const SAME_TIME: Duration = Duration::from_secs(1);
 /// The PDF thread stops this long after the last crop.
 pub const IDLE_STOP: Duration = Duration::from_secs(30);
-/// How the PDF view's dark mode colours pages (`pdf::geometry::dark_color_transform`): CSS
-/// `invert(1) hue-rotate(180deg)` mapped into paper..ink.
-const DARK_PAPER: f32 = 0.16;
-const DARK_INK: f32 = 0.92;
-const HUE_180: [[f32; 3]; 3] = [
-    [-0.574, 1.430, 0.144],
-    [0.426, 0.430, 0.144],
-    [0.426, 1.430, -0.856],
-];
 
 /// The crop worker of one window.
 struct Worker {
@@ -439,8 +430,8 @@ async fn render_region(
                 page,
                 scale_q,
                 tile: *tile,
+                dark: false,
             },
-            dark: false,
         })
         .collect();
     worker.handle.send(PdfCmd::Want(wants.clone()));
@@ -482,7 +473,8 @@ async fn render_region(
         }
     }
     if dark {
-        darken(&mut data);
+        // As the PDF view's dark pages are coloured.
+        lemma_pdf::dark::darken_bgra(&mut data);
     }
     let bytes = glib::Bytes::from_owned(data);
     Some(
@@ -495,25 +487,6 @@ async fn render_region(
         )
         .upcast(),
     )
-}
-
-/// Colours opaque BGRA pixels as the PDF view's dark mode does.
-fn darken(data: &mut [u8]) {
-    let contrast = DARK_INK - DARK_PAPER;
-    for pixel in data.as_chunks_mut::<4>().0 {
-        let rgb = [
-            f32::from(pixel[2]) / 255.0,
-            f32::from(pixel[1]) / 255.0,
-            f32::from(pixel[0]) / 255.0,
-        ];
-        let channel = |row: &[f32; 3]| {
-            let v = DARK_INK - contrast * (row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2]);
-            (v.clamp(0.0, 1.0) * 255.0).round() as u8
-        };
-        pixel[2] = channel(&HUE_180[0]);
-        pixel[1] = channel(&HUE_180[1]);
-        pixel[0] = channel(&HUE_180[2]);
-    }
 }
 
 // ----- the widget -----
@@ -620,17 +593,5 @@ mod tests {
         assert_eq!(region.3, MAX_HEIGHT);
         assert_eq!(region_of(&[], a4), None);
         assert_eq!(region_of(&[sync_box(1, 1.0, 1.0, 0.0, 0.0)], a4), None);
-    }
-
-    #[test]
-    fn dark_pixels() {
-        // White paper becomes the dark paper grey, black ink the light ink grey.
-        let mut data = vec![255, 255, 255, 255, 0, 0, 0, 255];
-        darken(&mut data);
-        let paper = (DARK_PAPER * 255.0).round() as u8;
-        let ink = (DARK_INK * 255.0).round() as u8;
-        assert_eq!(&data[..3], &[paper, paper, paper]);
-        assert_eq!(&data[4..7], &[ink, ink, ink]);
-        assert_eq!(data[3], 255);
     }
 }

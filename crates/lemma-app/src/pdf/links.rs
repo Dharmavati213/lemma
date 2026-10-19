@@ -373,8 +373,8 @@ impl Links {
             .unwrap_or_else(|| (page + 1).to_string());
         preview.caption.set_text(&format!("Page {label}"));
         match self.view.page_texture(page) {
-            Some(texture) => {
-                picture.set_texture(Some(&texture));
+            Some((texture, dark)) => {
+                picture.set_page_texture(Some(&texture), dark);
                 preview.want.set(None);
                 self.want_thumbnail(None);
             }

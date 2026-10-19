@@ -158,6 +158,7 @@ mod tests {
             page,
             scale_q,
             tile: None,
+            dark: false,
         }
     }
 
