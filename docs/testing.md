@@ -137,10 +137,10 @@ the environment:
 Runs that quit by themselves (`--quit-after-ms`) write no local history and no review state into
 the user's state directory.
 
-### The other backends (M5): API key and Pi
+### The other backends (M5): API key, Pi and the other ACP agents
 
-Neither backend's real counterpart runs in a test: no request reaches the Anthropic API and `pi`
-or its adapter never starts.
+No backend's real counterpart runs in a test: no request reaches the Anthropic API, and `pi`,
+`codex`, `grok`, `gemini`, `opencode`, `copilot` and their adapters never start.
 
 - **API key** (`lemma_agent::messages`, `keys`): `crates/lemma-agent/tests/messages_backend.rs`
   serves scripted SSE from a std `TcpListener` on 127.0.0.1 through `LEMMA_ANTHROPIC_BASE_URL`
@@ -155,6 +155,16 @@ or its adapter never starts.
   `fs/write_text_file` edits make the same hunks as MCP edits, `fs/read_text_file` reads the
   live buffer, an auth error shows the login hint. The Pi install branches run with a fake
   `node`/`npm` on a temporary `PATH`.
+- **Codex, Grok Build, Gemini CLI, OpenCode, Copilot, custom** (also `AcpFlavor::Generic`):
+  `acp_fs.rs` checks the generic mode policy against the fake agent's `_options.modes: "codex"`
+  (Codex's modes, no `default`: the elevated `agent-full-access` is never offered and is
+  switched back from) and that Lemma's instructions open only the first prompt (`echo_prompt`;
+  the fake agent leaves that block out of its keyword search). `install.rs`'s unit tests find
+  each tool in a temporary home (`PATH`, `~/.local/bin`, `~/.<tool>/bin`, mise's `npm:`
+  installs), a configured `command`, and Codex's node, `codex` and adapter. `gtk_agent_backends`
+  runs a Grok turn end to end (instructions, a disk write that becomes a hunk, Codex's modes in
+  the picker), lists every backend in the picker with `[agent.<backend>] name`, explains a
+  missing tool, installs the Codex adapter with a fake npm, and shows each agent's login hint.
 - **Picker and key row** (`gtk_agent_backends`): switching backends (with the confirmation while
   a turn runs) and saving `[agent] backend`, the API key row and its dialog with a fake
   `secret-tool` (the key goes on stdin, never in the arguments), and the cost label. The process

@@ -26,7 +26,7 @@ fn key_seen_by(flavor: AcpFlavor) -> String {
     )
     .unwrap();
     let mut cfg = sb.config(&script);
-    cfg.node = "/bin/sh".into();
+    cfg.program = "/bin/sh".into();
     cfg.flavor = flavor;
     let handle = lemma_agent::spawn(cfg).unwrap();
     assert!(

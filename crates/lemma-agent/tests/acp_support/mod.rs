@@ -140,9 +140,12 @@ impl Sandbox {
     pub fn config(&self, scenario: &Path) -> AgentConfig {
         let bins = bins();
         AgentConfig {
-            node: bins.fake_agent.clone(),
-            adapter_js: scenario.to_path_buf(),
-            claude_exe: PathBuf::from("/nonexistent/claude"),
+            program: bins.fake_agent.clone(),
+            args: vec![scenario.as_os_str().to_owned()],
+            env: vec![(
+                "CLAUDE_CODE_EXECUTABLE".into(),
+                "/nonexistent/claude".into(),
+            )],
             cwd: self.project(),
             mcp_bridge: bins.mcp_bridge.clone(),
             mcp_socket: self.socket(),

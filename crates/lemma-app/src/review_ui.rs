@@ -583,7 +583,10 @@ impl Inner {
                 Some(None) => format!("Changes to review · {counts}"),
                 None => format!(
                     "{} changed {counts}",
-                    crate::agent::bridge::agent_label(state.config.agent.backend)
+                    crate::agent::bridge::agent_label(
+                        state.config.agent.backend,
+                        &state.config.agent
+                    )
                 ),
             };
             state.banner.set_title(notice.as_deref().unwrap_or(&text));

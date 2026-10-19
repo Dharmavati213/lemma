@@ -241,12 +241,100 @@ pub struct AgentCfg {
     /// keeps the agent's default.
     pub effort: String,
     /// Which agent the pane talks to (M5): Claude Code through its ACP adapter, the Anthropic
-    /// API with the user's key, or Pi through its ACP adapter.
+    /// API with the user's key, or another ACP agent (Pi, Codex, Grok Build, …).
     pub backend: AgentBackend,
     /// npm prefix of the Pi ACP adapter install (`~` is expanded with [`expand_tilde`]).
     pub pi_adapter_dir: PathBuf,
     /// Pi ACP adapter version (`@openma/pi-acp`) installed by the in-app action.
     pub pi_adapter_version: String,
+    /// npm prefix of the Codex ACP adapter install (`~` is expanded with [`expand_tilde`]).
+    pub codex_adapter_dir: PathBuf,
+    /// Codex ACP adapter version (`@agentclientprotocol/codex-acp`) installed by the in-app
+    /// action.
+    pub codex_adapter_version: String,
+    /// `[agent.pi]`: how the Pi backend starts (see [`AcpAgentCfg`]).
+    pub pi: AcpAgentCfg,
+    /// `[agent.codex]`: how the Codex backend starts.
+    pub codex: AcpAgentCfg,
+    /// `[agent.grok]`: how the Grok Build backend starts.
+    pub grok: AcpAgentCfg,
+    /// `[agent.gemini]`: how the Gemini CLI backend starts.
+    pub gemini: AcpAgentCfg,
+    /// `[agent.opencode]`: how the OpenCode backend starts.
+    pub opencode: AcpAgentCfg,
+    /// `[agent.copilot]`: how the GitHub Copilot CLI backend starts.
+    pub copilot: AcpAgentCfg,
+    /// `[agent.custom]`: any other agent that speaks ACP on stdio (it needs a `command`).
+    pub custom: AcpAgentCfg,
+}
+
+impl AgentCfg {
+    /// The `[agent.<backend>]` table of `backend`; `None` for Claude Code and the API, which
+    /// have none.
+    pub fn acp(&self, backend: AgentBackend) -> Option<&AcpAgentCfg> {
+        match backend {
+            AgentBackend::Claude | AgentBackend::Api => None,
+            AgentBackend::Pi => Some(&self.pi),
+            AgentBackend::Codex => Some(&self.codex),
+            AgentBackend::Grok => Some(&self.grok),
+            AgentBackend::Gemini => Some(&self.gemini),
+            AgentBackend::OpenCode => Some(&self.opencode),
+            AgentBackend::Copilot => Some(&self.copilot),
+            AgentBackend::Custom => Some(&self.custom),
+        }
+    }
+
+    /// The `model` option to select when `backend` starts: its table's `model`, else
+    /// [`AgentCfg::model`].
+    pub fn model_for(&self, backend: AgentBackend) -> &str {
+        self.acp(backend)
+            .map(|t| t.model.as_str())
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&self.model)
+    }
+
+    /// The effort to select when `backend` starts: its table's `effort`, else
+    /// [`AgentCfg::effort`].
+    pub fn effort_for(&self, backend: AgentBackend) -> &str {
+        self.acp(backend)
+            .map(|t| t.effort.as_str())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(&self.effort)
+    }
+}
+
+/// `[agent.<backend>]`: how Lemma starts an ACP agent other than Claude Code. Every key is
+/// optional; an empty table keeps the backend's own way of starting.
+///
+/// ```toml
+/// [agent.grok]
+/// args = ["agent", "stdio", "--debug"]
+/// model = "grok-4.7-build-fast"
+///
+/// [agent.custom]
+/// name = "Goose"
+/// command = "goose"
+/// args = ["acp"]
+/// env = { GOOSE_MODE = "approve" }
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AcpAgentCfg {
+    /// The program that speaks ACP on stdin/stdout (`~` is expanded; a bare name is looked up
+    /// in `PATH`). Empty: the backend's own (for Pi and Codex node with the adapter Lemma
+    /// installs, for the others their command line tool). The custom agent needs one.
+    pub command: PathBuf,
+    /// Its arguments. With `command` empty: the backend's when empty (`grok agent stdio`,
+    /// `gemini --acp`, …), else they replace them (after the script, for an npm adapter).
+    pub args: Vec<String>,
+    /// Environment variables set for the agent.
+    pub env: BTreeMap<String, String>,
+    /// The name Lemma shows; empty: the backend's ("Grok Build", "Custom agent", …).
+    pub name: String,
+    /// The `model` option to select when the agent starts; empty: [`AgentCfg::model`].
+    pub model: String,
+    /// The reasoning effort to select when the agent starts; empty: [`AgentCfg::effort`].
+    pub effort: String,
 }
 
 /// `[agent] backend`: the agent behind the pane (M5).
@@ -260,11 +348,34 @@ pub enum AgentBackend {
     Api,
     /// The pi coding agent through `@openma/pi-acp`.
     Pi,
+    /// OpenAI's Codex CLI through `@agentclientprotocol/codex-acp`.
+    Codex,
+    /// xAI's Grok Build (`grok agent stdio`).
+    Grok,
+    /// Google's Gemini CLI (`gemini --acp`).
+    Gemini,
+    /// OpenCode (`opencode acp`).
+    #[serde(rename = "opencode")]
+    OpenCode,
+    /// The GitHub Copilot CLI (`copilot --acp`).
+    Copilot,
+    /// Any other ACP agent, from `[agent.custom]`.
+    Custom,
 }
 
 impl AgentBackend {
     /// Every backend, in the order the picker lists them.
-    pub const ALL: [AgentBackend; 3] = [Self::Claude, Self::Api, Self::Pi];
+    pub const ALL: [AgentBackend; 9] = [
+        Self::Claude,
+        Self::Api,
+        Self::Pi,
+        Self::Codex,
+        Self::Grok,
+        Self::Gemini,
+        Self::OpenCode,
+        Self::Copilot,
+        Self::Custom,
+    ];
 
     /// The value in `config.toml`.
     pub fn as_str(self) -> &'static str {
@@ -272,6 +383,12 @@ impl AgentBackend {
             Self::Claude => "claude",
             Self::Api => "api",
             Self::Pi => "pi",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Gemini => "gemini",
+            Self::OpenCode => "opencode",
+            Self::Copilot => "copilot",
+            Self::Custom => "custom",
         }
     }
 
@@ -298,6 +415,15 @@ impl Default for AgentCfg {
             backend: AgentBackend::Claude,
             pi_adapter_dir: "~/.local/share/lemma/acp-pi".into(),
             pi_adapter_version: "0.1.7".into(),
+            codex_adapter_dir: "~/.local/share/lemma/acp-codex".into(),
+            codex_adapter_version: "2.2.2".into(),
+            pi: AcpAgentCfg::default(),
+            codex: AcpAgentCfg::default(),
+            grok: AcpAgentCfg::default(),
+            gemini: AcpAgentCfg::default(),
+            opencode: AcpAgentCfg::default(),
+            copilot: AcpAgentCfg::default(),
+            custom: AcpAgentCfg::default(),
         }
     }
 }
@@ -826,6 +952,42 @@ mod tests {
         assert!(parse("[agent]\nbackend = \"Pi\"\n").is_err());
         assert!(parse("[agent]\nbackend = \"openai\"\n").is_err());
         assert_eq!(AgentBackend::from_name("openai"), None);
+        assert_eq!(AgentBackend::OpenCode.as_str(), "opencode");
+        assert_eq!(
+            c.agent.codex_adapter_dir,
+            PathBuf::from("~/.local/share/lemma/acp-codex")
+        );
+    }
+
+    #[test]
+    fn acp_agent_tables() {
+        let c = parse(
+            "[agent]\nbackend = \"custom\"\nmodel = \"opus\"\n\
+             [agent.grok]\nargs = [\"agent\", \"stdio\", \"--debug\"]\nmodel = \"grok-4.7\"\n\
+             [agent.custom]\nname = \"Goose\"\ncommand = \"~/bin/goose\"\nargs = [\"acp\"]\n\
+             env = { GOOSE_MODE = \"approve\" }\n",
+        )
+        .unwrap();
+        assert_eq!(c.agent.backend, AgentBackend::Custom);
+        assert_eq!(c.agent.grok.args, ["agent", "stdio", "--debug"]);
+        assert_eq!(c.agent.grok.command, PathBuf::new());
+        let custom = c.agent.acp(AgentBackend::Custom).unwrap();
+        assert_eq!(custom.name, "Goose");
+        assert_eq!(custom.command, PathBuf::from("~/bin/goose"));
+        assert_eq!(custom.env["GOOSE_MODE"], "approve");
+        assert!(c.agent.acp(AgentBackend::Claude).is_none());
+        assert!(c.agent.acp(AgentBackend::Api).is_none());
+        assert_eq!(c.agent.codex, AcpAgentCfg::default());
+        // The table's model wins; without one, `agent.model`.
+        assert_eq!(c.agent.model_for(AgentBackend::Grok), "grok-4.7");
+        assert_eq!(c.agent.model_for(AgentBackend::Codex), "opus");
+        assert_eq!(c.agent.model_for(AgentBackend::Claude), "opus");
+        assert_eq!(c.agent.effort_for(AgentBackend::Grok), "");
+        assert!(parse("[agent.grok]\ncomand = \"grok\"\n").is_err());
+        assert!(parse("[agent.claude]\ncommand = \"claude\"\n").is_err());
+        // It round-trips.
+        let text = toml::to_string(&c).unwrap();
+        assert_eq!(parse(&text).unwrap(), c);
     }
 
     #[test]

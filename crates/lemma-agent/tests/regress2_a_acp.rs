@@ -138,9 +138,12 @@ fn scripted(sb: &Sandbox, scenario: &str) -> AgentConfig {
     let script = sb.dir.join(format!("agent-{scenario}.py"));
     std::fs::write(&script, AGENT.replace("@SCENARIO@", scenario)).unwrap();
     let mut cfg = sb.config(&script);
-    cfg.node = python();
+    cfg.program = python();
     // The agent's log (the only path the client passes on: $CLAUDE_CODE_EXECUTABLE).
-    cfg.claude_exe = sb.dir.join("agent.log");
+    cfg.env = vec![(
+        "CLAUDE_CODE_EXECUTABLE".into(),
+        sb.dir.join("agent.log").into_os_string(),
+    )];
     cfg
 }
 

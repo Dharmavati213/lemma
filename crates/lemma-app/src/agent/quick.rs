@@ -276,7 +276,7 @@ pub fn run(state: &Rc<WindowState>, name: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "{} is busy",
-            super::bridge::agent_label(state.config.agent.backend)
+            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
         ))
     }
 }
@@ -301,7 +301,7 @@ pub fn agent_command(state: &Rc<WindowState>, arg: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "{} is busy",
-            super::bridge::agent_label(state.config.agent.backend)
+            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
         ))
     }
 }

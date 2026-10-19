@@ -3,8 +3,9 @@
 //!
 //! # Threads
 //!
-//! [`spawn`] starts the agent process (`node <adapter_js>`, or `lemma-fake-agent <scenario>` in
-//! tests) as the leader of its own process group, then these threads, all named `lemma-agent*`:
+//! [`spawn`] starts the agent process (`program args`: `node <adapter.js>`, an agent's own command
+//! line tool such as `grok agent stdio`, or `lemma-fake-agent <scenario>` in tests) as the leader
+//! of its own process group, then these threads, all named `lemma-agent*`:
 //!
 //! | Thread | Job |
 //! |---|---|
@@ -31,10 +32,13 @@
 //!
 //! # Lemma's policy on modes and permissions (risk §9.6)
 //!
-//! Only the `default` and `plan` modes are offered: `Ready.modes`, the `mode` config option and
-//! `SetMode`/`SetConfig` are limited to them; a session that starts in another mode, or that the
-//! agent switches to another mode, is switched back to `default` (with a `Notice` in the second
-//! case; a switch during start-up is reverted right after `Ready`, which reports it). Permission
+//! With Claude Code only the `default` and `plan` modes are offered; with other agents
+//! ([`AcpFlavor::Generic`]) every mode they have except [`ELEVATED_MODES`] (see
+//! [`AcpFlavor::offers_mode`]). `Ready.modes`, the `mode` config option and `SetMode`/`SetConfig`
+//! are limited to the offered modes; a session that starts in another mode, or that the agent
+//! switches to another mode, is switched back to the session's fallback mode (`default`, or for an
+//! agent without one the first mode it offers; with a `Notice` in the second case; a switch
+//! during start-up is reverted right after `Ready`, which reports it). Permission
 //! options that leave plan mode for an elevated mode (`exit-plan-auto`, `exit-plan-bypass`,
 //! `exit-plan-accept-edits` and their `exit-plan-clear-*` variants) are not offered;
 //! `exit-plan-default` and `reject` remain. A permission request the agent withdraws
@@ -54,6 +58,13 @@
 //!
 //! An agent error with ACP's "authentication required" code (-32000) gets
 //! [`crate::LOGIN_REQUIRED`] appended to its message.
+//!
+//! # Instructions
+//!
+//! `system_prompt_append` goes in `session/new`'s `_meta.systemPrompt.append` (Claude's adapter
+//! reads it; others ignore it). ACP itself has no system prompt, so for [`AcpFlavor::Generic`]
+//! it is also sent as the first text block of the session's first prompt, between
+//! [`INSTRUCTIONS_TAG`] and `</lemma_instructions>`.
 //!
 //! # Process lifecycle
 //!
@@ -98,8 +109,23 @@ pub const STDERR_RING_BYTES: usize = 64 * 1024;
 pub const EXIT_GRACE: Duration = Duration::from_millis(300);
 /// After SIGTERM, how long the process group may take to exit before SIGKILL.
 pub const TERM_GRACE: Duration = Duration::from_millis(300);
-/// The modes Lemma offers (§10.4).
+/// The modes Lemma offers with Claude Code (§10.4).
 pub const OFFERED_MODES: &[&str] = &["default", "plan"];
+/// How the block of Lemma's instructions starts in the first prompt of an agent other than
+/// Claude Code (see the module docs).
+pub const INSTRUCTIONS_TAG: &str = "<lemma_instructions>";
+/// The modes Lemma never offers with other agents ([`AcpFlavor::Generic`]): they let the agent
+/// run commands without asking, or leave its sandbox (Codex's `agent-full-access`, Gemini CLI's
+/// `yolo`), plus the modes of Claude Code's that Lemma does not offer, should another agent
+/// use those names. (Edits never need the agent's own approval: the user reviews them in Lemma.)
+pub const ELEVATED_MODES: &[&str] = &[
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "agent-full-access",
+    "full-access",
+    "yolo",
+];
 /// Permission options that would switch the session to a mode Lemma does not offer.
 const ELEVATING_OPTIONS: &[&str] = &[
     "exit-plan-auto",
@@ -154,14 +180,14 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
         )?)
     };
 
-    let mut command = Command::new(&cfg.node);
-    command.arg(&cfg.adapter_js);
+    let mut command = Command::new(&cfg.program);
+    command.args(&cfg.args);
     if cfg.flavor == AcpFlavor::Claude {
-        command.env("CLAUDE_CODE_EXECUTABLE", &cfg.claude_exe);
         // Claude Code reuses the user's login; an API key meant for the API-key backend would
         // make it bill that key instead. (Pi's keys belong to Pi: generic adapters keep it.)
         command.env_remove(crate::keys::ENV_VAR);
     }
+    command.envs(cfg.env.iter().map(|(k, v)| (k, v)));
     command
         // A Claude Code session in the terminal that started Lemma must not leak into ours.
         .env_remove("CLAUDECODE")
@@ -178,7 +204,7 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
             }
             return Err(io::Error::new(
                 e.kind(),
-                format!("cannot start {}: {e}", cfg.node.display()),
+                format!("cannot start {}: {e}", cfg.program.display()),
             ));
         }
     };
@@ -224,7 +250,10 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
         })?,
     ];
 
-    let shared = Arc::new(Shared::new(events_tx, process.exited_flag()));
+    let shared = Arc::new(Shared::new(events_tx, process.exited_flag(), cfg.flavor));
+    if cfg.flavor == AcpFlavor::Generic && !cfg.system_prompt_append.is_empty() {
+        shared.lock().instructions = Some(cfg.system_prompt_append.clone());
+    }
     let fs = Arc::new(FsRouter {
         tools: fs_tools,
         shared: shared.clone(),
@@ -662,30 +691,32 @@ impl Session {
             .as_ref()
             .map(|m| m.current_mode_id.0.to_string())
             .unwrap_or_default();
-        if new.modes.is_some() && !OFFERED_MODES.contains(&mode.as_str()) {
-            let offers_default = new
-                .modes
-                .as_ref()
-                .is_some_and(|m| m.available_modes.iter().any(|m| &*m.id.0 == "default"));
-            if !offers_default {
-                return Err(StartError::Failed(format!(
-                    "The agent started in mode \"{mode}\" and offers no \"default\" mode."
-                )));
-            }
+        if new.modes.is_some() && !self.cfg.flavor.offers_mode(&mode) {
+            let Some(fallback) = self.shared.lock().fallback_mode.clone() else {
+                return Err(StartError::Failed(match self.cfg.flavor {
+                    AcpFlavor::Claude => format!(
+                        "The agent started in mode \"{mode}\" and offers no \"default\" mode."
+                    ),
+                    AcpFlavor::Generic => format!(
+                        "The agent started in mode \"{mode}\" and offers no mode that Lemma \
+                         offers."
+                    ),
+                }));
+            };
             let before = self.shared.mode_generation();
             cx.send_request(s::SetSessionModeRequest::new(
                 session_id.clone(),
-                "default",
+                fallback.clone(),
             ))
             .block_task()
             .await
             .map_err(|e| {
                 StartError::from_acp(
-                    &format!("The agent started in mode \"{mode}\", which Lemma does not offer, and could not switch to \"default\""),
+                    &format!("The agent started in mode \"{mode}\", which Lemma does not offer, and could not switch to \"{fallback}\""),
                     &e,
                 )
             })?;
-            self.shared.set_mode_silently("default", before);
+            self.shared.set_mode_silently(&fallback, before);
         }
         Ok(Started {
             session_id,
@@ -716,11 +747,18 @@ impl Session {
                 {
                     shared.emit(AgentEvent::Notice(notice.into()));
                 }
+                // Lemma's instructions open the session's first prompt (see the module docs).
+                let instructions = shared.lock().instructions.take();
                 let sent = cx.send_request(s::PromptRequest::new(
                     sid.clone(),
-                    blocks
+                    instructions
+                        .map(|text| {
+                            s::ContentBlock::Text(s::TextContent::new(format!(
+                                "{INSTRUCTIONS_TAG}\n{text}\n</lemma_instructions>"
+                            )))
+                        })
                         .into_iter()
-                        .map(|b| content_block(b, started.images))
+                        .chain(blocks.into_iter().map(|b| content_block(b, started.images)))
                         .collect(),
                 ));
                 let shared = shared.clone();
@@ -739,7 +777,7 @@ impl Session {
                 shared.answer_permission(request, option_id);
             }
             AgentCmd::SetMode(mode) => {
-                if !OFFERED_MODES.contains(&mode.as_str()) {
+                if !self.cfg.flavor.offers_mode(&mode) {
                     shared.emit(AgentEvent::Error(format!(
                         "Lemma does not offer the mode \"{mode}\"."
                     )));
@@ -758,7 +796,7 @@ impl Session {
                 });
             }
             AgentCmd::SetConfig { id, value } => {
-                if id == "mode" && !OFFERED_MODES.contains(&value.as_str()) {
+                if id == "mode" && !self.cfg.flavor.offers_mode(&value) {
                     shared.emit(AgentEvent::Error(format!(
                         "Lemma does not offer the mode \"{value}\"."
                     )));
@@ -1025,6 +1063,8 @@ struct Shared {
     events: async_channel::Sender<AgentEvent>,
     /// Set by the wait thread when the agent exited.
     exited: Arc<AtomicBool>,
+    /// Which modes Lemma offers ([`AcpFlavor::offers_mode`]).
+    flavor: AcpFlavor,
     state: Mutex<State>,
 }
 
@@ -1042,8 +1082,13 @@ struct State {
     /// Bumped when an update from the agent changes the mode: a `session/set_mode` sent before
     /// is then not confirmed (the update is newer). Answers to our own requests do not bump it.
     mode_generation: u64,
-    /// A switch back to `default` is in flight (or failed): do not ask again.
+    /// A switch back to `fallback_mode` is in flight (or failed): do not ask again.
     reverting_mode: bool,
+    /// The offered mode a session in a mode Lemma does not offer is switched to
+    /// ([`fallback_mode`]); `None` when there is none.
+    fallback_mode: Option<String>,
+    /// Lemma's instructions, until the first prompt carries them ([`AcpFlavor::Generic`]).
+    instructions: Option<String>,
     options: Vec<ConfigOpt>,
     boolean_options: HashSet<String>,
     agent: String,
@@ -1065,10 +1110,15 @@ struct PendingPermission {
 }
 
 impl Shared {
-    fn new(events: async_channel::Sender<AgentEvent>, exited: Arc<AtomicBool>) -> Self {
+    fn new(
+        events: async_channel::Sender<AgentEvent>,
+        exited: Arc<AtomicBool>,
+        flavor: AcpFlavor,
+    ) -> Self {
         Self {
             events,
             exited,
+            flavor,
             state: Mutex::new(State::default()),
         }
     }
@@ -1116,18 +1166,21 @@ impl Shared {
             .map(|m| {
                 m.available_modes
                     .iter()
-                    .filter(|m| OFFERED_MODES.contains(&&*m.id.0))
+                    .filter(|m| self.flavor.offers_mode(&m.id.0))
                     .map(|m| (m.id.0.to_string(), m.name.clone()))
                     .collect()
             })
             .unwrap_or_default();
+        st.fallback_mode = fallback_mode(self.flavor, &st.modes);
         st.mode = new
             .modes
             .as_ref()
             .map(|m| m.current_mode_id.0.to_string())
             .unwrap_or_default();
-        let (options, booleans) =
-            convert_options(new.config_options.as_deref().unwrap_or_default());
+        let (options, booleans) = convert_options(
+            new.config_options.as_deref().unwrap_or_default(),
+            self.flavor,
+        );
         st.options = options;
         st.boolean_options = booleans;
     }
@@ -1367,7 +1420,7 @@ impl Shared {
             return false;
         }
         mode.clone_into(&mut st.mode);
-        if OFFERED_MODES.contains(&mode) {
+        if self.flavor.offers_mode(mode) {
             st.reverting_mode = false;
         }
         if let Some(option) = st.options.iter_mut().find(|o| o.id == "mode") {
@@ -1395,7 +1448,7 @@ impl Shared {
 
     fn config_confirmed(&self, options: &[s::SessionConfigOption]) {
         let mut st = self.lock();
-        let (options, booleans) = convert_options(options);
+        let (options, booleans) = convert_options(options, self.flavor);
         st.boolean_options = booleans;
         st.options.clone_from(&options);
         self.emit_locked(&mut st, AgentEvent::ConfigChanged(options.clone()));
@@ -1464,7 +1517,7 @@ impl Shared {
                 None
             }
             s::SessionUpdate::ConfigOptionUpdate(u) => {
-                let (options, booleans) = convert_options(&u.config_options);
+                let (options, booleans) = convert_options(&u.config_options, self.flavor);
                 st.boolean_options = booleans;
                 let mode = options
                     .iter()
@@ -1500,7 +1553,8 @@ impl Shared {
         }
     }
 
-    /// The agent switched to a mode Lemma does not offer: switch back to `default`.
+    /// The agent switched to a mode Lemma does not offer: switch back to the fallback mode
+    /// (`default`).
     fn enforce_offered_mode(
         self: &Arc<Self>,
         st: &mut State,
@@ -1510,30 +1564,43 @@ impl Shared {
         let Some(sid) = st.session.clone() else {
             return;
         };
-        if !st.ready || st.reverting_mode || mode.is_empty() || OFFERED_MODES.contains(&mode) {
+        if !st.ready || st.reverting_mode || mode.is_empty() || self.flavor.offers_mode(mode) {
             return;
         }
         st.reverting_mode = true;
+        let Some(fallback) = st.fallback_mode.clone() else {
+            self.emit_locked(
+                st,
+                AgentEvent::Notice(format!(
+                    "The agent switched to the mode \"{mode}\", which Lemma does not offer, and \
+                     has no other mode to switch back to."
+                )),
+            );
+            return;
+        };
         self.emit_locked(
             st,
             AgentEvent::Notice(format!(
-                "The agent switched to the mode \"{mode}\", which Lemma does not offer; switching back to \"default\"."
+                "The agent switched to the mode \"{mode}\", which Lemma does not offer; switching back to \"{fallback}\"."
             )),
         );
         let before = st.mode_generation;
-        let sent = cx.send_request(s::SetSessionModeRequest::new(sid, "default"));
+        let sent = cx.send_request(s::SetSessionModeRequest::new(sid, fallback.clone()));
         let shared = self.clone();
         if let Err(e) = cx.spawn(async move {
             match sent.block_task().await {
                 // Confirmed with `ModeChanged` unless an update already reported the switch.
-                Ok(_) => shared.mode_confirmed("default", before),
+                Ok(_) => shared.mode_confirmed(&fallback, before),
                 Err(e) => {
-                    shared.request_failed(&e, "Could not switch the agent back to \"default\"");
+                    shared.request_failed(
+                        &e,
+                        &format!("Could not switch the agent back to \"{fallback}\""),
+                    );
                 }
             }
             Ok(())
         }) {
-            tracing::warn!("cannot switch the agent back to default: {e}");
+            tracing::warn!("cannot switch the agent back to an offered mode: {e}");
         }
     }
 }
@@ -1547,8 +1614,22 @@ fn update_name(update: &s::SessionUpdate) -> &'static str {
     }
 }
 
-/// `ConfigOpt`s (the `mode` option limited to the offered modes) and the ids of boolean options.
-fn convert_options(options: &[s::SessionConfigOption]) -> (Vec<ConfigOpt>, HashSet<String>) {
+/// The mode a session in a mode Lemma does not offer is switched to, from the offered `modes`:
+/// `default`; for other agents than Claude Code, without one, the first offered mode.
+fn fallback_mode(flavor: AcpFlavor, modes: &[(String, String)]) -> Option<String> {
+    let ids = || modes.iter().map(|(id, _)| id);
+    ids()
+        .find(|id| *id == "default")
+        .or_else(|| ids().next().filter(|_| flavor == AcpFlavor::Generic))
+        .cloned()
+}
+
+/// `ConfigOpt`s (the `mode` option limited to the modes `flavor` offers) and the ids of boolean
+/// options.
+fn convert_options(
+    options: &[s::SessionConfigOption],
+    flavor: AcpFlavor,
+) -> (Vec<ConfigOpt>, HashSet<String>) {
     let mut out = Vec::new();
     let mut booleans = HashSet::new();
     for option in options {
@@ -1587,7 +1668,7 @@ fn convert_options(options: &[s::SessionConfigOption]) -> (Vec<ConfigOpt>, HashS
             _ => continue,
         };
         if id == "mode" {
-            values.retain(|(v, _)| OFFERED_MODES.contains(&v.as_str()));
+            values.retain(|(v, _)| flavor.offers_mode(v));
         }
         out.push(ConfigOpt {
             id,
@@ -2235,7 +2316,7 @@ mod tests {
             {"id": "fast", "name": "Fast mode", "type": "boolean", "currentValue": false}
         ]);
         let options: Vec<s::SessionConfigOption> = serde_json::from_value(json).unwrap();
-        let (converted, booleans) = convert_options(&options);
+        let (converted, booleans) = convert_options(&options, AcpFlavor::Claude);
         assert_eq!(
             converted[0].values,
             [
@@ -2247,6 +2328,54 @@ mod tests {
         assert_eq!(converted[1].current, "opus");
         assert_eq!(converted[2].current, "false");
         assert!(booleans.contains("fast"));
+    }
+
+    #[test]
+    fn other_agents_keep_their_modes_but_the_elevated_ones() {
+        let json = serde_json::json!([
+            {"id": "mode", "name": "Mode", "type": "select", "currentValue": "agent",
+             "options": [{"value": "read-only", "name": "Read-only"},
+                         {"value": "workspace-write", "name": "Workspace access"},
+                         {"value": "agent", "name": "Auto review"},
+                         {"value": "agent-full-access", "name": "Full access"}]}
+        ]);
+        let options: Vec<s::SessionConfigOption> = serde_json::from_value(json).unwrap();
+        let (converted, _) = convert_options(&options, AcpFlavor::Generic);
+        let ids: Vec<&str> = converted[0]
+            .values
+            .iter()
+            .map(|(v, _)| v.as_str())
+            .collect();
+        assert_eq!(ids, ["read-only", "workspace-write", "agent"]);
+        for mode in ["default", "plan", "autoEdit", "read-only", "agent", "build"] {
+            assert!(AcpFlavor::Generic.offers_mode(mode), "{mode}");
+        }
+        for mode in [
+            "",
+            "yolo",
+            "bypassPermissions",
+            "agent-full-access",
+            "acceptEdits",
+        ] {
+            assert!(!AcpFlavor::Generic.offers_mode(mode), "{mode}");
+        }
+        assert!(!AcpFlavor::Claude.offers_mode("agent"));
+        // The fallback: `default`, else (not for Claude Code) the first offered mode.
+        let modes = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|id| ((*id).to_owned(), String::new()))
+                .collect()
+        };
+        assert_eq!(
+            fallback_mode(AcpFlavor::Generic, &modes(&["read-only", "agent"])).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            fallback_mode(AcpFlavor::Generic, &modes(&["autoEdit", "default"])).as_deref(),
+            Some("default")
+        );
+        assert_eq!(fallback_mode(AcpFlavor::Claude, &modes(&["plan"])), None);
+        assert_eq!(fallback_mode(AcpFlavor::Generic, &[]), None);
     }
 
     #[test]

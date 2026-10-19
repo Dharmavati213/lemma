@@ -9,16 +9,17 @@ build diagnostics in plain English, completion, snippets, a project outline and 
 
 ## Features
 
-- **Agent edits as reviewable hunks.** Claude Code (over ACP), the Anthropic API with your own
-  key, or the Pi agent edits the project through Lemma's own tools. Each edit becomes a hunk
-  with word-level highlighting. Accept or reject per hunk (Alt+Y / Alt+N), per file or per
+- **Agent edits as reviewable hunks.** Claude Code, Codex, Grok Build, Gemini CLI, OpenCode,
+  GitHub Copilot, Pi or any other agent that speaks ACP, or the Anthropic API with your own key,
+  edits the project through Lemma's own tools. Each edit becomes a hunk with word-level
+  highlighting. Accept or reject per hunk (Alt+Y / Alt+N), per file or per
   turn, and switch to a reading mode that hides deletions (Alt+D). Ctrl+K edits just the
   selection or paragraph.
 - **Attach images and files to a prompt.** Click the paperclip under the agent's prompt box, drop
   files or images on the agent pane, or paste (Ctrl+V) a screenshot or files copied in a file
   manager. Images (PNG, JPEG, GIF, WebP, and anything else GTK can read; files up to 64 MB) go
   to the model as images, scaled down when they are too large; PDFs and text files are attached
-  too. Claude Code and Pi take PDFs and text files of any size: large ones are sent as a link
+  too. The ACP agents take PDFs and text files of any size: large ones are sent as a link
   that the agent opens itself. With the API backend everything travels inside the request, so
   PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
@@ -51,8 +52,9 @@ Lemma targets current GNOME 50-era libraries:
 To build documents you need a TeX distribution with `latexmk` (e.g. TeX Live).
 
 Optional tools turn features on when they are found: `chktex` (lint), `texcount` (word
-count), `mylatexformat` (faster math previews) and `git` (the git gutter). The agent needs
-`node` and `npm`. For the Claude backend you also need the `claude` CLI, logged in.
+count), `mylatexformat` (faster math previews) and `git` (the git gutter). The Claude, Codex
+and Pi backends need `node` and `npm`, plus the agent itself, logged in (the `claude` or
+`codex` CLI). The other agents only need their own command line tool.
 
 Arch Linux ships all of these. Other distributions may not have libraries this new yet.
 
@@ -122,8 +124,38 @@ Open the agent pane (F10) and choose a backend in its header:
 - **API**: the Anthropic Messages API with your own key. Click "Set API Key…" in the pane to
   store it in the GNOME keyring, or set `ANTHROPIC_API_KEY`.
 - **Pi**: the `pi` coding agent through its ACP adapter. Run `pi` once to log in.
+- **Codex**: OpenAI's Codex CLI through the ACP adapter `@agentclientprotocol/codex-acp`, which
+  the pane's **Install** button installs. It runs your own `codex`; log in with `codex login`.
+- **Grok Build** (`grok agent stdio`), **Gemini CLI** (`gemini --acp`), **OpenCode**
+  (`opencode acp`) and **GitHub Copilot** (`copilot --acp`) speak ACP themselves: Lemma finds
+  the tool on `PATH`, in `~/.local/bin` or in mise's installs. Log in with the tool first
+  (`grok login`, …).
+- **Custom**: any other agent that speaks ACP on stdio, from `[agent.custom]` (below).
 
-Agent edits always arrive as hunks for review. Nothing is accepted for you.
+Agent edits always arrive as hunks for review. Nothing is accepted for you. Agents that edit
+through ACP's file methods (Pi, Gemini CLI) edit the live buffers; edits that an agent writes to
+disk itself are picked up during the turn. Lemma never offers an agent's modes that skip its
+permission prompts (`bypassPermissions`, `yolo`, Codex's full access, …).
+
+How each ACP agent starts can be changed in `config.toml`; every key is optional:
+
+```toml
+[agent]
+backend = "grok"
+
+[agent.grok]
+args = ["agent", "stdio", "--debug"]   # replaces the default arguments
+model = "grok-4.7-build-fast"          # selected when the agent starts
+effort = "high"
+
+[agent.codex]
+env = { CODEX_PATH = "/opt/codex/bin/codex" }
+
+[agent.custom]
+name = "Goose"
+command = "goose"                      # a name on PATH, or an absolute path
+args = ["acp"]
+```
 
 ### Configuration
 

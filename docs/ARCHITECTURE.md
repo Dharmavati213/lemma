@@ -1060,6 +1060,22 @@ they conflict with the sections above, this section wins.
     `ANTHROPIC_API_KEY`) and `pi` (ACP through a pinned pi adapter, with ACP `fs/*` routed through the review). The
     API and Pi backends are tested only against fakes.
   - The Claude adapter no longer inherits `ANTHROPIC_API_KEY`.
+  - More ACP agents (2026-10-19): `codex` (`@agentclientprotocol/codex-acp` 2.2.2, installed with
+    `--omit=optional` like Claude's adapter, running the user's `codex` through `CODEX_PATH`),
+    `grok` (`grok agent stdio`), `gemini` (`gemini --acp`), `opencode` (`opencode acp`), `copilot`
+    (`copilot --acp`) and `custom`. All run as `AcpFlavor::Generic`; `[agent.<backend>]` tables
+    override `command`, `args`, `env`, `name`, `model` and `effort`. `AgentConfig` takes
+    `program`/`args`/`env` instead of `node`/`adapter_js`/`claude_exe`.
+    - Modes: Claude Code keeps `default`/`plan` only; other agents keep their own modes except
+      `ELEVATED_MODES` (`bypassPermissions`, `yolo`, Codex's `agent-full-access`, Claude's
+      `acceptEdits`/`auto`), falling back to `default` or else their first offered mode.
+    - Instructions: ACP has no system prompt and only Claude's adapter reads
+      `_meta.systemPrompt.append`, so other agents get `GENERIC_APPEND` as the first block of the
+      session's first prompt, inside `<lemma_instructions>`.
+    - Agents that write files themselves (Codex's `apply_patch`, …) are covered by the file
+      monitor and the turn snapshot; the tool cards recognise Lemma's tools under other naming
+      schemes (`mcp.lemma.edit`).
+    - The effort picker and `agent.effort` use `effort` or, failing that, `reasoning_effort`.
   - Vim mode is off by default.
   - The default renderer is cairo (`[editor] renderer`).
   - The memory budgets are re-based on real-Wayland measurements (`scripts/budgets.toml`).

@@ -1095,7 +1095,7 @@ fn raw_log_records_both_directions_privately() {
 fn spawn_fails_for_a_missing_program_and_cleans_up() {
     let sb = Sandbox::new("missing");
     let mut cfg = sb.config(&sb.scenario(&json!({"default": []})));
-    cfg.node = PathBuf::from("/nonexistent/node");
+    cfg.program = PathBuf::from("/nonexistent/node");
     let err = lemma_agent::spawn(cfg).err().expect("spawn fails");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(err.to_string().contains("/nonexistent/node"), "{err}");

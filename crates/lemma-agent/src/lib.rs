@@ -1,5 +1,6 @@
 //! Agent thread (ACP client over futures_executor::block_on, no tokio) + in-process MCP server on a unix socket.
 //! ALL agent-client-protocol usage lives in acp.rs; nothing else in the workspace imports that crate.
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 
@@ -9,34 +10,60 @@ pub mod mcp;
 /// The API-key backend (WP5.1): Anthropic's Messages API, same [`AgentHandle`] as [`spawn`].
 pub mod messages;
 
-pub use acp::{EXIT_GRACE, OFFERED_MODES, STDERR_RING_BYTES, TERM_GRACE};
+pub use acp::{
+    ELEVATED_MODES, EXIT_GRACE, INSTRUCTIONS_TAG, OFFERED_MODES, STDERR_RING_BYTES, TERM_GRACE,
+};
 
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    pub node: PathBuf,       // absolute (mise path stored in config)
-    pub adapter_js: PathBuf, // ~/.local/share/lemma/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js
-    pub claude_exe: PathBuf, // -> env CLAUDE_CODE_EXECUTABLE
+    /// The program that speaks ACP on stdio (absolute): `node` for an npm adapter (Claude Code,
+    /// Pi, Codex), the agent's own command line tool (`grok`, `gemini`, …), or
+    /// `lemma-fake-agent` in tests.
+    pub program: PathBuf,
+    /// Its arguments: the adapter's script
+    /// (`~/.local/share/lemma/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js`),
+    /// `agent stdio` for Grok Build, a scenario for the fake agent.
+    pub args: Vec<OsString>,
+    /// Environment variables set for it (`CLAUDE_CODE_EXECUTABLE`, `CODEX_PATH`, the user's
+    /// `[agent.<backend>] env`).
+    pub env: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,        // project root
     pub mcp_bridge: PathBuf, // the lemma-mcp binary next to `lemma`
     pub mcp_socket: PathBuf, // $XDG_RUNTIME_DIR/lemma/mcp-<pid>.sock (dir 0700)
     pub mcp_token: String,   // 32 hex chars from /dev/urandom
+    /// Lemma's instructions for the agent (see [`AcpFlavor`] for how they reach it).
     pub system_prompt_append: String,
     pub raw_log: Option<PathBuf>, // debug only; contains account info, never commit
-    /// Which ACP adapter `adapter_js` is (WP5.2): see [`AcpFlavor`].
+    /// Which kind of ACP agent `program` is (WP5.2): see [`AcpFlavor`].
     pub flavor: AcpFlavor,
 }
-/// The kind of ACP adapter [`spawn`] runs.
+/// The kind of ACP agent [`spawn`] runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AcpFlavor {
     /// Claude Code's adapter: its own `Edit`/`Write` are disallowed in `session/new`, so every
-    /// change goes through Lemma's MCP tools; `CLAUDE_CODE_EXECUTABLE` names `claude_exe`; the
-    /// client advertises no `fs` capability.
+    /// change goes through Lemma's MCP tools; `system_prompt_append` goes in `session/new`'s
+    /// `_meta.systemPrompt.append`; the client advertises no `fs` capability; only the modes
+    /// [`OFFERED_MODES`] are offered; `ANTHROPIC_API_KEY` is removed from its environment.
     #[default]
     Claude,
-    /// Any other adapter (Pi): the client also advertises `fs.readTextFile`/`fs.writeTextFile`,
-    /// so the agent's own read/write/edit tools reach the editor as [`EditorRequest::ReadText`]
-    /// and [`EditorRequest::WriteText`] calls on `handle.tools`; `claude_exe` is not used.
+    /// Any other agent (Pi, Codex, Grok Build, Gemini CLI, …): the client also advertises
+    /// `fs.readTextFile`/`fs.writeTextFile`, so an agent that delegates its own read/write/edit
+    /// tools reaches the editor as [`EditorRequest::ReadText`] and [`EditorRequest::WriteText`]
+    /// calls on `handle.tools`. ACP has no system prompt, so `system_prompt_append` is sent as
+    /// the first block of the session's first prompt. Every mode the agent has is offered
+    /// except [`ELEVATED_MODES`].
     Generic,
+}
+
+impl AcpFlavor {
+    /// True when Lemma offers the session mode `mode` with this kind of agent (risk §9.6):
+    /// with Claude Code only [`OFFERED_MODES`], with other agents any but [`ELEVATED_MODES`].
+    pub fn offers_mode(self, mode: &str) -> bool {
+        match self {
+            Self::Claude => OFFERED_MODES.contains(&mode),
+            Self::Generic => !mode.is_empty() && !ELEVATED_MODES.contains(&mode),
+        }
+    }
 }
 /// Appended to an `Error` message when the agent answered with ACP's "authentication required"
 /// error (-32000): the agent needs its own login (Pi: run `pi` once in a terminal).
@@ -349,8 +376,9 @@ pub struct AgentHandle {
 /// _meta={"claudeCode":{"options":{"disallowedTools":["Edit","Write","NotebookEdit"],"allowedTools":["mcp__lemma__*"]}},
 ///        "systemPrompt":{"append": system_prompt_append}}.
 ///
-/// - **Process:** `node adapter_js` with `CLAUDE_CODE_EXECUTABLE=claude_exe` (and without `CLAUDECODE`), in
-///   `cwd`, as the leader of its own process group. A process that cannot be started is an `Err` here.
+/// - **Process:** `program args` with `env` (and without `CLAUDECODE`; for [`AcpFlavor::Claude`] also without
+///   `ANTHROPIC_API_KEY`), in `cwd`, as the leader of its own process group. A process that cannot be started
+///   is an `Err` here.
 /// - **MCP server:** started on `mcp_socket` with `mcp_token`, its tool calls arriving on `handle.tools`, and
 ///   stopped when the session ends. If something already accepts connections on `mcp_socket` (the caller
 ///   started its own [`mcp::McpServer`]), none is started: the caller's server gets the calls and

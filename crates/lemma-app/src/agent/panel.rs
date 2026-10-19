@@ -52,7 +52,9 @@
 //! - The "N changes to review" entry after a turn follows the review (the latest one only; it
 //!   counts what the banner and the header count).
 //! - **Backends** (WP5.2): a dropdown in the header picks `agent.backend` (Claude Code, the
-//!   Anthropic API, Pi); the choice is written to `config.toml` (or kept for this window when the
+//!   Anthropic API, Pi, Codex, Grok Build, Gemini CLI, OpenCode, GitHub Copilot, a custom ACP
+//!   agent; labels from [`super::bridge::picker_label`], so `[agent.<backend>] name` shows
+//!   there); the choice is written to `config.toml` (or kept for this window when the
 //!   file cannot be written). Switching stops the running agent (asking first while a turn runs)
 //!   and the chosen one starts with the next prompt. A backend that `config.toml` names after a
 //!   reload (another Lemma window's choice, a hand edit) never stops a session that is up here:
@@ -61,13 +63,16 @@
 //!   is first shown) shows where the key comes from ("Key:
 //!   from GNOME keyring") with **Set API key…**, whose dialog stores the key through
 //!   `lemma_agent::keys::store` (never in `config.toml`); the header shows the cost of the turn
-//!   and the session (`AgentEvent::Cost`). For Pi, the set-up card installs `@openma/pi-acp`
-//!   ([`install::install_pi_adapter`]), and an "authentication required" answer
-//!   ([`lemma_agent::needs_login`]) shows the hint to run `pi` once to log in.
+//!   and the session (`AgentEvent::Cost`). For Pi and Codex, the set-up card installs their
+//!   adapter (`@openma/pi-acp`, [`install::install_pi_adapter`]; `@agentclientprotocol/codex-acp`,
+//!   [`install::install_codex_adapter`]); for the agents that speak ACP themselves it says how
+//!   to install the missing tool. An "authentication required" answer
+//!   ([`lemma_agent::needs_login`]) of any agent but Claude Code shows how to log in to it
+//!   ([`login_hint`]). Modes follow the backend's policy ([`super::bridge::acp_flavor`]).
 //! - **Attachments:** the paperclip button (a file chooser), files or images dropped anywhere on
 //!   the pane, and images (or files copied in a file manager) pasted into the prompt box attach
 //!   them to the next prompt ([`attach`](super::attach) decides how each is sent; large PDFs and
-//!   text files go to Claude Code and Pi as links, and the API backend refuses them). They show as
+//!   text files go to the ACP agents as links, and the API backend refuses them). They show as
 //!   chips above the prompt box (an image with a preview) with a remove button; a prompt may be
 //!   only attachments. Sending waits until every attachment is read. Images show as previews in
 //!   the transcript.
@@ -91,7 +96,8 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-/// Session modes Lemma offers (risk §9.6: never `acceptEdits`, `auto` or `bypassPermissions`).
+/// Session modes Lemma offers with Claude Code (risk §9.6: never `acceptEdits`, `auto` or
+/// `bypassPermissions`); other agents: [`super::bridge::acp_flavor`].
 pub const OFFERED_MODES: &[&str] = &["default", "plan"];
 /// Permission options that would switch the session to a mode Lemma does not offer.
 const HIDDEN_OPTIONS: &[&str] = &[
@@ -295,7 +301,7 @@ pub fn send_prompt(
     if is_busy(&controller) {
         state.toast(&format!(
             "{} is still working on the last request; wait for it or press Stop",
-            super::bridge::agent_label(state.config.agent.backend)
+            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
         ));
         return false;
     }
@@ -1526,23 +1532,49 @@ const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
     ("Skill", "Use a skill", "applications-science-symbolic"),
 ];
 
-/// The display name and icon of a tool call: Lemma's MCP tools (`mcp__lemma__edit` → "Edit"),
-/// the CLI's built-in tools reported by their bare name (`ToolSearch` → "Loading tools", `Bash`
-/// → "Run a command"), other MCP tools (`mcp__server__tool` → "server: tool"), and the titles the
-/// adapter writes itself ("`latexmk -pdf`", "Read /path/main.tex") as they are, with the icon of
-/// their kind.
+/// The Lemma tool a tool call's title names: `mcp__lemma__edit` (Claude Code),
+/// `mcp.lemma.edit` (Codex), or `lemma__edit`, `lemma.edit`, `lemma/edit`, `lemma:edit` (other
+/// agents), for the tools in [`LEMMA_TOOLS`] only.
+pub fn lemma_tool(title: &str) -> Option<&'static str> {
+    let tool = [
+        "mcp__lemma__",
+        "mcp.lemma.",
+        "lemma__",
+        "lemma.",
+        "lemma/",
+        "lemma:",
+    ]
+    .iter()
+    .find_map(|prefix| title.strip_prefix(prefix))?;
+    LEMMA_TOOLS
+        .iter()
+        .find(|(id, _, _)| *id == tool.trim())
+        .map(|(id, _, _)| *id)
+}
+
+/// The display name and icon of a tool call: Lemma's MCP tools (`mcp__lemma__edit` → "Edit",
+/// see [`lemma_tool`]), the CLI's built-in tools reported by their bare name (`ToolSearch` →
+/// "Loading tools", `Bash` → "Run a command"), other MCP tools (`mcp__server__tool`,
+/// `mcp.server.tool` → "server: tool"), and the titles the adapter writes itself ("`latexmk
+/// -pdf`", "Read /path/main.tex") as they are, with the icon of their kind.
 pub fn tool_display(title: &str, kind: &str) -> (String, &'static str) {
     let title = markdown::without_nul(title);
-    let known = match title.strip_prefix("mcp__lemma__") {
+    let known = match lemma_tool(&title) {
         Some(tool) => LEMMA_TOOLS.iter().find(|(id, _, _)| *id == tool),
         None => BUILTIN_TOOLS.iter().find(|(id, _, _)| *id == title),
     };
     if let Some((_, name, icon)) = known {
         return ((*name).to_owned(), icon);
     }
-    let name = match title.strip_prefix("mcp__") {
-        Some(rest) => rest.replacen("__", ": ", 1),
-        None => title.into_owned(),
+    let name = if let Some(rest) = title.strip_prefix("mcp__") {
+        rest.replacen("__", ": ", 1)
+    } else if let Some((server, tool)) = title
+        .strip_prefix("mcp.")
+        .and_then(|rest| rest.split_once('.'))
+    {
+        format!("{server}: {tool}")
+    } else {
+        title.into_owned()
     };
     let icon = match kind {
         "read" => "document-open-symbolic",
@@ -1567,7 +1599,7 @@ pub fn is_quiet_tool(title: &str) -> bool {
 
 /// True for tools that change files (their cards link to the hunk).
 fn is_edit_tool(title: &str, kind: &str) -> bool {
-    matches!(title, "mcp__lemma__edit" | "mcp__lemma__write") || kind == "edit"
+    matches!(lemma_tool(title), Some("edit" | "write")) || kind == "edit"
 }
 
 /// The subdued row of a bookkeeping tool ([`is_quiet_tool`]).
@@ -1639,7 +1671,7 @@ fn tool_row(card: &ToolCard, panel: &Weak<Inner>) -> gtk::Widget {
     }));
     row.append(&status);
     let linkable = card.link.is_some()
-        || (card.title == "mcp__lemma__compile" && card.status != ToolStatus::Pending);
+        || (lemma_tool(&card.title) == Some("compile") && card.status != ToolStatus::Pending);
     if !linkable {
         row.add_css_class("lemma-tool-card");
         row.set_widget_name(&format!("tool-{}", card.id));
@@ -2797,7 +2829,7 @@ impl Inner {
             AgentState::Running { .. } => "running",
             AgentState::Failed(_) => "not running",
         };
-        let name = super::bridge::backend_name(self.backend());
+        let name = glib::markup_escape_text(&self.backend_name());
         self.status.set_markup(&format!("<b>{name}</b> · {what}"));
         self.refresh_names();
         let name = self.agent_name.borrow();
@@ -2872,6 +2904,34 @@ impl Inner {
                     .set_text(&format!("{} could not start", self.backend_name()));
                 let state = self.state.upgrade();
                 let detail = match &toolchain {
+                    Some(install::ToolchainError::CodexAdapter { found, wanted }) => {
+                        s.install.set_visible(true);
+                        let place = state
+                            .as_ref()
+                            .map(|st| st.config.agent.codex_adapter_dir.display().to_string())
+                            .unwrap_or_default();
+                        let package = install::CODEX_ADAPTER_PACKAGE;
+                        match found {
+                            None => format!(
+                                "Lemma talks to Codex through the ACP adapter {package} {wanted}, \
+                                 which is not installed. Install it with npm into {place} (it \
+                                 uses your own codex)."
+                            ),
+                            Some(found) => format!(
+                                "The Codex ACP adapter in {place} is version {found}; Lemma \
+                                 needs {wanted}. Install that version with npm."
+                            ),
+                        }
+                    }
+                    Some(install::ToolchainError::ProgramNotFound { backend, program }) => {
+                        missing_program_text(*backend, program)
+                    }
+                    Some(install::ToolchainError::NoCustomCommand) => {
+                        "No custom agent is set up. Add the command that starts an agent \
+                         speaking ACP on stdin and stdout to config.toml, for example:\n\n\
+                         [agent.custom]\nname = \"Goose\"\ncommand = \"goose\"\nargs = [\"acp\"]"
+                            .to_owned()
+                    }
                     Some(install::ToolchainError::PiAdapter { found, wanted }) => {
                         s.install.set_visible(true);
                         let place = state
@@ -2928,22 +2988,24 @@ impl Inner {
             }
             SetupState::Installing => {
                 s.spinner.set_visible(true);
-                let pi = self.backend() == AgentBackend::Pi;
-                s.title.set_text(if pi {
-                    "Installing the Pi ACP adapter…"
-                } else {
-                    "Installing the Claude ACP adapter…"
+                let backend = self.backend();
+                s.title.set_text(match backend {
+                    AgentBackend::Pi => "Installing the Pi ACP adapter…",
+                    AgentBackend::Codex => "Installing the Codex ACP adapter…",
+                    _ => "Installing the Claude ACP adapter…",
                 });
                 let line = self
                     .state
                     .upgrade()
                     .and_then(|st| {
-                        st.paths.as_ref().map(|p| {
-                            if pi {
+                        st.paths.as_ref().map(|p| match backend {
+                            AgentBackend::Pi => {
                                 install::pi_install_command_line(&st.config.agent, p)
-                            } else {
-                                install::install_command_line(&st.config.agent, p)
                             }
+                            AgentBackend::Codex => {
+                                install::codex_install_command_line(&st.config.agent, p)
+                            }
+                            _ => install::install_command_line(&st.config.agent, p),
                         })
                     })
                     .unwrap_or_default();
@@ -2990,14 +3052,16 @@ impl Inner {
             }
         };
         let future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> =
-            if cfg.backend == AgentBackend::Pi {
-                Box::pin(install::install_pi_adapter(
+            match self.backend() {
+                AgentBackend::Pi => Box::pin(install::install_pi_adapter(
                     &cfg, &paths, &env, &cancel, on_line,
-                ))
-            } else {
-                Box::pin(install::install_adapter(
+                )),
+                AgentBackend::Codex => Box::pin(install::install_codex_adapter(
                     &cfg, &paths, &env, &cancel, on_line,
-                ))
+                )),
+                _ => Box::pin(install::install_adapter(
+                    &cfg, &paths, &env, &cancel, on_line,
+                )),
             };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -3674,7 +3738,7 @@ impl Inner {
         let Some(Entry::Tool(card)) = self.tools.borrow().get(id).map(|i| i.entry()) else {
             return;
         };
-        if card.title == "mcp__lemma__compile" && card.link.is_none() {
+        if lemma_tool(&card.title) == Some("compile") && card.link.is_none() {
             crate::diagnostics_panel::reveal(&state);
             return;
         }
@@ -4144,7 +4208,7 @@ impl Inner {
     fn set_mode_value(&self, mode: &str) {
         let changed = *self.mode.borrow() != mode;
         self.mode.replace(mode.to_owned());
-        if changed && !OFFERED_MODES.contains(&mode) {
+        if changed && !self.offers_mode(mode) {
             self.push(Entry::Notice(format!(
                 "The agent switched to the mode “{mode}”."
             )));
@@ -4157,7 +4221,7 @@ impl Inner {
             .modes
             .borrow()
             .iter()
-            .filter(|(id, _)| OFFERED_MODES.contains(&id.as_str()))
+            .filter(|(id, _)| self.offers_mode(id))
             .cloned()
             .collect();
         let current = self.mode.borrow().clone();
@@ -4173,12 +4237,11 @@ impl Inner {
             shown.push((current.clone(), name));
         }
         fill_picker(&self.mode_picker, &shown, &current);
-        let options = self.options.borrow();
-        for (picker, id) in [
+        for (picker, which) in [
             (&self.model_picker, "model"),
             (&self.effort_picker, "effort"),
         ] {
-            match options.iter().find(|o| o.id == id) {
+            match self.picker_option(which) {
                 Some(opt) => fill_picker(picker, &opt.values, &opt.current),
                 None => fill_picker(picker, &[], ""),
             }
@@ -4203,7 +4266,7 @@ impl Inner {
                 .modes
                 .borrow()
                 .iter()
-                .filter(|(id, _)| OFFERED_MODES.contains(&id.as_str()))
+                .filter(|(id, _)| self.offers_mode(id))
                 .map(|(id, _)| id.clone())
                 .collect();
             // The extra item of a mode Lemma does not offer is past the offered ones.
@@ -4215,24 +4278,42 @@ impl Inner {
             }
             return;
         }
-        let value = self
-            .options
-            .borrow()
-            .iter()
-            .find(|o| o.id == which)
-            .and_then(|o| {
-                let (value, _) = o.values.get(index)?;
-                (*value != o.current).then(|| value.clone())
-            });
+        let Some(option) = self.picker_option(which) else {
+            return;
+        };
+        let value = option
+            .values
+            .get(index)
+            .and_then(|(value, _)| (*value != option.current).then(|| value.clone()));
         if let Some(value) = value {
             let forward = self.command(&PanelCommand::SetConfig {
-                id: which.to_owned(),
+                id: option.id.clone(),
                 value: value.clone(),
             });
             if forward {
-                controller.set_config(which, &value);
+                controller.set_config(&option.id, &value);
             }
         }
+    }
+
+    /// The session option a picker shows: `model`, or for `effort` the first of
+    /// [`super::bridge::EFFORT_OPTIONS`] the agent has (Codex and Grok Build call it
+    /// `reasoning_effort`).
+    fn picker_option(&self, which: &str) -> Option<ConfigOpt> {
+        let ids: &[&str] = if which == "effort" {
+            super::bridge::EFFORT_OPTIONS
+        } else {
+            &[which]
+        };
+        let options = self.options.borrow();
+        ids.iter()
+            .find_map(|id| options.iter().find(|o| o.id == *id))
+            .cloned()
+    }
+
+    /// True when Lemma offers the session mode `mode` with this window's backend.
+    fn offers_mode(&self, mode: &str) -> bool {
+        super::bridge::acp_flavor(self.backend()).offers_mode(mode)
     }
 
     fn refresh_ring(&self) {
@@ -4994,13 +5075,96 @@ struct BackendUi {
     key_wanted: Cell<bool>,
     /// True while the picker is set from the configuration (no switch).
     syncing: Cell<bool>,
+    /// New labels wait for an idle callback ([`Inner::refresh_backend_labels`]).
+    relabel_pending: Cell<bool>,
 }
 
-/// The picker's labels, in [`AgentBackend::ALL`] order.
-const BACKEND_LABELS: [&str; 3] = ["Claude Code", "Anthropic API", "Pi"];
+/// The picker's labels for `cfg`, in [`AgentBackend::ALL`] order.
+fn backend_labels(cfg: &lemma_config::AgentCfg) -> Vec<String> {
+    AgentBackend::ALL
+        .iter()
+        .map(|b| super::bridge::picker_label(*b, cfg))
+        .collect()
+}
+
+/// How to log in to `backend`'s agent (called `name`, markup-escaped), as markup for the hint
+/// shown when it answers "authentication required". `pi_found`: the `pi` command was found.
+pub fn login_hint(backend: AgentBackend, name: &str, pi_found: bool) -> String {
+    let how = match backend {
+        AgentBackend::Pi if pi_found => {
+            "run <tt>pi</tt> once in a terminal and log in with <tt>/login</tt> (or set up an \
+             API key there)"
+        }
+        AgentBackend::Pi => {
+            return "Pi needs a login, and the <tt>pi</tt> command was not found: install it \
+                    with <tt>npm i -g @earendil-works/pi-coding-agent</tt>, run <tt>pi</tt> \
+                    once in a terminal to log in, then send your message again."
+                .to_owned();
+        }
+        AgentBackend::Codex => {
+            "run <tt>codex login</tt> in a terminal (or set <tt>OPENAI_API_KEY</tt> in \
+             <tt>[agent.codex] env</tt>)"
+        }
+        AgentBackend::Grok => "run <tt>grok login</tt> in a terminal",
+        AgentBackend::Gemini => {
+            "run <tt>gemini</tt> once in a terminal and sign in (or set \
+             <tt>GEMINI_API_KEY</tt> in <tt>[agent.gemini] env</tt>)"
+        }
+        AgentBackend::OpenCode => "run <tt>opencode auth login</tt> in a terminal",
+        AgentBackend::Copilot => {
+            "run <tt>copilot</tt> once in a terminal and log in with <tt>/login</tt>"
+        }
+        _ => "log in to it in a terminal",
+    };
+    format!("{name} needs a login: {how}, then send your message again.")
+}
+
+/// What the set-up card says when `backend`'s `program` was not found.
+fn missing_program_text(backend: AgentBackend, program: &str) -> String {
+    let install = match (backend, program) {
+        (AgentBackend::Codex, "codex") => {
+            "Lemma runs Codex through its ACP adapter with your own codex, which was not found \
+             on PATH, in ~/.local/bin or in mise's installs. Install the Codex CLI (for example \
+             `npm i -g @openai/codex`) and log in with `codex login`"
+        }
+        (AgentBackend::Grok, "grok") => {
+            "Grok Build (grok) was not found on PATH, in ~/.local/bin or in mise's installs. \
+             Install it and log in with `grok login`"
+        }
+        (AgentBackend::Gemini, "gemini") => {
+            "Gemini CLI (gemini) was not found on PATH, in ~/.local/bin or in mise's installs. \
+             Install it (for example `npm i -g @google/gemini-cli`) and sign in once"
+        }
+        (AgentBackend::OpenCode, "opencode") => {
+            "OpenCode (opencode) was not found on PATH, in ~/.local/bin, ~/.opencode/bin or in \
+             mise's installs. Install it and log in with `opencode auth login`"
+        }
+        (AgentBackend::Copilot, "copilot") => {
+            "The GitHub Copilot CLI (copilot) was not found on PATH, in ~/.local/bin or in \
+             mise's installs. Install it (for example `npm i -g @github/copilot`) and log in \
+             once"
+        }
+        _ => {
+            return format!(
+                "The command {program} from [agent.{}] in config.toml was not found or is not \
+                 an executable file.",
+                backend.as_str()
+            );
+        }
+    };
+    format!(
+        "{install}, or set its path in config.toml:\n\n[agent.{}]\ncommand = \"/path/to/{program}\"",
+        backend.as_str()
+    )
+}
 
 fn build_backend_ui() -> BackendUi {
-    let picker = gtk::DropDown::from_strings(&BACKEND_LABELS);
+    let picker = gtk::DropDown::from_strings(
+        &backend_labels(&lemma_config::AgentCfg::default())
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
     picker.set_tooltip_text(Some("Agent"));
     picker.add_css_class("flat");
     picker.set_valign(gtk::Align::Center);
@@ -5041,6 +5205,7 @@ fn build_backend_ui() -> BackendUi {
         deferred: Cell::new(false),
         key_wanted: Cell::new(false),
         syncing: Cell::new(false),
+        relabel_pending: Cell::new(false),
     }
 }
 
@@ -5068,9 +5233,17 @@ impl Inner {
             .map_or(AgentBackend::Claude, |s| s.config.agent.backend)
     }
 
-    /// What messages call the agent ("Claude", "Pi").
-    fn agent_label(&self) -> &'static str {
-        super::bridge::agent_label(self.backend())
+    /// The window's agent settings (the defaults without a window).
+    fn agent_cfg(&self) -> lemma_config::AgentCfg {
+        self.state
+            .upgrade()
+            .map(|s| s.config.agent.clone())
+            .unwrap_or_default()
+    }
+
+    /// What messages call the agent ("Claude", "Pi", "Codex", …).
+    fn agent_label(&self) -> String {
+        super::bridge::agent_label(self.backend(), &self.agent_cfg())
     }
 
     /// The prompt box and the empty transcript name the agent.
@@ -5107,9 +5280,9 @@ impl Inner {
             .is_some_and(|c| matches!(c.state(), AgentState::Idle | AgentState::Running { .. }))
     }
 
-    /// The configured backend's name ("Claude", "Pi", …).
-    fn backend_name(&self) -> &'static str {
-        super::bridge::backend_name(self.backend())
+    /// The configured backend's name ("Claude", "Pi", "Grok Build", …).
+    fn backend_name(&self) -> String {
+        super::bridge::backend_name(self.backend(), &self.agent_cfg())
     }
 
     fn connect_backend_ui(self: &Rc<Self>) {
@@ -5156,10 +5329,54 @@ impl Inner {
             .position(|b| *b == backend)
             .unwrap_or(0);
         ui.syncing.set(true);
+        self.refresh_backend_labels();
         ui.picker.set_selected(index as u32);
         ui.syncing.set(false);
         self.refresh_key_status();
         self.refresh_header();
+    }
+
+    /// Gives the picker the labels of the configuration (`[agent.<backend>] name` may have
+    /// changed), keeping its selection. The model is replaced from an idle callback: this may
+    /// run inside the picker's own `notify::selected` (a switch writes `config.toml`, which
+    /// reloads), and a drop-down must not lose its model there.
+    fn refresh_backend_labels(self: &Rc<Self>) {
+        if self.backend_labels_differ() && !self.backend_ui.relabel_pending.replace(true) {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_once(move || {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let ui = &inner.backend_ui;
+                ui.relabel_pending.set(false);
+                if !inner.backend_labels_differ() {
+                    return;
+                }
+                let labels = backend_labels(&inner.agent_cfg());
+                let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let selected = ui.picker.selected();
+                let syncing = ui.syncing.replace(true);
+                ui.picker.set_model(Some(&gtk::StringList::new(&labels)));
+                ui.picker.set_selected(selected);
+                ui.syncing.set(syncing);
+            });
+        }
+    }
+
+    /// True when the picker's labels are not the configuration's.
+    fn backend_labels_differ(&self) -> bool {
+        let shown: Vec<String> = self
+            .backend_ui
+            .picker
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .map(|list| {
+                (0..list.n_items())
+                    .filter_map(|i| list.string(i).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        shown != backend_labels(&self.agent_cfg())
     }
 
     /// `config.toml` changed (in another Lemma window, or by hand): a new backend there applies
@@ -5170,6 +5387,8 @@ impl Inner {
         let backend = self.config_backend();
         if backend == self.backend_ui.shown.get() {
             self.backend_ui.deferred.set(false);
+            self.refresh_backend_labels();
+            self.refresh_header();
             return;
         }
         if self.session_live() {
@@ -5177,7 +5396,7 @@ impl Inner {
             self.push(Entry::Notice(format!(
                 "config.toml now selects {new}. {old} goes on here; {new} starts after you stop \
                  it or start a new session.",
-                new = super::bridge::backend_name(backend),
+                new = super::bridge::backend_name(backend, &self.agent_cfg()),
                 old = self.backend_name(),
             )));
             return;
@@ -5202,7 +5421,7 @@ impl Inner {
         self.sync_backend_picker();
         self.push(Entry::Notice(format!(
             "Switched to {}. It starts with your next prompt.",
-            super::bridge::backend_name(backend)
+            super::bridge::backend_name(backend, &self.agent_cfg())
         )));
     }
 
@@ -5219,7 +5438,7 @@ impl Inner {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let to = super::bridge::backend_name(backend);
+        let to = super::bridge::backend_name(backend, &self.agent_cfg());
         let dialog = adw::AlertDialog::builder()
             .heading(format!("Switch to {to}?"))
             .body(format!(
@@ -5295,7 +5514,7 @@ impl Inner {
         self.show_setup(SetupState::Hidden);
         self.push(Entry::Notice(format!(
             "Switched to {}. It starts with your next prompt.",
-            super::bridge::backend_name(backend)
+            super::bridge::backend_name(backend, &self.agent_cfg())
         )));
         self.refresh_header();
         self.refresh_key_status();
@@ -5436,23 +5655,27 @@ impl Inner {
         ui.cost_label.set_visible(true);
     }
 
-    /// Pi answered "authentication required": the hint to log in with `pi`.
+    /// An agent other than Claude Code answered "authentication required": how to log in to it
+    /// ([`login_hint`]).
     fn maybe_show_login_hint(&self, message: &str) {
-        if self.backend() != AgentBackend::Pi || !lemma_agent::needs_login(message) {
+        let backend = self.backend();
+        if matches!(backend, AgentBackend::Claude | AgentBackend::Api)
+            || !lemma_agent::needs_login(message)
+        {
             return;
         }
-        let pi_found = self.state.upgrade().and_then(|st| {
-            let paths = st.paths.clone()?;
-            install::find_pi(&paths, &install::Env::from_process(&paths))
-        });
-        self.hint_label.set_markup(if pi_found.is_some() {
-            "Pi needs a login: run <tt>pi</tt> once in a terminal and log in with \
-             <tt>/login</tt> (or set up an API key there), then send your message again."
-        } else {
-            "Pi needs a login, and the <tt>pi</tt> command was not found: install it with \
-             <tt>npm i -g @earendil-works/pi-coding-agent</tt>, run <tt>pi</tt> once in a \
-             terminal to log in, then send your message again."
-        });
+        let pi_found = backend == AgentBackend::Pi
+            && self
+                .state
+                .upgrade()
+                .and_then(|st| {
+                    let paths = st.paths.clone()?;
+                    install::find_pi(&paths, &install::Env::from_process(&paths))
+                })
+                .is_some();
+        let name = markdown::escape(&self.agent_label());
+        self.hint_label
+            .set_markup(&login_hint(backend, &name, pi_found));
         self.hint.set_reveal_child(true);
     }
 }
@@ -5959,6 +6182,16 @@ mod tests {
         );
         assert!(is_edit_tool("mcp__lemma__write", "other"));
         assert!(!is_edit_tool("mcp__lemma__read_file", "read"));
+        // Other agents name Lemma's tools their own way.
+        assert!(is_edit_tool("mcp.lemma.edit", "execute"));
+        assert_eq!(tool_display("mcp.lemma.compile", "execute").0, "Compile");
+        assert_eq!(tool_display("lemma__read_file", "other").0, "Read file");
+        assert_eq!(lemma_tool("lemma.nothing"), None);
+        assert_eq!(lemma_tool("lemmas.edit"), None);
+        assert_eq!(
+            tool_display("mcp.github.search", "other").0,
+            "github: search"
+        );
         // Every Lemma tool and every built-in tool the CLI may report by its bare name has a
         // name of its own and an icon of its own (not the generic "other" one).
         let lemma = [

@@ -35,14 +35,15 @@
 //! # Scenario files
 //!
 //! A JSON object mapping a prompt **keyword** to a list of steps. A prompt runs the steps of the
-//! longest keyword that occurs (case-insensitively) in its text blocks; `default` is used when no
-//! keyword matches. Keys starting with `_` are not keywords: `_description` is free text and
+//! longest keyword that occurs (case-insensitively) in its text blocks (except a block of Lemma's
+//! instructions, which starts with `<lemma_instructions>`); `default` is used when no keyword
+//! matches. Keys starting with `_` are not keywords: `_description` is free text and
 //! `_options` holds start-up behaviour:
 //!
 //! | `_options` key | Meaning |
 //! |---|---|
-//! | `modes` | `"lemma"` (default: `default`, `plan`) or `"adapter"` (the adapter's five modes) |
-//! | `initial_mode` | the mode a new session starts in (default `default`) |
+//! | `modes` | `"lemma"` (default: `default`, `plan`), `"adapter"` (the adapter's five modes) or `"codex"` (Codex's `read-only`, `workspace-write`, `agent`, `agent-full-access`: an agent without `default`) |
+//! | `initial_mode` | the mode a new session starts in (default `default`; `agent` with the `codex` modes) |
 //! | `startup_stderr` | text written to stderr at start-up |
 //! | `exit_on` | `"initialize"` or `"session/new"`: exit with `exit_code` (default 1) when it arrives |
 //! | `session_new_delay_ms` | delay before answering `session/new` |
@@ -110,6 +111,9 @@ const MCP_INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initia
 const MCP_TOOLS_LIST: &str = r#"{"method":"tools/list","jsonrpc":"2.0","id":1}"#;
 /// MCP protocol versions the CLI accepts in the `initialize` answer.
 const MCP_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+
+/// How Lemma's instructions start, in the first prompt of an agent other than Claude Code.
+const INSTRUCTIONS_TAG: &str = "<lemma_instructions>";
 
 const STOP_REASONS: &[&str] = &[
     "end_turn",
@@ -223,9 +227,10 @@ impl Scenario {
         if let Some(modes) = &options.modes
             && modes != "lemma"
             && modes != "adapter"
+            && modes != "codex"
         {
             return Err(format!(
-                "_options.modes: expected \"lemma\" or \"adapter\", got \"{modes}\""
+                "_options.modes: expected \"lemma\", \"adapter\" or \"codex\", got \"{modes}\""
             ));
         }
         if let Some(stage) = &options.exit_on
@@ -737,6 +742,15 @@ struct ModeInfo {
     description: &'static str,
 }
 
+/// The mode a new session starts in without `initial_mode`.
+fn default_mode(options: &Options) -> &'static str {
+    if options.modes.as_deref() == Some("codex") {
+        "agent"
+    } else {
+        "default"
+    }
+}
+
 fn modes_for(options: &Options) -> Vec<ModeInfo> {
     let mode = |id, name, description| ModeInfo {
         id,
@@ -745,6 +759,22 @@ fn modes_for(options: &Options) -> Vec<ModeInfo> {
     };
     let default = mode("default", "Manual", "Always ask before making changes");
     let plan = mode("plan", "Plan", "Create a plan before making changes");
+    if options.modes.as_deref() == Some("codex") {
+        return vec![
+            mode("read-only", "Read-only", "Requires approval to edit files"),
+            mode(
+                "workspace-write",
+                "Workspace access",
+                "Edit workspace files",
+            ),
+            mode(
+                "agent",
+                "Auto review",
+                "Only ask for potentially unsafe actions",
+            ),
+            mode("agent-full-access", "Full access", "Unrestricted access"),
+        ];
+    }
     if options.modes.as_deref() == Some("adapter") {
         vec![
             default,
@@ -1123,7 +1153,7 @@ fn session_new(agent: &Agent, params: &Value) -> RpcResult {
         mode: options
             .initial_mode
             .clone()
-            .unwrap_or_else(|| "default".into()),
+            .unwrap_or_else(|| default_mode(options).into()),
         model: "default".into(),
         effort: "default".into(),
     };
@@ -1321,6 +1351,9 @@ fn prompt(agent: &Arc<Agent>, params: &Value, id: Value) -> Result<(), (i64, Str
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|b| b.get("text").and_then(Value::as_str))
+        // Lemma's instructions (agents other than Claude Code get them in the first prompt)
+        // are not the user's words.
+        .filter(|t| !t.starts_with(INSTRUCTIONS_TAG))
         .collect();
     let (keyword, steps) = agent
         .scenario

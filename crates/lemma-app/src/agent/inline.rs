@@ -408,9 +408,9 @@ pub fn submit(state: &Rc<WindowState>, instruction: &str) {
     }
 }
 
-/// What messages call the window's agent ("Claude", "Pi").
-fn who(state: &WindowState) -> &'static str {
-    super::bridge::agent_label(state.config.agent.backend)
+/// What messages call the window's agent ("Claude", "Pi", "Codex", …).
+fn who(state: &WindowState) -> String {
+    super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
 }
 
 /// The prompt text of an inline edit of lines `a`–`b` of `file`.

@@ -24,15 +24,20 @@
 //!    [`AgentController::emit_event`]) and the tool calls of both the MCP server and
 //!    `handle.tools` into [`super::tools::handle`], each with `glib::spawn_future_local`;
 //! 4. on `Ready`, apply `agent.default_mode` (`default` or `plan`; any other mode the agent
-//!    starts in is switched to `default`), `agent.model` and `agent.effort` when set and offered.
+//!    starts in is switched to `default`), the model and the effort
+//!    ([`lemma_config::AgentCfg::model_for`], [`lemma_config::AgentCfg::effort_for`]; the effort
+//!    is the `effort` option, or `reasoning_effort` for agents that call it so) when set and
+//!    offered.
 //!
-//! **Backends** (`agent.backend`, WP5.2): `claude` as above; `pi` resolves node and the Pi ACP
-//! adapter with [`super::install::detect_pi`] (with a scenario, the fake agent as for Claude) and
-//! spawns it as [`lemma_agent::AcpFlavor::Generic`], so its `fs/*` reads and writes arrive on
-//! `handle.tools` like MCP tool calls; `api` starts `lemma_agent::messages::spawn` with the key
-//! from `lemma_agent::keys::lookup` (no process, no MCP server: its tool calls come on
-//! `handle.tools`). Whichever runs, the rest of this module is the same. [`backend_name`] names
-//! it in messages.
+//! **Backends** (`agent.backend`, WP5.2): `claude` as above; every other ACP agent (`pi`,
+//! `codex`, `grok`, `gemini`, `opencode`, `copilot`, `custom`) is resolved with
+//! [`super::install::detect_agent`] (with a scenario, the fake agent as for Claude) and spawned
+//! as [`lemma_agent::AcpFlavor::Generic`] with [`GENERIC_APPEND`] as its instructions, so the
+//! `fs/*` reads and writes of an agent that delegates them arrive on `handle.tools` like MCP
+//! tool calls (one that writes files itself is covered by the file monitor, below); `api`
+//! starts `lemma_agent::messages::spawn` with the key from `lemma_agent::keys::lookup` (no
+//! process, no MCP server: its tool calls come on `handle.tools`). Whichever runs, the rest of
+//! this module is the same. [`backend_name`] and [`agent_label`] name it in messages.
 //!
 //! A start that sees no `Ready` within [`START_TIMEOUT`] fails. An `Error` or `Exited` before
 //! `Ready` fails the start with the agent's message.
@@ -103,6 +108,7 @@ use lemma_agent::{AgentCmd, AgentConfig, AgentEvent, ConfigOpt, StopReason, Tool
 use lemma_config::{AgentBackend, AgentCfg, Paths};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -120,6 +126,17 @@ change you make as red/green hunks. Make ALL file changes with mcp__lemma__edit 
 mcp__lemma__write; never write files with Bash or other tools. mcp__lemma__read_file returns the \
 live editor buffer, including unsaved changes. Build with mcp__lemma__compile and read errors with \
 mcp__lemma__get_diagnostics instead of running latexmk. Tool results may contain a \
+<review_feedback> block listing hunks the user accepted, rejected or modified; do not re-apply \
+rejected changes unless asked. Follow the project's existing macros and style.";
+
+/// [`APPEND`] for the other ACP agents, which name MCP tools their own way and keep their own
+/// file tools (`lemma-agent` sends it with the session's first prompt).
+pub const GENERIC_APPEND: &str = "You are working inside Lemma, a LaTeX editor. The user \
+reviews every change you make as red/green hunks. Lemma provides an MCP server named \"lemma\" \
+whose tools work on the live editor buffers: prefer its edit and write tools for changing files \
+and its read_file tool for reading them (it includes unsaved changes). Never change files with \
+shell commands (sed, redirections, scripts). Build with its compile tool and read errors with \
+its get_diagnostics tool instead of running latexmk. Tool results may contain a \
 <review_feedback> block listing hunks the user accepted, rejected or modified; do not re-apply \
 rejected changes unless asked. Follow the project's existing macros and style.";
 
@@ -191,6 +208,8 @@ struct Session {
     /// Commands in order, forwarded to `cmd` by a task, so sending never blocks.
     outbox: async_channel::Sender<AgentCmd>,
     mcp: Option<McpServer>,
+    /// Which modes may be chosen ([`lemma_agent::AcpFlavor::offers_mode`]).
+    flavor: lemma_agent::AcpFlavor,
 }
 
 impl Session {
@@ -495,9 +514,10 @@ fn begin_start(controller: &Rc<AgentController>) {
             let bridge = controller.bridge();
             bridge.start_timer.take();
             if bridge.generation.get() == generation && controller.state() == AgentState::Starting {
-                let name = controller
-                    .window()
-                    .map_or("The agent", |s| backend_name(s.config.agent.backend));
+                let name = controller.window().map_or_else(
+                    || "The agent".to_owned(),
+                    |s| backend_name(s.config.agent.backend, &s.config.agent),
+                );
                 fail_start(
                     &controller,
                     format!(
@@ -520,35 +540,84 @@ fn begin_start(controller: &Rc<AgentController>) {
     });
 }
 
-/// The name of `backend` in messages and the pane's header.
-pub fn backend_name(backend: AgentBackend) -> &'static str {
+/// The name `[agent.<backend>] name` gives `backend`, if any.
+fn configured_name(backend: AgentBackend, cfg: &AgentCfg) -> Option<String> {
+    cfg.acp(backend)
+        .map(|t| t.name.trim())
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+}
+
+/// The name of `backend` in messages and the pane's header (`[agent.<backend>] name` when set).
+pub fn backend_name(backend: AgentBackend, cfg: &AgentCfg) -> String {
+    if let Some(name) = configured_name(backend, cfg) {
+        return name;
+    }
     match backend {
         AgentBackend::Claude => "Claude",
         AgentBackend::Api => "Claude (API)",
         AgentBackend::Pi => "Pi",
+        AgentBackend::Codex => "Codex",
+        AgentBackend::Grok => "Grok Build",
+        AgentBackend::Gemini => "Gemini CLI",
+        AgentBackend::OpenCode => "OpenCode",
+        AgentBackend::Copilot => "Copilot",
+        AgentBackend::Custom => "Custom agent",
     }
+    .to_owned()
 }
 
-/// What messages call the agent of `backend`: "Claude" (Claude Code or the API) or "Pi".
-pub fn agent_label(backend: AgentBackend) -> &'static str {
+/// What messages call the agent of `backend`: "Claude" (Claude Code or the API), "Pi", "Codex",
+/// "Grok", … (`[agent.<backend>] name` when set).
+pub fn agent_label(backend: AgentBackend, cfg: &AgentCfg) -> String {
+    if let Some(name) = configured_name(backend, cfg) {
+        return name;
+    }
     match backend {
         AgentBackend::Claude | AgentBackend::Api => "Claude",
-        AgentBackend::Pi => "Pi",
+        AgentBackend::Grok => "Grok",
+        AgentBackend::Gemini => "Gemini",
+        other => return backend_name(other, cfg),
+    }
+    .to_owned()
+}
+
+/// The backend picker's label of `backend` (`[agent.<backend>] name` when set).
+pub fn picker_label(backend: AgentBackend, cfg: &AgentCfg) -> String {
+    if let Some(name) = configured_name(backend, cfg) {
+        return name;
+    }
+    match backend {
+        AgentBackend::Claude => "Claude Code",
+        AgentBackend::Api => "Anthropic API",
+        AgentBackend::Copilot => "GitHub Copilot",
+        other => return backend_name(other, cfg),
+    }
+    .to_owned()
+}
+
+/// The kind of ACP agent `backend` runs, which also decides the modes Lemma offers with it:
+/// Claude Code's policy for Claude Code and the API, the generic one for the others.
+pub fn acp_flavor(backend: AgentBackend) -> lemma_agent::AcpFlavor {
+    match backend {
+        AgentBackend::Claude | AgentBackend::Api => lemma_agent::AcpFlavor::Claude,
+        _ => lemma_agent::AcpFlavor::Generic,
     }
 }
 
 /// [`agent_label`] for `controller`'s window ("The agent" without one).
-fn label_of(controller: &AgentController) -> &'static str {
-    controller
-        .window()
-        .map_or("The agent", |s| agent_label(s.config.agent.backend))
+fn label_of(controller: &AgentController) -> String {
+    controller.window().map_or_else(
+        || "The agent".to_owned(),
+        |s| agent_label(s.config.agent.backend, &s.config.agent),
+    )
 }
 
 /// What the start needs from the jobs thread.
 struct Resolved {
-    node: PathBuf,
-    adapter_js: PathBuf,
-    claude: PathBuf,
+    program: PathBuf,
+    args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
     mcp_bridge: PathBuf,
     socket: PathBuf,
     token: String,
@@ -599,28 +668,42 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
                 resolved.socket.display()
             )
         })?;
+    let flavor = resolved.flavor;
     let config = AgentConfig {
-        node: resolved.node,
-        adapter_js: resolved.adapter_js,
-        claude_exe: resolved.claude,
+        program: resolved.program,
+        args: resolved.args,
+        env: resolved.env,
         cwd: root.clone(),
         mcp_bridge: resolved.mcp_bridge,
         mcp_socket: resolved.socket,
         mcp_token: resolved.token,
-        system_prompt_append: APPEND.to_owned(),
+        system_prompt_append: match flavor {
+            lemma_agent::AcpFlavor::Claude => APPEND,
+            lemma_agent::AcpFlavor::Generic => GENERIC_APPEND,
+        }
+        .to_owned(),
         raw_log: None,
-        flavor: resolved.flavor,
+        flavor,
     };
     tracing::info!(
         "starting the agent: {} {}",
-        config.node.display(),
-        config.adapter_js.display()
+        config.program.display(),
+        config
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     let handle = match lemma_agent::spawn(config) {
         Ok(handle) => handle,
         Err(e) => {
             mcp.stop();
-            return Err(format!("cannot start {}: {e}", backend_name(backend)));
+            let name = controller.window().map_or_else(
+                || "the agent".to_owned(),
+                |s| backend_name(backend, &s.config.agent),
+            );
+            return Err(format!("cannot start {name}: {e}"));
         }
     };
     attach_session(
@@ -631,6 +714,7 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
         handle,
         Some(mcp),
         Some(tool_rx),
+        flavor,
     );
     Ok(())
 }
@@ -670,9 +754,22 @@ async fn start_api_session(
     config.timeouts = Timeouts::for_build_timeout(build_timeout);
     // After a 401, a key stored since ("Set API key…") is used without a restart.
     config.key_lookup = Some(stored_api_key);
-    let handle = lemma_agent::messages::spawn(config)
-        .map_err(|e| format!("cannot start {}: {e}", backend_name(AgentBackend::Api)))?;
-    attach_session(&controller, weak, generation, root, handle, None, None);
+    let handle = lemma_agent::messages::spawn(config).map_err(|e| {
+        format!(
+            "cannot start {}: {e}",
+            backend_name(AgentBackend::Api, &AgentCfg::default())
+        )
+    })?;
+    attach_session(
+        &controller,
+        weak,
+        generation,
+        root,
+        handle,
+        None,
+        None,
+        lemma_agent::AcpFlavor::Claude,
+    );
     Ok(())
 }
 
@@ -682,6 +779,7 @@ fn stored_api_key() -> Option<lemma_agent::keys::ApiKey> {
 }
 
 /// Makes `handle` the running session and starts its pumps (the MCP server's tool calls too).
+#[allow(clippy::too_many_arguments)]
 fn attach_session(
     controller: &Rc<AgentController>,
     weak: &Weak<AgentController>,
@@ -690,6 +788,7 @@ fn attach_session(
     handle: lemma_agent::AgentHandle,
     mcp: Option<McpServer>,
     mcp_tools: Option<async_channel::Receiver<ToolCall>>,
+    flavor: lemma_agent::AcpFlavor,
 ) {
     let bridge = controller.bridge();
     let (outbox, queued) = async_channel::unbounded();
@@ -700,6 +799,7 @@ fn attach_session(
         cmd: handle.cmd,
         outbox,
         mcp,
+        flavor,
     }));
     if !bridge.root_hooked.replace(true)
         && let Some(state) = controller.window()
@@ -749,6 +849,11 @@ pub fn attach_channel(controller: &Rc<AgentController>, cmd: async_channel::Send
         cmd,
         outbox,
         mcp: None,
+        flavor: controller
+            .window()
+            .map_or(lemma_agent::AcpFlavor::Claude, |s| {
+                acp_flavor(s.config.agent.backend)
+            }),
     }));
     forget_held(controller);
     controller.set_state(AgentState::Starting);
@@ -761,11 +866,8 @@ fn resolve(
     paths: Option<&Paths>,
     runtime: &Path,
 ) -> Result<Resolved, String> {
-    let flavor = match cfg.backend {
-        AgentBackend::Pi => lemma_agent::AcpFlavor::Generic,
-        _ => lemma_agent::AcpFlavor::Claude,
-    };
-    let (node, adapter_js, claude) = match scenario {
+    let flavor = acp_flavor(cfg.backend);
+    let (program, args, env) = match scenario {
         Some(scenario) => {
             let fake = testmode::fake_agent_binary().ok_or(
                 "the test agent lemma-fake-agent was not found next to lemma (build it, or set \
@@ -777,17 +879,30 @@ fn resolve(
                     scenario.display()
                 ));
             }
-            (fake, scenario, PathBuf::new())
-        }
-        None if cfg.backend == AgentBackend::Pi => {
-            let paths = paths.ok_or("the home directory is unknown, so Pi cannot be found")?;
-            let toolchain = install::detect_pi(cfg, paths).map_err(|e| e.to_string())?;
-            (toolchain.node, toolchain.adapter_js, PathBuf::new())
+            (fake, vec![scenario.into_os_string()], Vec::new())
         }
         None => {
-            let paths = paths.ok_or("the home directory is unknown, so Claude cannot be found")?;
-            let toolchain = install::detect(cfg, paths).map_err(|e| e.to_string())?;
-            (toolchain.node, toolchain.adapter_js, toolchain.claude)
+            let paths = paths.ok_or_else(|| {
+                format!(
+                    "the home directory is unknown, so {} cannot be found",
+                    backend_name(cfg.backend, cfg)
+                )
+            })?;
+            if cfg.backend == AgentBackend::Claude {
+                let toolchain = install::detect(cfg, paths).map_err(|e| e.to_string())?;
+                (
+                    toolchain.node,
+                    vec![toolchain.adapter_js.into_os_string()],
+                    vec![(
+                        OsString::from("CLAUDE_CODE_EXECUTABLE"),
+                        toolchain.claude.into_os_string(),
+                    )],
+                )
+            } else {
+                let command =
+                    install::detect_agent(cfg, cfg.backend, paths).map_err(|e| e.to_string())?;
+                (command.program, command.args, command.env)
+            }
         }
     };
     let mcp_bridge = testmode::sibling_binary(MCP_BRIDGE)
@@ -807,9 +922,9 @@ fn resolve(
         ));
     }
     Ok(Resolved {
-        node,
-        adapter_js,
-        claude,
+        program,
+        args,
+        env,
         mcp_bridge,
         socket,
         token: random_token()?,
@@ -876,7 +991,7 @@ fn root_changed(state: &Rc<WindowState>) {
         "The project folder is now {}: {} was stopped, and starts there with your next \
          message",
         root.display(),
-        agent_label(state.config.agent.backend)
+        agent_label(state.config.agent.backend, &state.config.agent)
     ));
 }
 
@@ -1114,9 +1229,11 @@ fn apply_preferences(
         return;
     };
     let cfg = state.config.agent.clone();
+    let backend = cfg.backend;
     let bridge = controller.bridge();
-    // Only `default` and `plan` are offered (risk §9.6): an agent that starts in any other mode
-    // (`acceptEdits`, `bypassPermissions`, …) is switched to `default`.
+    // Only offered modes (risk §9.6): an agent that starts in a mode Lemma does not offer
+    // (`acceptEdits`, `bypassPermissions`, …) was switched by `lemma-agent`; here the configured
+    // mode, when the agent has it.
     let wanted = if cfg.default_mode == "plan" {
         "plan"
     } else {
@@ -1125,22 +1242,42 @@ fn apply_preferences(
     if mode != wanted && modes.iter().any(|(id, _)| id == wanted) {
         bridge.send(AgentCmd::SetMode(wanted.to_owned()));
     }
-    for (id, value) in [("model", &cfg.model), ("effort", &cfg.effort)] {
+    for (key, value) in [
+        ("model", cfg.model_for(backend)),
+        ("effort", cfg.effort_for(backend)),
+    ] {
         if value.is_empty() {
             continue;
         }
-        match options.iter().find(|o| o.id == id) {
-            Some(option) if option.current == *value => {}
-            Some(option) if option.values.iter().any(|(v, _)| v == value) => {
-                bridge.send(AgentCmd::SetConfig {
-                    id: id.to_owned(),
-                    value: value.clone(),
-                });
-            }
-            _ => tracing::warn!("agent.{id} = {value:?} is not offered by the agent; ignored"),
+        let ids = if key == "effort" {
+            EFFORT_OPTIONS
+        } else {
+            &["model"][..]
+        };
+        let Some(option) = ids
+            .iter()
+            .find_map(|id| options.iter().find(|o| o.id == *id))
+        else {
+            tracing::warn!("agent.{key} = {value:?}: the agent has no such option; ignored");
+            continue;
+        };
+        if option.current == value {
+            continue;
+        }
+        if option.values.iter().any(|(v, _)| v == value) {
+            bridge.send(AgentCmd::SetConfig {
+                id: option.id.clone(),
+                value: value.to_owned(),
+            });
+        } else {
+            tracing::warn!("agent.{key} = {value:?} is not offered by the agent; ignored");
         }
     }
 }
+
+/// The ids of the session option that sets the reasoning effort: Claude Code's `effort`, and
+/// `reasoning_effort` of Codex and Grok Build.
+pub const EFFORT_OPTIONS: &[&str] = &["effort", "reasoning_effort"];
 
 // ----- turns -----
 
@@ -1490,7 +1627,7 @@ fn notify_turn_ended(state: &WindowState, reason: StopReason) {
 /// The title and body of the turn-end notification: the stop reason, and how many changes wait
 /// for review in how many files.
 pub fn notification_text(state: &WindowState, reason: StopReason) -> (String, String) {
-    let name = agent_label(state.config.agent.backend);
+    let name = agent_label(state.config.agent.backend, &state.config.agent);
     let title = match reason {
         StopReason::EndTurn | StopReason::Cancelled => format!("{name} finished"),
         StopReason::MaxTokens => format!("{name} stopped: the reply reached its length limit"),
@@ -1657,8 +1794,14 @@ pub fn permission(controller: &AgentController, request: u64, option_id: Option<
 
 /// See the module docs: only `default` and `plan` are accepted (risk §9.6).
 pub fn set_mode(controller: &AgentController, mode: &str) {
-    if !matches!(mode, "default" | "plan") {
-        tracing::warn!("mode {mode:?} refused: Lemma only offers default and plan");
+    let flavor = controller
+        .bridge()
+        .session
+        .borrow()
+        .as_ref()
+        .map_or(lemma_agent::AcpFlavor::Claude, |s| s.flavor);
+    if !flavor.offers_mode(mode) {
+        tracing::warn!("mode {mode:?} refused: Lemma does not offer it");
         return;
     }
     if !controller.bridge().send(AgentCmd::SetMode(mode.to_owned())) {

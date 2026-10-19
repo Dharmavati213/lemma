@@ -5,7 +5,7 @@
 mod acp_support;
 
 use acp_support::*;
-use lemma_agent::{AcpFlavor, AgentEvent, EditorRequest, StopReason, ToolReply};
+use lemma_agent::{AcpFlavor, AgentCmd, AgentEvent, EditorRequest, StopReason, ToolReply};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -237,4 +237,133 @@ fn authentication_required_is_marked_as_a_login() {
     let failed = errors(&events);
     assert!(failed.iter().any(|e| e.contains("boom")), "{events:#?}");
     assert!(!failed.iter().any(|e| lemma_agent::needs_login(e)));
+}
+
+/// The modes a `Ready` offers and the mode it reports.
+fn ready_modes(ready: &AgentEvent) -> (Vec<String>, String) {
+    let AgentEvent::Ready { modes, mode, .. } = ready else {
+        panic!("not Ready: {ready:?}")
+    };
+    (
+        modes.iter().map(|(id, _)| id.clone()).collect(),
+        mode.clone(),
+    )
+}
+
+#[test]
+fn other_agents_keep_their_own_modes_but_never_the_elevated_ones() {
+    // An agent with Codex's modes: no `default`, starts in `agent`.
+    let sb = Sandbox::new("modes-generic");
+    let cfg = generic(
+        &sb,
+        &json!({"_options": {"modes": "codex"}, "default": [{"say": "ok"}],
+                "escalate": [{"mode": "agent-full-access"}, {"say": "done"}]}),
+    );
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (modes, mode) = ready_modes(&expect_ready(&handle));
+    assert_eq!(modes, ["read-only", "workspace-write", "agent"]);
+    assert_eq!(mode, "agent", "an offered mode is kept");
+    // The full-access mode is refused; the others go through.
+    send(&handle, AgentCmd::SetMode("agent-full-access".into()));
+    send(&handle, AgentCmd::SetMode("read-only".into()));
+    let events = events_until(
+        &handle,
+        SLOW,
+        |e| matches!(e, AgentEvent::ModeChanged(m) if m == "read-only"),
+    );
+    assert!(
+        errors(&events)
+            .iter()
+            .any(|e| e.contains("does not offer the mode \"agent-full-access\"")),
+        "{events:#?}"
+    );
+    // The agent switching itself to it is switched back to its first offered mode.
+    send(&handle, AgentCmd::SetMode("workspace-write".into()));
+    events_until(
+        &handle,
+        SLOW,
+        |e| matches!(e, AgentEvent::ModeChanged(m) if m == "workspace-write"),
+    );
+    prompt(&handle, "escalate");
+    let events = events_until(
+        &handle,
+        SLOW,
+        |e| matches!(e, AgentEvent::ModeChanged(m) if m == "read-only"),
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Notice(n)
+            if n.contains("\"agent-full-access\"") && n.contains("switching back to \"read-only\""))),
+        "{events:#?}"
+    );
+    events_until(&handle, SLOW, is_turn_end);
+    shutdown(&handle);
+
+    // Starting in the full-access mode: switched before `Ready`.
+    let sb = Sandbox::new("modes-generic-start");
+    let cfg = generic(
+        &sb,
+        &json!({"_options": {"modes": "codex", "initial_mode": "agent-full-access"},
+                "default": [{"say": "ok"}]}),
+    );
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (_, mode) = ready_modes(&expect_ready(&handle));
+    assert_eq!(mode, "read-only");
+    shutdown(&handle);
+
+    // An agent with Claude Code's mode names: its elevated ones are never offered either.
+    let sb = Sandbox::new("modes-generic-adapter");
+    let cfg = generic(
+        &sb,
+        &json!({"_options": {"modes": "adapter"}, "default": [{"say": "ok"}]}),
+    );
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (modes, mode) = ready_modes(&expect_ready(&handle));
+    assert_eq!(modes, ["default", "plan"]);
+    assert_eq!(mode, "default");
+    shutdown(&handle);
+}
+
+#[test]
+fn other_agents_get_the_instructions_in_their_first_prompt() {
+    let sb = Sandbox::new("instructions");
+    let cfg = generic(
+        &sb,
+        &json!({"_options": {"mcp": "skip"}, "default": [{"echo_prompt": true}],
+                "lemma": [{"say": "the keyword came from the instructions"}]}),
+    );
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    expect_ready(&handle);
+    let first = |text: &str| -> serde_json::Value {
+        prompt(&handle, text);
+        let events = events_until(&handle, SLOW, is_turn_end);
+        assert!(errors(&events).is_empty(), "{events:#?}");
+        serde_json::from_str(&message_text(&events)).expect("the echoed prompt")
+    };
+    let echoed = first("hello");
+    let blocks = echoed["prompt"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "{echoed}");
+    assert_eq!(
+        blocks[0]["text"],
+        format!(
+            "{}\nYou are working inside Lemma (test).\n</lemma_instructions>",
+            lemma_agent::INSTRUCTIONS_TAG
+        )
+    );
+    assert_eq!(blocks[1]["text"], "hello");
+    // Only the first prompt carries them.
+    let echoed = first("again");
+    assert_eq!(echoed["prompt"].as_array().unwrap().len(), 1, "{echoed}");
+    shutdown(&handle);
+
+    // Claude Code gets them in `session/new` only.
+    let sb = Sandbox::new("instructions-claude");
+    let scenario =
+        sb.scenario(&json!({"_options": {"mcp": "skip"}, "default": [{"echo_prompt": true}]}));
+    let handle = lemma_agent::spawn(sb.config(&scenario)).unwrap();
+    expect_ready(&handle);
+    prompt(&handle, "hello");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    let echoed: serde_json::Value = serde_json::from_str(&message_text(&events)).unwrap();
+    assert_eq!(echoed["prompt"].as_array().unwrap().len(), 1, "{echoed}");
+    shutdown(&handle);
 }

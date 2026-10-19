@@ -55,8 +55,36 @@
 //! adapter; `pi` itself is only looked for, for that hint ([`find_pi`]). [`install_pi_adapter`]
 //! runs `npm i --prefix <dir> @openma/pi-acp@<version> --omit=optional --no-audit --no-fund`,
 //! only when the user clicks Install.
+//!
+//! # Other ACP agents ([`detect_agent`])
+//!
+//! Every backend but Claude Code and the API starts from an [`AgentCommand`]:
+//!
+//! - **`[agent.<backend>] command`**, when set, is the program (`~` expanded; a bare name is
+//!   looked for like the tools below), with exactly `args` and `env`.
+//! - **Pi**: node and the Pi adapter, as above.
+//! - **Codex**: node and **`@agentclientprotocol/codex-acp`** ([`CODEX_ADAPTER_PACKAGE`], version
+//!   `agent.codex_adapter_version`, in `agent.codex_adapter_dir`, default
+//!   `~/.local/share/lemma/acp-codex`), started as `node <dir>/node_modules/
+//!   @agentclientprotocol/codex-acp/dist/index.js`, with `CODEX_PATH` naming the user's own
+//!   `codex` (unless `env` sets it). Like Claude's, the adapter is installed with
+//!   `--omit=optional`: the Codex binary it would bring is about 430 MB, and the user's `codex`
+//!   (which they log in with, `codex login`) is used instead. Order of the checks: node, codex,
+//!   then the adapter ([`ToolchainError::CodexAdapter`]: the panel offers Install,
+//!   [`install_codex_adapter`]).
+//! - **Agents that speak ACP themselves** ([`preset_command`]): Grok Build (`grok agent stdio`),
+//!   Gemini CLI (`gemini --acp`), OpenCode (`opencode acp`) and the GitHub Copilot CLI
+//!   (`copilot --acp`). Their tool is looked for on `PATH` (mise shims skipped), in
+//!   `~/.local/bin`, `~/.<tool>/bin`, mise's node installs (npm global packages), mise's own
+//!   install of the tool and its `npm:` installs ([`find_tool`]). `args`, when set, replace the
+//!   preset's arguments.
+//! - **Custom**: needs `command` ([`ToolchainError::NoCustomCommand`]).
+//!
+//! Logging in is the agent's business (`codex login`, `grok login`, …); the panel shows a hint
+//! when the agent answers "authentication required". A failure is remembered for
+//! [`last_result`], like [`detect_pi`]'s.
 
-use lemma_config::{AgentCfg, Paths};
+use lemma_config::{AgentBackend, AgentCfg, Paths};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::Future;
@@ -69,6 +97,8 @@ use std::time::{Duration, Instant};
 pub const ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
 /// The npm package of the Pi ACP adapter (see the module docs).
 pub const PI_ADAPTER_PACKAGE: &str = "@openma/pi-acp";
+/// The npm package of the Codex ACP adapter (see the module docs).
+pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 /// The oldest `claude` the adapter supports; older ones get the "Run `claude update`" hint.
 pub const MIN_CLAUDE_VERSION: (u32, u32, u32) = (2, 1, 293);
 /// How long `claude --version` may take.
@@ -109,6 +139,20 @@ pub enum ToolchainError {
         found: Option<String>,
         wanted: String,
     },
+    /// The Codex ACP adapter is not installed or has another version (the panel offers
+    /// Install).
+    CodexAdapter {
+        found: Option<String>,
+        wanted: String,
+    },
+    /// The program `program` that `backend` needs was not found (its command line tool, or the
+    /// `command` of its `[agent.<backend>]` table).
+    ProgramNotFound {
+        backend: AgentBackend,
+        program: String,
+    },
+    /// `backend = "custom"` without `[agent.custom] command`.
+    NoCustomCommand,
     /// Anything else, with a message for the user.
     Other(String),
 }
@@ -144,6 +188,25 @@ impl fmt::Display for ToolchainError {
                 f,
                 "the Pi ACP adapter is version {found}, but Lemma needs {wanted}"
             ),
+            Self::CodexAdapter {
+                found: None,
+                wanted,
+            } => write!(f, "the Codex ACP adapter {wanted} is not installed"),
+            Self::CodexAdapter {
+                found: Some(found),
+                wanted,
+            } => write!(
+                f,
+                "the Codex ACP adapter is version {found}, but Lemma needs {wanted}"
+            ),
+            Self::ProgramNotFound { backend, program } => write!(
+                f,
+                "{program} was not found (set [agent.{}] command in config.toml)",
+                backend.as_str()
+            ),
+            Self::NoCustomCommand => {
+                f.write_str("the custom agent has no command (set [agent.custom] command)")
+            }
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -330,6 +393,236 @@ pub fn install_pi_adapter<F: Fn(&str) + 'static>(
     let search = env.path.clone();
     let npm = node.as_deref().and_then(|n| find_npm(n, env));
     let check = move |dir: &Path| match pi_adapter_version(dir) {
+        Some(found) if found == version => Ok(()),
+        Some(found) => Err(format!(
+            "npm finished, but the adapter is version {found} instead of {version}"
+        )),
+        None => Err("npm finished, but the adapter was not installed".into()),
+    };
+    run_npm(node, npm, search, dir, args, cancel.clone(), on_line, check)
+}
+
+/// How an ACP agent other than Claude Code starts (see "Other ACP agents" in the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCommand {
+    /// The program, absolute.
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    /// Environment variables set for the agent.
+    pub env: Vec<(OsString, OsString)>,
+}
+
+/// The tool and arguments of a backend that speaks ACP itself; `None` for the others.
+pub fn preset_command(backend: AgentBackend) -> Option<(&'static str, &'static [&'static str])> {
+    match backend {
+        AgentBackend::Grok => Some(("grok", &["agent", "stdio"])),
+        AgentBackend::Gemini => Some(("gemini", &["--acp"])),
+        AgentBackend::OpenCode => Some(("opencode", &["acp"])),
+        AgentBackend::Copilot => Some(("copilot", &["--acp"])),
+        _ => None,
+    }
+}
+
+/// Finds how `backend` starts in the process environment (see "Other ACP agents" in the
+/// module docs). A failure is remembered for [`last_result`]; a success forgets the last
+/// result. Blocking.
+pub fn detect_agent(
+    cfg: &AgentCfg,
+    backend: AgentBackend,
+    paths: &Paths,
+) -> Result<AgentCommand, ToolchainError> {
+    let result = detect_agent_in(cfg, backend, paths, &Env::from_process(paths));
+    if let Ok(mut last) = LAST.lock() {
+        *last = result.as_ref().err().map(|e| Err(e.clone()));
+    }
+    result
+}
+
+/// [`detect_agent`] with an explicit environment, without remembering the result. Blocking.
+pub fn detect_agent_in(
+    cfg: &AgentCfg,
+    backend: AgentBackend,
+    paths: &Paths,
+    env: &Env,
+) -> Result<AgentCommand, ToolchainError> {
+    let table = cfg.acp(backend).ok_or_else(|| {
+        ToolchainError::Other(format!("{} is not an ACP agent", backend.as_str()))
+    })?;
+    let args: Vec<OsString> = table.args.iter().map(OsString::from).collect();
+    let mut vars: Vec<(OsString, OsString)> = table
+        .env
+        .iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+    if !table.command.as_os_str().is_empty() {
+        let program =
+            find_command(&table.command, paths, env).ok_or(ToolchainError::ProgramNotFound {
+                backend,
+                program: table.command.display().to_string(),
+            })?;
+        return Ok(AgentCommand {
+            program,
+            args,
+            env: vars,
+        });
+    }
+    let with_script = |script: PathBuf| {
+        let mut all = vec![script.into_os_string()];
+        all.extend(args.iter().cloned());
+        all
+    };
+    match backend {
+        AgentBackend::Pi => {
+            let toolchain = detect_pi_in(cfg, paths, env)?;
+            Ok(AgentCommand {
+                program: toolchain.node,
+                args: with_script(toolchain.adapter_js),
+                env: vars,
+            })
+        }
+        AgentBackend::Codex => {
+            let node = find_node(cfg, paths, env).ok_or(ToolchainError::NodeNotFound)?;
+            if !table.env.contains_key("CODEX_PATH") {
+                let codex = find_codex(paths, env).ok_or(ToolchainError::ProgramNotFound {
+                    backend,
+                    program: "codex".into(),
+                })?;
+                vars.push(("CODEX_PATH".into(), codex.into_os_string()));
+            }
+            let dir = paths.expand(&cfg.codex_adapter_dir);
+            let wanted = cfg.codex_adapter_version.clone();
+            match codex_adapter_version(&dir) {
+                Some(found) if found == wanted => {}
+                found => return Err(ToolchainError::CodexAdapter { found, wanted }),
+            }
+            Ok(AgentCommand {
+                program: node.path,
+                args: with_script(codex_adapter_js(&dir)),
+                env: vars,
+            })
+        }
+        AgentBackend::Custom => Err(ToolchainError::NoCustomCommand),
+        _ => {
+            let (tool, preset) = preset_command(backend).ok_or_else(|| {
+                ToolchainError::Other(format!("{} has no command", backend.as_str()))
+            })?;
+            let program = find_tool(tool, paths, env).ok_or(ToolchainError::ProgramNotFound {
+                backend,
+                program: tool.into(),
+            })?;
+            Ok(AgentCommand {
+                program,
+                args: if args.is_empty() {
+                    preset.iter().map(OsString::from).collect()
+                } else {
+                    args
+                },
+                env: vars,
+            })
+        }
+    }
+}
+
+/// The program a configured `command` names: a path (`~` expanded) that must be an absolute
+/// executable, or a bare name looked for like [`find_tool`].
+pub fn find_command(command: &Path, paths: &Paths, env: &Env) -> Option<PathBuf> {
+    let is_name = command.components().count() == 1
+        && matches!(command.components().next(), Some(Component::Normal(_)));
+    if is_name {
+        return find_tool(command.to_str()?, paths, env);
+    }
+    let path = paths.expand(command);
+    (path.is_absolute() && is_executable(&path)).then_some(path)
+}
+
+/// The command line tool `name` (`grok`, `gemini`, …): on `PATH` (mise shims skipped), else in
+/// `~/.local/bin`, `~/.<name>/bin`, mise's node installs (npm global packages: `node/latest`,
+/// else the newest version), mise's own install of the tool (`<name>/latest`) and its `npm:`
+/// installs (`npm-*/latest/node_modules/.bin`).
+pub fn find_tool(name: &str, paths: &Paths, env: &Env) -> Option<PathBuf> {
+    let installs = &env.mise_installs;
+    search_path(&env.path, name, installs)
+        .or_else(|| {
+            [
+                paths.home.join(".local/bin").join(name),
+                paths.home.join(format!(".{name}/bin")).join(name),
+                installs.join("node/latest/bin").join(name),
+                installs.join(name).join("latest/bin").join(name),
+                installs.join(name).join("latest").join(name),
+            ]
+            .into_iter()
+            .find(|p| is_executable(p))
+        })
+        .or_else(|| newest_version(&installs.join("node"), &Path::new("bin").join(name)))
+        .or_else(|| {
+            let mut npm: Vec<PathBuf> = std::fs::read_dir(installs)
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("npm-"))
+                .map(|e| e.path().join("latest/node_modules/.bin").join(name))
+                .filter(|p| is_executable(p))
+                .collect();
+            npm.sort();
+            npm.into_iter().next()
+        })
+}
+
+/// The user's `codex`: like [`find_tool`], then the standalone installer's
+/// `~/.codex/packages/standalone/current/bin/codex`.
+pub fn find_codex(paths: &Paths, env: &Env) -> Option<PathBuf> {
+    find_tool("codex", paths, env).or_else(|| {
+        let standalone = paths
+            .home
+            .join(".codex/packages/standalone/current/bin/codex");
+        is_executable(&standalone).then_some(standalone)
+    })
+}
+
+/// The Codex adapter's entry point under the npm prefix `dir` (already `~`-expanded).
+pub fn codex_adapter_js(dir: &Path) -> PathBuf {
+    dir.join("node_modules")
+        .join(CODEX_ADAPTER_PACKAGE)
+        .join("dist/index.js")
+}
+
+/// The installed Codex adapter's version under the npm prefix `dir` (like
+/// [`adapter_version`]).
+pub fn codex_adapter_version(dir: &Path) -> Option<String> {
+    package_version(
+        &dir.join("node_modules")
+            .join(CODEX_ADAPTER_PACKAGE)
+            .join("package.json"),
+    )
+}
+
+/// The arguments of the Codex adapter's install command after `npm`.
+pub fn codex_install_args(dir: &Path, version: &str) -> Vec<OsString> {
+    package_install_args(dir, CODEX_ADAPTER_PACKAGE, version)
+}
+
+/// The whole Codex install command line, for display.
+pub fn codex_install_command_line(cfg: &AgentCfg, paths: &Paths) -> String {
+    let dir = paths.expand(&cfg.codex_adapter_dir);
+    command_line(&codex_install_args(&dir, &cfg.codex_adapter_version))
+}
+
+/// Installs the Codex adapter version `cfg.codex_adapter_version` into
+/// `cfg.codex_adapter_dir`, like [`install_adapter`] does for Claude's. Run it only when the
+/// user asked for it.
+pub fn install_codex_adapter<F: Fn(&str) + 'static>(
+    cfg: &AgentCfg,
+    paths: &Paths,
+    env: &Env,
+    cancel: &gio::Cancellable,
+    on_line: F,
+) -> impl Future<Output = Result<(), String>> + use<F> {
+    let dir = paths.expand(&cfg.codex_adapter_dir);
+    let args = codex_install_args(&dir, &cfg.codex_adapter_version);
+    let version = cfg.codex_adapter_version.clone();
+    let node = find_node(cfg, paths, env).map(|f| f.path);
+    let search = env.path.clone();
+    let npm = node.as_deref().and_then(|n| find_npm(n, env));
+    let check = move |dir: &Path| match codex_adapter_version(dir) {
         Some(found) if found == version => Ok(()),
         Some(found) => Err(format!(
             "npm finished, but the adapter is version {found} instead of {version}"
@@ -1070,6 +1363,186 @@ mod tests {
         assert_eq!(
             version_in_claude_layout(&path("/opt/1.2.3/bin/claude")),
             None
+        );
+    }
+
+    /// `home`'s environment with only its `bin` on `PATH` (no system node, grok or codex).
+    fn private_env(home: &Home) -> Env {
+        Env {
+            path: home.dir.join("bin").into_os_string(),
+            ..home.env()
+        }
+    }
+
+    fn os(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn agents_that_speak_acp_start_with_their_presets() {
+        let home = Home::new("acp-presets");
+        let (paths, env) = (home.paths(), private_env(&home));
+        let mut cfg = AgentCfg::default();
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Grok, &paths, &env),
+            Err(ToolchainError::ProgramNotFound {
+                backend: AgentBackend::Grok,
+                program: "grok".into()
+            })
+        );
+        // mise's `npm:` install, when it is not on PATH.
+        let npm = home.script(
+            ".local/share/mise/installs/npm-xai-official-grok/latest/node_modules/.bin/grok",
+            "exit 0",
+        );
+        let command = detect_agent_in(&cfg, AgentBackend::Grok, &paths, &env).unwrap();
+        assert_eq!(command.program, npm);
+        assert_eq!(command.args, os(&["agent", "stdio"]));
+        assert!(command.env.is_empty());
+        // `~/.local/bin` comes first, PATH before that.
+        let local = home.script(".local/bin/grok", "exit 0");
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Grok, &paths, &env)
+                .unwrap()
+                .program,
+            local
+        );
+        let on_path = home.script("bin/grok", "exit 0");
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Grok, &paths, &env)
+                .unwrap()
+                .program,
+            on_path
+        );
+        // `args` replace the preset's; `env` is passed on.
+        cfg.grok.args = vec!["agent".into(), "stdio".into(), "--debug".into()];
+        cfg.grok.env.insert("GROK_SANDBOX".into(), "strict".into());
+        let command = detect_agent_in(&cfg, AgentBackend::Grok, &paths, &env).unwrap();
+        assert_eq!(command.args, os(&["agent", "stdio", "--debug"]));
+        assert_eq!(command.env, [("GROK_SANDBOX".into(), "strict".into())]);
+        // The other presets.
+        for (backend, tool, args) in [
+            (AgentBackend::Gemini, "gemini", &["--acp"][..]),
+            (AgentBackend::OpenCode, "opencode", &["acp"][..]),
+            (AgentBackend::Copilot, "copilot", &["--acp"][..]),
+        ] {
+            let program = home.script(&format!(".{tool}/bin/{tool}"), "exit 0");
+            let command = detect_agent_in(&cfg, backend, &paths, &env).unwrap();
+            assert_eq!((command.program, command.args), (program, os(args)));
+        }
+        // Claude Code and the API have no such command.
+        assert!(matches!(
+            detect_agent_in(&cfg, AgentBackend::Claude, &paths, &env),
+            Err(ToolchainError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn a_configured_command_wins() {
+        let home = Home::new("acp-command");
+        let (paths, env) = (home.paths(), private_env(&home));
+        let mut cfg = AgentCfg::default();
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Custom, &paths, &env),
+            Err(ToolchainError::NoCustomCommand)
+        );
+        cfg.custom.command = "~/agents/goose".into();
+        cfg.custom.args = vec!["acp".into()];
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Custom, &paths, &env),
+            Err(ToolchainError::ProgramNotFound {
+                backend: AgentBackend::Custom,
+                program: "~/agents/goose".into()
+            })
+        );
+        let goose = home.script("agents/goose", "exit 0");
+        let command = detect_agent_in(&cfg, AgentBackend::Custom, &paths, &env).unwrap();
+        assert_eq!(command.program, goose);
+        assert_eq!(command.args, os(&["acp"]));
+        // A bare name is looked for like the presets' tools.
+        cfg.custom.command = "kimi".into();
+        let kimi = home.script("bin/kimi", "exit 0");
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Custom, &paths, &env)
+                .unwrap()
+                .program,
+            kimi
+        );
+        // A relative path is not a program.
+        cfg.custom.command = "bin/kimi".into();
+        assert!(detect_agent_in(&cfg, AgentBackend::Custom, &paths, &env).is_err());
+        // For Pi and Codex it replaces node and the adapter: nothing else is checked.
+        cfg.codex.command = goose.clone();
+        let command = detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env).unwrap();
+        assert_eq!((command.program, command.args), (goose, Vec::new()));
+    }
+
+    #[test]
+    fn codex_needs_node_its_cli_and_the_adapter() {
+        let home = Home::new("acp-codex");
+        let (paths, env) = (home.paths(), private_env(&home));
+        let mut cfg = AgentCfg::default();
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env),
+            Err(ToolchainError::NodeNotFound)
+        );
+        let node = home.script("bin/node", "exit 0");
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env),
+            Err(ToolchainError::ProgramNotFound {
+                backend: AgentBackend::Codex,
+                program: "codex".into()
+            })
+        );
+        // The standalone installer's codex.
+        let codex = home.script(".codex/packages/standalone/current/bin/codex", "exit 0");
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env),
+            Err(ToolchainError::CodexAdapter {
+                found: None,
+                wanted: "2.2.2".into()
+            })
+        );
+        let dir = home.dir.join(".local/share/lemma/acp-codex");
+        let pkg = dir.join("node_modules/@agentclientprotocol/codex-acp/package.json");
+        std::fs::create_dir_all(pkg.parent().unwrap()).unwrap();
+        std::fs::write(&pkg, r#"{"version":"2.2.1"}"#).unwrap();
+        assert_eq!(
+            detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env),
+            Err(ToolchainError::CodexAdapter {
+                found: Some("2.2.1".into()),
+                wanted: "2.2.2".into()
+            })
+        );
+        std::fs::write(&pkg, r#"{"version":"2.2.2"}"#).unwrap();
+        let command = detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env).unwrap();
+        assert_eq!(command.program, node);
+        assert_eq!(command.args, [codex_adapter_js(&dir).into_os_string()]);
+        assert_eq!(
+            command.env,
+            [("CODEX_PATH".into(), codex.clone().into_os_string())]
+        );
+        // `CODEX_PATH` in the table wins (and then no codex need be found).
+        std::fs::remove_file(&codex).unwrap();
+        cfg.codex
+            .env
+            .insert("CODEX_PATH".into(), "/opt/codex/bin/codex".into());
+        let command = detect_agent_in(&cfg, AgentBackend::Codex, &paths, &env).unwrap();
+        assert_eq!(
+            command.env,
+            [("CODEX_PATH".into(), "/opt/codex/bin/codex".into())]
+        );
+        assert_eq!(
+            codex_install_args(&dir, "2.2.2"),
+            os(&[
+                "i",
+                "--prefix",
+                dir.to_str().unwrap(),
+                "@agentclientprotocol/codex-acp@2.2.2",
+                "--omit=optional",
+                "--no-audit",
+                "--no-fund"
+            ])
         );
     }
 }

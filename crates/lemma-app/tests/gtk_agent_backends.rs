@@ -2,7 +2,10 @@
 //! edits (end to end with `lemma-fake-agent`), `fs/read_text_file` reads the live buffer, the
 //! backend picker switches (asking while a turn runs) and is written to `config.toml`, the Pi
 //! install branches run with a fake `node`/`npm` on `PATH`, the login hint, the API key row with
-//! a fake `secret-tool`, and the cost label.
+//! a fake `secret-tool`, and the cost label. The other ACP agents (Codex, Grok Build, …): their
+//! first prompt carries Lemma's instructions, files they write themselves become hunks, their
+//! own modes are offered but the elevated ones, the set-up card explains a missing tool, the
+//! Codex adapter installs with a fake npm, and each has its login hint.
 //!
 //! The process environment is isolated before GTK starts (as in `gtk_agent_panel`): `HOME`, the
 //! `XDG_*` directories and `LEMMA_CONFIG` point into a temporary directory, `PATH` is a temporary
@@ -59,6 +62,18 @@ fn main() -> ExitCode {
             regress5_lazy_key_lookup,
         ),
         ("regress5_pi_is_not_called_claude", regress5_pi_names),
+        // More ACP agents (Codex, Grok Build, Gemini CLI, …)
+        (
+            "e2e_other_agents_get_instructions_modes_and_hunks",
+            other_agents_e2e,
+        ),
+        (
+            "picker_lists_every_agent_and_custom_names",
+            picker_lists_agents,
+        ),
+        ("missing_tools_explain_themselves", missing_tools),
+        ("codex_install_branches", codex_install_branches),
+        ("login_hints_for_every_agent", login_hints),
     ])
 }
 
@@ -899,4 +914,304 @@ fn regress5_pi_names() {
         "{notices:?}"
     );
     assert!(!notices.iter().any(|n| n.contains("Claude")), "{notices:?}");
+}
+
+// ----- more ACP agents -----
+
+fn picker_items(dd: &gtk::DropDown) -> Vec<String> {
+    let model = dd.model().and_downcast::<gtk::StringList>().unwrap();
+    (0..model.n_items())
+        .map(|i| model.string(i).unwrap().to_string())
+        .collect()
+}
+
+/// Grok Build stands for every agent that writes files itself, through the real bridge with the
+/// fake agent playing it with Codex's modes.
+fn other_agents_e2e() {
+    let f = fixture("grok-e2e", &[("main.tex", MAIN)], false, |c| {
+        c.agent.backend = AgentBackend::Grok;
+    });
+    f.show_panel();
+    let panel = f.panel();
+    let events = f.run_turn(
+        &serde_json::json!({"_options": {"modes": "codex"}, "default": [
+            {"echo_prompt": true},
+            {"disk_write": {"path": "main.tex", "old_string": "OLD", "new_string": "NEW"}}
+        ]}),
+        PromptOrigin::Panel,
+    );
+    assert!(errors(&events).is_empty(), "{events:?}");
+    // Lemma's instructions open the first prompt (ACP has no system prompt).
+    let echoed: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageChunk(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    let echoed: serde_json::Value = serde_json::from_str(&echoed).expect("the echoed prompt");
+    let first = echoed["prompt"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        first.starts_with(lemma_agent::INSTRUCTIONS_TAG)
+            && first.contains(lemma_app::agent::bridge::GENERIC_APPEND),
+        "{echoed}"
+    );
+    assert_eq!(echoed["prompt"][1]["text"], "please edit");
+    // What it wrote on disk is a hunk to review.
+    common::pump_until(TIMEOUT, || {
+        f.state
+            .workspace
+            .get(&f.dir.join("main.tex"))
+            .is_some_and(|d| review_ui::hunk_count(&d) == 1)
+    });
+    assert!(fs_text_of(&f, "main.tex").contains("The NEW claim."));
+    // Its modes, but not the full-access one.
+    assert_eq!(
+        picker_items(&panel.mode_picker()),
+        ["Read-only", "Workspace access", "Auto review"]
+    );
+    assert_eq!(
+        panel.mode_picker().selected(),
+        2,
+        "it started in its own default"
+    );
+    assert!(panel.status_text().starts_with("Grok Build"));
+    // The pane talks of Grok.
+    let texts: Vec<String> = descendants(&panel.widget())
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.text().to_string()))
+        .collect();
+    assert!(texts.iter().any(|t| t == "Ask Grok…"), "{texts:?}");
+    review_ui::decide_everything(&f.state, review_ui::Decision::Reject);
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(f.dir.join("main.tex")).unwrap() == MAIN
+    });
+}
+
+fn picker_lists_agents() {
+    // `[agent.custom] name`, in the window's configuration and in the file it edits.
+    std::fs::create_dir_all(env().config.parent().unwrap()).unwrap();
+    std::fs::write(&env().config, "[agent.custom]\nname = \"Goose\"\n").unwrap();
+    let f = fixture("picker-agents", &[("main.tex", MAIN)], true, |c| {
+        c.agent.custom.name = "Goose".into();
+    });
+    f.state
+        .set_settings_files(Some(lemma_app::settings::SettingsFiles::next_to(
+            env().config.clone(),
+        )));
+    f.show_panel();
+    let panel = f.panel();
+    f.take_commands();
+    let picker = panel.backend_picker();
+    // (The labels follow the configuration from an idle callback.)
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(
+        picker_items(&picker),
+        [
+            "Claude Code",
+            "Anthropic API",
+            "Pi",
+            "Codex",
+            "Grok Build",
+            "Gemini CLI",
+            "OpenCode",
+            "GitHub Copilot",
+            "Goose"
+        ]
+    );
+    picker.set_selected(4);
+    assert_eq!(
+        f.take_commands(),
+        [PanelCommand::SwitchBackend(AgentBackend::Grok)]
+    );
+    let saved = std::fs::read_to_string(&env().config).unwrap();
+    assert!(saved.contains("backend = \"grok\""), "{saved}");
+    assert!(panel.status_text().starts_with("Grok Build"));
+    assert!(
+        panel.entries().contains(&Entry::Notice(
+            "Switched to Grok Build. It starts with your next prompt.".into()
+        )),
+        "{:?}",
+        panel.entries()
+    );
+    // A name given in config.toml shows at once, in the picker and the header.
+    let text = format!("{saved}\n[agent.grok]\nname = \"Grok (work)\"\n");
+    f.state
+        .edit_config_file(|_| Ok(text.clone()))
+        .expect("write the config");
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(picker_items(&picker)[4], "Grok (work)");
+    assert_eq!(picker.selected(), 4);
+    assert!(f.take_commands().is_empty(), "no switch");
+    assert!(
+        panel.status_text().starts_with("Grok (work)"),
+        "{}",
+        panel.status_text()
+    );
+    let _ = std::fs::remove_file(&env().config);
+}
+
+fn missing_tools() {
+    remove_program("grok");
+    let f = fixture("missing-grok", &[("main.tex", MAIN)], true, |c| {
+        c.agent.backend = AgentBackend::Grok;
+    });
+    let panel = f.panel();
+    let paths = f.state.paths.clone().unwrap();
+    let error =
+        install::detect_agent(&f.state.config.agent, AgentBackend::Grok, &paths).unwrap_err();
+    assert_eq!(
+        error,
+        install::ToolchainError::ProgramNotFound {
+            backend: AgentBackend::Grok,
+            program: "grok".into()
+        }
+    );
+    f.agent().set_state(AgentState::Failed(error.to_string()));
+    let (title, message) = panel.setup().expect("the set-up card");
+    assert_eq!(title, "Grok Build could not start");
+    assert!(
+        message.contains("grok login") && message.contains("[agent.grok]"),
+        "{message}"
+    );
+    assert!(!panel.install_button().is_visible(), "nothing to install");
+    // Found: it starts as `grok agent stdio`.
+    let grok = fake_program("grok", "exit 0");
+    let command = install::detect_agent(&f.state.config.agent, AgentBackend::Grok, &paths).unwrap();
+    assert_eq!(command.program, grok);
+    assert_eq!(command.args, ["agent", "stdio"]);
+    remove_program("grok");
+
+    // The custom agent without a command says how to set one up.
+    let g = fixture("missing-custom", &[("main.tex", MAIN)], true, |c| {
+        c.agent.backend = AgentBackend::Custom;
+    });
+    let error =
+        install::detect_agent(&g.state.config.agent, AgentBackend::Custom, &paths).unwrap_err();
+    assert_eq!(error, install::ToolchainError::NoCustomCommand);
+    g.agent().set_state(AgentState::Failed(error.to_string()));
+    let (title, message) = g.panel().setup().expect("the set-up card");
+    assert_eq!(title, "Custom agent could not start");
+    assert!(message.contains("[agent.custom]"), "{message}");
+}
+
+const FAKE_NPM_CODEX: &str = r#"echo "$@" > "$HOME/npm-args.txt"
+prefix=""; pkg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix) prefix="$2"; shift 2;;
+    @agentclientprotocol/*) pkg="$1"; shift;;
+    *) shift;;
+  esac
+done
+ver="${pkg##*@}"
+echo "npm notice fake install of $pkg"
+dir="$prefix/node_modules/@agentclientprotocol/codex-acp"
+mkdir -p "$dir/dist"
+printf '{"name":"@agentclientprotocol/codex-acp","version":"%s"}' "$ver" > "$dir/package.json"
+echo "// fake" > "$dir/dist/index.js"
+echo "added 30 packages in 1s""#;
+
+fn codex_install_branches() {
+    let dir = env().home.join(".local/share/lemma/acp-codex");
+    let _ = std::fs::remove_dir_all(&dir);
+    let f = fixture("codex-install", &[("main.tex", MAIN)], true, |c| {
+        c.agent.backend = AgentBackend::Codex;
+    });
+    let panel = f.panel();
+    let paths = f.state.paths.clone().unwrap();
+    let detect = || install::detect_agent(&f.state.config.agent, AgentBackend::Codex, &paths);
+    let node = fake_program("node", "exit 0");
+    fake_program("npm", FAKE_NPM_CODEX);
+    remove_program("codex");
+    // No codex: Lemma uses the user's own, so that comes first.
+    let error = detect().unwrap_err();
+    f.agent().set_state(AgentState::Failed(error.to_string()));
+    let (title, message) = panel.setup().expect("the set-up card");
+    assert_eq!(title, "Codex could not start");
+    assert!(message.contains("codex login"), "{message}");
+    assert!(!panel.install_button().is_visible());
+    let codex = fake_program("codex", "exit 0");
+    let error = detect().unwrap_err();
+    assert_eq!(
+        error,
+        install::ToolchainError::CodexAdapter {
+            found: None,
+            wanted: "2.2.2".into()
+        }
+    );
+    f.agent().set_state(AgentState::Stopped);
+    f.agent().set_state(AgentState::Failed(error.to_string()));
+    let (_, message) = panel.setup().expect("the set-up card");
+    assert!(
+        message.contains("@agentclientprotocol/codex-acp 2.2.2, which is not installed"),
+        "{message}"
+    );
+    assert!(panel.install_button().is_visible());
+    let _ = std::fs::remove_file(env().home.join("npm-args.txt"));
+    panel.install_button().emit_clicked();
+    assert_eq!(
+        panel.setup().map(|(t, _)| t).as_deref(),
+        Some("Installing the Codex ACP adapter…")
+    );
+    common::pump_until(TIMEOUT, || !panel.installing());
+    let log = panel.install_log();
+    assert!(
+        log.contains("fake install of @agentclientprotocol/codex-acp@2.2.2")
+            && log.ends_with("Installed."),
+        "{log}"
+    );
+    let args = std::fs::read_to_string(env().home.join("npm-args.txt")).unwrap();
+    assert_eq!(
+        args.trim(),
+        format!(
+            "i --prefix {} @agentclientprotocol/codex-acp@2.2.2 --omit=optional --no-audit \
+             --no-fund",
+            dir.display()
+        )
+    );
+    assert_eq!(f.take_commands().last(), Some(&PanelCommand::Start));
+    let command = detect().unwrap();
+    assert_eq!(command.program, node);
+    assert_eq!(
+        command.args,
+        [dir.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js")]
+    );
+    assert_eq!(command.env, [("CODEX_PATH".into(), codex.into_os_string())]);
+    remove_program("codex");
+}
+
+fn login_hints() {
+    let login = format!(
+        "The agent could not start a session: Authentication required {}",
+        lemma_agent::LOGIN_REQUIRED
+    );
+    for (backend, how) in [
+        (AgentBackend::Codex, "Codex needs a login: run codex login"),
+        (AgentBackend::Grok, "Grok needs a login: run grok login"),
+        (
+            AgentBackend::Gemini,
+            "Gemini needs a login: run gemini once",
+        ),
+        (
+            AgentBackend::OpenCode,
+            "OpenCode needs a login: run opencode auth login",
+        ),
+        (
+            AgentBackend::Copilot,
+            "Copilot needs a login: run copilot once",
+        ),
+        (AgentBackend::Custom, "Custom agent needs a login"),
+    ] {
+        let f = fixture(
+            &format!("login-{}", backend.as_str()),
+            &[("main.tex", MAIN)],
+            true,
+            |c| c.agent.backend = backend,
+        );
+        f.show_panel();
+        f.event(AgentEvent::Error(login.clone()));
+        let hint = f.panel().update_hint().expect("the login hint");
+        assert!(hint.starts_with(how), "{backend:?}: {hint}");
+    }
 }

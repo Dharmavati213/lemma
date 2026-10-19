@@ -10,9 +10,9 @@
 //! | UTF-8 text without NUL, up to [`MAX_TEXT_BYTES`] | `Resource` with the text |
 //! | a larger PDF or text file, any size | `Document` without bytes: a link, the agent opens the file itself |
 //!
-//! Links only work for ACP agents (Claude Code, Pi), which read files with their own tools; for
-//! the API backend (`embed_only`) a file too large to include is refused. Anything else is
-//! refused with a message for the user. Files are read with gio (never on the main thread
+//! Links only work for ACP agents (Claude Code, Pi, Codex, …), which read files with their own
+//! tools; for the API backend (`embed_only`) a file too large to include is refused. Anything
+//! else is refused with a message for the user. Files are read with gio (never on the main thread
 //! synchronously; a file sent as a link is only sniffed); images are decoded, scaled and encoded
 //! on a worker (`gio::spawn_blocking`).
 
@@ -140,7 +140,7 @@ pub async fn from_file(file: &gio::File, embed_only: bool) -> Result<Attachment,
         if embed_only {
             return Err(format!(
                 "{name} is too large for the Anthropic API ({}; it takes PDFs up to {}). \
-                 Claude Code and Pi take PDFs of any size.",
+                 The ACP agents (Claude Code, Codex, …) take PDFs of any size.",
                 format_size(size),
                 format_size(MAX_EMBEDDED_DOCUMENT_BYTES)
             ));
@@ -172,7 +172,7 @@ pub async fn from_file(file: &gio::File, embed_only: bool) -> Result<Attachment,
     if embed_only {
         return Err(format!(
             "{name} is too large for the Anthropic API ({}; it takes text files up to {}). \
-             Claude Code and Pi take text files of any size.",
+             The ACP agents (Claude Code, Codex, …) take text files of any size.",
             format_size(size),
             format_size(MAX_TEXT_BYTES)
         ));
