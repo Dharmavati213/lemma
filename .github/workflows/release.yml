@@ -1,0 +1,243 @@
+# Builds every file of a release, installs each package in a fresh container of its distribution
+# and starts Lemma there (an offscreen snapshot), then publishes the release.
+#
+#   git tag epsilon && git push origin epsilon
+#
+# publishes "Lemma epsilon" with docs/releases/epsilon.md as its notes (GitHub's generated notes
+# when there is no such file), these files and SHA256SUMS:
+#
+#   Lemma-<tag>-macos-arm64.dmg      macOS 15+, Apple silicon (packaging/macos/)
+#   Lemma-macos-arm64.dmg            the same, under the name packaging/macos/install.sh downloads
+#   lemma_<version>-1_amd64.deb      Ubuntu 26.04+, Debian sid (packaging/linux/)
+#   lemma-<version>-1.fc44.x86_64.rpm  Fedora 44+
+#   lemma-<version>-<rel>-x86_64.pkg.tar.zst  Arch Linux (packaging/PKGBUILD)
+#   lemma-<tag>-linux-x86_64.tar.gz  other distributions with GNOME 50's libraries (install.sh)
+#
+# GitHub adds the source code (zip and tar.gz) itself. Run by hand (workflow_dispatch), it builds
+# and tests everything and keeps the files as artifacts without publishing.
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release
+
+env:
+  LABEL: ${{ github.ref_type == 'tag' && github.ref_name || 'snapshot' }}
+
+jobs:
+  macos:
+    name: macOS DMG
+    uses: ./.github/workflows/macos.yml
+    with:
+      release-tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+  deb:
+    name: Ubuntu 26.04 .deb and the Linux tarball
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Build tools and libraries
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git \
+            pkgconf dpkg-dev file libgtk-4-dev libadwaita-1-dev libgtksourceview-5-dev \
+            libspelling-1-dev libpoppler-glib-dev zlib1g-dev
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (bundled SyncTeX)
+        run: LEMMA_SYNCTEX_BUNDLED=1 cargo build --release --locked -p lemma-app -p lemma-mcp
+      - name: .deb and tarball
+        env:
+          LEMMA_RELEASE_LABEL: ${{ env.LABEL }}
+        run: |
+          packaging/linux/package.sh deb
+          packaging/linux/package.sh tarball
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-deb
+          path: dist/*.deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-tarball
+          path: dist/*.tar.gz
+
+  rpm:
+    name: Fedora 44 .rpm
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Build tools and libraries
+        run: >
+          dnf install -y gcc git tar rust cargo pkgconf-pkg-config rpm-build zlib-devel
+          gtk4-devel libadwaita-devel gtksourceview5-devel libspelling-devel poppler-glib-devel
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (bundled SyncTeX)
+        run: LEMMA_SYNCTEX_BUNDLED=1 cargo build --release --locked -p lemma-app -p lemma-mcp
+      - name: .rpm
+        run: packaging/linux/package.sh rpm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-rpm
+          path: dist/*.rpm
+
+  arch:
+    name: Arch Linux package
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Build tools and libraries
+        run: >
+          pacman -Syu --noconfirm --needed base-devel git rust
+          gtk4 libadwaita gtksourceview5 libspelling libsynctex poppler-glib
+      - uses: actions/checkout@v7
+      - name: makepkg (packaging/PKGBUILD)
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+          su builder -c "cd packaging && makepkg --noconfirm"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-arch
+          path: packaging/lemma-[0-9]*.pkg.tar.zst
+
+  test-deb:
+    name: Install the .deb on Ubuntu 26.04
+    needs: deb
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-deb
+          path: dist
+      - run: |
+          apt-get update
+          apt-get install -y ./dist/lemma_*.deb libgtk-4-bin fonts-dejavu-core
+          packaging/linux/smoke-test.sh /usr/bin/lemma shots deb-ubuntu-26.04
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shot-deb
+          path: shots/
+
+  test-rpm:
+    name: Install the .rpm on Fedora 44
+    needs: rpm
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - run: dnf install -y git tar
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-rpm
+          path: dist
+      - run: |
+          dnf install -y ./dist/lemma-*.rpm dejavu-sans-fonts dejavu-sans-mono-fonts
+          packaging/linux/smoke-test.sh /usr/bin/lemma shots rpm-fedora-44
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shot-rpm
+          path: shots/
+
+  test-arch:
+    name: Install the Arch package
+    needs: arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-arch
+          path: dist
+      - run: |
+          pacman -Syu --noconfirm ttf-dejavu
+          pacman -U --noconfirm dist/lemma-*.pkg.tar.zst
+          packaging/linux/smoke-test.sh /usr/bin/lemma shots arch
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shot-arch
+          path: shots/
+
+  test-tarball:
+    name: Install the tarball on Debian sid
+    needs: deb
+    runs-on: ubuntu-latest
+    container: debian:sid
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-tarball
+          path: dist
+      - name: install.sh names the missing libraries
+        run: |
+          tar -C /tmp -xzf dist/lemma-*-linux-x86_64.tar.gz
+          if /tmp/lemma-*-linux-x86_64/install.sh 2>missing.txt; then
+            echo "install.sh installed without the libraries"; exit 1
+          fi
+          cat missing.txt
+          grep -q "libgtk-4" missing.txt
+      - name: install.sh installs, Lemma starts
+        run: |
+          apt-get update
+          apt-get install -y libgtk-4-1 libadwaita-1-0 libgtksourceview-5-0 libspelling-1-2 \
+            libpoppler-glib8t64 libgtk-4-bin fonts-dejavu-core
+          /tmp/lemma-*-linux-x86_64/install.sh --system
+          packaging/linux/smoke-test.sh /usr/local/bin/lemma shots tarball-debian-sid
+          /tmp/lemma-*-linux-x86_64/install.sh --system --uninstall
+          test ! -e /usr/local/bin/lemma
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shot-tarball
+          path: shots/
+
+  publish:
+    name: Publish the release
+    needs: [macos, test-deb, test-rpm, test-arch, test-tarball]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: The files and SHA256SUMS
+        run: |
+          mkdir release
+          cp "artifacts/Lemma-macos-arm64/Lemma-$LABEL-macos-arm64.dmg" release/
+          cp "release/Lemma-$LABEL-macos-arm64.dmg" release/Lemma-macos-arm64.dmg
+          cp artifacts/linux-deb/*.deb artifacts/linux-rpm/*.rpm \
+            artifacts/linux-arch/*.pkg.tar.zst artifacts/linux-tarball/*.tar.gz release/
+          (cd release && sha256sum -- * > SHA256SUMS)
+          cat release/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            notes="docs/releases/$TAG.md"
+            if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+            gh release create "$TAG" --verify-tag --title "Lemma $TAG" "$@" release/*
+          fi

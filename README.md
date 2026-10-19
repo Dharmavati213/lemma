@@ -43,7 +43,7 @@ Lemma targets current GNOME 50-era libraries:
 |---|---|
 | GTK | 4.22 |
 | libadwaita | 1.9 |
-| GtkSourceView | 5.20 |
+| GtkSourceView | 5.18 |
 | libspelling | 0.4 (with enchant and a hunspell dictionary, e.g. `en_US`) |
 | poppler-glib | 26.01 or newer |
 | libsynctex | 2.0 |
@@ -61,7 +61,35 @@ macOS, Homebrew has them all (see [macOS](#macos) below).
 
 ## Installation
 
-### Arch Linux (recommended)
+### Linux: release packages
+
+Each [release](https://github.com/dharmavati213/lemma/releases) has ready-made packages for
+x86_64. Download the one for your distribution and install it:
+
+| Distribution | File | Install |
+|---|---|---|
+| Ubuntu 26.04 or later, Debian sid | `lemma_<version>-1_amd64.deb` | `sudo apt install ./lemma_*_amd64.deb` |
+| Fedora 44 or later | `lemma-<version>-1.fc44.x86_64.rpm` | `sudo dnf install ./lemma-*.x86_64.rpm` |
+| Arch Linux | `lemma-<version>-<rel>-x86_64.pkg.tar.zst` | `sudo pacman -U ./lemma-*-x86_64.pkg.tar.zst` |
+| Others (openSUSE Tumbleweed, …) | `lemma-<release>-linux-x86_64.tar.gz` | see below |
+
+The packages bring in the libraries they need; TeX (`latexmk`) and a spelling dictionary are
+recommended alongside. Older releases (Debian 13, Ubuntu 25.10, Fedora 43 and earlier) do not
+have GNOME 50's libraries, which Lemma needs.
+
+For other distributions, unpack the tarball and run its installer. It checks for the libraries
+first and tells you which packages to install if they are missing:
+
+```sh
+tar xf lemma-*-linux-x86_64.tar.gz
+lemma-*-linux-x86_64/install.sh                   # for you, into ~/.local
+sudo lemma-*-linux-x86_64/install.sh --system     # or for everyone, into /usr/local
+```
+
+`install.sh --uninstall` (with `--system` if you used it) removes Lemma again. Each release also
+has `SHA256SUMS` to check the downloads: `sha256sum -c SHA256SUMS --ignore-missing`.
+
+### Arch Linux: build the package yourself
 
 The repository includes a `PKGBUILD` that builds the checkout you have:
 
