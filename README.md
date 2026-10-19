@@ -84,29 +84,69 @@ covers updating.
 
 ### macOS
 
-Lemma runs on Macs with Apple silicon and macOS 15 (Sequoia) or later. Download
-`Lemma-…-macos-arm64.dmg` from the [releases](https://github.com/dharmavati213/lemma/releases),
-open it and drag Lemma to Applications. The app brings GTK and everything else it needs.
+Lemma runs on Macs with Apple silicon (M1 or newer) and macOS 15 Sequoia or later. Intel Macs
+are not tested. For now the Mac version lives on the `macos-port` branch.
 
-The app is not notarized by Apple, so the first start is blocked: open **System Settings →
-Privacy & Security**, scroll down and click **Open Anyway** next to the message about Lemma (or run
-`xattr -dr com.apple.quarantine /Applications/Lemma.app` once).
-
-For building documents, install a TeX distribution with `latexmk`, for example
-[MacTeX](https://tug.org/mactex/) (`brew install --cask mactex-no-gui`). Lemma finds it in
-`/Library/TeX/texbin`, and finds Homebrew's tools and the ones on your login shell's `PATH` even
-when started from Finder. The API key is kept in the macOS Keychain. Shortcuts use Ctrl, as on
-Linux.
-
-To build the app yourself (Xcode's command line tools, Rust and Homebrew):
+**1. Install TeX.** Lemma builds documents with `latexmk`. The simplest choice is
+[MacTeX](https://tug.org/mactex/), which includes it:
 
 ```sh
-brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg
-packaging/macos/bundle.sh        # dist/Lemma.app and dist/Lemma-<version>-macos-arm64.dmg
+brew install --cask mactex-no-gui
 ```
 
-`cargo build --release -p lemma-app -p lemma-mcp` works too and runs against Homebrew's libraries.
-See [`packaging/macos/README.md`](packaging/macos/README.md).
+(The smaller BasicTeX works too: `brew install --cask basictex`, then
+`sudo tlmgr update --self && sudo tlmgr install latexmk`.)
+
+**2a. Install the ready-made app.** Download `Lemma-…-macos-arm64.dmg` from the
+[releases](https://github.com/dharmavati213/lemma/releases). Until a release includes it, every
+run of the [macOS workflow](https://github.com/dharmavati213/lemma/actions/workflows/macos.yml)
+builds it: open the latest successful run and download the `Lemma-macos-arm64` artifact under
+**Artifacts** (you must be signed in to GitHub). Open the DMG and drag Lemma to Applications. The
+app brings GTK and everything else it needs; Homebrew is not required.
+
+The app is not notarized by Apple, so macOS blocks the first start. Try to open Lemma once, then
+open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to the
+message about Lemma. Or run this once in Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Lemma.app
+```
+
+**2b. Or build the app yourself.** You need Xcode's command line tools
+(`xcode-select --install`), [Homebrew](https://brew.sh) and Rust ([rustup](https://rustup.rs)).
+Then:
+
+```sh
+brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg pkgconf
+git clone https://github.com/dharmavati213/lemma.git
+cd lemma
+git checkout macos-port
+packaging/macos/bundle.sh              # several minutes; makes dist/Lemma.app and a DMG
+cp -R dist/Lemma.app /Applications/
+```
+
+An app you built yourself opens without the security prompt. To update, run `git pull` and
+`packaging/macos/bundle.sh` again, then replace the app in Applications.
+
+**3. Use it.** Start Lemma from Applications or Launchpad, or open a `.tex` file with
+**Open With → Lemma** in Finder. From Terminal:
+
+```sh
+open -a Lemma path/to/main.tex
+/Applications/Lemma.app/Contents/MacOS/lemma path/to/project/   # the command line options below work too
+```
+
+Good to know on a Mac:
+
+- Lemma finds MacTeX in `/Library/TeX/texbin`, Homebrew's tools and everything on your login
+  shell's `PATH`, even when started from Finder.
+- The agents that need Node (Claude, Codex, Pi) want `brew install node`.
+- The API key is stored in the macOS Keychain.
+- Shortcuts use **Ctrl**, as on Linux, not Cmd. macOS reserves some Ctrl shortcuts (Ctrl+arrow
+  keys for Mission Control, Ctrl+Space for input sources) until you turn them off in **System
+  Settings → Keyboard → Keyboard Shortcuts**.
+
+See [`packaging/macos/README.md`](packaging/macos/README.md) for how the app is put together.
 
 ### From source (any distribution)
 
