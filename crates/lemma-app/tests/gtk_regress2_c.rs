@@ -369,7 +369,7 @@ fn text_of(blocks: &[PromptBlock]) -> String {
         .iter()
         .filter_map(|b| match b {
             PromptBlock::Text(t) => Some(t.as_str()),
-            PromptBlock::Resource { .. } => None,
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")

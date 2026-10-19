@@ -1393,6 +1393,30 @@ fn user_content(blocks: Vec<PromptBlock>) -> Vec<Value> {
                     "text": format!("<resource uri=\"{uri}\"{mime}>\n{text}\n</resource>"),
                 }))
             }
+            PromptBlock::Image { mime, data, .. } => Some(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": mcp::base64(&data)},
+            })),
+            PromptBlock::Document { uri, mime, data }
+                if mime == "application/pdf" && !data.is_empty() =>
+            {
+                Some(json!({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": mime, "data": mcp::base64(&data)},
+                    "title": PromptBlock::file_name(&uri),
+                }))
+            }
+            PromptBlock::Document { uri, mime, data } => {
+                let why = if data.is_empty() {
+                    "too large to include here"
+                } else {
+                    "a binary file that cannot be shown here"
+                };
+                Some(json!({
+                    "type": "text",
+                    "text": format!("<attachment uri=\"{uri}\" mime=\"{mime}\">({why})</attachment>"),
+                }))
+            }
         })
         .collect();
     if content.is_empty() {
@@ -1641,6 +1665,61 @@ impl RawLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachments_become_image_and_document_blocks() {
+        let content = user_content(vec![
+            PromptBlock::Text("What is in these?".into()),
+            PromptBlock::Image {
+                uri: String::new(),
+                mime: "image/jpeg".into(),
+                data: b"JPG".to_vec(),
+            },
+            PromptBlock::Document {
+                uri: "file:///p/my%20paper.pdf".into(),
+                mime: "application/pdf".into(),
+                data: b"%PDF".to_vec(),
+            },
+            PromptBlock::Document {
+                uri: "file:///p/a.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: vec![0],
+            },
+            PromptBlock::Document {
+                uri: "file:///p/huge.pdf".into(),
+                mime: "application/pdf".into(),
+                data: Vec::new(),
+            },
+        ]);
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "What is in these?"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type": "image", "source":
+                {"type": "base64", "media_type": "image/jpeg", "data": "SlBH"}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "document", "title": "my paper.pdf", "source":
+                {"type": "base64", "media_type": "application/pdf", "data": "JVBERg=="}})
+        );
+        assert_eq!(content[3]["type"], "text");
+        assert!(
+            content[3]["text"]
+                .as_str()
+                .unwrap()
+                .contains("file:///p/a.bin")
+        );
+        assert_eq!(content[4]["type"], "text");
+        assert!(
+            content[4]["text"]
+                .as_str()
+                .unwrap()
+                .contains("too large to include")
+        );
+    }
 
     #[test]
     fn effort_and_thinking_follow_the_model() {

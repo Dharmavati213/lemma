@@ -33,7 +33,7 @@ use lemma_app::editor::Editor;
 use lemma_app::testmode;
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
-use lemma_config::{Config, Paths, parse_prompts};
+use lemma_config::{AgentBackend, Config, Paths, parse_prompts};
 use lemma_core::{DiagSource, ProjectRoot, Severity};
 use std::cell::RefCell;
 use std::future::Future;
@@ -71,6 +71,8 @@ fn main() -> ExitCode {
         ),
         ("slash_and_file_suggestions", suggestions),
         ("selection_chip", selection_chip),
+        ("attachments_from_files_and_paste", attachments),
+        ("attachments_too_large_to_include", large_attachments),
         ("tool_cards_link_to_hunks", tool_cards),
         (
             "cli_tools_have_names_and_tool_search_is_quiet",
@@ -365,7 +367,7 @@ fn text_of(blocks: &[PromptBlock]) -> String {
         .iter()
         .filter_map(|b| match b {
             PromptBlock::Text(t) => Some(t.as_str()),
-            PromptBlock::Resource { .. } => None,
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1155,6 +1157,316 @@ fn suggestions() {
         panic!()
     };
     assert_eq!(text, MAIN);
+}
+
+/// A PNG of `w` × `h` noise pixels (noise, so that it does not compress).
+fn noise_png(w: i32, h: i32, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..w * h {
+        for _ in 0..3 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((x >> 24) as u8);
+        }
+        data.push(255);
+    }
+    gdk::MemoryTexture::new(
+        w,
+        h,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_owned(data),
+        (w * 4) as usize,
+    )
+    .save_to_png_bytes()
+    .to_vec()
+}
+
+/// Images, PDFs and text files attached with the paperclip (what a drop runs too), pasted
+/// images and copied files, refusals, removal, a message of attachments only, and the
+/// transcript entry with image previews.
+fn attachments() {
+    let pdf = "%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n";
+    let f = fixture(
+        "attach",
+        &[
+            ("main.tex", MAIN),
+            ("notes.txt", "Some notes.\n"),
+            ("paper.pdf", pdf),
+        ],
+        Hook::Swallow,
+    );
+    std::fs::write(f.dir.join("fig.png"), noise_png(40, 30, 1)).unwrap();
+    std::fs::write(f.dir.join("huge.png"), noise_png(2200, 1400, 2)).unwrap();
+    std::fs::write(f.dir.join("blob.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
+    std::fs::create_dir_all(f.dir.join("figs")).unwrap();
+    f.show_panel();
+    let panel = f.panel();
+    let view = panel.prompt_view();
+    let file = |name: &str| gio::File::for_path(f.dir.join(name));
+    let names = |panel: &panel::Panel| -> Vec<String> {
+        panel.attachments().into_iter().map(|(n, _)| n).collect()
+    };
+    let text = |v: &gtk::TextView| {
+        let b = v.buffer();
+        b.text(&b.start_iter(), &b.end_iter(), false).to_string()
+    };
+    assert!(panel.attach_button().is_visible());
+    assert!(!panel.send_button().is_sensitive());
+
+    // A binary file and a folder are refused; the rest are attached in order.
+    panel.attach_files(vec![
+        file("fig.png"),
+        file("blob.bin"),
+        file("notes.txt"),
+        file("figs"),
+        file("paper.pdf"),
+    ]);
+    common::pump_until(TIMEOUT, || !panel.is_attaching());
+    assert_eq!(names(&panel), ["fig.png", "notes.txt", "paper.pdf"]);
+    let details = panel.attachments();
+    assert!(
+        details[0].1.starts_with("PNG image · 40 × 30 · "),
+        "{details:?}"
+    );
+    assert!(details[1].1.starts_with("Text · "), "{details:?}");
+    assert!(details[2].1.starts_with("PDF document · "), "{details:?}");
+    assert!(
+        panel.send_button().is_sensitive(),
+        "attachments alone can be sent"
+    );
+    // The same file again is attached once.
+    panel.attach_files(vec![file("fig.png")]);
+    common::pump_until(TIMEOUT, || !panel.is_attaching());
+    assert_eq!(names(&panel).len(), 3);
+    // An image over the size limit is scaled down and sent as PNG.
+    panel.attach_files(vec![file("huge.png")]);
+    common::pump_until(Duration::from_secs(90), || !panel.is_attaching());
+    let (name, detail) = panel.attachments()[3].clone();
+    assert_eq!(name, "huge.png");
+    assert!(
+        detail.starts_with("PNG image") && detail.ends_with("(scaled down from 2200 × 1400)"),
+        "{detail}"
+    );
+
+    // Ctrl+V with an image on the clipboard attaches it (it is not pasted as text).
+    let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(noise_png(20, 10, 3))).unwrap();
+    view.clipboard().set_texture(&texture);
+    view.emit_paste_clipboard();
+    common::pump_until(TIMEOUT, || names(&panel).len() == 5);
+    assert_eq!(names(&panel)[4], "Pasted image");
+    assert_eq!(text(&view), "");
+    // Removing one; pasting copied files attaches them; text still pastes as text.
+    panel.remove_attachment(1);
+    assert_eq!(
+        names(&panel),
+        ["fig.png", "paper.pdf", "huge.png", "Pasted image"]
+    );
+    view.clipboard()
+        .set(&gdk::FileList::from_array(&[file("notes.txt")]));
+    view.emit_paste_clipboard();
+    common::pump_until(TIMEOUT, || names(&panel).len() == 5);
+    assert_eq!(names(&panel)[4], "notes.txt");
+    assert_eq!(text(&view), "");
+    view.clipboard().set_text("Describe");
+    view.emit_paste_clipboard();
+    common::pump_until(TIMEOUT, || text(&view) == "Describe");
+    type_into(&view, " these");
+
+    // Sending: the text, then the attachments in order; the chips go.
+    panel.send();
+    common::pump_until(TIMEOUT, || !prompts(&f.commands()).is_empty());
+    let (blocks, origin) = prompts(&f.take_commands()).remove(0);
+    assert_eq!(origin, PromptOrigin::Panel);
+    assert!(panel.attachments().is_empty());
+    assert_eq!(blocks.len(), 6, "{blocks:#?}");
+    assert_eq!(blocks[0], PromptBlock::Text("Describe these".into()));
+    let PromptBlock::Image { uri, mime, data } = &blocks[1] else {
+        panic!("{:?}", blocks[1])
+    };
+    assert!(
+        uri.starts_with("file://") && uri.ends_with("/fig.png"),
+        "{uri}"
+    );
+    assert_eq!(mime, "image/png");
+    assert_eq!(*data, std::fs::read(f.dir.join("fig.png")).unwrap());
+    let PromptBlock::Document { uri, mime, data } = &blocks[2] else {
+        panic!("{:?}", blocks[2])
+    };
+    assert!(uri.ends_with("/paper.pdf"), "{uri}");
+    assert_eq!(mime, "application/pdf");
+    assert_eq!(data, pdf.as_bytes());
+    let PromptBlock::Image { mime, data, .. } = &blocks[3] else {
+        panic!("{:?}", blocks[3])
+    };
+    assert_eq!(mime, "image/png");
+    assert!(data.len() <= lemma_app::agent::attach::MAX_IMAGE_BYTES);
+    let scaled = gdk::Texture::from_bytes(&glib::Bytes::from(data.as_slice())).unwrap();
+    assert!(scaled.width() <= 1568);
+    assert!((scaled.width() * 1400 / 2200 - scaled.height()).abs() <= 1);
+    let PromptBlock::Image { uri, mime, .. } = &blocks[4] else {
+        panic!("{:?}", blocks[4])
+    };
+    assert_eq!((uri.as_str(), mime.as_str()), ("", "image/png"));
+    let PromptBlock::Resource {
+        text: notes, mime, ..
+    } = &blocks[5]
+    else {
+        panic!("{:?}", blocks[5])
+    };
+    assert_eq!(
+        (notes.as_str(), mime.as_str()),
+        ("Some notes.\n", "text/plain")
+    );
+
+    // The transcript lists the attachments and shows previews of the images.
+    let agent = f.agent();
+    let turn = agent.begin_turn();
+    agent.set_state(AgentState::Running { turn });
+    agent.emit_prompt(&SentPrompt {
+        turn,
+        origin: PromptOrigin::Panel,
+        blocks,
+    });
+    let user = || {
+        panel
+            .entries()
+            .into_iter()
+            .find_map(|e| match e {
+                Entry::User {
+                    attachments,
+                    images,
+                    ..
+                } => Some((attachments, images)),
+                _ => None,
+            })
+            .expect("the prompt's entry")
+    };
+    assert_eq!(
+        user().0,
+        [
+            "fig.png",
+            "paper.pdf",
+            "huge.png",
+            "Pasted image",
+            "notes.txt"
+        ]
+    );
+    common::pump_until(TIMEOUT, || user().1.len() == 3);
+    assert!(user().1.iter().all(|t| t.width().max(t.height()) <= 160));
+    f.frames(2);
+    f.end(StopReason::EndTurn);
+    // `LEMMA_TEST_SNAPSHOTS=dir` saves the pane with previews and chips as `f-agent-attach.png`.
+    if let Some(dir) = std::env::var_os("LEMMA_TEST_SNAPSHOTS").map(PathBuf::from) {
+        panel.attach_files(vec![file("fig.png"), file("paper.pdf"), file("notes.txt")]);
+        common::pump_until(TIMEOUT, || names(&panel).len() == 3);
+        type_into(&view, "What does the figure show?");
+        panel.flush();
+        f.frames(3);
+        panel.scroll_to_end();
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("f-agent-attach.png");
+        block_on(testmode::snapshot_next_frame(&f.state.window, &png)).unwrap();
+        println!("    snapshot {}", png.display());
+        view.buffer().set_text("");
+        for _ in 0..3 {
+            panel.remove_attachment(0);
+        }
+    }
+
+    // A message of attachments only.
+    panel.attach_files(vec![file("notes.txt")]);
+    common::pump_until(TIMEOUT, || {
+        !panel.is_attaching() && names(&panel).len() == 1
+    });
+    assert_eq!(text(&view), "");
+    panel.send();
+    common::pump_until(TIMEOUT, || !prompts(&f.commands()).is_empty());
+    let (blocks, _) = prompts(&f.take_commands()).remove(0);
+    assert!(
+        matches!(blocks.as_slice(), [PromptBlock::Resource { text, .. }] if text == "Some notes.\n"),
+        "{blocks:#?}"
+    );
+}
+
+/// Writes a sparse file of `len` bytes that starts with `head`.
+fn sparse_file(path: &std::path::Path, head: &[u8], len: u64) {
+    std::fs::write(path, head).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+}
+
+/// Files too large to include: Claude Code (and Pi) get large PDFs and text files as links
+/// (the files are never read whole), the API backend refuses them; an image file over the
+/// image limit is refused by both.
+fn large_attachments() {
+    let files = [("main.tex", MAIN), ("notes.txt", "Some notes.\n")];
+    let write_large = |dir: &std::path::Path| {
+        let line = "Line of a long build log, plain UTF-8 text: é ü ∀.\n";
+        std::fs::write(dir.join("build.log"), line.repeat(12_000)).unwrap();
+        sparse_file(&dir.join("thesis.pdf"), b"%PDF-1.7\n", 300 << 20);
+        sparse_file(&dir.join("scan.png"), b"\x89PNG\r\n\x1a\n", 100 << 20);
+        sparse_file(&dir.join("disk.img"), b"\0\0\0\x01", 4 << 20);
+    };
+    let names = |panel: &panel::Panel| -> Vec<String> {
+        panel.attachments().into_iter().map(|(n, _)| n).collect()
+    };
+
+    let f = fixture("attach-large", &files, Hook::Swallow);
+    write_large(&f.dir);
+    let panel = f.panel();
+    let file = |name: &str| gio::File::for_path(f.dir.join(name));
+    panel.attach_files(vec![
+        file("build.log"),
+        file("thesis.pdf"),
+        file("scan.png"),
+        file("disk.img"),
+    ]);
+    common::pump_until(TIMEOUT, || !panel.is_attaching());
+    assert_eq!(names(&panel), ["build.log", "thesis.pdf"]);
+    for (name, detail) in panel.attachments() {
+        assert!(detail.contains("sent as a link"), "{name}: {detail}");
+    }
+    panel.prompt_view().buffer().set_text("Summarize these");
+    panel.send();
+    common::pump_until(TIMEOUT, || !prompts(&f.commands()).is_empty());
+    let (blocks, _) = prompts(&f.take_commands()).remove(0);
+    let links: Vec<String> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            PromptBlock::Document { uri, mime, data } => {
+                assert!(data.is_empty(), "{uri} was read");
+                // `.log` is `text/x-log` or `text/plain`, after the system's MIME database.
+                let kind = if mime.starts_with("text/") {
+                    "text"
+                } else {
+                    mime
+                };
+                Some(format!("{} {kind}", PromptBlock::file_name(uri)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(links, ["build.log text", "thesis.pdf application/pdf"]);
+    drop(f);
+
+    // The API backend cannot open files: only what fits in the request is attached.
+    let f = fixture_with("attach-large-api", &files, Hook::Swallow, |c| {
+        c.agent.backend = AgentBackend::Api;
+    });
+    write_large(&f.dir);
+    let panel = f.panel();
+    let file = |name: &str| gio::File::for_path(f.dir.join(name));
+    panel.attach_files(vec![
+        file("build.log"),
+        file("thesis.pdf"),
+        file("notes.txt"),
+    ]);
+    common::pump_until(TIMEOUT, || !panel.is_attaching());
+    assert_eq!(names(&panel), ["notes.txt"]);
 }
 
 fn selection_chip() {

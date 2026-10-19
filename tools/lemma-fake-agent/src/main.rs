@@ -49,6 +49,7 @@
 //! | `mcp` | `"required"` (default: no MCP server is an error) or `"skip"` (never launch one) |
 //! | `fs` | `"required"`: `initialize` must advertise `fs.readTextFile` and `fs.writeTextFile` (else error -32602); `"forbidden"`: it must advertise neither (WP5.2) |
 //! | `agent_name` | the `agentInfo.name` to report (default `lemma-fake-agent`), e.g. to play Pi's adapter |
+//! | `no_images` | `true`: advertise `promptCapabilities.image: false` (an agent that takes no images) |
 //! | `session_new_error` | `{"code": n, "message": "…"}`: answer `session/new` with this error (e.g. -32000, Pi's "authentication required") |
 //!
 //! Steps (each an object with one key; strings may contain `{{i}}` inside `repeat`):
@@ -172,6 +173,7 @@ struct Options {
     fs: Option<String>,
     agent_name: Option<String>,
     session_new_error: Option<RpcErrorSpec>,
+    no_images: bool,
 }
 
 /// `_options.session_new_error`.
@@ -1063,7 +1065,10 @@ fn initialize(agent: &Agent, params: &Value) -> RpcResult {
         "protocolVersion": 1,
         "agentCapabilities": {
             "loadSession": false,
-            "promptCapabilities": {"image": true, "embeddedContext": true},
+            "promptCapabilities": {
+                "image": !agent.scenario.options.no_images,
+                "embeddedContext": true
+            },
             "mcpCapabilities": {"http": false, "sse": false},
             "sessionCapabilities": {"close": {}}
         },

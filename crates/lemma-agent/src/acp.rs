@@ -466,6 +466,8 @@ impl StartError {
 struct Started {
     session_id: s::SessionId,
     can_close: bool,
+    /// The agent accepts `image` blocks in prompts (`promptCapabilities.image`).
+    images: bool,
 }
 
 impl Session {
@@ -623,6 +625,7 @@ impl Session {
             |info| format!("{} {}", info.name, info.version),
         );
         let can_close = init.agent_capabilities.session_capabilities.close.is_some();
+        let images = init.agent_capabilities.prompt_capabilities.image;
 
         let bridge = s::McpServerStdio::new("lemma", self.cfg.mcp_bridge.clone()).env(vec![
             s::EnvVariable::new("LEMMA_MCP_SOCKET", self.socket.clone()),
@@ -687,6 +690,7 @@ impl Session {
         Ok(Started {
             session_id,
             can_close,
+            images,
         })
     }
 
@@ -707,9 +711,17 @@ impl Session {
                     ));
                     return std::ops::ControlFlow::Continue(());
                 };
+                if !started.images
+                    && let Some(notice) = no_images_notice(&blocks)
+                {
+                    shared.emit(AgentEvent::Notice(notice.into()));
+                }
                 let sent = cx.send_request(s::PromptRequest::new(
                     sid.clone(),
-                    blocks.into_iter().map(content_block).collect(),
+                    blocks
+                        .into_iter()
+                        .map(|b| content_block(b, started.images))
+                        .collect(),
                 ));
                 let shared = shared.clone();
                 self.spawn(cx, async move {
@@ -937,7 +949,9 @@ fn session_meta(append: &str) -> s::Meta {
     }
 }
 
-fn content_block(block: PromptBlock) -> s::ContentBlock {
+/// The ACP content of a prompt block. `images`: the agent accepts `image` blocks; without that
+/// capability an image becomes a `resource_link` to its file (a note for a pasted one).
+fn content_block(block: PromptBlock, images: bool) -> s::ContentBlock {
     match block {
         PromptBlock::Text(text) => s::ContentBlock::Text(s::TextContent::new(text)),
         PromptBlock::Resource { uri, mime, text } => {
@@ -949,7 +963,58 @@ fn content_block(block: PromptBlock) -> s::ContentBlock {
                 s::EmbeddedResourceResource::TextResourceContents(contents),
             ))
         }
+        PromptBlock::Image { uri, mime, data } if images => {
+            let mut image = s::ImageContent::new(mcp::base64(&data), mime);
+            if !uri.is_empty() {
+                image = image.uri(uri);
+            }
+            s::ContentBlock::Image(image)
+        }
+        PromptBlock::Image { uri, .. } if uri.is_empty() => {
+            s::ContentBlock::Text(s::TextContent::new(
+                "[The user pasted an image, but this agent cannot receive images.]",
+            ))
+        }
+        PromptBlock::Image { uri, mime, data } | PromptBlock::Document { uri, mime, data } => {
+            s::ContentBlock::ResourceLink(resource_link(uri, mime, data.len()))
+        }
     }
+}
+
+/// What to tell the user when `blocks` carry images for an agent that does not accept them.
+fn no_images_notice(blocks: &[PromptBlock]) -> Option<&'static str> {
+    let (mut files, mut pasted) = (false, false);
+    for block in blocks {
+        if let PromptBlock::Image { uri, .. } = block {
+            if uri.is_empty() {
+                pasted = true;
+            } else {
+                files = true;
+            }
+        }
+    }
+    match (files, pasted) {
+        (false, false) => None,
+        (true, false) => Some(
+            "This agent does not accept images: it was given the paths of the attached image \
+             files instead.",
+        ),
+        (false, true) => Some("This agent does not accept images: the pasted image was not sent."),
+        (true, true) => Some(
+            "This agent does not accept images: it was given the paths of the attached image \
+             files instead, and the pasted image was not sent.",
+        ),
+    }
+}
+
+/// A `resource_link` to the attached file at `uri`; `size` 0: unknown (a file sent without its
+/// bytes).
+fn resource_link(uri: String, mime: String, size: usize) -> s::ResourceLink {
+    let mut link = s::ResourceLink::new(PromptBlock::file_name(&uri), uri);
+    if !mime.is_empty() {
+        link = link.mime_type(mime);
+    }
+    link.size(i64::try_from(size).ok().filter(|&n| n > 0))
 }
 
 // ============================================================================== shared state
@@ -2186,18 +2251,71 @@ mod tests {
 
     #[test]
     fn prompt_blocks_become_acp_content() {
-        let text = serde_json::to_value(content_block(PromptBlock::Text("hi".into()))).unwrap();
+        let text =
+            serde_json::to_value(content_block(PromptBlock::Text("hi".into()), true)).unwrap();
         assert_eq!(text, serde_json::json!({"type": "text", "text": "hi"}));
-        let resource = serde_json::to_value(content_block(PromptBlock::Resource {
-            uri: "file:///p/main.tex".into(),
-            mime: "text/x-tex".into(),
-            text: "x".into(),
-        }))
+        let resource = serde_json::to_value(content_block(
+            PromptBlock::Resource {
+                uri: "file:///p/main.tex".into(),
+                mime: "text/x-tex".into(),
+                text: "x".into(),
+            },
+            true,
+        ))
         .unwrap();
         assert_eq!(
             resource,
             serde_json::json!({"type": "resource", "resource":
                 {"uri": "file:///p/main.tex", "mimeType": "text/x-tex", "text": "x"}})
+        );
+    }
+
+    #[test]
+    fn attached_images_and_documents_become_acp_content() {
+        let image = |uri: &str| PromptBlock::Image {
+            uri: uri.into(),
+            mime: "image/png".into(),
+            data: b"PNG".to_vec(),
+        };
+        let json = |b, images| serde_json::to_value(content_block(b, images)).unwrap();
+        assert_eq!(
+            json(image("file:///p/fig%201.png"), true),
+            serde_json::json!({"type": "image", "data": "UE5H", "mimeType": "image/png",
+                               "uri": "file:///p/fig%201.png"})
+        );
+        assert_eq!(
+            json(image(""), true),
+            serde_json::json!({"type": "image", "data": "UE5H", "mimeType": "image/png"})
+        );
+        // An agent without the image capability gets a link to the file instead.
+        assert_eq!(
+            json(image("file:///p/fig%201.png"), false),
+            serde_json::json!({"type": "resource_link", "name": "fig 1.png",
+                               "uri": "file:///p/fig%201.png", "mimeType": "image/png",
+                               "size": 3})
+        );
+        assert_eq!(json(image(""), false)["type"], "text");
+        let pdf = PromptBlock::Document {
+            uri: "file:///p/paper.pdf".into(),
+            mime: "application/pdf".into(),
+            data: vec![0; 10],
+        };
+        assert_eq!(
+            json(pdf, true),
+            serde_json::json!({"type": "resource_link", "name": "paper.pdf",
+                               "uri": "file:///p/paper.pdf", "mimeType": "application/pdf",
+                               "size": 10})
+        );
+        // A file too large to include is sent without its bytes: no size.
+        let log = PromptBlock::Document {
+            uri: "file:///p/huge.log".into(),
+            mime: "text/plain".into(),
+            data: Vec::new(),
+        };
+        assert_eq!(
+            json(log, true),
+            serde_json::json!({"type": "resource_link", "name": "huge.log",
+                               "uri": "file:///p/huge.log", "mimeType": "text/plain"})
         );
     }
 

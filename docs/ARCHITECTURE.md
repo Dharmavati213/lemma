@@ -1034,6 +1034,25 @@ they conflict with the sections above, this section wins.
     and 60–70 MB PSS (hunspell en_US-large alone is 8 MB), which is over the 50 MB PSS budget. `scripts/rss.sh` asserts
     RSS and PSS only on real Wayland (`LEMMA_RSS_WAYLAND=1`). The PSS budgets are to be re-checked there.
 - **Real agent:** edit routing and image delivery verified with the real adapter (§9.2).
+- **Prompt attachments (§10.3, §10.4):** `PromptBlock` gains `Image { uri, mime, data }` and
+  `Document { uri, mime, data }` (`uri` is the file's `file://` URI, empty for a pasted image).
+  - The agent pane attaches files from a file chooser (the paperclip), drops on the pane and
+    Ctrl+V (an image, or a file list of local files) in the prompt box (`agent/attach.rs`).
+    PNG/JPEG/GIF/WebP within 3.75 MiB (5 MiB as base64, the API's limit) and 8000 px are sent
+    as they are; other images, and larger ones (files up to 64 MiB), are re-encoded as PNG on a
+    worker and scaled down to 1568 px (then by ¾ steps) until they fit. PDFs up to 20 MiB become
+    `Document`s with their bytes (the API's 32 MB request limit, base64), UTF-8 text up to
+    512 KiB a `Resource`. Larger PDFs and text files, of any size, become `Document`s without
+    bytes (only the first 4 KiB is read, to sniff the type): a link that ACP agents open with
+    their own tools; with the API backend they are refused. Anything else is refused with a
+    toast.
+  - ACP: `Image` → an `image` block when the agent advertises `promptCapabilities.image`
+    (Claude's adapter does), otherwise a `resource_link` to the file (a pasted image: a text
+    note) and an `AgentEvent::Notice`; `Document` → a `resource_link` (Claude's adapter ignores
+    blob resources; its Read tool opens the file).
+  - API backend: `Image` → an `image` block, a PDF `Document` with bytes → a `document`
+    block, any other `Document` → a note naming the file.
+  - The fake agent's `_options.no_images` advertises `image: false`.
 - **M5 (2026-10-12):**
   - The M4 row is cut. Its important parts (completion for packed packages, environment tools, the align helper and
     latexindent as hunks) are in M5.

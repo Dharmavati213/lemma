@@ -53,7 +53,65 @@ pub enum PromptBlock {
         mime: String,
         text: String,
     },
+    /// An image the user attached (PNG, JPEG, GIF or WebP): `data` holds the encoded bytes,
+    /// `uri` the file it came from (`file://…`; empty for a pasted image).
+    ///
+    /// ACP: an `image` block when the agent advertises the `image` prompt capability, otherwise a
+    /// `resource_link` to the file (or a note for a pasted image). API backend: an `image` block.
+    Image {
+        uri: String,
+        mime: String,
+        data: Vec<u8>,
+    },
+    /// A file the user attached that the agent gets by reference, at `uri` (`file://…`): a PDF
+    /// (`data` holds its bytes when it is small enough to include) or a text file too large to
+    /// include (`data` empty).
+    ///
+    /// ACP: a `resource_link`, so the agent reads the file with its own tools (Claude Code's Read
+    /// handles PDFs and pages through long files). API backend: a PDF with `data` becomes a
+    /// `document` block; anything else a note naming the file.
+    Document {
+        uri: String,
+        mime: String,
+        data: Vec<u8>,
+    },
 }
+
+impl PromptBlock {
+    /// The file name at the end of `uri`, percent-decoded (`file:///p/my%20fig.png` →
+    /// `my fig.png`), or `uri` itself when it has none.
+    pub fn file_name(uri: &str) -> String {
+        let path = uri.split(['#', '?']).next().unwrap_or(uri);
+        match path.rsplit('/').next() {
+            Some(name) if !name.is_empty() => percent_decode(name),
+            _ => uri.to_owned(),
+        }
+    }
+}
+
+/// `%XX` escapes decoded (invalid ones kept as they are; invalid UTF-8 replaced).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'?'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCmd {
     Prompt(Vec<PromptBlock>),
@@ -303,4 +361,21 @@ pub struct AgentHandle {
 ///   offer, the stderr ring, the shutdown sequence): the module docs of `src/acp.rs`.
 pub fn spawn(cfg: AgentConfig) -> std::io::Result<AgentHandle> {
     acp::spawn(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PromptBlock;
+
+    #[test]
+    fn file_names_of_uris() {
+        assert_eq!(PromptBlock::file_name("file:///p/fig.png"), "fig.png");
+        assert_eq!(
+            PromptBlock::file_name("file:///p/my%20fig%C3%A9.pdf#page=2"),
+            "my figé.pdf"
+        );
+        assert_eq!(PromptBlock::file_name("file:///p/100%.txt"), "100%.txt");
+        assert_eq!(PromptBlock::file_name(""), "");
+        assert_eq!(PromptBlock::file_name("file:///p/"), "file:///p/");
+    }
 }

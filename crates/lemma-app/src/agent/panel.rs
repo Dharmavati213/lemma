@@ -12,8 +12,9 @@
 //! │ transcript: a virtualised gtk::ListView of turn items                          │
 //! ├ / and @ suggestions                                                            ┤
 //! │ [Selection · main.tex 12–14]                                                   │
+//! │ [🖼 fig.png ✕] [📄 paper.pdf ✕]                                                 │  attachments
 //! │ ┌ prompt (Enter sends, Shift+Enter newline) ┐ [➤]                              │
-//! └ [Quick actions ▾]                                                              ┘
+//! └ [📎] [Quick actions ▾]                                                         ┘
 //! ```
 //!
 //! # Contract
@@ -63,10 +64,18 @@
 //!   and the session (`AgentEvent::Cost`). For Pi, the set-up card installs `@openma/pi-acp`
 //!   ([`install::install_pi_adapter`]), and an "authentication required" answer
 //!   ([`lemma_agent::needs_login`]) shows the hint to run `pi` once to log in.
+//! - **Attachments:** the paperclip button (a file chooser), files or images dropped anywhere on
+//!   the pane, and images (or files copied in a file manager) pasted into the prompt box attach
+//!   them to the next prompt ([`attach`](super::attach) decides how each is sent; large PDFs and
+//!   text files go to Claude Code and Pi as links, and the API backend refuses them). They show as
+//!   chips above the prompt box (an image with a preview) with a remove button; a prompt may be
+//!   only attachments. Sending waits until every attachment is read. Images show as previews in
+//!   the transcript.
 //! - Tool cards for `edit`/`write` link to the hunk the call made (the review's hunks before the
 //!   call and after it completes are compared); clicking one shows it. A `compile` card shows
 //!   the Problems page.
 
+use super::attach::{self, Attachment};
 use super::bridge::ToolRecord;
 use super::markdown::{self, Block};
 use super::{AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, install};
@@ -97,6 +106,8 @@ const HIDDEN_OPTIONS: &[&str] = &[
 const MAX_ATTACHMENT: usize = 512 * 1024;
 /// Files offered after `@`.
 const MAX_FILES: usize = 2000;
+/// Attachments (button, drop, paste) per prompt.
+pub const MAX_ATTACHMENTS: usize = 20;
 /// Suggestions shown at once.
 const MAX_SUGGESTIONS: usize = 8;
 /// Lines of npm output kept in the set-up card.
@@ -157,6 +168,8 @@ pub enum Entry {
         heading: String,
         text: String,
         attachments: Vec<String>,
+        /// Previews of the attached images (filled in once they are made).
+        images: Vec<gdk::Texture>,
     },
     /// The agent's Markdown, as streamed so far.
     Agent {
@@ -470,6 +483,41 @@ impl Panel {
             .iter()
             .map(|s| s.label.clone())
             .collect()
+    }
+
+    /// The attachments waiting for the next prompt: (name, detail) each.
+    pub fn attachments(&self) -> Vec<(String, String)> {
+        self.inner
+            .attachments
+            .borrow()
+            .iter()
+            .map(|a| (a.name.clone(), a.detail.clone()))
+            .collect()
+    }
+
+    /// True while attachments are being read (sending waits for them).
+    pub fn is_attaching(&self) -> bool {
+        self.inner.attaching.get() > 0
+    }
+
+    /// Attaches `files` to the next prompt, as the file chooser and a drop do.
+    pub fn attach_files(&self, files: Vec<gio::File>) {
+        self.inner.attach_files(files);
+    }
+
+    /// Attaches `texture` to the next prompt, as pasting an image does.
+    pub fn attach_image(&self, texture: gdk::Texture) {
+        self.inner.attach_texture(texture, "Pasted image");
+    }
+
+    /// Removes attachment `index`, as its chip's remove button does.
+    pub fn remove_attachment(&self, index: usize) {
+        self.inner.remove_attachment(index);
+    }
+
+    /// The paperclip button (opens a file chooser).
+    pub fn attach_button(&self) -> gtk::Button {
+        self.inner.attach_button.clone()
     }
 
     /// The selection chip's text while it is shown.
@@ -1251,6 +1299,7 @@ fn build_row(entry: &Entry, panel: &Weak<Inner>) -> gtk::Widget {
             heading,
             text,
             attachments,
+            images,
             ..
         } => {
             let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -1263,6 +1312,8 @@ fn build_row(entry: &Entry, panel: &Weak<Inner>) -> gtk::Widget {
             head.add_css_class("dim-label");
             card.append(&head);
             match origin {
+                // A prompt of attachments only has no text.
+                PromptOrigin::Panel if text.is_empty() => {}
                 PromptOrigin::Panel => card.append(&wrapped_label(text, false)),
                 PromptOrigin::Inline { .. } => {
                     let (first, rest) = text.split_once("\n\n").unwrap_or((text, ""));
@@ -1274,6 +1325,29 @@ fn build_row(entry: &Entry, panel: &Weak<Inner>) -> gtk::Widget {
                 PromptOrigin::QuickAction(_) | PromptOrigin::FixDiagnostic => {
                     card.append(&collapsed("Prompt", text.trim()));
                 }
+            }
+            if !images.is_empty() {
+                // Previews are at most `attach::THUMBNAIL_SIDE` pixels; they wrap in a narrow pane.
+                let previews = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .activate_on_single_click(false)
+                    .column_spacing(4)
+                    .row_spacing(4)
+                    .max_children_per_line(images.len() as u32)
+                    .halign(gtk::Align::Start)
+                    .build();
+                previews.add_css_class("lemma-agent-user-images");
+                for texture in images {
+                    let picture = gtk::Picture::for_paintable(texture);
+                    picture.set_can_shrink(false);
+                    picture.set_halign(gtk::Align::Start);
+                    picture.set_valign(gtk::Align::Start);
+                    let child = gtk::FlowBoxChild::new();
+                    child.set_focusable(false);
+                    child.set_child(Some(&picture));
+                    previews.append(&child);
+                }
+                card.append(&previews);
             }
             for name in attachments {
                 let label = gtk::Label::builder()
@@ -1756,9 +1830,11 @@ pub(crate) struct Inner {
     suggest_list: gtk::ListBox,
     chip: gtk::Box,
     chip_label: gtk::Label,
+    attach_box: gtk::FlowBox,
     prompt: gtk::TextView,
     placeholder: gtk::Label,
     send_button: gtk::Button,
+    attach_button: gtk::Button,
     quick_menu: gio::Menu,
     // agent data
     agent_name: RefCell<String>,
@@ -1790,6 +1866,12 @@ pub(crate) struct Inner {
     scrolling: Cell<bool>,
     // prompt data
     pending_prompt: RefCell<Option<String>>,
+    /// Files and images attached to the next prompt.
+    attachments: RefCell<Vec<Attachment>>,
+    /// The attachments of the prompt being sent (they go back with its text if it is refused).
+    pending_attachments: RefCell<Vec<Attachment>>,
+    /// Attachment reads in progress.
+    attaching: Cell<u32>,
     /// The widget a permission card moved the focus to by itself, and when (see
     /// [`AUTO_FOCUS_GRACE`]).
     auto_focus: RefCell<Option<(glib::WeakRef<gtk::Widget>, Instant)>>,
@@ -1947,7 +2029,8 @@ impl Inner {
             .title("Ask Claude")
             .description(
                 "Claude's changes show up as red/green hunks to accept or reject.\n\
-                 Type / for commands and @ to attach a file.",
+                 Type / for commands and @ to mention a file. Drop or paste images and \
+                 files to attach them.",
             )
             .build();
         empty.add_css_class("compact");
@@ -1981,6 +2064,17 @@ impl Inner {
             "The selection and the cursor line are sent with your prompt",
         ));
         chip.set_visible(false);
+        let attach_box = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .activate_on_single_click(false)
+            .column_spacing(4)
+            .row_spacing(4)
+            .min_children_per_line(1)
+            .max_children_per_line(MAX_ATTACHMENTS as u32)
+            .homogeneous(false)
+            .visible(false)
+            .build();
+        attach_box.add_css_class("lemma-agent-attachments");
         let prompt = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .accepts_tab(false)
@@ -2033,16 +2127,26 @@ impl Inner {
             .build();
         quick_button.add_css_class("flat");
         quick_button.add_css_class("caption");
+        let attach_button = gtk::Button::builder()
+            .icon_name("mail-attachment-symbolic")
+            .tooltip_text("Attach Images or Files (or drop or paste them here)")
+            .build();
+        attach_button.add_css_class("flat");
+        attach_button
+            .update_property(&[gtk::accessible::Property::Label("Attach images or files")]);
         let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bottom.append(&attach_button);
         bottom.append(&quick_button);
         let prompt_area = gtk::Box::new(gtk::Orientation::Vertical, 4);
         prompt_area.add_css_class("lemma-agent-prompt-area");
         prompt_area.append(&suggest_revealer);
         prompt_area.append(&chip);
+        prompt_area.append(&attach_box);
         prompt_area.append(&prompt_row);
         prompt_area.append(&bottom);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.add_css_class("lemma-agent-content");
         content.append(&header);
         content.append(&setup.revealer);
         content.append(&hint);
@@ -2076,9 +2180,11 @@ impl Inner {
             suggest_list,
             chip,
             chip_label,
+            attach_box,
             prompt,
             placeholder,
             send_button,
+            attach_button,
             quick_menu,
             agent_name: RefCell::new(String::new()),
             modes: RefCell::new(Vec::new()),
@@ -2102,6 +2208,9 @@ impl Inner {
             stick: Cell::new(true),
             scrolling: Cell::new(false),
             pending_prompt: RefCell::new(None),
+            attachments: RefCell::new(Vec::new()),
+            pending_attachments: RefCell::new(Vec::new()),
+            attaching: Cell::new(0),
             auto_focus: RefCell::new(None),
             permission_toast: RefCell::new(None),
             suggestions: RefCell::new(Vec::new()),
@@ -2318,6 +2427,47 @@ impl Inner {
         self.send_button.connect_clicked(move |_| {
             if let Some(inner) = weak.upgrade() {
                 inner.send_from_box();
+            }
+        });
+        // Attachments: the paperclip, drops anywhere on the pane, pasted images and files.
+        let weak = Rc::downgrade(self);
+        self.attach_button.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.choose_files();
+            }
+        });
+        let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        // Image data first: a browser's image also offers its (remote) URL as a file list.
+        target.set_types(&[gdk::Texture::static_type(), gdk::FileList::static_type()]);
+        // Before the prompt box's own drop target, which would insert the URIs as text.
+        target.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        target.connect_drop(move |_, value, _, _| {
+            let Some(inner) = weak.upgrade() else {
+                return false;
+            };
+            if let Ok(list) = value.get::<gdk::FileList>() {
+                inner.attach_files(list.files());
+                true
+            } else if let Ok(texture) = value.get::<gdk::Texture>() {
+                inner.attach_texture(texture, "Dropped image");
+                true
+            } else {
+                false
+            }
+        });
+        self.content.add_controller(target);
+        let weak = Rc::downgrade(self);
+        self.prompt.connect_paste_clipboard(move |view| {
+            let formats = view.clipboard().formats();
+            let image = crate::paste::clipboard_has_image(&formats);
+            let files = clipboard_has_files(&formats);
+            if !image && !files {
+                return;
+            }
+            view.stop_signal_emission_by_name("paste-clipboard");
+            if let Some(inner) = weak.upgrade() {
+                inner.paste_attachments(image);
             }
         });
         let weak = Rc::downgrade(self);
@@ -2657,8 +2807,7 @@ impl Inner {
         let busy = self.controller().is_some_and(|c| is_busy(&c));
         // Stop also cancels a prompt that waits for the agent to start.
         self.stop_button.set_visible(busy);
-        self.send_button
-            .set_sensitive(!busy && !self.prompt_text().trim().is_empty());
+        self.refresh_send();
         // A choice needs a session to go to.
         self.pickers.set_sensitive(matches!(
             state,
@@ -3008,6 +3157,7 @@ impl Inner {
 
     fn on_prompt(self: &Rc<Self>, prompt: &SentPrompt) {
         self.pending_prompt.replace(None);
+        self.pending_attachments.replace(Vec::new());
         self.backend_ui.turn_cost.set(0);
         self.turn.set(prompt.turn);
         self.known_hunks.replace(self.hunk_shapes());
@@ -3019,7 +3169,7 @@ impl Inner {
             .iter()
             .filter_map(|b| match b {
                 PromptBlock::Text(t) => Some(t.as_str()),
-                PromptBlock::Resource { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -3027,19 +3177,50 @@ impl Inner {
             .blocks
             .iter()
             .filter_map(|b| match b {
-                PromptBlock::Resource { uri, .. } => Some(self.resource_name(uri)),
+                PromptBlock::Resource { uri, .. } | PromptBlock::Document { uri, .. } => {
+                    Some(self.resource_name(uri))
+                }
+                PromptBlock::Image { uri, .. } if uri.is_empty() => Some("Pasted image".into()),
+                PromptBlock::Image { uri, .. } => Some(self.resource_name(uri)),
                 PromptBlock::Text(_) => None,
+            })
+            .collect();
+        let images: Vec<Vec<u8>> = prompt
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PromptBlock::Image { data, .. } => Some(data.clone()),
+                _ => None,
             })
             .collect();
         let heading = self.origin_heading(&prompt.origin);
         self.stick.set(true);
-        self.push(Entry::User {
+        let item = self.push(Entry::User {
             turn: prompt.turn,
             origin: prompt.origin.clone(),
             heading,
             text,
             attachments,
+            images: Vec::new(),
         });
+        if !images.is_empty() {
+            // Previews are made on a worker and shown when ready.
+            let item = item.downgrade();
+            glib::spawn_future_local(async move {
+                let mut previews = Vec::with_capacity(images.len());
+                for data in images {
+                    previews.extend(attach::thumbnail(data).await);
+                }
+                if let Some(item) = item.upgrade() {
+                    item.with_entry(|e| {
+                        if let Entry::User { images, .. } = e {
+                            *images = previews;
+                        }
+                    });
+                    item.notify_changed();
+                }
+            });
+        }
         self.refresh_header();
     }
 
@@ -4145,10 +4326,20 @@ impl Inner {
     fn prompt_changed(self: &Rc<Self>) {
         let text = self.prompt_text();
         self.placeholder.set_visible(text.is_empty());
-        let busy = self.controller().is_some_and(|c| is_busy(&c));
-        self.send_button
-            .set_sensitive(!busy && !text.trim().is_empty());
+        self.refresh_send();
         self.update_suggestions();
+    }
+
+    /// Something to send (text or attachments), every attachment read, and the agent free.
+    fn can_send(&self) -> bool {
+        let busy = self.controller().is_some_and(|c| is_busy(&c));
+        !busy
+            && self.attaching.get() == 0
+            && (!self.prompt_text().trim().is_empty() || !self.attachments.borrow().is_empty())
+    }
+
+    fn refresh_send(&self) {
+        self.send_button.set_sensitive(self.can_send());
     }
 
     fn prompt_key(
@@ -4201,7 +4392,7 @@ impl Inner {
     fn send_from_box(self: &Rc<Self>) {
         let text = self.prompt_text();
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && self.attachments.borrow().is_empty() {
             return;
         }
         let Some(state) = self.state.upgrade() else {
@@ -4214,14 +4405,24 @@ impl Inner {
             ));
             return;
         }
+        if self.attaching.get() > 0 {
+            state.toast("The attachments are still being read; send again in a moment");
+            return;
+        }
         let text = trimmed.to_owned();
         self.prompt.buffer().set_text("");
         self.hide_suggestions();
         self.pending_prompt.replace(Some(text.clone()));
+        let attachments = self.attachments.take();
+        self.pending_attachments.replace(attachments.clone());
+        self.refresh_attachments();
         let mentions = mentions(&text);
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let mut blocks = vec![PromptBlock::Text(text)];
+            let mut blocks = Vec::new();
+            if !text.is_empty() {
+                blocks.push(PromptBlock::Text(text));
+            }
             let mut skipped = Vec::new();
             for mention in mentions {
                 match attachment(&state, &mention).await {
@@ -4233,6 +4434,7 @@ impl Inner {
             for e in skipped {
                 state.toast(&e);
             }
+            blocks.extend(attachments.into_iter().map(|a| a.block));
             if let Some(inner) = weak.upgrade()
                 && !send_prompt(&state, blocks, PromptOrigin::Panel)
             {
@@ -4242,12 +4444,209 @@ impl Inner {
         });
     }
 
-    /// Puts an unsent prompt back into the empty box after its turn failed to start.
-    fn restore_pending_prompt(&self) {
+    /// Puts an unsent prompt (and its attachments) back into the empty box after its turn
+    /// failed to start.
+    fn restore_pending_prompt(self: &Rc<Self>) {
         if let Some(text) = self.pending_prompt.take()
             && self.prompt_text().is_empty()
         {
             self.prompt.buffer().set_text(&text);
+        }
+        let attachments = self.pending_attachments.take();
+        if !attachments.is_empty() && self.attachments.borrow().is_empty() {
+            self.attachments.replace(attachments);
+            self.refresh_attachments();
+        }
+    }
+
+    // ----- attachments -----
+
+    /// The paperclip: a file chooser for images, PDFs and text files.
+    fn choose_files(self: &Rc<Self>) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        let supported = gtk::FileFilter::new();
+        supported.set_name(Some("Images, PDFs and Text Files"));
+        let images = gtk::FileFilter::new();
+        images.set_name(Some("Images"));
+        for mime in ["image/*", "application/pdf", "text/*"] {
+            supported.add_mime_type(mime);
+        }
+        images.add_mime_type("image/*");
+        let all = gtk::FileFilter::new();
+        all.set_name(Some("All Files"));
+        all.add_pattern("*");
+        filters.append(&supported);
+        filters.append(&images);
+        filters.append(&all);
+        let dialog = gtk::FileDialog::builder()
+            .title("Attach Files")
+            .accept_label("_Attach")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&supported)
+            .initial_folder(&gio::File::for_path(state.workspace.root().path()))
+            .build();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // Dismissed or cancelled: nothing to do.
+            let Ok(model) = dialog.open_multiple_future(Some(&state.window)).await else {
+                return;
+            };
+            let files: Vec<gio::File> = (0..model.n_items())
+                .filter_map(|i| model.item(i).and_downcast::<gio::File>())
+                .collect();
+            if let Some(inner) = weak.upgrade() {
+                inner.attach_files(files);
+                inner.prompt.grab_focus();
+            }
+        });
+    }
+
+    /// Reads `files` and attaches them (each failure is a toast).
+    fn attach_files(self: &Rc<Self>, files: Vec<gio::File>) {
+        if files.is_empty() {
+            return;
+        }
+        self.begin_attaching();
+        // The API backend cannot open files: what is too large to include is refused.
+        let embed_only = self.backend() == AgentBackend::Api;
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let mut results = Vec::with_capacity(files.len());
+            for file in &files {
+                results.push(attach::from_file(file, embed_only).await);
+            }
+            if let Some(inner) = weak.upgrade() {
+                inner.end_attaching(results);
+            }
+        });
+    }
+
+    /// Attaches a pasted or dropped image.
+    fn attach_texture(self: &Rc<Self>, texture: gdk::Texture, name: &str) {
+        self.begin_attaching();
+        let weak = Rc::downgrade(self);
+        let name = name.to_owned();
+        glib::spawn_future_local(async move {
+            let result = attach::from_texture(texture).await.map(|mut a| {
+                a.name = name;
+                a
+            });
+            if let Some(inner) = weak.upgrade() {
+                inner.end_attaching(vec![result]);
+            }
+        });
+    }
+
+    /// Ctrl+V in the prompt box with an image (`image`) or a file list on the clipboard. A file
+    /// list that is not only local files (a browser's link) is pasted as text.
+    fn paste_attachments(self: &Rc<Self>, image: bool) {
+        let clipboard = self.prompt.clipboard();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            if image {
+                let texture = clipboard.read_texture_future().await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                match texture {
+                    Ok(Some(texture)) => inner.attach_texture(texture, "Pasted image"),
+                    _ => inner.toast("Cannot read the image on the clipboard"),
+                }
+                return;
+            }
+            let files = clipboard
+                .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
+                .await
+                .ok()
+                .and_then(|v| v.get::<gdk::FileList>().ok())
+                .map(|list| list.files())
+                .unwrap_or_default();
+            if !files.is_empty() && files.iter().all(|f| f.path().is_some()) {
+                if let Some(inner) = weak.upgrade() {
+                    inner.attach_files(files);
+                }
+                return;
+            }
+            let text = clipboard.read_text_future().await;
+            if let (Some(inner), Ok(Some(text))) = (weak.upgrade(), text) {
+                let buffer = inner.prompt.buffer();
+                buffer.delete_selection(true, true);
+                buffer.insert_interactive_at_cursor(&text, true);
+                inner.prompt.scroll_mark_onscreen(&buffer.get_insert());
+            }
+        });
+    }
+
+    fn begin_attaching(&self) {
+        self.attaching.set(self.attaching.get() + 1);
+        self.refresh_send();
+    }
+
+    /// Adds what was read (failures, duplicates and attachments over [`MAX_ATTACHMENTS`] are
+    /// toasts).
+    fn end_attaching(self: &Rc<Self>, results: Vec<Result<Attachment, String>>) {
+        self.attaching.set(self.attaching.get().saturating_sub(1));
+        let mut problems = Vec::new();
+        {
+            let mut list = self.attachments.borrow_mut();
+            for result in results {
+                match result {
+                    Ok(a) if list.iter().any(|b| b.same_file(&a)) => {}
+                    Ok(a) if list.len() >= MAX_ATTACHMENTS => problems.push(format!(
+                        "{} was not attached: at most {MAX_ATTACHMENTS} attachments per message",
+                        a.name
+                    )),
+                    Ok(a) => list.push(a),
+                    Err(e) => problems.push(e),
+                }
+            }
+        }
+        for problem in problems {
+            self.toast(&problem);
+        }
+        self.refresh_attachments();
+    }
+
+    fn remove_attachment(self: &Rc<Self>, index: usize) {
+        let removed = {
+            let mut list = self.attachments.borrow_mut();
+            (index < list.len()).then(|| list.remove(index))
+        };
+        if removed.is_some() {
+            self.refresh_attachments();
+            self.prompt.grab_focus();
+        }
+    }
+
+    /// Shows the attachments as chips above the prompt box.
+    fn refresh_attachments(self: &Rc<Self>) {
+        self.attach_box.remove_all();
+        let list = self.attachments.borrow();
+        for (index, attachment) in list.iter().enumerate() {
+            let (chip, remove) = attachment_chip(attachment);
+            let weak = Rc::downgrade(self);
+            remove.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.remove_attachment(index);
+                }
+            });
+            let child = gtk::FlowBoxChild::new();
+            child.set_focusable(false);
+            child.set_child(Some(&chip));
+            self.attach_box.append(&child);
+        }
+        self.attach_box.set_visible(!list.is_empty());
+        drop(list);
+        self.refresh_send();
+    }
+
+    fn toast(&self, text: &str) {
+        if let Some(state) = self.state.upgrade() {
+            state.toast(text);
         }
     }
 
@@ -4695,7 +5094,8 @@ impl Inner {
             page.set_title(&format!("Ask {name}"));
             page.set_description(Some(&format!(
                 "{name}'s changes show up as red/green hunks to accept or reject.\n\
-                 Type / for commands and @ to attach a file."
+                 Type / for commands and @ to mention a file. Drop or paste images and \
+                 files to attach them."
             )));
         }
     }
@@ -5193,6 +5593,49 @@ fn split_line(text: &str) -> (&str, Option<u32>) {
     (text, None)
 }
 
+/// True when `formats` offer a list of files (a file manager's copy).
+pub fn clipboard_has_files(formats: &gdk::ContentFormats) -> bool {
+    formats.contains_type(gdk::FileList::static_type())
+        || formats.contain_mime_type("text/uri-list")
+}
+
+/// An attachment's chip: preview or icon, name (details in the tooltip) and its remove button.
+fn attachment_chip(attachment: &Attachment) -> (gtk::Box, gtk::Button) {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    chip.add_css_class("lemma-agent-attachment");
+    chip.set_tooltip_text(Some(&format!("{}\n{}", attachment.name, attachment.detail)));
+    let icon = match &attachment.thumbnail {
+        Some(texture) => {
+            let image = gtk::Image::from_paintable(Some(texture));
+            image.add_css_class("lemma-agent-attachment-preview");
+            image
+        }
+        None => gtk::Image::from_icon_name(attachment.icon_name()),
+    };
+    icon.set_pixel_size(24);
+    chip.append(&icon);
+    let label = gtk::Label::builder()
+        .label(attachment.name.as_str())
+        .ellipsize(pango::EllipsizeMode::Middle)
+        .max_width_chars(20)
+        .xalign(0.0)
+        .build();
+    chip.append(&label);
+    let remove = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Remove")
+        .valign(gtk::Align::Center)
+        .build();
+    remove.add_css_class("flat");
+    remove.add_css_class("circular");
+    remove.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Remove {}",
+        attachment.name
+    ))]);
+    chip.append(&remove);
+    (chip, remove)
+}
+
 /// The `@path` mentions of a prompt (trailing punctuation dropped, duplicates removed).
 pub fn mentions(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -5422,6 +5865,13 @@ const CSS: &str = "
 .lemma-agent-prompt textview, .lemma-agent-prompt textview text { background: none; }
 .lemma-agent-chip { font-size: 0.85em; padding: 1px 8px; border-radius: 99px; background-color: alpha(@accent_bg_color, 0.15); }
 .lemma-agent-suggest row { padding: 2px 8px; }
+.lemma-agent-attachments > flowboxchild { padding: 0; }
+.lemma-agent-attachment { font-size: 0.85em; padding: 2px 2px 2px 4px; border-radius: 8px;
+                          background-color: alpha(currentColor, 0.07); }
+.lemma-agent-attachment button { min-height: 20px; min-width: 20px; padding: 0; }
+.lemma-agent-attachment-preview { border-radius: 4px; }
+.lemma-agent-user-images picture { border-radius: 6px; }
+.lemma-agent-content:drop(active) .lemma-agent-prompt { border-color: @accent_color; }
 .lemma-agent-ring.warning { color: @warning_color; }
 .lemma-agent-ring.error { color: @error_color; }
 ";

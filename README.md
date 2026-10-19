@@ -14,6 +14,13 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   with word-level highlighting. Accept or reject per hunk (Alt+Y / Alt+N), per file or per
   turn, and switch to a reading mode that hides deletions (Alt+D). Ctrl+K edits just the
   selection or paragraph.
+- **Attach images and files to a prompt.** Click the paperclip under the agent's prompt box, drop
+  files or images on the agent pane, or paste (Ctrl+V) a screenshot or files copied in a file
+  manager. Images (PNG, JPEG, GIF, WebP, and anything else GTK can read; files up to 64 MB) go
+  to the model as images, scaled down when they are too large; PDFs and text files are attached
+  too. Claude Code and Pi take PDFs and text files of any size: large ones are sent as a link
+  that the agent opens itself. With the API backend everything travels inside the request, so
+  PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place, supports dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways
   (Ctrl+Alt+J forward, Ctrl+click in the PDF for inverse).

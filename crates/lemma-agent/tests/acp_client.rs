@@ -768,6 +768,73 @@ fn prompt_blocks_reach_the_agent_and_select_the_turn() {
 }
 
 #[test]
+fn attached_images_and_documents_reach_the_agent() {
+    let blocks = || {
+        vec![
+            PromptBlock::Text("ECHO the attachments".into()),
+            PromptBlock::Image {
+                uri: "file:///proj/fig.png".into(),
+                mime: "image/png".into(),
+                data: b"PNG".to_vec(),
+            },
+            PromptBlock::Image {
+                uri: String::new(),
+                mime: "image/png".into(),
+                data: b"PNG".to_vec(),
+            },
+            PromptBlock::Document {
+                uri: "file:///proj/paper.pdf".into(),
+                mime: "application/pdf".into(),
+                data: b"%PDF".to_vec(),
+            },
+        ]
+    };
+    let run = |no_images: bool| {
+        let sb = Sandbox::new(if no_images { "noimg" } else { "img" });
+        let scenario = sb.scenario(&json!({
+            "_options": {"no_images": no_images},
+            "default": [{"echo_prompt": true}]
+        }));
+        let handle = lemma_agent::spawn(sb.config(&scenario)).unwrap();
+        expect_ready(&handle);
+        send(&handle, AgentCmd::Prompt(blocks()));
+        let events = events_until(&handle, SLOW, is_turn_end);
+        shutdown(&handle);
+        let echoed: serde_json::Value = serde_json::from_str(&message_text(&events)).unwrap();
+        (echoed, events)
+    };
+    // The fake agent, like Claude's adapter, takes images.
+    let (echoed, events) = run(false);
+    assert_eq!(
+        echoed,
+        json!({"prompt": [
+            {"type": "text", "text": "ECHO the attachments"},
+            {"type": "image", "data": "UE5H", "mimeType": "image/png", "uri": "file:///proj/fig.png"},
+            {"type": "image", "data": "UE5H", "mimeType": "image/png"},
+            {"type": "resource_link", "name": "paper.pdf", "uri": "file:///proj/paper.pdf",
+             "mimeType": "application/pdf", "size": 4}
+        ]})
+    );
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Notice(_))));
+    // An agent without the image capability gets links to the files and the user a notice.
+    let (echoed, events) = run(true);
+    let prompt = echoed["prompt"].as_array().unwrap();
+    assert_eq!(
+        prompt[1],
+        json!({"type": "resource_link", "name": "fig.png", "uri": "file:///proj/fig.png",
+               "mimeType": "image/png", "size": 3})
+    );
+    assert_eq!(prompt[2]["type"], "text");
+    assert_eq!(prompt[3]["type"], "resource_link");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("does not accept images"))),
+        "{events:#?}"
+    );
+}
+
+#[test]
 fn unknown_updates_are_ignored() {
     let sb = Sandbox::new("unknown");
     let scenario = sb.scenario(&json!({"default": [

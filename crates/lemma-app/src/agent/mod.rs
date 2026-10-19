@@ -18,6 +18,7 @@
 //! | `install` | WP2.5 | finding node/claude, installing the ACP adapter |
 //! | `inline` | WP2.5 | Ctrl+K inline edit |
 //! | `quick` | WP2.5 | quick actions (prompt templates) and "Ask agent to fix" |
+//! | `attach` | — | images and files attached to a prompt (button, drop, paste) |
 //!
 //! The shell calls, once per window and in this order, after the M1 install hooks:
 //! [`review_persist::install`](crate::review_persist::install), [`AgentController::new`] (stored
@@ -28,6 +29,7 @@
 //!
 //! [`WindowState::agent_controller`]: crate::window::WindowState::agent_controller
 
+pub mod attach;
 pub mod bridge;
 pub mod history;
 pub mod inline;
