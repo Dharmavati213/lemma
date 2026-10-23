@@ -94,6 +94,12 @@ impl Paths {
         self.state_dir.join("sessions")
     }
 
+    /// `state_dir/sessions/last.json`: the project and file a window last had open, which
+    /// `lemma` without a FILE reopens.
+    pub fn last_session_file(&self) -> PathBuf {
+        self.sessions_dir().join("last.json")
+    }
+
     /// `cache_dir/preview/` (M3: the math preview's preamble formats, one directory per
     /// project root).
     pub fn preview_cache_dir(&self) -> PathBuf {
@@ -164,6 +170,10 @@ mod tests {
         assert_eq!(
             p.sessions_dir(),
             PathBuf::from("/home/u/.local/state/lemma/sessions")
+        );
+        assert_eq!(
+            p.last_session_file(),
+            PathBuf::from("/home/u/.local/state/lemma/sessions/last.json")
         );
         assert_eq!(
             p.preview_cache_dir(),

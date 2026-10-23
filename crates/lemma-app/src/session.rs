@@ -24,6 +24,13 @@
 //! window), the first line of a restored tab that has not been drawn yet. The restored state
 //! is saved once the restore is done.
 //!
+//! **The last session.** `Paths::last_session_file()` (`sessions/last.json`, a [`LastSession`])
+//! names the project root and the selected file of the window that saved last: a save that
+//! changes them writes it (with the session), and closing a window writes it again, so the window
+//! closed last wins. A window without tabs leaves it alone. `lemma` without a FILE reopens it
+//! ([`reopen`]): the app opens that root (pinned, as `lemma DIR` does) and the file, then
+//! restores the root's session as usual.
+//!
 //! **Restoring.** The app calls [`restore`] once, after the FILE argument was handled and
 //! before the scripted steps (not in scripted runs unless `--restore-session`, and not while
 //! `[session] restore` is false). Tabs whose files are gone are skipped; the others open in
@@ -39,13 +46,14 @@
 //! after the first build, or when a hidden PDF pane is shown); another PDF drops them.
 //!
 //! Tests: [`file_for_root`], [`parse`], [`state_file`], [`is_restoring`],
-//! [`pdf_place_pending`], [`flush`]; with temporary XDG directories only.
+//! [`pdf_place_pending`], [`flush`], [`reopen`]; with temporary XDG directories only.
 
 use crate::editor::Editor;
 use crate::pdf::pdf_view;
 use crate::window::WindowState;
 use crate::workspace::normalize;
 use adw::prelude::*;
+use lemma_config::Paths;
 use lemma_core::fnv1a64;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -136,6 +144,76 @@ pub struct PdfPlace {
     pub dark: Option<bool>,
 }
 
+/// What `lemma` without a FILE reopens (see the module docs): the project and file of the
+/// window that saved or closed last.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastSession {
+    pub version: u32,
+    /// The project root (absolute).
+    pub root: String,
+    /// The selected tab's file (absolute).
+    pub file: Option<String>,
+}
+
+/// Where `lemma` without a FILE starts: [`LastSession`] with what is still there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reopen {
+    /// The project root: a directory.
+    pub root: PathBuf,
+    /// The file to open: a file, if it still exists.
+    pub file: Option<PathBuf>,
+}
+
+/// Parses `last.json`.
+pub fn parse_last(bytes: &[u8]) -> Result<LastSession, String> {
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// The project and file that `lemma` without a FILE reopens; `None` when nothing was saved, the
+/// file does not parse, or its root is no longer a directory. It reads the disk: the app calls it
+/// once, before the window is built.
+pub fn reopen(paths: &Paths) -> Option<Reopen> {
+    let file = paths.last_session_file();
+    let bytes = std::fs::read(&file).ok()?;
+    let last = match parse_last(&bytes) {
+        Ok(last) => last,
+        Err(e) => {
+            tracing::warn!("ignoring {} that does not parse: {e}", file.display());
+            return None;
+        }
+    };
+    let root = PathBuf::from(&last.root);
+    if !root.is_absolute() || root.parent().is_none() || !root.is_dir() {
+        tracing::info!("session: the last project {} is gone", last.root);
+        return None;
+    }
+    let file = last
+        .file
+        .map(PathBuf::from)
+        .filter(|f| f.is_absolute() && f.is_file());
+    tracing::info!("session: reopening the last project {}", root.display());
+    Some(Reopen {
+        root: normalize(&root),
+        file: file.map(|f| normalize(&f)),
+    })
+}
+
+/// The [`LastSession`] of a snapshot of the project at `root`: `None` without tabs (or for a
+/// root that is not UTF-8).
+fn last_session_of(snapshot: &SessionFile, root: &Path) -> Option<LastSession> {
+    let tab = snapshot
+        .active
+        .and_then(|i| snapshot.tabs.get(i))
+        .or_else(|| snapshot.tabs.first())?;
+    let file = absolute(root, &tab.path);
+    Some(LastSession {
+        version: VERSION,
+        root: root.to_str()?.to_owned(),
+        file: file.to_str().map(str::to_owned),
+    })
+}
+
 /// The session file of the project at `root`: `sessions_dir/<fnv1a64(root) as 16 hex>.json`.
 pub fn file_for_root(sessions_dir: &Path, root: &Path) -> PathBuf {
     let hash = fnv1a64(&[root.as_os_str().as_encoded_bytes()]);
@@ -189,6 +267,9 @@ pub fn save(state: &Rc<WindowState>) {
     let root = state.workspace.root().path().to_path_buf();
     let file = file_for_root(&paths.sessions_dir(), &root);
     let snapshot = s.capture(state, &root);
+    if let Some(last) = last_session_of(&snapshot, &root) {
+        s.remember_last(paths.last_session_file(), &last);
+    }
     let unchanged = s
         .last
         .borrow()
@@ -261,6 +342,10 @@ struct Session {
     queued: RefCell<Option<Queued>>,
     /// A write failure was reported (once per window).
     reported: Cell<bool>,
+    /// Writes `last.json` (see [`LastSession`]).
+    last_writer: Arc<Writer>,
+    /// This window's [`LastSession`] as last handed to `last_writer`: closing writes it again.
+    last_queued: RefCell<Option<Queued>>,
 }
 
 /// A snapshot handed to a writer.
@@ -300,6 +385,8 @@ fn session_for(state: &Rc<WindowState>) -> Rc<Session> {
         seq: Cell::new(0),
         queued: RefCell::new(None),
         reported: Cell::new(false),
+        last_writer: Arc::new(Writer::default()),
+        last_queued: RefCell::new(None),
     });
     SESSIONS.with(|list| list.borrow_mut().push(s.clone()));
     // The shell saves in its close-request handler (connected before this one), so the write
@@ -473,10 +560,71 @@ impl Session {
         (Some(file), Some(place))
     }
 
-    /// Hands `bytes` to the jobs thread for `file`.
-    fn write(self: &Rc<Self>, file: PathBuf, bytes: Vec<u8>) {
+    /// The next sequence number of a write (for either writer).
+    fn next_seq(&self) -> u64 {
         let seq = self.seq.get() + 1;
         self.seq.set(seq);
+        seq
+    }
+
+    /// Hands `last` to the jobs thread for `file` unless it is what this window wrote last.
+    fn remember_last(&self, file: PathBuf, last: &LastSession) {
+        let bytes = match serde_json::to_vec_pretty(last) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("cannot serialize the last session: {e}");
+                return;
+            }
+        };
+        let same = self
+            .last_queued
+            .borrow()
+            .as_ref()
+            .is_some_and(|q| q.file == file && *q.bytes == bytes);
+        if same {
+            return;
+        }
+        let seq = self.next_seq();
+        let bytes = Arc::new(bytes);
+        self.last_queued.replace(Some(Queued {
+            seq,
+            file: file.clone(),
+            bytes: bytes.clone(),
+        }));
+        let writer = self.last_writer.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || writer.write(&file, &bytes, seq)).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("cannot save the last session: {e}"),
+                Err(_) => tracing::warn!("cannot save the last session: the writer panicked"),
+            }
+        });
+    }
+
+    /// Writes this window's [`LastSession`] again, now: the window closes, so it is the one
+    /// `lemma` reopens (even when another window wrote the file since).
+    fn write_last_now(&self) {
+        let Some(Queued { file, bytes, .. }) = self.last_queued.borrow().clone() else {
+            return;
+        };
+        // Not when sessions were switched off meanwhile.
+        if self
+            .state
+            .upgrade()
+            .is_some_and(|state| !state.session_saves_enabled())
+        {
+            return;
+        }
+        let seq = self.next_seq();
+        if let Err(e) = self.last_writer.rewrite(&file, &bytes, seq) {
+            tracing::warn!("cannot save the last session: {e}");
+        }
+    }
+
+    /// Hands `bytes` to the jobs thread for `file`.
+    fn write(self: &Rc<Self>, file: PathBuf, bytes: Vec<u8>) {
+        let seq = self.next_seq();
         let bytes = Arc::new(bytes);
         self.queued.replace(Some(Queued {
             seq,
@@ -525,6 +673,7 @@ impl Session {
             return;
         }
         self.flush();
+        self.write_last_now();
         self.phase.set(Phase::Closed);
         self.pending_pdf.replace(None);
         if let (Some(handler), Some(state)) = (self.pdf_map_handler.take(), self.state.upgrade())
@@ -980,6 +1129,22 @@ impl Writer {
     /// Writes `bytes` to `file` atomically (a private temporary file renamed over it) unless a
     /// newer snapshot was written already; identical contents are not written again.
     fn write(&self, file: &Path, bytes: &[u8], seq: u64) -> Result<(), String> {
+        self.write_with(file, bytes, seq, true)
+    }
+
+    /// [`Writer::write`], also when it wrote the same contents before (another process may have
+    /// replaced them since).
+    fn rewrite(&self, file: &Path, bytes: &[u8], seq: u64) -> Result<(), String> {
+        self.write_with(file, bytes, seq, false)
+    }
+
+    fn write_with(
+        &self,
+        file: &Path,
+        bytes: &[u8],
+        seq: u64,
+        skip_identical: bool,
+    ) -> Result<(), String> {
         use std::io::Write as _;
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         let mut committed = self
@@ -990,10 +1155,11 @@ impl Writer {
             return Ok(());
         }
         let hash = fnv1a64(&[bytes]);
-        if committed
-            .1
-            .as_ref()
-            .is_some_and(|(f, h)| f == file && *h == hash)
+        if skip_identical
+            && committed
+                .1
+                .as_ref()
+                .is_some_and(|(f, h)| f == file && *h == hash)
         {
             committed.0 = seq;
             return Ok(());
@@ -1006,7 +1172,10 @@ impl Writer {
                 .create(dir)
                 .map_err(shown)?;
         }
-        let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+        // Unique in the process too: the windows of one process all write `last.json`.
+        static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = file.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
         let written = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1120,6 +1289,106 @@ mod tests {
         assert_eq!(dir_mode & 0o777, 0o700);
         writer.write(&file, b"three", 3).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"three");
+        // Another process replaces the file: the same contents are not written again, unless
+        // asked to (closing a window rewrites `last.json`).
+        std::fs::write(&file, b"other").unwrap();
+        writer.write(&file, b"three", 4).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"other");
+        writer.rewrite(&file, b"three", 5).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"three");
+        writer.rewrite(&file, b"stale", 5).unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"three",
+            "older than the last write"
+        );
+        let leftovers = std::fs::read_dir(file.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary files are left");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_session_is_the_selected_tab_of_a_window_with_tabs() {
+        let root = Path::new("/home/u/thesis");
+        let tab = |path: &str| TabState {
+            path: path.into(),
+            ..TabState::default()
+        };
+        let mut snapshot = SessionFile {
+            tabs: vec![tab("main.tex"), tab("ch/a.tex"), tab("/etc/macros.tex")],
+            active: Some(1),
+            ..SessionFile::default()
+        };
+        let last = last_session_of(&snapshot, root).unwrap();
+        assert_eq!(last.root, "/home/u/thesis");
+        assert_eq!(last.file.as_deref(), Some("/home/u/thesis/ch/a.tex"));
+        assert_eq!(last.version, VERSION);
+        snapshot.active = Some(2);
+        let last = last_session_of(&snapshot, root).unwrap();
+        assert_eq!(last.file.as_deref(), Some("/etc/macros.tex"));
+        // No selection (or a stale one): the first tab.
+        snapshot.active = Some(7);
+        let last = last_session_of(&snapshot, root).unwrap();
+        assert_eq!(last.file.as_deref(), Some("/home/u/thesis/main.tex"));
+        // A window without tabs leaves the last session alone.
+        snapshot.tabs.clear();
+        assert_eq!(last_session_of(&snapshot, root), None);
+        let json = serde_json::to_vec(&last).unwrap();
+        assert_eq!(parse_last(&json).unwrap(), last);
+        assert_eq!(parse_last(b"{}").unwrap(), LastSession::default());
+        assert!(parse_last(b"[").is_err());
+    }
+
+    #[test]
+    fn reopen_reads_what_is_still_there() {
+        let base = std::env::temp_dir().join(format!("lemma-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let paths = Paths::from_vars(|name| match name {
+            "HOME" => Some(base.join("home").into()),
+            "XDG_STATE_HOME" => Some(base.join("state").into()),
+            _ => None,
+        })
+        .unwrap();
+        let project = base.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("main.tex"), "x\n").unwrap();
+        let file = paths.last_session_file();
+        assert_eq!(reopen(&paths), None, "nothing saved yet");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let write = |root: &Path, main: &Path| {
+            let last = LastSession {
+                version: VERSION,
+                root: root.to_str().unwrap().into(),
+                file: Some(main.to_str().unwrap().into()),
+            };
+            std::fs::write(&file, serde_json::to_vec(&last).unwrap()).unwrap();
+        };
+        write(&project, &project.join("main.tex"));
+        assert_eq!(
+            reopen(&paths),
+            Some(Reopen {
+                root: project.clone(),
+                file: Some(project.join("main.tex")),
+            })
+        );
+        // A file that is gone: the project still opens.
+        write(&project, &project.join("gone.tex"));
+        assert_eq!(
+            reopen(&paths),
+            Some(Reopen {
+                root: project.clone(),
+                file: None,
+            })
+        );
+        // A project that is gone, a relative one, `/`, or a file that does not parse: nothing.
+        write(&base.join("gone"), &base.join("gone/main.tex"));
+        assert_eq!(reopen(&paths), None);
+        write(Path::new("proj"), Path::new("proj/main.tex"));
+        assert_eq!(reopen(&paths), None);
+        write(Path::new("/"), &project.join("main.tex"));
+        assert_eq!(reopen(&paths), None);
+        std::fs::write(&file, "{oops").unwrap();
+        assert_eq!(reopen(&paths), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

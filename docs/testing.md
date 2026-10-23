@@ -335,7 +335,7 @@ report, snapshot; runs that quit by themselves write no local history or review 
 | `--apply-as-agent JSON` | applies the edits in JSON as agent edits, as the MCP tools would (format in `testmode/review.rs`) |
 | `--build` | builds as F5 does and waits for the result; after TeX errors, the cursor goes to the first error |
 | `--sidebar outline\|changes\|problems\|search` | shows that sidebar page at the end |
-| `--restore-session` | restores the project's session in a scripted run too (scripted runs never restore otherwise, and never save one) |
+| `--restore-session` | restores the project's session in a scripted run too, and without a FILE reopens the last session's project and file (scripted runs never restore otherwise, and never save one) |
 
 Scripted runs turn GTK animations off, so a snapshot never catches a transition halfway.
 `testmode::snapshot_png` places a popover so that its visible part touches what it points at,

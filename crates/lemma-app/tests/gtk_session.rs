@@ -18,7 +18,9 @@ use lemma_app::editor::Editor;
 use lemma_app::history_ui;
 use lemma_app::pdf::pdf_view;
 use lemma_app::review_ui::{self, Decision};
-use lemma_app::session::{self, PaneState, PdfState, SessionFile, SidebarState, TabState};
+use lemma_app::session::{
+    self, LastSession, PaneState, PdfState, Reopen, SessionFile, SidebarState, TabState,
+};
 use lemma_app::testmode;
 use lemma_app::window::{PAGE_PROBLEMS, PAGE_SEARCH, WindowState};
 use lemma_app::workspace::{Workspace, normalize};
@@ -49,6 +51,8 @@ fn main() -> ExitCode {
         ("session_agent_pane_only_when_safe", agent_pane),
         ("session_bad_files_are_ignored_or_reported", bad_files),
         ("scripted_runs_restore_only_when_asked", scripted_runs),
+        ("session_remembers_the_last_project", last_project),
+        ("lemma_without_a_file_reopens_the_last_session", reopen_runs),
         ("timeline_lists_previews_and_restores", timeline_restore),
         ("timeline_reaches_deleted_files", timeline_deleted),
         ("timeline_empty_state_and_menu", timeline_empty),
@@ -678,6 +682,144 @@ fn scripted_runs() {
         before,
         "scripted runs never write the session"
     );
+}
+
+/// `last.json`: the project and selected file of the window that saved or closed last; windows
+/// without tabs, or with sessions off, leave it alone.
+fn last_project() {
+    let base = common::temp_dir("last");
+    write(
+        &base,
+        &[
+            ("a/main.tex", "a\n"),
+            ("a/ch.tex", "c\n"),
+            ("b/main.tex", "b\n"),
+        ],
+    );
+    let a = base.join("a").canonicalize().unwrap();
+    let b = base.join("b").canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let file = paths.last_session_file();
+    let reopened = || session::reopen(&paths);
+    let last = |root: &Path, f: &str| {
+        Some(Reopen {
+            root: root.to_path_buf(),
+            file: Some(root.join(f)),
+        })
+    };
+    // No tabs: nothing to reopen.
+    let wa = window(&a, &paths, |_| {});
+    block_on(session::restore(&wa)).unwrap();
+    common::pump_for(Duration::from_millis(200));
+    assert!(!file.exists());
+    let main_a = open(&wa, &a, "main.tex");
+    let _ch = open(&wa, &a, "ch.tex");
+    common::pump_until(TIMEOUT, || reopened() == last(&a, "ch.tex"));
+    let saved: LastSession = session::parse_last(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(saved.root, a.to_string_lossy());
+    // Another window saves later: its project is the last one.
+    let wb = window(&b, &paths, |_| {});
+    block_on(session::restore(&wb)).unwrap();
+    let main_b = open(&wb, &b, "main.tex");
+    common::pump_until(TIMEOUT, || reopened() == last(&b, "main.tex"));
+    // Selecting another tab of the first window changes it.
+    wa.select_editor(&main_a);
+    common::pump_until(TIMEOUT, || reopened() == last(&a, "main.tex"));
+    // A cursor move does not (the project and file are the same): the second window's save
+    // after a move leaves the first window's choice.
+    place(&main_b, 0, 1);
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(reopened(), last(&a, "main.tex"));
+    // The window closed last wins, even when it changed nothing since its last save.
+    drop(main_b);
+    close(wb);
+    assert_eq!(reopened(), last(&b, "main.tex"));
+    drop(main_a);
+    close(wa);
+    assert_eq!(reopened(), last(&a, "main.tex"));
+    // With sessions off, a window does not touch it.
+    let wb = window(&b, &paths, |c| c.session.restore = false);
+    block_on(session::restore(&wb)).unwrap();
+    let _main_b = open(&wb, &b, "main.tex");
+    wb.save_session_now();
+    common::pump_for(Duration::from_millis(200));
+    close(wb);
+    assert_eq!(reopened(), last(&a, "main.tex"));
+}
+
+/// The binary: without a FILE, an interactive run (here a scripted one with `--restore-session`)
+/// opens the last session's project and file instead of the current directory.
+fn reopen_runs() {
+    let base = common::temp_dir("reopen");
+    let dir = base.join("proj");
+    write(&dir, &[("main.tex", "main\n"), ("b.tex", "b\n")]);
+    let dir = dir.canonicalize().unwrap();
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let xdg = base.join("xdg");
+    let paths = paths_in(&xdg);
+    let session = SessionFile {
+        version: session::VERSION,
+        root: dir.to_string_lossy().into_owned(),
+        tabs: ["main.tex", "b.tex"]
+            .iter()
+            .map(|p| TabState {
+                path: (*p).into(),
+                ..TabState::default()
+            })
+            .collect(),
+        active: Some(1),
+        ..SessionFile::default()
+    };
+    write_session(&paths, &dir, &session);
+    let last = LastSession {
+        version: session::VERSION,
+        root: dir.to_string_lossy().into_owned(),
+        file: Some(dir.join("b.tex").to_string_lossy().into_owned()),
+    };
+    std::fs::write(
+        paths.last_session_file(),
+        serde_json::to_vec(&last).unwrap(),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_lemma"))
+            .current_dir(&elsewhere)
+            .args(["--quit-after-ms", "1500"])
+            .args(args)
+            .env("LEMMA_CONFIG", "/dev/null")
+            .env("LEMMA_LOG", "lemma_app::session=info")
+            .env("HOME", xdg.join("home"))
+            .env("XDG_CONFIG_HOME", xdg.join("config"))
+            .env("XDG_STATE_HOME", xdg.join("state"))
+            .env("XDG_DATA_HOME", xdg.join("data"))
+            .env("XDG_CACHE_HOME", xdg.join("cache"))
+            .output()
+            .expect("run lemma");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "lemma failed: {stderr}");
+        stderr
+    };
+    let reopened = run(&["--restore-session"]);
+    assert!(
+        reopened.contains(&format!("reopening the last project {}", dir.display())),
+        "{reopened}"
+    );
+    assert!(
+        reopened.contains("session: restored 2 of 2 tabs"),
+        "{reopened}"
+    );
+    // Scripted runs do not reopen it unless asked; a FILE (or `lemma .`) wins.
+    let plain = run(&[]);
+    assert!(!plain.contains("reopening"), "{plain}");
+    let here = run(&[".", "--restore-session"]);
+    assert!(!here.contains("reopening"), "{here}");
+    assert!(!here.contains("session: restored"), "{here}");
+    // A project that is gone: the current directory, as before.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let gone = run(&["--restore-session"]);
+    assert!(!gone.contains("reopening"), "{gone}");
+    assert!(gone.contains("the last project"), "{gone}");
 }
 
 // ----- the history timeline -----

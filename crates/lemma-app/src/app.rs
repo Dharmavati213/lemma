@@ -1,6 +1,7 @@
 //! The `adw::Application`: settings (and their live reload), application actions and
-//! accelerators, windows, and the start-up sequence (open the FILE argument, restore the
-//! session, then the scripted steps of [`crate::testmode`]).
+//! accelerators, windows, and the start-up sequence (open the FILE argument, or without one the
+//! project and file of the last session, restore the session, then the scripted steps of
+//! [`crate::testmode`]).
 //!
 //! It also holds the registry of what the actions are called ([`ACTIONS`], [`action_info`],
 //! [`describe_action`]) and of the keys that are not accelerators ([`KEY_LAYER_SHORTCUTS`]):
@@ -506,11 +507,29 @@ fn startup(app: &adw::Application, shared: &Rc<Shared>) {
 }
 
 fn activate(app: &adw::Application, shared: &Rc<Shared>) {
+    open_window(app, shared, true);
+}
+
+/// Opens the window (or presents it when it is open already). Without a FILE argument, the
+/// window reopens the last session ([`last_session`]) when `reopen_last` is set; else it starts
+/// in the current directory.
+fn open_window(app: &adw::Application, shared: &Rc<Shared>, reopen_last: bool) {
     if let Some(state) = shared.windows.borrow().first() {
         state.window.present();
         return;
     }
-    let root = match project_root(shared.options.file.as_deref()) {
+    let reopen = if reopen_last {
+        last_session(shared)
+    } else {
+        None
+    };
+    // The last session's root is chosen as `lemma DIR` would choose it.
+    let wanted = shared
+        .options
+        .file
+        .clone()
+        .or_else(|| reopen.as_ref().map(|r| r.root.clone()));
+    let root = match project_root(wanted.as_deref()) {
         Ok(root) => root,
         Err(e) => {
             tracing::error!("no usable project directory: {e}");
@@ -542,8 +561,9 @@ fn activate(app: &adw::Application, shared: &Rc<Shared>) {
         agent.set_scenario(Some(normalize(scenario)));
     }
     state.set_settings_files(shared.files.clone());
-    if shared.options.file.as_deref().is_some_and(is_directory) {
-        // `lemma DIR`: the user chose the project; opening a document does not move it.
+    if wanted.as_deref().is_some_and(is_directory) {
+        // `lemma DIR` (or the last session's root): the user chose the project; opening a
+        // document does not move it.
         state.pin_root();
     }
     perf::mark("window", shared.started);
@@ -553,7 +573,20 @@ fn activate(app: &adw::Application, shared: &Rc<Shared>) {
     state.window.present();
     perf::mark("presented", shared.started);
     perf::watch_first_frame(&state.window, shared.started);
-    glib::spawn_future_local(start(state, shared.clone()));
+    glib::spawn_future_local(start(state, shared.clone(), reopen.and_then(|r| r.file)));
+}
+
+/// The project and file `lemma` without a FILE reopens (`session::reopen`): only when the run
+/// restores sessions (`[session] restore`, and a scripted run only with `--restore-session`).
+fn last_session(shared: &Shared) -> Option<session::Reopen> {
+    let opts = &shared.options;
+    if opts.file.is_some()
+        || (opts.is_scripted() && !opts.restore_session)
+        || !shared.settings.borrow().config.session.restore
+    {
+        return None;
+    }
+    session::reopen(shared.paths.as_ref()?)
 }
 
 /// True when the FILE argument names an existing directory (`lemma .`, as with `nvim .`).
@@ -597,8 +630,9 @@ fn no_project_dir() -> PathBuf {
     glib::user_runtime_dir().join(format!("lemma-{}-no-project", std::process::id()))
 }
 
-/// Opens the FILE argument and runs the scripted steps.
-async fn start(state: Rc<WindowState>, shared: Rc<Shared>) {
+/// Opens the FILE argument (or `reopened`, the last session's file) and runs the scripted
+/// steps.
+async fn start(state: Rc<WindowState>, shared: Rc<Shared>, reopened: Option<PathBuf>) {
     let opts = &shared.options;
     let scripted = opts.is_scripted();
     let report = |message: &str| {
@@ -616,7 +650,11 @@ async fn start(state: Rc<WindowState>, shared: Rc<Shared>) {
         report(&e);
     }
     // A directory (`lemma .`) is the project root (see `project_root`): nothing to open.
-    if let Some(file) = opts.file.as_deref().filter(|f| !is_directory(f))
+    let file = match opts.file.as_deref() {
+        Some(file) => Some(file).filter(|f| !is_directory(f)),
+        None => reopened.as_deref(),
+    };
+    if let Some(file) = file
         && let Err(e) = state.open_file(file).await
     {
         report(&e);
@@ -680,7 +718,8 @@ fn install_actions(app: &adw::Application, shared: &Rc<Shared>) {
 #[cfg(target_os = "macos")]
 fn open_handed_files(app: &adw::Application, shared: &Rc<Shared>, files: &[gio::File]) {
     if shared.windows.borrow().is_empty() {
-        activate(app, shared);
+        // The documents handed over are what the user opens, not the last session.
+        open_window(app, shared, false);
     }
     let Some(state) = active_window(app, shared) else {
         return;

@@ -681,7 +681,8 @@ impl Default for GitCfg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionCfg {
-    /// Save the session of a project and restore it when a file of that project is opened.
+    /// Save the session of a project and restore it when a file of that project is opened;
+    /// `lemma` without a FILE reopens the project and file that were open last.
     pub restore: bool,
 }
 

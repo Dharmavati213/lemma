@@ -9,6 +9,9 @@ use std::time::Duration;
 pub const USAGE: &str = "\
 Usage: lemma [FILE] [OPTIONS]
 
+FILE is a document or a project directory (`.` for the current one). Without it, Lemma
+reopens the project and file it had open last.
+
 Options:
   --snapshot PNG          render the window to PNG once the first frame is drawn
   --quit-after-ms N       quit N milliseconds after start (after the snapshot, if any)
@@ -20,7 +23,8 @@ Options:
   --build                 build the document (as F5 does) and wait for the result
   --sidebar PAGE          show a sidebar page at the end: outline, changes, problems or
                           search
-  --restore-session       restore the project's session in a scripted run too
+  --restore-session       restore the project's session (without FILE, reopen the last
+                          one) in a scripted run too
   --agent-scenario JSON   run lemma-fake-agent with this scenario instead of Claude
                           (the binary is found next to lemma or through LEMMA_FAKE_AGENT)
   -h, --help              show this help
@@ -138,8 +142,8 @@ pub struct Options {
     /// A `lemma-fake-agent` scenario: the agent is the fake agent playing it (tests, demos).
     /// It does not make the run scripted.
     pub agent_scenario: Option<PathBuf>,
-    /// Restore the project's session although the run is scripted (M3). It does not make the
-    /// run scripted.
+    /// Restore the project's session although the run is scripted (M3), and without a FILE
+    /// reopen the last session's project and file. It does not make the run scripted.
     pub restore_session: bool,
 }
 

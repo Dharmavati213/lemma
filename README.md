@@ -246,8 +246,12 @@ cargo run --release -p lemma-app -- path/to/main.tex
 ```sh
 lemma path/to/main.tex     # open a document; its directory is the project
 lemma path/to/project/     # open a project directory
-lemma                      # empty window; open a file with Ctrl+O
+lemma                      # reopen the file you had open last (with its project's tabs)
+lemma .                    # open the current directory as the project
 ```
+
+The first `lemma` without a file (or after turning `[session] restore` off) shows an empty
+window; open a file with Ctrl+O.
 
 Saving builds the document. F8 toggles the PDF pane, F9 the sidebar and F10 the agent pane.
 Ctrl+? lists every shortcut, and Ctrl+, opens Preferences.
