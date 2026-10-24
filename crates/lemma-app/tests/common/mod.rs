@@ -88,10 +88,14 @@ fn count_logged_problems() {
     });
 }
 
-/// Warnings about the machine rather than about Lemma, printed but not counted: enchant (spell
-/// checking, WP2.9b) warns once per process about every optional provider plugin whose library
-/// is not installed (`Error loading plugin: libvoikko.so.1: …`), through structured logging that
-/// no log handler can intercept.
+/// Warnings about the machine rather than about Lemma, printed but not counted:
+/// - enchant (spell checking, WP2.9b) warns once per process about every optional provider
+///   plugin whose library is not installed (`Error loading plugin: libvoikko.so.1: …`), through
+///   structured logging that no log handler can intercept;
+/// - GTK 4.24's Broadway backend warns about its own frame clock now and then (`Duplicate call
+///   to gdk_frame_timings_submitted() with different values`, `… called on submitted frame`),
+///   about once a second while frames are drawn. The function is internal to GDK, so nothing
+///   Lemma does can cause it.
 pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
     let field = |key: &str| {
         fields
@@ -99,8 +103,12 @@ pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
             .find(|f| f.key() == key)
             .and_then(glib::LogField::value_str)
     };
-    field("GLIB_DOMAIN") == Some("libenchant")
-        && field("MESSAGE").is_some_and(|m| m.contains("Error loading plugin"))
+    let message = field("MESSAGE");
+    match field("GLIB_DOMAIN") {
+        Some("libenchant") => message.is_some_and(|m| m.contains("Error loading plugin")),
+        Some("Gdk") => message.is_some_and(|m| m.contains("gdk_frame_timings_submitted()")),
+        _ => false,
+    }
 }
 
 /// How many warnings and criticals GLib has logged in this process so far.
