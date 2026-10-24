@@ -1088,6 +1088,21 @@ they conflict with the sections above, this section wins.
   its modification time to the nanosecond; none when that time is a whole second, as on FAT or
   HFS+), and `PdfController::open_if_changed` skips the open when the latest open asked for the
   same file with the same stamp. The main thread reads no file for it.
+- **Builds (§6, 2026-10-25):**
+  - Clean Build Files and Rebuild (`win.clean-build`, no default key) stops the running build
+    and builds as F5 does, with
+    `latexmk [-pdf|-lualatex|-xelatex] [-bibtex-cond1] -c -outdir=<outdir> ./<root>.tex`
+    (`clean_command_line`: `-c` keeps the PDF and the SyncTeX file; `-bibtex-cond1` deletes
+    the `.bbl` when its `.bib` files exist, and is left out when `outdir` is the root's
+    directory, where a `.bbl` may be a source) run first on that build's thread, so no other
+    latexmk runs beside it. The clean-up goes with that build: when it fails, that is the
+    build's outcome; when the build cannot start, or is stopped before it starts, there is no
+    clean-up; a Stop while it runs stops it, and there is no build.
+  - Each build's toast replaces the previous build's (a success or Stop withdraws it).
+  - A latexmk that does not start with `NotFound` is explained (`build_ui::LATEXMK_MISSING`:
+    what to install, `[build] latexmk`): F5 every time, the other triggers once per window
+    until a latexmk starts; the status bar says "Not built: latexmk not found".
+  - Auto-save saves its documents together and then requests one `Save` build.
 
 ## 12. macOS (2026-10-19)
 
@@ -1157,7 +1172,10 @@ their behaviour; the Windows paths are `cfg`-gated. The differences:
   before it looks at the disk, so `ProjectRoot::resolve` accepts `new/../x.tex` there (it is
   `x.tex`, still inside the root). latexmk gets `./<root>.tex` with `/` (TeX would read
   `\main` in `.\main.tex` as a command); drops insert `/`-separated paths; `TEXINPUTS` uses `;`.
-  SyncTeX's `<cwd>/./<rel>` names may use either slash.
+  SyncTeX's `<cwd>/./<rel>` names may use either slash. The log parser (on every platform; Linux
+  and macOS logs have no such paths) takes `file:line:` error headers whose path starts with a
+  drive (`C:/…`, `C:\…`), as TeX names the distribution's files when it reports an error in
+  one (an unknown package option).
 - **Per-user directories** (`lemma-config/src/paths.rs`): `%APPDATA%\lemma` for the settings,
   `%LOCALAPPDATA%\lemma\{state,data,cache}` for the rest; an absolute `XDG_*` still wins (the
   tests rely on it). The default editor font is Consolas (Pango's `Monospace` alias is Courier

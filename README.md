@@ -25,7 +25,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
   dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways (Ctrl+Alt+J forward,
-  Ctrl+click in the PDF for inverse).
+  Ctrl+click in the PDF for inverse). When a damaged `.aux` or `.bbl` keeps a build failing,
+  **Clean Build Files and Rebuild** in the command palette runs `latexmk -c` (the PDF stays) and
+  builds again.
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
   explanations and quick fixes for common errors, plus optional `chktex` lint.
 - **Writing help.** Completion for commands, environments, labels, citations and Unicode math

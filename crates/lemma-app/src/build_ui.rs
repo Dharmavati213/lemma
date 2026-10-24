@@ -11,6 +11,13 @@
 //! replace the previous ones. A build that left the PDF as it was (latexmk found nothing to do)
 //! reloads nothing: the build thread stamps the PDF ([`lemma_build::PdfStamp`]), and the preview
 //! compares the stamp with the one of the PDF it opened last.
+//!
+//! A failed build is toasted; each build's result replaces the toast of the one before, so a
+//! series of failing builds (repeated saves, auto-save, the agent's `compile` calls) never queues
+//! up stale toasts, and a build that succeeds or is stopped withdraws the old one. A latexmk that
+//! is not installed is explained once for the automatic builds (F5 always says it); after that
+//! the status bar says so. Clean Build Files and Rebuild (`win.clean-build`) stops the running
+//! build and runs `latexmk -c` on the next build's thread before latexmk builds.
 
 use crate::diagnostics_panel::{self, DiagnosticsPanel, EditJournal, Problem};
 use crate::saver::SaveError;
@@ -45,7 +52,13 @@ pub enum Reason {
 }
 
 /// Default accelerators of the actions this module adds (`[keys]` in config.toml wins).
+/// `win.clean-build` has none: it is rare, and the command palette has it.
 const ACCELS: &[(&str, &[&str])] = &[("win.stop-build", &["<Shift>F5"])];
+
+/// What a build says when latexmk does not start because it is not installed (or not on PATH).
+/// MiKTeX's latexmk also needs a Perl that MiKTeX does not bring; TeX Live's has its own.
+pub const LATEXMK_MISSING: &str = "latexmk was not found: install TeX Live, MacTeX or MiKTeX \
+                                   (with Perl on Windows), or set [build] latexmk in config.toml";
 
 const CSS: &str = ".lemma-build-indicator { padding: 2px 6px; }";
 
@@ -70,6 +83,9 @@ struct Finished {
 /// The build being run.
 struct Running {
     request: BuildRequest,
+    reason: Reason,
+    /// `latexmk -c` runs first (Clean Build Files and Rebuild).
+    clean: bool,
     canceller: Option<Canceller>,
     stop_requested: bool,
     /// The edits made since the build's sources were saved.
@@ -96,6 +112,8 @@ struct Inner {
     waiting_reason: Cell<Reason>,
     /// The edits made since the waiting build's sources were saved.
     waiting_journal: RefCell<Option<EditJournal>>,
+    /// The waiting build starts with `latexmk -c`.
+    waiting_clean: Cell<bool>,
     running: RefCell<Option<Running>>,
     /// The root of the last build, or the user's answer to "which is the main document?".
     remembered_root: RefCell<Option<PathBuf>>,
@@ -104,6 +122,14 @@ struct Inner {
     chosen_roots: RefCell<HashMap<PathBuf, PathBuf>>,
     last: RefCell<Option<BuildOutcome>>,
     finished: RefCell<Vec<Rc<FinishedFn>>>,
+    /// The toast of the last build or failed request, while it is shown or waits to be.
+    toast: RefCell<Option<adw::Toast>>,
+    /// The next request that is queued starts with `latexmk -c` (Clean Build Files and
+    /// Rebuild).
+    clean_next: Cell<bool>,
+    /// The missing latexmk was toasted; automatic builds now only say so in the status bar.
+    /// Cleared by a build whose latexmk started.
+    latexmk_missing_told: Cell<bool>,
     diagnostics: DiagnosticsPanel,
     indicator: Indicator,
 }
@@ -122,43 +148,19 @@ impl BuildController {
     /// Asks for a build of the active document's root. Dirty documents are saved first. One
     /// build runs at a time; a request made meanwhile waits, replacing any waiting one.
     pub fn request(&self, reason: Reason) {
-        let inner = self.inner.clone();
-        if inner.preparing.replace(true) {
-            inner.again.set(Some(reason));
-            return;
-        }
-        // Taken now: a Stop that comes before the future first runs must count too.
-        let mut generation = inner.stop_generation.get();
-        glib::spawn_future_local(async move {
-            let mut reason = reason;
-            loop {
-                let prepared = inner.prepare(reason).await;
-                let stopped = inner.stop_generation.get() != generation;
-                match prepared {
-                    Ok(_) if stopped => {
-                        tracing::info!("build request dropped: Stop was pressed while saving");
-                    }
-                    Ok((request, journal)) => inner.enqueue(request, reason, journal),
-                    Err(Some(message)) => inner.fail(&message),
-                    Err(None) => {}
-                }
-                // Stop clears `again`, so a request found here came after any Stop so far.
-                match inner.again.take() {
-                    Some(next) => {
-                        reason = next;
-                        generation = inner.stop_generation.get();
-                    }
-                    None => break,
-                }
-            }
-            inner.preparing.set(false);
-        });
+        self.inner.request(reason);
     }
 
     /// Stops the running build (killing its whole process group) and drops the waiting one and
     /// any request still saving or finding its root.
     pub fn stop(&self) {
         self.inner.stop();
+    }
+
+    /// The toast of the last build (or of a request that could not start) while it is shown or
+    /// waits to be shown; `None` once it is dismissed or withdrawn.
+    pub fn toast(&self) -> Option<adw::Toast> {
+        self.inner.toast.borrow().clone()
     }
 
     /// True while a build runs.
@@ -201,6 +203,60 @@ impl BuildController {
 }
 
 impl Inner {
+    /// [`BuildController::request`].
+    fn request(self: &Rc<Self>, reason: Reason) {
+        let inner = self.clone();
+        if inner.preparing.replace(true) {
+            inner.again.set(Some(reason));
+            return;
+        }
+        // Taken now: a Stop that comes before the future first runs must count too.
+        let mut generation = inner.stop_generation.get();
+        glib::spawn_future_local(async move {
+            let mut reason = reason;
+            loop {
+                let prepared = inner.prepare(reason).await;
+                let stopped = inner.stop_generation.get() != generation;
+                match prepared {
+                    Ok(_) if stopped => {
+                        tracing::info!("build request dropped: Stop was pressed while saving");
+                    }
+                    Ok((request, journal)) => inner.enqueue(request, reason, journal),
+                    Err(message) => {
+                        // A clean-up asked for with this request is dropped with it.
+                        if !stopped {
+                            inner.clean_next.set(false);
+                        }
+                        if let Some(message) = message {
+                            inner.fail(&message);
+                        }
+                    }
+                }
+                // Stop clears `again`, so a request found here came after any Stop so far.
+                match inner.again.take() {
+                    Some(next) => {
+                        reason = next;
+                        generation = inner.stop_generation.get();
+                    }
+                    None => break,
+                }
+            }
+            inner.preparing.set(false);
+        });
+    }
+
+    /// Clean Build Files and Rebuild: stops the running build (and drops any other), then builds
+    /// as F5 does, with `latexmk -c` first. The clean-up runs on that build's thread once the
+    /// stopped build has ended, for the root, engine and output directory that build uses, so
+    /// no other latexmk ever runs beside it. It goes with that build: when the build cannot
+    /// start, or a Stop comes before it starts, there is no clean-up either; a Stop while it
+    /// runs stops it, and there is no build.
+    fn clean_and_rebuild(self: &Rc<Self>) {
+        self.stop();
+        self.clean_next.set(true);
+        self.request(Reason::Manual);
+    }
+
     /// Saves the dirty documents and works out what to build. `Err(None)` means there is
     /// nothing more to report. The journal records the edits made from the save on, so the
     /// build's line numbers can be mapped to the text when it finishes.
@@ -347,26 +403,39 @@ impl Inner {
     }
 
     fn enqueue(self: &Rc<Self>, request: BuildRequest, reason: Reason, journal: EditJournal) {
+        let clean = self.clean_next.take();
         let start = self.queue.borrow_mut().request(request);
         match start {
-            Some(request) => self.start(request, reason, Some(journal)),
+            Some(request) => self.start(request, reason, Some(journal), clean),
             None => {
                 self.waiting_reason.set(reason);
                 self.waiting_journal.replace(Some(journal));
+                // A newer request replaces the waiting one, but not its clean-up.
+                self.waiting_clean.set(self.waiting_clean.get() || clean);
                 self.show_running();
             }
         }
     }
 
-    /// Runs `request` on a new thread and handles its messages on the main thread.
-    fn start(self: &Rc<Self>, request: BuildRequest, reason: Reason, journal: Option<EditJournal>) {
+    /// Runs `request` on a new thread (after `latexmk -c` when `clean` is set) and handles its
+    /// messages on the main thread.
+    fn start(
+        self: &Rc<Self>,
+        request: BuildRequest,
+        reason: Reason,
+        journal: Option<EditJournal>,
+        clean: bool,
+    ) {
         tracing::info!(
-            "building {} ({:?}, {reason:?})",
+            "building {} ({:?}, {reason:?}{})",
             request.root.display(),
-            request.engine
+            request.engine,
+            if clean { ", cleaned first" } else { "" }
         );
         self.running.replace(Some(Running {
             request: request.clone(),
+            reason,
+            clean,
             canceller: None,
             stop_requested: false,
             journal,
@@ -376,7 +445,7 @@ impl Inner {
         let thread_request = request.clone();
         let spawned = std::thread::Builder::new()
             .name("build".into())
-            .spawn(move || run_build(&thread_request, &tx));
+            .spawn(move || run_build(&thread_request, clean, &tx));
         if let Err(e) = spawned {
             let outcome = BuildOutcome::spawn_failed(&e);
             self.finish(Finished {
@@ -416,8 +485,10 @@ impl Inner {
         self.stop_generation
             .set(self.stop_generation.get().wrapping_add(1));
         self.again.set(None);
+        self.clean_next.set(false);
         self.queue.borrow_mut().clear_waiting();
         self.waiting_journal.take();
+        self.waiting_clean.set(false);
         let running = {
             let mut running = self.running.borrow_mut();
             if let Some(running) = running.as_mut() {
@@ -444,9 +515,9 @@ impl Inner {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let (root, journal) = match running {
-            Some(running) => (running.request.root, running.journal),
-            None => (PathBuf::new(), None),
+        let (root, reason, journal) = match running {
+            Some(running) => (running.request.root, running.reason, running.journal),
+            None => (PathBuf::new(), Reason::Manual, None),
         };
         tracing::info!(
             "build of {} finished: {:?} in {:.1?}",
@@ -468,23 +539,51 @@ impl Inner {
         }
         self.last.replace(Some(outcome.clone()));
         let next = self.queue.borrow_mut().finished();
-        self.show_result(&state, &outcome, &root);
+        self.show_result(&state, &outcome, &root, reason);
         let observers = self.finished.borrow().clone();
         for observer in observers {
             observer(&outcome);
         }
         if let Some(next) = next {
             let journal = self.waiting_journal.take();
-            self.start(next, self.waiting_reason.get(), journal);
+            let clean = self.waiting_clean.take();
+            self.start(next, self.waiting_reason.get(), journal, clean);
         }
     }
 
     /// Reports a request that could not start.
-    fn fail(&self, message: &str) {
+    fn fail(self: &Rc<Self>, message: &str) {
         if let Some(state) = self.state.upgrade() {
-            state.toast(message);
+            let toast = adw::Toast::builder()
+                .title(message)
+                .use_markup(false)
+                .build();
+            self.replace_toast(&state, Some(toast));
             state.status.build.set_text(message);
         }
+    }
+
+    /// Shows `toast` in place of the toast of the build before, which is dismissed whether it
+    /// is on screen or still waits behind other toasts; `None` only withdraws that one.
+    fn replace_toast(self: &Rc<Self>, state: &WindowState, toast: Option<adw::Toast>) {
+        let old = self.toast.replace(toast.clone());
+        // Dismissed outside the borrow: `dismissed` handlers run right away.
+        if let Some(old) = old {
+            old.dismiss();
+        }
+        let Some(toast) = toast else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        toast.connect_dismissed(move |toast| {
+            if let Some(inner) = weak.upgrade() {
+                let mut current = inner.toast.borrow_mut();
+                if current.as_ref() == Some(toast) {
+                    current.take();
+                }
+            }
+        });
+        state.toasts.add_toast(toast);
     }
 
     async fn show_existing_pdf(self: &Rc<Self>) -> Result<PathBuf, String> {
@@ -532,12 +631,17 @@ impl Inner {
             return;
         };
         let name = display_name(&running.request.root);
+        let building = if running.clean {
+            format!("Cleaning and building {name}…")
+        } else {
+            format!("Building {name}…")
+        };
         let text = if running.stop_requested {
             "Stopping build…".to_owned()
         } else if self.queue.borrow().waiting().is_some() {
-            format!("Building {name}… (another build waits)")
+            format!("{building} (another build waits)")
         } else {
-            format!("Building {name}…")
+            building
         };
         state.status.build.set_text(&text);
         let i = &self.indicator;
@@ -558,7 +662,13 @@ impl Inner {
         button.set_action_name(Some("win.stop-build"));
     }
 
-    fn show_result(&self, state: &Rc<WindowState>, outcome: &BuildOutcome, root: &Path) {
+    fn show_result(
+        self: &Rc<Self>,
+        state: &Rc<WindowState>,
+        outcome: &BuildOutcome,
+        root: &Path,
+        reason: Reason,
+    ) {
         if self.running.borrow().is_none() {
             let button = &state.header.build_button;
             button.set_icon_name("media-playback-start-symbolic");
@@ -569,7 +679,10 @@ impl Inner {
         let text = status_text(outcome, errors, warnings);
         state.status.build.set_text(&text);
         let detail = diagnostics_panel::summary(errors, warnings, bad_boxes);
-        let tooltip = if detail.is_empty() || !text.starts_with("Built") {
+        let missing = latexmk_missing(outcome);
+        let tooltip = if missing {
+            LATEXMK_MISSING.to_owned()
+        } else if detail.is_empty() || !text.starts_with("Built") {
             text.clone()
         } else {
             format!("{text}\n{detail}")
@@ -600,6 +713,17 @@ impl Inner {
         i.warning_icon.set_visible(show_warnings);
         i.warnings.set_visible(show_warnings);
 
+        // Without latexmk every save would toast the same advice: F5 shows it each time, the
+        // automatic builds once (until a latexmk starts again). Otherwise the status bar says
+        // it, and a toast still showing it stays.
+        if missing {
+            let told = self.latexmk_missing_told.replace(true);
+            if told && reason != Reason::Manual {
+                return;
+            }
+        } else {
+            self.latexmk_missing_told.set(false);
+        }
         let toast = match &outcome.status {
             BuildStatus::Errors => Some((
                 match errors {
@@ -616,10 +740,11 @@ impl Inner {
                 ),
                 false,
             )),
+            BuildStatus::SpawnFailed(error) if missing => Some((error.clone(), false)),
             BuildStatus::SpawnFailed(error) => Some((format!("Could not build: {error}"), false)),
             BuildStatus::Success | BuildStatus::Cancelled => None,
         };
-        if let Some((title, show_problems)) = toast {
+        let toast = toast.map(|(title, show_problems)| {
             let toast = adw::Toast::builder().title(title).use_markup(false).build();
             if show_problems {
                 toast.set_button_label(Some("_Show"));
@@ -630,9 +755,15 @@ impl Inner {
                     }
                 });
             }
-            state.toasts.add_toast(toast);
-        }
+            toast
+        });
+        self.replace_toast(state, toast);
     }
+}
+
+/// Whether `outcome` is a build whose latexmk is not installed ([`LATEXMK_MISSING`]).
+fn latexmk_missing(outcome: &BuildOutcome) -> bool {
+    matches!(&outcome.status, BuildStatus::SpawnFailed(error) if error == LATEXMK_MISSING)
 }
 
 /// The status-bar text after a build.
@@ -654,6 +785,9 @@ pub fn status_text(outcome: &BuildOutcome, errors: usize, warnings: usize) -> St
         }
         BuildStatus::Cancelled => "Build stopped".to_owned(),
         BuildStatus::TimedOut => "Build timed out".to_owned(),
+        BuildStatus::SpawnFailed(_) if latexmk_missing(outcome) => {
+            "Not built: latexmk not found".to_owned()
+        }
         BuildStatus::SpawnFailed(_) => "Build could not start".to_owned(),
     }
 }
@@ -683,16 +817,33 @@ fn earlier_pdf_text(modified: Option<SystemTime>) -> String {
     }
 }
 
-/// The build thread: starts latexmk, reports its canceller, waits, and maps the diagnostics to
-/// problems (which touches the file system, so it happens here rather than on the main thread).
-fn run_build(request: &BuildRequest, tx: &async_channel::Sender<BuildMsg>) {
-    let outcome = catch_unwind(AssertUnwindSafe(|| match Build::start(request) {
-        Ok(build) => {
-            // The receiver only goes away with the window; the build is still waited for.
-            let _ = tx.send_blocking(BuildMsg::Started(build.canceller()));
-            build.wait()
+/// The build thread: runs `latexmk -c` first when `clean` is set, starts latexmk, reports its
+/// canceller (the clean-up's first), waits, and maps the diagnostics to problems (which touches
+/// the file system, so it happens here rather than on the main thread). A failed clean-up is the
+/// build's outcome: the files it was to remove would make the build fail again. A stopped one
+/// ends the build.
+fn run_build(request: &BuildRequest, clean: bool, tx: &async_channel::Sender<BuildMsg>) {
+    // The receiver only goes away with the window; the build is still waited for.
+    let started = |canceller| {
+        let _ = tx.send_blocking(BuildMsg::Started(canceller));
+    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if clean {
+            match Build::clean(request, started) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    return BuildOutcome::cancelled();
+                }
+                Err(e) => return spawn_failed(&e),
+            }
         }
-        Err(e) => BuildOutcome::spawn_failed(&e),
+        match Build::start(request) {
+            Ok(build) => {
+                started(build.canceller());
+                build.wait()
+            }
+            Err(e) => spawn_failed(&e),
+        }
     }))
     .unwrap_or_else(|_| BuildOutcome::spawn_failed(&io::Error::other("the build thread panicked")));
     let problems = diagnostics_panel::problems_from(
@@ -701,6 +852,17 @@ fn run_build(request: &BuildRequest, tx: &async_channel::Sender<BuildMsg>) {
         &request.outdir,
     );
     let _ = tx.send_blocking(BuildMsg::Finished(Box::new(Finished { outcome, problems })));
+}
+
+/// The outcome of a build whose latexmk did not start. A program that does not exist (latexmk,
+/// or the interpreter of its `#!` line) gets [`LATEXMK_MISSING`] instead of the system's "No
+/// such file or directory", which says neither what is missing nor how to get it.
+fn spawn_failed(error: &io::Error) -> BuildOutcome {
+    if error.kind() == io::ErrorKind::NotFound {
+        BuildOutcome::spawn_failed(&io::Error::new(error.kind(), LATEXMK_MISSING))
+    } else {
+        BuildOutcome::spawn_failed(error)
+    }
 }
 
 /// Root detection input, copied from the main thread.
@@ -965,7 +1127,8 @@ fn build_indicator() -> Indicator {
 }
 
 /// Called once per window after the layout is built: the build indicator, the `win.stop-build`
-/// action, the Problems panel, and loading an earlier build's PDF when a document is shown.
+/// and `win.clean-build` actions, the Problems panel, and loading an earlier build's PDF when a
+/// document is shown.
 pub fn install(state: &Rc<WindowState>) -> BuildController {
     install_css_once("build", CSS);
     install_css_once("problems", diagnostics_panel::CSS);
@@ -982,11 +1145,15 @@ pub fn install(state: &Rc<WindowState>) -> BuildController {
         stop_generation: Cell::new(0),
         waiting_reason: Cell::new(Reason::Manual),
         waiting_journal: RefCell::new(None),
+        waiting_clean: Cell::new(false),
         running: RefCell::new(None),
         remembered_root: RefCell::new(None),
         chosen_roots: RefCell::new(HashMap::new()),
         last: RefCell::new(None),
         finished: RefCell::new(Vec::new()),
+        toast: RefCell::new(None),
+        clean_next: Cell::new(false),
+        latexmk_missing_told: Cell::new(false),
         diagnostics: DiagnosticsPanel::new(state),
         indicator,
     });
@@ -1006,6 +1173,14 @@ pub fn install(state: &Rc<WindowState>) -> BuildController {
         }
     });
     state.window.add_action(&stop);
+    let clean = gio::SimpleAction::new("clean-build", None);
+    let weak = Rc::downgrade(&inner);
+    clean.connect_activate(move |_, _| {
+        if let Some(inner) = weak.upgrade() {
+            inner.clean_and_rebuild();
+        }
+    });
+    state.window.add_action(&clean);
     set_default_accels(state, ACCELS);
 
     // Show the PDF of an earlier build as soon as a document is shown and no PDF is.
@@ -1106,6 +1281,44 @@ mod tests {
         assert_eq!(
             status_text(&outcome(BuildStatus::Cancelled, 800), 0, 0),
             "Build stopped"
+        );
+        assert_eq!(
+            status_text(
+                &outcome(BuildStatus::SpawnFailed("permission denied".into()), 0),
+                0,
+                0
+            ),
+            "Build could not start"
+        );
+    }
+
+    /// A latexmk that does not exist is explained, whichever way it is missing; other failures
+    /// keep the system's message.
+    #[test]
+    fn a_missing_latexmk_is_explained() {
+        let missing = spawn_failed(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot run latexmk: No such file or directory (os error 2)",
+        ));
+        assert_eq!(
+            missing.status,
+            BuildStatus::SpawnFailed(LATEXMK_MISSING.to_owned())
+        );
+        assert!(latexmk_missing(&missing));
+        assert_eq!(status_text(&missing, 0, 0), "Not built: latexmk not found");
+        for kind in ["TeX Live", "MacTeX", "MiKTeX", "Perl", "[build] latexmk"] {
+            assert!(LATEXMK_MISSING.contains(kind), "{kind}");
+        }
+        let denied = spawn_failed(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot run latexmk: Permission denied (os error 13)",
+        ));
+        assert!(!latexmk_missing(&denied));
+        assert_eq!(
+            denied.status,
+            BuildStatus::SpawnFailed(
+                "cannot run latexmk: Permission denied (os error 13)".to_owned()
+            )
         );
     }
 

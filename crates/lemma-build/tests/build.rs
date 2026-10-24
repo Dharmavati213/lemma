@@ -230,6 +230,95 @@ fn include_needs_and_gets_mirror_dirs() {
     );
 }
 
+/// Clean Build Files and Rebuild: `latexmk -c` removes what the build generated and keeps the
+/// PDF, the SyncTeX file and the sources, also when the output directory holds the sources.
+#[test]
+fn clean_removes_generated_files_and_keeps_the_pdf_and_sources() {
+    if !have_latexmk() {
+        return;
+    }
+    let main = "\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\
+                \\section{A}\\label{a}\nSee \\ref{a}.\n\\end{document}\n";
+    for outdir in [".build", "."] {
+        let dir = project(&[("main.tex", main), ("notes.txt", "keep me\n")]);
+        let mut req = request(dir.path().join("main.tex"), Duration::from_secs(120));
+        req.outdir = outdir.into();
+        let outcome = build(&req);
+        assert_eq!(outcome.status, BuildStatus::Success, "{outdir}");
+        let out = dir.path().join(outdir);
+        let generated = ["aux", "toc", "fls", "log", "fdb_latexmk"];
+        for ext in generated {
+            assert!(out.join(format!("main.{ext}")).is_file(), "{outdir}: {ext}");
+        }
+
+        Build::clean(&req, |_| {}).expect("latexmk -c");
+        for ext in generated {
+            assert!(!out.join(format!("main.{ext}")).exists(), "{outdir}: {ext}");
+        }
+        for kept in ["main.pdf", "main.synctex.gz"] {
+            assert!(out.join(kept).is_file(), "{outdir}: {kept}");
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("main.tex")).unwrap(),
+            main
+        );
+        assert!(dir.path().join("notes.txt").is_file());
+
+        // The next build starts from the sources.
+        let outcome = build(&req);
+        assert_eq!(outcome.status, BuildStatus::Success, "{outdir}");
+        assert!(out.join("main.aux").is_file());
+    }
+}
+
+/// A stale `.bbl` (here biblatex's, after a switch to BibTeX) fails every build until it is
+/// deleted, and the clean-up deletes it from `.build`. A `.bbl` that is a source (arXiv: next to
+/// `main.tex`, without the `.bib`) stays, also when the output directory is the root's.
+#[test]
+fn clean_removes_a_stale_bbl_but_not_a_source_one() {
+    if !have_latexmk() {
+        return;
+    }
+    let main = "\\documentclass{article}\n\\begin{document}\nSee \\cite{k}.\n\
+                \\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n";
+    let bib = "@article{k, author = {A. B}, title = {T}, journal = {J}, year = {2020}}\n";
+    let dir = project(&[("main.tex", main), ("refs.bib", bib)]);
+    let req = request(dir.path().join("main.tex"), Duration::from_secs(120));
+    assert_eq!(build(&req).status, BuildStatus::Success);
+    let bbl = dir.path().join(".build/main.bbl");
+    assert!(bbl.is_file());
+    fs::write(
+        &bbl,
+        "\\refsection{0}\n\\datalist[entry]{nty/global//global/global}\n\\endrefsection\n",
+    )
+    .unwrap();
+    assert_eq!(build(&req).status, BuildStatus::Errors);
+    Build::clean(&req, |_| {}).expect("latexmk -c");
+    assert!(!bbl.exists());
+    let outcome = build(&req);
+    assert_eq!(
+        outcome.status,
+        BuildStatus::Success,
+        "{:?}",
+        errors(&outcome)
+    );
+
+    let source_bbl = "\\begin{thebibliography}{1}\n\\bibitem{k} A. B. T. 2020.\n\
+                      \\end{thebibliography}\n";
+    for outdir in [".build", "."] {
+        let dir = project(&[("main.tex", main), ("main.bbl", source_bbl)]);
+        let mut req = request(dir.path().join("main.tex"), Duration::from_secs(120));
+        req.outdir = outdir.into();
+        let kept = || fs::read_to_string(dir.path().join("main.bbl")).ok();
+        Build::clean(&req, |_| {}).expect("latexmk -c before any build");
+        assert_eq!(kept().as_deref(), Some(source_bbl), "{outdir}: never built");
+        let outcome = build(&req);
+        assert_eq!(outcome.status, BuildStatus::Success, "{outdir}");
+        Build::clean(&req, |_| {}).expect("latexmk -c");
+        assert_eq!(kept().as_deref(), Some(source_bbl), "{outdir}: built");
+    }
+}
+
 #[test]
 fn errors_are_parsed_and_the_pdf_is_still_reported() {
     if !have_latexmk() {

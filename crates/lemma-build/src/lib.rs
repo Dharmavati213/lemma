@@ -20,6 +20,6 @@ pub use blg::parse_blg;
 pub use detect::{Engine, RootGuess, RootSource, detect_engine, detect_root};
 pub use process::{Build, BuildOutcome, BuildStatus, Canceller, PdfStamp};
 pub use queue::BuildQueue;
-pub use request::{BuildRequest, command_line};
+pub use request::{BuildRequest, clean_command_line, command_line};
 pub use runaway::{locate_runaway, locate_runaways};
 pub use texlog::{LogReport, parse_log};

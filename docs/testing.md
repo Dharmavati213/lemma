@@ -63,6 +63,14 @@ without its program): `pdflatex` with `mylatexformat` (math preview: `lemma-prev
 with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CEILING_DIRECTORIES`, so no
 user or system git configuration and no enclosing repository is read).
 
+**A fake latexmk:** build behaviour that does not depend on TeX is tested without it, with a
+shell script as `[build] latexmk` (copied into place with `cp`, so no forked child holds it open
+for writing): `gtk_pdf` (the build toasts replace each other, a missing latexmk is explained once,
+Clean Build Files and Rebuild stops the build and runs `-c` with the build's engine flag and
+output directory, and Stop stops the clean-up) and `gtk_qol` (auto-saving several documents
+builds once). `lemma-build`'s `tests/build.rs` runs the real `latexmk -c` (`Build::clean`) with
+`outdir` `.build` and `.`, and with a stale `.bbl` and one that is a source.
+
 **State and settings in tests:** every test window gets `Paths` in a temporary directory (or
 none) and an in-memory `Config`; binary runs get `LEMMA_CONFIG=/dev/null` (or a temporary
 `config.toml`) and temporary `HOME`/`XDG_*` directories. Runs that quit by themselves never

@@ -1,17 +1,19 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
 //! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
 //! reloaded, anchored zoom, dark mode, save → build → diagnostics (and a build with nothing to
-//! do), stopping a build, and SyncTeX in both directions.
+//! do), stopping a build, and SyncTeX in both directions; with a fake latexmk, the build toasts,
+//! a latexmk that is not installed, and Clean Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
-//! need latexmk. Tests whose prerequisites are missing print `SKIP` and pass.
+//! need latexmk, except those with the fake one. Tests whose prerequisites are missing print
+//! `SKIP` and pass.
 
 mod common;
 
 use adw::prelude::*;
 use gtk::{gdk, graphene};
-use lemma_app::build_ui::Reason;
+use lemma_app::build_ui::{LATEXMK_MISSING, Reason};
 use lemma_app::diagnostics_panel::{ERROR_CATEGORY, ERROR_TAG};
 use lemma_app::pdf::pdf_view::{self, PdfView};
 use lemma_app::window::WindowState;
@@ -20,7 +22,7 @@ use lemma_build::{BuildStatus, PdfStamp};
 use lemma_config::Config;
 use lemma_core::{ProjectRoot, Severity};
 use sourceview5::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
@@ -45,6 +47,9 @@ fn main() -> ExitCode {
         ),
         ("save_builds_and_shows_diagnostics", save_build_diagnostics),
         ("stop_cancels_a_running_build", stop_cancels),
+        ("build_toasts_replace_each_other", build_toasts_replace),
+        ("a_missing_latexmk_is_explained_once", missing_latexmk),
+        ("clean_build_files_and_rebuild", clean_and_rebuild),
     ])
 }
 
@@ -763,5 +768,286 @@ fn stop_cancels() {
         Some("win.build")
     );
     assert!(!build.is_running());
+    state.window.destroy();
+}
+
+// ----- with a fake latexmk -----
+
+/// A fake latexmk that appends its arguments to `calls.txt` next to it and "builds"
+/// `main.tex` into `.build`: it fails with one TeX error while a file `fail` lies next to it or
+/// `.build/main.aux` says `broken`, sleeps 30 s first while a file `slow` does, and with `-c`
+/// removes the `.aux`, the log and `slow` (after 300 ms, so the clean-up can be watched, and
+/// 30 s more while a file `slow-clean` lies next to it).
+const FAKE_LATEXMK: &str = r#"#!/bin/sh
+here="$(dirname "$0")"
+echo "$*" >> "$here/calls.txt"
+case " $* " in
+  *" -c "*)
+    sleep 0.3
+    [ -f "$here/slow-clean" ] && sleep 30
+    rm -f .build/main.aux .build/main.log "$here/slow"
+    exit 0 ;;
+esac
+[ -f "$here/slow" ] && sleep 30
+mkdir -p .build
+if [ -f "$here/fail" ] || grep -q broken .build/main.aux 2>/dev/null; then
+  printf '(./main.tex\n./main.tex:3: Undefined control sequence.\nl.3 \\foo\n\n)\n' > .build/main.log
+  exit 12
+fi
+printf '\\relax\n' > .build/main.aux
+printf '(./main.tex)\n' > .build/main.log
+exit 0
+"#;
+
+const SIMPLE_DOC: &str = "\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n";
+
+/// A project with `main.tex` and, in a directory of its own, the fake latexmk; returns the
+/// project and the fake.
+fn fake_latexmk_project(name: &str) -> (PathBuf, PathBuf) {
+    let dir = common::temp_dir(name).canonicalize().unwrap();
+    std::fs::write(dir.join("main.tex"), SIMPLE_DOC).unwrap();
+    let bin = common::temp_dir(&format!("{name}-bin"));
+    // Copied into place by `cp`: had this process written it, a child forked meanwhile by a
+    // build thread could still hold it open for writing when it runs ("Text file busy").
+    let source = bin.join("latexmk.src");
+    std::fs::write(&source, FAKE_LATEXMK).unwrap();
+    let latexmk = bin.join("latexmk");
+    let copied = Command::new("cp").arg(&source).arg(&latexmk).status();
+    assert!(copied.is_ok_and(|s| s.success()));
+    let chmod = Command::new("chmod").arg("755").arg(&latexmk).status();
+    assert!(chmod.is_ok_and(|s| s.success()));
+    (dir, latexmk)
+}
+
+/// The fake latexmk's calls so far, one argument line each.
+fn fake_calls(latexmk: &Path) -> Vec<String> {
+    std::fs::read_to_string(latexmk.with_file_name("calls.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Collects every finished build's outcome.
+fn record_outcomes(state: &WindowState) -> Rc<RefCell<Vec<lemma_build::BuildOutcome>>> {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let seen = outcomes.clone();
+    state
+        .build
+        .get()
+        .unwrap()
+        .connect_finished(move |o| seen.borrow_mut().push(o.clone()));
+    outcomes
+}
+
+/// Counts how often `toast` is dismissed.
+fn count_dismissals(toast: &adw::Toast) -> Rc<Cell<u32>> {
+    let count = Rc::new(Cell::new(0));
+    let seen = count.clone();
+    toast.connect_dismissed(move |_| seen.set(seen.get() + 1));
+    count
+}
+
+/// Each build's toast replaces the one before: failing builds leave one toast (with the latest
+/// count), not a queue of them, and a build that succeeds withdraws it.
+fn build_toasts_replace() {
+    let (dir, latexmk) = fake_latexmk_project("toasts");
+    let fail = latexmk.with_file_name("fail");
+    std::fs::write(&fail, "").unwrap();
+    let mut config = config();
+    config.build.latexmk = latexmk.clone();
+    let state = window(&dir, config);
+    open(&state, &dir.join("main.tex"));
+    let build = state.build.get().unwrap();
+    let outcomes = record_outcomes(&state);
+
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 1);
+    assert_eq!(outcomes.borrow()[0].status, BuildStatus::Errors);
+    let first = build.toast().expect("a failed build is toasted");
+    assert_eq!(first.title().as_deref(), Some("Build failed: 1 error"));
+    let first_dismissed = count_dismissals(&first);
+
+    // A save while the error remains: its toast takes the place of the first.
+    build.request(Reason::Save);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 2);
+    assert_eq!(first_dismissed.get(), 1, "the first toast is withdrawn");
+    let second = build.toast().expect("the second build's toast");
+    assert_ne!(second, first);
+    assert_eq!(second.title().as_deref(), Some("Build failed: 1 error"));
+    let second_dismissed = count_dismissals(&second);
+
+    // Fixed: the success withdraws the failure's toast and shows none of its own.
+    std::fs::remove_file(&fail).unwrap();
+    build.request(Reason::Save);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 3);
+    assert_eq!(outcomes.borrow()[2].status, BuildStatus::Success);
+    assert_eq!(second_dismissed.get(), 1);
+    assert!(build.toast().is_none());
+    assert_eq!(fake_calls(&latexmk).len(), 3);
+    state.window.destroy();
+}
+
+/// Without latexmk, a build says what to install. F5 says it every time; the automatic builds
+/// (saves, the agent) once, then only in the status bar, until a latexmk starts again.
+fn missing_latexmk() {
+    let (dir, fake) = fake_latexmk_project("no-latexmk");
+    let missing = dir.join("no-such-dir/latexmk");
+    let mut config = config();
+    config.build.latexmk = missing.clone();
+    let state = window(&dir, config.clone());
+    open(&state, &dir.join("main.tex"));
+    let build = state.build.get().unwrap();
+    let outcomes = record_outcomes(&state);
+    let built = |n: usize| common::pump_until(TIMEOUT, || outcomes.borrow().len() == n);
+    let missing_text = "Not built: latexmk not found";
+
+    build.request(Reason::Save);
+    built(1);
+    assert_eq!(
+        outcomes.borrow()[0].status,
+        BuildStatus::SpawnFailed(LATEXMK_MISSING.to_owned())
+    );
+    assert_eq!(state.status.build.text(), missing_text);
+    let toast = build.toast().expect("the first automatic build explains");
+    assert_eq!(toast.title().as_deref(), Some(LATEXMK_MISSING));
+    let dismissed = count_dismissals(&toast);
+    review_snapshot(&state, "build-latexmk-missing");
+
+    // The next save says nothing new, and leaves the explanation alone.
+    build.request(Reason::Save);
+    built(2);
+    assert_eq!(build.toast().as_ref(), Some(&toast));
+    assert_eq!(dismissed.get(), 0);
+    assert_eq!(state.status.build.text(), missing_text);
+    // Gone (its timeout): the agent's builds bring it back no more.
+    toast.dismiss();
+    assert!(build.toast().is_none());
+    build.request(Reason::AgentTurnEnd);
+    built(3);
+    build.request(Reason::AgentCompile);
+    built(4);
+    assert!(build.toast().is_none());
+    assert_eq!(state.status.build.text(), missing_text);
+
+    // F5 always explains.
+    build.request(Reason::Manual);
+    built(5);
+    let manual = build.toast().expect("F5 explains");
+    assert_eq!(manual.title().as_deref(), Some(LATEXMK_MISSING));
+
+    // Once a latexmk runs, a missing one is explained again.
+    let mut working = config.clone();
+    working.build.latexmk = fake;
+    state.set_config(Rc::new(working));
+    build.request(Reason::Save);
+    built(6);
+    assert_eq!(outcomes.borrow()[5].status, BuildStatus::Success);
+    assert!(build.toast().is_none(), "the success withdraws the advice");
+    state.set_config(Rc::new(config));
+    build.request(Reason::Save);
+    built(7);
+    let again = build.toast().expect("explained again");
+    assert_eq!(again.title().as_deref(), Some(LATEXMK_MISSING));
+    assert!(!missing.exists());
+    state.window.destroy();
+}
+
+/// Clean Build Files and Rebuild: stops the running build, runs `latexmk -c` with the build's
+/// engine flag and output directory, then builds again, which a stale `.aux` no longer breaks.
+/// Stop drops the clean-up before it starts, and stops it while it runs.
+fn clean_and_rebuild() {
+    let (dir, latexmk) = fake_latexmk_project("clean");
+    let mut config = config();
+    config.build.latexmk = latexmk.clone();
+    let state = window(&dir, config);
+    let build = state.build.get().unwrap();
+    let outcomes = record_outcomes(&state);
+
+    // Asked for with nothing to build: the clean-up goes with the build that cannot start, and
+    // the next build does not clean.
+    activate(&state, "win.clean-build");
+    common::pump_until(TIMEOUT, || {
+        build
+            .toast()
+            .is_some_and(|t| t.title().as_deref() == Some("Open a document to build"))
+    });
+    open(&state, &dir.join("main.tex"));
+
+    // A broken `.aux` fails every build.
+    std::fs::create_dir_all(dir.join(".build")).unwrap();
+    std::fs::write(dir.join(".build/main.aux"), "broken\n").unwrap();
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 1);
+    assert_eq!(outcomes.borrow()[0].status, BuildStatus::Errors);
+    assert_eq!(fake_calls(&latexmk).len(), 1, "no clean-up");
+
+    // Another build runs (slowly, until the clean-up) when the clean-up is asked for: it is
+    // stopped first.
+    let slow = latexmk.with_file_name("slow");
+    std::fs::write(&slow, "").unwrap();
+    build.request(Reason::Save);
+    common::pump_until(TIMEOUT, || fake_calls(&latexmk).len() == 2);
+    activate(&state, "win.clean-build");
+    common::pump_until(TIMEOUT, || {
+        state.status.build.text() == "Cleaning and building main.tex…"
+    });
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 3);
+    let statuses: Vec<BuildStatus> = outcomes.borrow().iter().map(|o| o.status.clone()).collect();
+    assert_eq!(
+        statuses,
+        [
+            BuildStatus::Errors,
+            BuildStatus::Cancelled,
+            BuildStatus::Success
+        ]
+    );
+    let calls = fake_calls(&latexmk);
+    assert_eq!(calls.len(), 4, "{calls:#?}");
+    assert_eq!(calls[2], "-pdf -bibtex-cond1 -c -outdir=.build ./main.tex");
+    assert!(calls[3].starts_with("-pdf -synctex=1 "), "{calls:#?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.tex")).unwrap(),
+        SIMPLE_DOC
+    );
+    assert!(state.status.build.text().starts_with("Built in"));
+    assert!(build.diagnostics().problems().is_empty());
+
+    // A Stop before the build starts drops the clean-up with it.
+    std::fs::write(&slow, "").unwrap();
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || fake_calls(&latexmk).len() == 5);
+    activate(&state, "win.clean-build");
+    activate(&state, "win.stop-build");
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 4);
+    assert_eq!(outcomes.borrow()[3].status, BuildStatus::Cancelled);
+    std::fs::remove_file(&slow).unwrap();
+    common::pump_for(Duration::from_millis(500));
+    assert_eq!(outcomes.borrow().len(), 4, "nothing builds after the Stop");
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 5);
+    let calls = fake_calls(&latexmk);
+    assert!(calls[5..].iter().all(|c| !c.contains(" -c ")), "{calls:#?}");
+
+    // A Stop while the clean-up runs stops it, and nothing builds after it.
+    let slow_clean = latexmk.with_file_name("slow-clean");
+    std::fs::write(&slow_clean, "").unwrap();
+    std::fs::write(dir.join(".build/main.aux"), "broken\n").unwrap();
+    let before = fake_calls(&latexmk).len();
+    activate(&state, "win.clean-build");
+    common::pump_until(TIMEOUT, || fake_calls(&latexmk).len() == before + 1);
+    activate(&state, "win.stop-build");
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 6);
+    assert_eq!(outcomes.borrow()[5].status, BuildStatus::Cancelled);
+    assert_eq!(state.status.build.text(), "Build stopped");
+    common::pump_for(Duration::from_millis(300));
+    let calls = fake_calls(&latexmk);
+    assert_eq!(calls.len(), before + 1, "{calls:#?}");
+    assert!(calls[before].contains(" -c "), "{calls:#?}");
+    assert!(
+        dir.join(".build/main.aux").exists(),
+        "the clean-up was stopped"
+    );
+    std::fs::remove_file(&slow_clean).unwrap();
     state.window.destroy();
 }

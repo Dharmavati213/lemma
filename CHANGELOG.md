@@ -12,9 +12,25 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   locally with `packaging/windows/build.sh`, natively in MSYS2 or as a cross build from Linux.
   The API key is kept in the Windows Credential Manager, settings in `%APPDATA%\lemma`; TeX
   Live and MiKTeX are found in their usual folders.
+- Clean Build Files and Rebuild (command palette): stops the build, runs `latexmk -c`, which
+  keeps the PDF, and builds again, for a build that a damaged `.aux` or `.bbl` keeps failing.
+
+### Changed
+
+- A build's toast replaces the previous build's instead of queueing behind it, and a build that
+  succeeds or is stopped withdraws it: repeated saves or the agent's `compile` calls no longer
+  leave a train of stale "Build failed" toasts.
+- Without latexmk, a build says what to install (TeX Live, MacTeX or MiKTeX, with Perl on
+  Windows) and that `[build] latexmk` can point at it: F5 every time, saves and the agent once
+  per window; the status bar says "latexmk not found".
+- Auto-saving several documents requests one build once they are all written, not one per
+  document, which ran latexmk a second time for nothing and wrote the documents twice.
 
 ### Fixed
 
+- Windows: errors TeX reports in a file of the TeX distribution under a drive
+  (`C:/texlive/…/geometry.sty:1005: …`), such as an unknown package option, reach the Problems
+  page.
 - A build that writes no new PDF (latexmk finds nothing to do, as after saving without changes
   or a repeated `compile` from the agent) no longer reloads the PDF: its pages, thumbnails,
   links and an open search are not redone, and a link preview stays open.

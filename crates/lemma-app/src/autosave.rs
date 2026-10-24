@@ -8,11 +8,11 @@
 //!
 //! "Edited" means the open documents with unsaved changes; a change is the user's (typing,
 //! undo and redo, accepting or rejecting a hunk), never an agent's or a reload's. Saves go
-//! through the normal save path ([`WindowState::save_document`]): a file another program
-//! changed is not overwritten (the Overwrite toast offers it), and a build follows when
-//! `[build] on_save` is set. While an agent turn runs nothing is saved; a save that came due is
-//! made when the turn ends (two seconds later for `"idle"`, at once for `"focus"` if the window
-//! is still in the background).
+//! through the normal save path ([`WindowState::save_documents`]): a file another program
+//! changed is not overwritten (the Overwrite toast offers it), and when `[build] on_save` is set
+//! one build follows, once every document is written. While an agent turn runs nothing is saved;
+//! a save that came due is made when the turn ends (two seconds later for `"idle"`, at once for
+//! `"focus"` if the window is still in the background).
 //!
 //! Hooks: [`install`] once per window; [`attach`] / [`detach`] per editor tab. Tests:
 //! [`set_idle_delay`], [`is_scheduled`], [`is_deferred`], [`focus_lost`], [`save_now`].
@@ -142,15 +142,16 @@ pub fn save_now(state: &Rc<WindowState>) -> usize {
         }
         return 0;
     }
-    let mut started = 0;
-    for editor in state.editors() {
-        let doc = editor.document();
-        if doc.is_dirty() {
-            state.save_document(doc);
-            started += 1;
-        }
+    let dirty: Vec<DocRef> = state
+        .editors()
+        .iter()
+        .map(|editor| editor.document().clone())
+        .filter(|doc| doc.is_dirty())
+        .collect();
+    if !dirty.is_empty() {
+        state.save_documents(&dirty);
     }
-    started
+    dirty.len()
 }
 
 /// Sets the idle delay (tests).

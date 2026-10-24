@@ -15,7 +15,7 @@ use lemma_app::editor::Editor;
 use lemma_app::review_ui::{self, Decision};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::{Workspace, normalize};
-use lemma_app::{autosave, bibimport, paste, templates};
+use lemma_app::{autosave, bibimport, paste, saver, templates};
 use lemma_config::{Autosave, Config};
 use lemma_core::ProjectRoot;
 use std::cell::RefCell;
@@ -48,6 +48,10 @@ fn main() -> ExitCode {
         ("citation_dialog_reports_errors", citation_dialog),
         ("autosave_idle_waits_for_agent_turns", autosave_idle),
         ("autosave_focus_and_off", autosave_focus),
+        (
+            "autosave_of_several_documents_builds_once",
+            autosave_builds_once,
+        ),
         ("regress5_markup_plain_text", regress5_markup),
         ("regress5_drops_go_on_their_own_lines", regress5_drops),
         (
@@ -705,6 +709,84 @@ fn autosave_focus() {
     common::pump_for(Duration::from_millis(200));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ba\n");
     assert!(editor.document().is_dirty());
+    close(&state);
+}
+
+/// Auto-saving several documents builds once, when all of them are written, and writes each of
+/// them once. (A build per document ran latexmk a second time for nothing, and the second
+/// build's save wrote the documents still being saved again.)
+fn autosave_builds_once() {
+    let root = common::temp_dir("autosave-build");
+    write(
+        &root,
+        &[
+            (
+                "main.tex",
+                "\\documentclass{article}\n\\begin{document}\n\\input{a}\n\\input{b}\n\\end{document}\n",
+            ),
+            ("a.tex", "a\n"),
+            ("b.tex", "b\n"),
+        ],
+    );
+    // A fake latexmk that only counts its runs, copied into place by `cp`: had this process
+    // written it, a child forked meanwhile could still hold it open for writing ("Text file
+    // busy").
+    let bin = common::temp_dir("autosave-build-bin");
+    let source = bin.join("latexmk.src");
+    std::fs::write(
+        &source,
+        "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/calls.txt\"\n",
+    )
+    .unwrap();
+    let latexmk = bin.join("latexmk");
+    for (program, args) in [
+        ("cp", [source.as_os_str(), latexmk.as_os_str()]),
+        ("chmod", [std::ffi::OsStr::new("755"), latexmk.as_os_str()]),
+    ] {
+        let status = std::process::Command::new(program).args(args).status();
+        assert!(status.is_ok_and(|s| s.success()), "{program}");
+    }
+    let fake = latexmk.clone();
+    let state = window_with(&root, move |c| {
+        c.editor.autosave = Autosave::Idle;
+        c.build.on_save = true;
+        c.build.latexmk = fake;
+    });
+    autosave::set_idle_delay(&state, Duration::from_millis(150));
+    let builds = Rc::new(RefCell::new(Vec::new()));
+    let seen = builds.clone();
+    state
+        .build
+        .get()
+        .unwrap()
+        .connect_finished(move |o| seen.borrow_mut().push(o.status.clone()));
+    let saves = Rc::new(RefCell::new(Vec::new()));
+    let seen = saves.clone();
+    let hook = saver::connect_saved(move |path, _| seen.borrow_mut().push(path.to_path_buf()));
+
+    let a = open(&state, &root.join("a.tex"));
+    let b = open(&state, &root.join("b.tex"));
+    a.place_cursor_at(0);
+    b.place_cursor_at(0);
+    type_text(&a, "x");
+    type_text(&b, "y");
+    common::pump_until(TIMEOUT, || builds.borrow().len() == 1);
+    common::pump_for(Duration::from_millis(500));
+    assert_eq!(*builds.borrow(), [lemma_build::BuildStatus::Success]);
+    let calls = std::fs::read_to_string(bin.join("calls.txt")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+    let mut saved = saves.borrow().clone();
+    saved.sort();
+    assert_eq!(
+        saved,
+        [
+            normalize(&root.join("a.tex")),
+            normalize(&root.join("b.tex"))
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(root.join("a.tex")).unwrap(), "xa\n");
+    assert_eq!(std::fs::read_to_string(root.join("b.tex")).unwrap(), "yb\n");
+    saver::disconnect_saved(hook);
     close(&state);
 }
 

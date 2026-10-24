@@ -705,14 +705,47 @@ impl WindowState {
         }
     }
 
+    /// Saves the documents `docs` on behalf of the user, concurrently, as
+    /// [`WindowState::save_document`] saves one, but with one build (`build.on_save`) once they
+    /// are all written, if any of them was: a build per document would run latexmk again for
+    /// nothing, and its save of the documents still being written would write them twice.
+    pub fn save_documents(self: &Rc<Self>, docs: &[DocRef]) {
+        let saves: Vec<_> = docs.iter().map(|doc| (doc.clone(), doc.save())).collect();
+        let state = self.clone();
+        glib::spawn_future_local(async move {
+            let mut saved = false;
+            for (doc, save) in saves {
+                let result = save.await;
+                saved |= state.report_user_save(&doc, result);
+            }
+            if saved {
+                state.after_saves();
+            }
+        });
+    }
+
     fn after_user_save(self: &Rc<Self>, doc: &DocRef, result: Result<(), SaveError>) {
+        if self.report_user_save(doc, result) {
+            self.after_saves();
+        }
+    }
+
+    /// Handles the result of a save the user asked for: a refused save offers to overwrite, a
+    /// failed one is toasted. Returns whether `doc` was saved.
+    fn report_user_save(self: &Rc<Self>, doc: &DocRef, result: Result<(), SaveError>) -> bool {
         match result {
             Ok(()) => {
                 self.withdraw_overwrite(doc);
-                self.after_saves();
+                true
             }
-            Err(SaveError::ExternallyModified) => self.offer_overwrite(doc),
-            Err(e) => self.toast(&format!("Could not save “{}”: {e}", doc.display_name())),
+            Err(SaveError::ExternallyModified) => {
+                self.offer_overwrite(doc);
+                false
+            }
+            Err(e) => {
+                self.toast(&format!("Could not save “{}”: {e}", doc.display_name()));
+                false
+            }
         }
     }
 

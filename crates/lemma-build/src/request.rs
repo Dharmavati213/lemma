@@ -1,8 +1,9 @@
 //! What to build, and the exact latexmk invocation for it (§6).
 
 use crate::Engine;
+use crate::paths::normalize;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// One latexmk run.
@@ -58,22 +59,67 @@ pub fn command_line(req: &BuildRequest) -> (Vec<OsString>, Vec<(String, String)>
         ]
         .map(OsString::from),
     );
+    args.push(outdir_arg(req));
+    args.push(root_arg(req));
+    let env = LOG_ENV
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    (args, env)
+}
+
+/// The arguments (without the program) that remove what the build of `req` generated:
+///
+/// ```text
+/// latexmk [-pdf|-lualatex|-xelatex] [-bibtex-cond1] -c -outdir=<outdir> ./<root file name>
+/// ```
+///
+/// With the engine flag and output directory of [`command_line`], latexmk deletes the files it
+/// knows that build to have generated in the output directory (`.aux`, `.toc`, `.fls`, the log,
+/// its own database, …), so the next build starts from the sources. `-c` rather than `-C`: the
+/// PDF and the SyncTeX file stay, so the preview does not go blank. `-bibtex-cond1` also deletes
+/// the `.bbl` when its `.bib` files exist (a stale one, say biblatex's after a switch to
+/// BibTeX, fails the next build before BibTeX can replace it), but only in an output directory
+/// of its own: in the root's directory (`outdir = "."`) the `.bbl` may be a source (arXiv
+/// projects come with one and no `.bib`), and there latexmk deletes it too when the project
+/// was never built. Sources are never deleted.
+pub fn clean_command_line(req: &BuildRequest) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(5);
+    if let Some(flag) = engine_flag(req.engine) {
+        args.push(flag.into());
+    }
+    if !outdir_is_root_dir(req) {
+        args.push("-bibtex-cond1".into());
+    }
+    args.push("-c".into());
+    args.push(outdir_arg(req));
+    args.push(root_arg(req));
+    args
+}
+
+/// Whether the output directory is the root's directory (`outdir = "."`).
+fn outdir_is_root_dir(req: &BuildRequest) -> bool {
+    let root_dir = req.root.parent().unwrap_or(Path::new(""));
+    normalize(&root_dir.join(&req.outdir)) == normalize(root_dir)
+}
+
+/// `-outdir=<outdir>`.
+fn outdir_arg(req: &BuildRequest) -> OsString {
     let mut outdir = OsString::from("-outdir=");
     outdir.push(&req.outdir);
-    args.push(outdir);
-    args.push(match req.root.file_name() {
+    outdir
+}
+
+/// `./<root file name>` (see [`command_line`]).
+fn root_arg(req: &BuildRequest) -> OsString {
+    match req.root.file_name() {
         Some(name) => {
             let mut arg = OsString::from("./");
             arg.push(name);
             arg
         }
         None => req.root.clone().into_os_string(),
-    });
-    let env = LOG_ENV
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    (args, env)
+    }
 }
 
 fn engine_flag(engine: Engine) -> Option<&'static str> {
@@ -161,5 +207,47 @@ mod tests {
             argv(&req).last().map(String::as_str),
             Some("./-pdflatex=touch x;true.tex")
         );
+        let clean = clean_command_line(&req);
+        assert_eq!(
+            clean.last().and_then(|a| a.to_str()),
+            Some("./-pdflatex=touch x;true.tex")
+        );
+    }
+
+    /// The clean-up names the build's engine flag, output directory and root, with `-c` (which
+    /// keeps the PDF), and deletes the `.bbl` only in an output directory of its own.
+    #[test]
+    fn exact_clean_argv_per_engine() {
+        let clean_argv = |req: &BuildRequest| -> Vec<String> {
+            clean_command_line(req)
+                .into_iter()
+                .map(|a| a.into_string().expect("utf-8 arg"))
+                .collect()
+        };
+        for (engine, flag) in [
+            (Engine::PdfLatex, Some("-pdf")),
+            (Engine::LuaLatex, Some("-lualatex")),
+            (Engine::XeLatex, Some("-xelatex")),
+            (Engine::Latexmkrc, None),
+        ] {
+            let mut req = request(engine);
+            let want: Vec<&str> = flag
+                .into_iter()
+                .chain(["-bibtex-cond1", "-c", "-outdir=.build", "./main.tex"])
+                .collect();
+            assert_eq!(clean_argv(&req), want, "{engine:?}");
+            for outdir in [".", "./", "", "out/..", "/home/u/thesis"] {
+                req.outdir = outdir.into();
+                let want: Vec<String> = flag
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain(["-c".to_owned(), format!("-outdir={outdir}")])
+                    .chain(["./main.tex".to_owned()])
+                    .collect();
+                assert_eq!(clean_argv(&req), want, "{engine:?} {outdir:?}");
+            }
+            req.outdir = "../build".into();
+            assert!(clean_argv(&req).contains(&"-bibtex-cond1".to_owned()));
+        }
     }
 }

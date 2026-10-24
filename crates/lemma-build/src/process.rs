@@ -1,10 +1,14 @@
-//! Running latexmk: spawning, cancellation, the timeout, and collecting the results.
+//! Running latexmk: spawning, cancellation, the timeout, and collecting the results; and the
+//! clean-up of a build's files (`latexmk -c`).
 
 use crate::paths::{normalize, resolve};
 use crate::runaway::runaway_text;
-use crate::{BuildRequest, LogReport, command_line, locate_runaways, parse_blg, parse_log};
+use crate::{
+    BuildRequest, LogReport, clean_command_line, command_line, locate_runaways, parse_blg,
+    parse_log,
+};
 use lemma_core::{DiagSource, Diagnostic, Severity};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
@@ -198,8 +202,17 @@ pub struct BuildOutcome {
 impl BuildOutcome {
     /// The outcome for a build whose [`Build::start`] failed.
     pub fn spawn_failed(error: &io::Error) -> Self {
+        BuildOutcome::without_run(BuildStatus::SpawnFailed(error.to_string()))
+    }
+
+    /// The outcome for a build that was stopped before latexmk built (during [`Build::clean`]).
+    pub fn cancelled() -> Self {
+        BuildOutcome::without_run(BuildStatus::Cancelled)
+    }
+
+    fn without_run(status: BuildStatus) -> Self {
         BuildOutcome {
-            status: BuildStatus::SpawnFailed(error.to_string()),
+            status,
             exit_code: None,
             elapsed: Duration::ZERO,
             report: LogReport::default(),
@@ -237,6 +250,47 @@ impl Build {
     /// root's directory as the leader of a new process group (on Windows: in a new job), with
     /// stdin from /dev/null. Its output goes to `<outdir>/<stem>.latexmk.log`.
     pub fn start(req: &BuildRequest) -> io::Result<Build> {
+        let (args, env) = command_line(req);
+        Build::launch(req, &args, env)
+    }
+
+    /// Blocking: removes what the build of `req` generated (`latexmk -c`, see
+    /// [`clean_command_line`]), so that the next build starts from the sources, and waits for it,
+    /// enforcing `req.timeout`. It runs as a build does (in the root's directory and its own
+    /// process group or job, its output in `<outdir>/<stem>.latexmk.log`); `started` gets its
+    /// canceller once it runs. Fails when latexmk cannot run (a missing latexmk is
+    /// [`io::ErrorKind::NotFound`]), is cancelled ([`io::ErrorKind::Interrupted`]) or does not
+    /// exit with 0.
+    pub fn clean(req: &BuildRequest, started: impl FnOnce(Canceller)) -> io::Result<()> {
+        let mut clean = Build::launch(req, &clean_command_line(req), Vec::new())?;
+        started(clean.canceller());
+        let (status, exit_code, _) = clean.wait_for_exit();
+        match status {
+            BuildStatus::Success => Ok(()),
+            BuildStatus::Cancelled => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "latexmk -c was stopped",
+            )),
+            BuildStatus::TimedOut => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "latexmk -c did not finish within {} s",
+                    req.timeout.as_secs()
+                ),
+            )),
+            _ => Err(io::Error::other(match exit_code {
+                Some(code) => format!("latexmk -c failed with exit code {code}"),
+                None => "latexmk -c was killed by a signal".to_owned(),
+            })),
+        }
+    }
+
+    /// What [`Build::start`] does, with the arguments `args` and the extra environment `env`.
+    fn launch(
+        req: &BuildRequest,
+        args: &[OsString],
+        env: Vec<(String, String)>,
+    ) -> io::Result<Build> {
         let (root_dir, stem) = root_parts(&req.root)?;
         let out_dir = root_dir.join(&req.outdir);
         fs::create_dir_all(&out_dir)?;
@@ -252,11 +306,10 @@ impl Build {
             },
             Err(_) => (Stdio::null(), Stdio::null()),
         };
-        let (args, env) = command_line(req);
         let started = Instant::now();
         let mut command = Command::new(&req.latexmk);
         command
-            .args(&args)
+            .args(args)
             .envs(env)
             .current_dir(&root_dir)
             .stdin(Stdio::null())
@@ -305,6 +358,14 @@ impl Build {
     /// resolved against the root's directory. If latexmk fails without any error in the log or
     /// `.blg`, an error on the root file carries the end of latexmk's own output as context.
     pub fn wait(mut self) -> BuildOutcome {
+        let (status, exit_code, elapsed) = self.wait_for_exit();
+        self.outcome(status, exit_code, elapsed)
+    }
+
+    /// Blocking: waits for latexmk (stopping it at `req.timeout`) and, after a cancel or timeout,
+    /// up to 1.5 s for the rest of its process group. Returns how the run ended, latexmk's exit
+    /// code (`None` when a signal ended it) and how long it ran.
+    fn wait_for_exit(&mut self) -> (BuildStatus, Option<i32>, Duration) {
         let timeout = self.req.timeout.saturating_sub(self.started.elapsed());
         let (done, finished) = mpsc::channel::<()>();
         let group = Arc::clone(&self.group);
@@ -337,7 +398,7 @@ impl Build {
         } else {
             BuildStatus::Errors
         };
-        self.outcome(status, exit_code, elapsed)
+        (status, exit_code, elapsed)
     }
 
     fn outcome(
@@ -648,6 +709,71 @@ mod tests {
         assert!(
             matches!(outcome.status, BuildStatus::SpawnFailed(ref m) if m.starts_with("cannot run "))
         );
+    }
+
+    #[test]
+    fn clean_reports_a_missing_latexmk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let req = BuildRequest {
+            root: dir.path().join("main.tex"),
+            engine: crate::Engine::PdfLatex,
+            outdir: ".build".into(),
+            mirror_dirs: Vec::new(),
+            timeout: Duration::from_secs(5),
+            latexmk: dir.path().join("no-such-latexmk"),
+        };
+        let err = Build::clean(&req, |_| {}).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().starts_with("cannot run "), "{err}");
+    }
+
+    /// `Build::clean` runs latexmk with the clean-up's arguments in the root's directory, reports
+    /// an exit code other than 0, and can be stopped.
+    #[cfg(unix)]
+    #[test]
+    fn clean_runs_latexmk_c_in_the_root_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let latexmk = dir.path().join("fake-latexmk");
+        // Copied into place by `cp`: had this process written it, a child forked meanwhile by a
+        // test on another thread could still hold it open for writing ("Text file busy").
+        let source = dir.path().join("fake-latexmk.src");
+        fs::write(
+            &source,
+            "#!/bin/sh\npwd -P > args.txt\necho \"$*\" >> args.txt\n[ -f fail ] && exit 3\n\
+             [ -f slow ] && sleep 30\nexit 0\n",
+        )
+        .expect("write");
+        let copied = Command::new("cp").arg(&source).arg(&latexmk).status();
+        assert!(copied.is_ok_and(|s| s.success()));
+        fs::set_permissions(&latexmk, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let req = BuildRequest {
+            root: dir.path().join("main.tex"),
+            engine: crate::Engine::LuaLatex,
+            outdir: ".build".into(),
+            mirror_dirs: Vec::new(),
+            timeout: Duration::from_secs(20),
+            latexmk,
+        };
+        Build::clean(&req, |_| {}).expect("clean");
+        let args = fs::read_to_string(dir.path().join("args.txt")).expect("args");
+        let cwd = fs::canonicalize(dir.path()).expect("canonical");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                cwd.to_str().expect("utf-8 path"),
+                "-lualatex -bibtex-cond1 -c -outdir=.build ./main.tex"
+            ]
+        );
+        fs::write(dir.path().join("fail"), "").expect("write");
+        let err = Build::clean(&req, |_| {}).expect_err("exit code 3");
+        assert_eq!(err.to_string(), "latexmk -c failed with exit code 3");
+        fs::remove_file(dir.path().join("fail")).expect("remove");
+        fs::write(dir.path().join("slow"), "").expect("write");
+        let started = Instant::now();
+        let err = Build::clean(&req, |canceller| canceller.cancel()).expect_err("stopped");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

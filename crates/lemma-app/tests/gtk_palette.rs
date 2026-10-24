@@ -399,6 +399,7 @@ fn ranking_table() {
         ("keyboard", &[], "win.shortcuts"),
         ("build", &[], "win.build"),
         ("stop build", &[], "win.stop-build"),
+        ("clean", &[], "win.clean-build"),
         ("go def", &[], "win.goto-definition"),
         ("references", &[], "win.find-references"),
         ("rename", &[], "win.rename-label"),

@@ -176,6 +176,7 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.agent-inline-edit", "Edit with Agent…", Agent),
         info("win.build", "Build", BuildPdf),
         info("win.stop-build", "Stop Build", BuildPdf),
+        info("win.clean-build", "Clean Build Files and Rebuild", BuildPdf),
         info("win.sync-forward", "Show Cursor in PDF", BuildPdf),
         info("win.pdf-invert", "Dark PDF Pages", BuildPdf),
         info("win.pdf-zoom-in", "Zoom In PDF", BuildPdf),

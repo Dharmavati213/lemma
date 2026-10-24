@@ -33,7 +33,8 @@ const ERROR_LOOKAHEAD: usize = 12;
 const WARNING_LOOKAHEAD: usize = 5;
 
 struct Patterns {
-    /// `./main.tex:66: Undefined control sequence.`
+    /// `./main.tex:66: Undefined control sequence.`; a file of the TeX distribution has an
+    /// absolute path, `/usr/share/…` or on Windows `C:/texlive/…` and `C:\Program Files\…`.
     file_line_error: Regex,
     /// `l.66 is an \equivalnce`
     line_number: Regex,
@@ -64,7 +65,7 @@ impl Patterns {
         let re = |pattern: &str| Regex::new(pattern).expect("valid regex");
         Patterns {
             file_line_error: re(
-                r"^(?P<file>(?:\.{1,2}/|/)[^:]*|[^\s:/(][^:]*\.(?:tex|sty|cls|ltx|def|cfg|clo|fd|bbl|aux|toc|lof|lot|out|nav|snm|vrb|bib|lbx|cbx|bbx|dbx|ldf|tikz|pgf|lua)):(?P<line>\d+): (?P<msg>.*)$",
+                r"^(?P<file>(?:\.{1,2}/|/|[A-Za-z]:[/\\])[^:]*|[^\s:/(][^:]*\.(?:tex|sty|cls|ltx|def|cfg|clo|fd|bbl|aux|toc|lof|lot|out|nav|snm|vrb|bib|lbx|cbx|bbx|dbx|ldf|tikz|pgf|lua)):(?P<line>\d+): (?P<msg>.*)$",
             ),
             line_number: re(r"^l\.(?P<line>\d+) (?P<pre>.*)$"),
             warning: re(
@@ -739,6 +740,77 @@ mod tests {
                     "Reference `y' on page 1 undefined on input line 9."
                 ),
             ]
+        );
+    }
+
+    /// Windows: an error TeX raises while it reads a file of the distribution (here an unknown
+    /// package option) names that file with a drive: with forward slashes (TeX Live) or with
+    /// backslashes (MiKTeX). The log is pdfTeX's, with the paths of a Windows installation.
+    #[test]
+    fn windows_error_headers() {
+        let log = "(./main.tex (C:/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty\n\
+                   Package: geometry 2020/01/02 v5.9 Page Geometry\n\n\n\
+                   C:/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty:1005: Package keyval Error: margn undefined.\n\n\
+                   See the keyval package documentation for explanation.\n\
+                   Type  H <return>  for immediate help.\n\
+                   \x20->\\errmessage  Package keyval Error: \\@tempa \\space undefined.\n\n\
+                   l.1005 \\ProcessOptionsKV[p]{Gm}\n\
+                   \x20                              %\n\
+                   Try typing  <return>  to proceed.\n\n\
+                   ) (\"C:\\Program Files\\MiKTeX\\tex/latex/amsmath\\amsmath.sty\"\n\
+                   Package: amsmath 2025/07/09 v2.17z AMS math features\n\n\n\
+                   C:\\Program Files\\MiKTeX\\tex/latex/amsmath\\amsmath.sty:93: LaTeX Error: Unknown option `foo' for package `amsmath'.\n\n\
+                   See the LaTeX manual or LaTeX Companion for explanation.\n\
+                   Type  H <return>  for immediate help.\n\n\
+                   l.93 \\ProcessOptions\\par\n\
+                   \x20                       \n\
+                   The option `foo' was not declared in package `amsmath', perhaps you\n\n\
+                   )\n\nLaTeX Warning: Reference `x' on page 1 undefined on input line 9.\n\n)\n";
+        let r = parse(log);
+        let found = located(&r);
+        assert_eq!(found.len(), 3, "{found:#?}");
+        // The paths are relative on Linux, where the test resolves them against `/w`.
+        assert!(
+            found[0]
+                .0
+                .ends_with("C:/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty"),
+            "{found:#?}"
+        );
+        assert_eq!(
+            (found[0].1, found[0].2, found[0].3),
+            (
+                Some(1005),
+                Severity::Error,
+                "Package keyval: margn undefined."
+            )
+        );
+        assert!(
+            found[1]
+                .0
+                .ends_with("C:/Program Files/MiKTeX/tex/latex/amsmath/amsmath.sty"),
+            "{found:#?}"
+        );
+        assert_eq!(
+            (found[1].1, found[1].2, found[1].3),
+            (
+                Some(93),
+                Severity::Error,
+                "Unknown option `foo' for package `amsmath'."
+            )
+        );
+        assert_eq!(
+            r.diagnostics[1].context.as_deref(),
+            Some("\\ProcessOptions\\par <HERE>")
+        );
+        // The file stack is intact afterwards.
+        assert_eq!(
+            found[2],
+            (
+                "/w/main.tex".to_owned(),
+                Some(9),
+                Severity::Warning,
+                "Reference `x' on page 1 undefined on input line 9."
+            )
         );
     }
 
