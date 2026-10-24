@@ -1888,7 +1888,7 @@ const PDF_SEARCH_ACTION: &str = "pdf-search";
 /// it is a symbolic link. Refuses a path that exists and is not a regular file (`/dev/null`).
 fn writable_config_target(path: &Path) -> Result<PathBuf, String> {
     let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).map_err(|e| {
+        Ok(m) if m.file_type().is_symlink() => lemma_core::canonicalize(path).map_err(|e| {
             format!(
                 "{} is a symbolic link that cannot be followed: {e}",
                 path.display()

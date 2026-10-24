@@ -697,7 +697,6 @@ fn write_state(
     committed: &Mutex<Committed>,
 ) -> Result<(), String> {
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let mut last = committed
         .lock()
         .map_err(|_| "a writer panicked".to_owned())?;
@@ -722,18 +721,15 @@ fn write_state(
         },
         Some(contents) => {
             if let Some(dir) = file.parent() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
+                crate::fsutil::private_dir_builder()
                     .create(dir)
                     .map_err(shown)?;
             }
             let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
-            let written = std::fs::OpenOptions::new()
+            let written = crate::fsutil::private_file_options()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .mode(0o600)
                 .open(&tmp)
                 .and_then(|mut f| f.write_all(contents))
                 .and_then(|()| std::fs::rename(&tmp, file));
@@ -912,6 +908,7 @@ mod tests {
         assert!(parse(b"{oops").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn writes_are_atomic_private_and_ordered() {
         use std::os::unix::fs::PermissionsExt as _;

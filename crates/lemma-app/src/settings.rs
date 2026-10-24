@@ -260,7 +260,7 @@ impl Targets {
     /// Watches the file that `path` (the settings file `file`) resolves to, when that is not
     /// `path` itself; stops watching a target it no longer resolves to.
     fn update(self: &Rc<Self>, file: ConfigFile, path: &Path) {
-        let target = std::fs::canonicalize(path)
+        let target = lemma_core::canonicalize(path)
             .ok()
             .filter(|t| t.is_file())
             .filter(|t| std::path::absolute(path).ok().as_ref() != Some(t));

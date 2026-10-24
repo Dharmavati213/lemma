@@ -40,7 +40,7 @@ pub struct ProjectRoot(PathBuf);
 impl ProjectRoot {
     /// Canonicalizes `dir`, which must be an existing directory.
     pub fn new(dir: &Path) -> io::Result<Self> {
-        let root = fs::canonicalize(dir)?;
+        let root = canonicalize(dir)?;
         if !root.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -59,7 +59,8 @@ impl ProjectRoot {
     /// rejecting `..` components that escape). Err(OutsideProject) unless the result is under the root.
     ///
     /// Missing directories are allowed (`new/dir/file.tex`), but a `..` inside the missing part is
-    /// refused because the OS could not resolve it either. Symbolic links, including dangling ones,
+    /// refused because the OS could not resolve it either. (Windows resolves `..` by the names
+    /// alone, before it looks at the disk, so there `new/../file.tex` is `file.tex`.) Symbolic links, including dangling ones,
     /// are followed, so a link that points outside the root is refused.
     pub fn resolve(&self, p: &Path) -> Result<PathBuf, PathError> {
         let resolved = canonicalize_lenient(&self.0.join(p), 0)?;
@@ -77,9 +78,21 @@ impl ProjectRoot {
     }
 }
 
+/// `fs::canonicalize`, except that on Windows the result is a plain path (`C:\…`,
+/// `\\server\share\…`) rather than the `\\?\` form `fs::canonicalize` returns, which TeX, many
+/// programs and comparisons with GTK's paths do not take. The `\\?\` form is kept only where the
+/// plain one would name another file or none (longer than `MAX_PATH`, or a component that Windows
+/// would change, such as a trailing dot or a device name like `CON`).
+pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    let canonical = windows::plain(canonical);
+    Ok(canonical)
+}
+
 /// Like `fs::canonicalize`, but the trailing components may not exist yet. `path` is absolute.
 fn canonicalize_lenient(path: &Path, hops: u32) -> Result<PathBuf, PathError> {
-    match fs::canonicalize(path) {
+    match canonicalize(path) {
         Ok(canonical) => return Ok(canonical),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(PathError::io(path, e)),
@@ -105,7 +118,7 @@ fn canonicalize_lenient(path: &Path, hops: u32) -> Result<PathBuf, PathError> {
         }
     }
 
-    let base = match fs::canonicalize(&existing) {
+    let base = match canonicalize(&existing) {
         Ok(base) => base,
         Err(e) if e.kind() == io::ErrorKind::NotFound && meta.is_symlink() => {
             // A dangling symlink: creating the file would follow it, so resolve its target.
@@ -125,9 +138,117 @@ fn canonicalize_lenient(path: &Path, hops: u32) -> Result<PathBuf, PathError> {
     Ok(resolved)
 }
 
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsString;
+    use std::path::{Component, PathBuf, Prefix};
+
+    /// Paths of this length or more need the `\\?\` form.
+    const MAX_PATH: usize = 260;
+
+    /// `path` without its `\\?\` prefix when the plain form names the same file (see
+    /// [`super::canonicalize`]).
+    pub(super) fn plain(path: PathBuf) -> PathBuf {
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return path;
+        };
+        let Some(text) = path.to_str() else {
+            return path;
+        };
+        let plain = match prefix.kind() {
+            Prefix::VerbatimDisk(_) => text[4..].to_owned(),
+            Prefix::VerbatimUNC(..) => format!(r"\\{}", &text[8..]),
+            _ => return path,
+        };
+        let plain = PathBuf::from(plain);
+        let names_alike = plain.components().all(|c| match c {
+            Component::Normal(name) => win32_name(name),
+            _ => true,
+        });
+        if plain.as_os_str().len() < MAX_PATH && names_alike {
+            plain
+        } else {
+            path
+        }
+    }
+
+    /// Whether the Win32 path parser leaves the file name `name` as it is: not empty, no
+    /// characters it refuses, no trailing dot or space, and not a device name (`CON`, `NUL.txt`,
+    /// `COM1`, …).
+    fn win32_name(name: &std::ffi::OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if name.is_empty()
+            || name.ends_with(['.', ' '])
+            || name.chars().any(|c| c < ' ' || r#"<>:"/\|?*"#.contains(c))
+        {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or(name).trim_end();
+        let upper: OsString = stem.to_ascii_uppercase().into();
+        let upper = upper.to_string_lossy();
+        let device = matches!(
+            &*upper,
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.chars().count() == 4
+            && upper
+                .chars()
+                .nth(3)
+                .is_some_and(|d| "0123456789¹²³".contains(d)));
+        !device
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::Path;
+
+        #[test]
+        fn verbatim_prefixes_are_dropped_when_the_plain_path_is_the_same() {
+            assert_eq!(
+                plain(PathBuf::from(r"\\?\C:\Users\u\thesis")),
+                Path::new(r"C:\Users\u\thesis")
+            );
+            assert_eq!(
+                plain(PathBuf::from(r"\\?\UNC\server\share\x")),
+                Path::new(r"\\server\share\x")
+            );
+            assert_eq!(
+                plain(PathBuf::from(r"C:\already\plain")),
+                Path::new(r"C:\already\plain")
+            );
+            for kept in [
+                r"\\?\C:\a\con",
+                r"\\?\C:\a\nul.tex",
+                r"\\?\C:\a\dot.",
+                r"\\?\C:\a\COM1",
+            ] {
+                assert_eq!(plain(PathBuf::from(kept)), Path::new(kept));
+            }
+            let long = format!(r"\\?\C:\{}", "x".repeat(300));
+            assert_eq!(plain(PathBuf::from(&long)), Path::new(&long));
+        }
+
+        #[test]
+        fn canonical_paths_are_plain() {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = super::super::canonicalize(dir.path()).unwrap();
+            assert!(
+                !canonical.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                canonical.display()
+            );
+            assert!(canonical.is_absolute());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
@@ -148,7 +269,7 @@ mod tests {
         fs::write(proj.join("sub/a.tex"), "a").unwrap();
         fs::write(outside.join("secret.txt"), "secret").unwrap();
         let root = ProjectRoot::new(&proj).unwrap();
-        let outside = fs::canonicalize(outside).unwrap();
+        let outside = canonicalize(outside).unwrap();
         Fixture {
             _tmp: tmp,
             root,
@@ -199,8 +320,15 @@ mod tests {
         ));
         assert!(refused(f.root.resolve(Path::new(".."))));
         assert!(refused(f.root.resolve(&f.outside.join("secret.txt"))));
-        // `..` inside a directory that does not exist cannot be resolved by the OS either.
+        // `..` inside a directory that does not exist cannot be resolved by the OS either; Windows
+        // resolves it by the names alone, which stays inside here.
+        #[cfg(unix)]
         assert!(refused(f.root.resolve(Path::new("newdir/../x.tex"))));
+        #[cfg(windows)]
+        assert_eq!(
+            f.root.resolve(Path::new("newdir/../x.tex")),
+            Ok(f.root.path().join("x.tex"))
+        );
         assert!(refused(f.root.resolve(Path::new("newdir/../../outside/x"))));
     }
 
@@ -212,6 +340,7 @@ mod tests {
         assert!(refused(f.root.resolve(&sibling.join("x.tex"))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_is_refused() {
         let f = fixture();
@@ -223,6 +352,7 @@ mod tests {
         assert!(refused(f.root.resolve(Path::new("secret-link.txt"))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dangling_symlinks_are_resolved_to_their_target() {
         let f = fixture();
@@ -239,6 +369,7 @@ mod tests {
         assert!(f.root.resolve(Path::new("loop-a")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_inside_the_root_is_accepted() {
         let f = fixture();
@@ -272,6 +403,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_reached_through_a_symlink_is_canonical() {
         let f = fixture();

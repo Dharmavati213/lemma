@@ -1537,6 +1537,7 @@ fn edit_config() {
     std::fs::write(&target, original).unwrap();
     let config = f.dir.join("config/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &config).unwrap();
     f.state
         .set_settings_files(Some(SettingsFiles::next_to(config.clone())));

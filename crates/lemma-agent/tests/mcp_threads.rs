@@ -1,6 +1,7 @@
 //! `McpServer::stop` leaves no thread behind, even with live bridges, calls the editor never
 //! answers and a client that has not sent its token. A test binary of its own, with a single
 //! test, so that no other test's threads disturb the count of `/proc/self/task`.
+#![cfg(unix)]
 
 mod mcp_support;
 
@@ -11,7 +12,6 @@ use mcp_support::{
     wait_until,
 };
 use serde_json::json;
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 fn server_threads() -> Vec<String> {
@@ -47,7 +47,7 @@ fn stop_joins_every_server_thread() {
             raw.call(&request(9, "ping", json!({})))["result"],
             json!({})
         );
-        let silent = UnixStream::connect(&socket).unwrap();
+        let silent = mcp_support::connect(&socket).unwrap();
 
         // accept + 5 connections + 2 call waiters.
         wait_until("all server threads to start", || {

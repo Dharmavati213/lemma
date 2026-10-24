@@ -192,8 +192,10 @@ fn unix_now() -> u64 {
 
 /// The history directory of the project at `root`.
 pub fn project_dir(history_dir: &Path, root: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    history_dir.join(format!("{:016x}", fnv1a64(&[root.as_os_str().as_bytes()])))
+    history_dir.join(format!(
+        "{:016x}",
+        fnv1a64(&[root.as_os_str().as_encoded_bytes()])
+    ))
 }
 
 /// Called once per window after the agent controller exists (see the module docs).

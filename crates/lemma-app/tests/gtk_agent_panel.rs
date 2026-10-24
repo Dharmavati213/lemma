@@ -37,6 +37,7 @@ use lemma_config::{AgentBackend, Config, Paths, parse_prompts};
 use lemma_core::{DiagSource, ProjectRoot, Severity};
 use std::cell::RefCell;
 use std::future::Future;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -158,6 +159,7 @@ fn isolate_environment() {
 fn fake_program(name: &str, body: &str) -> PathBuf {
     let path = env().bin.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }

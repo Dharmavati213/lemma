@@ -1,5 +1,6 @@
 //! End-to-end builds with the real latexmk, each in its own temporary directory. Every test
 //! prints `SKIP` and passes when latexmk is not installed.
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 
 use lemma_build::{Build, BuildOutcome, BuildRequest, BuildStatus, Engine};
 use lemma_core::Severity;
@@ -61,6 +62,7 @@ fn errors(outcome: &BuildOutcome) -> Vec<String> {
 }
 
 /// The command names of the processes in group `pgid`, from /proc.
+#[cfg(unix)]
 fn group_members(pgid: i32) -> Vec<String> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -83,12 +85,14 @@ fn group_members(pgid: i32) -> Vec<String> {
 }
 
 /// Whether the process group no longer exists: kill(-pgid, 0) fails with ESRCH.
+#[cfg(unix)]
 fn group_gone(pgid: i32) -> bool {
     // SAFETY: signal 0 only checks that the group exists.
     let result = unsafe { libc::kill(-pgid, 0) };
     result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(unix)]
 fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -100,11 +104,13 @@ fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+#[cfg(unix)]
 const INFINITE_LOOP: &str =
     "\\documentclass{article}\n\\begin{document}\nx\\loop\\iftrue\\repeat\n\\end{document}\n";
 
 /// Waits until pdflatex runs inside the build's group, so cancelling really has an orphan to
 /// leave behind if only latexmk were signalled.
+#[cfg(unix)]
 fn wait_for_tex(pgid: i32) {
     let running = wait_for(Duration::from_secs(60), || {
         group_members(pgid)
@@ -130,7 +136,7 @@ fn proj_builds_with_pdf_and_synctex() {
         .collect();
     let files: Vec<(&str, &str)> = files.iter().map(|(f, t)| (*f, t.as_str())).collect();
     let dir = project(&files);
-    let root = fs::canonicalize(dir.path())
+    let root = lemma_core::canonicalize(dir.path())
         .expect("canonical")
         .join("main.tex");
     let outcome = build(&request(root.clone(), Duration::from_secs(180)));
@@ -267,6 +273,7 @@ fn runaway_argument_is_located_in_an_input_file() {
 }
 
 #[test]
+#[cfg(unix)]
 fn cancel_kills_the_whole_process_group() {
     if !have_latexmk() {
         return;
@@ -303,6 +310,7 @@ fn cancel_kills_the_whole_process_group() {
 }
 
 #[test]
+#[cfg(unix)]
 fn timeout_stops_the_build() {
     if !have_latexmk() {
         return;
@@ -325,6 +333,7 @@ fn timeout_stops_the_build() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dropping_a_build_stops_it() {
     if !have_latexmk() {
         return;

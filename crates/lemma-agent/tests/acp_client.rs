@@ -1,7 +1,7 @@
 //! The ACP client (`lemma_agent::spawn`) against `lemma-fake-agent` (WP2.1 + WP2.3 acceptance).
-//! Every test runs a real agent process, Lemma's MCP server on a unix socket and the real
-//! `lemma-mcp` bridge between them, exactly as in the editor (only node + the adapter are
-//! replaced by the fake agent).
+//! Every test runs a real agent process, Lemma's MCP server on a unix socket (a loopback port on
+//! Windows) and the real `lemma-mcp` bridge between them, exactly as in the editor (only node +
+//! the adapter are replaced by the fake agent).
 
 mod acp_support;
 
@@ -1034,7 +1034,6 @@ fn dropping_the_command_sender_shuts_the_agent_down() {
 
 #[test]
 fn raw_log_records_both_directions_privately() {
-    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new("rawlog");
     let mut cfg = sb.config(
         &sb.scenario(&json!({"default": [{"say": "logged"}, {"stderr": "a stderr line"}]})),
@@ -1046,8 +1045,12 @@ fn raw_log_records_both_directions_privately() {
     prompt(&handle, "go");
     events_until(&handle, SLOW, is_turn_end);
     shutdown(&handle);
-    let mode = std::fs::metadata(&raw_log).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&raw_log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
     let log = std::fs::read_to_string(&raw_log).unwrap();
     let first = log.lines().next().unwrap();
     assert!(
@@ -1151,6 +1154,10 @@ fn commands_sent_during_startup_run_after_ready() {
     shutdown(&handle);
 }
 
+// Windows: a child inherits every inheritable handle, so the fake agent's MCP bridge holds the
+// agent's stdout too, and closing it does not end the pipe while the bridge runs. An agent that
+// dies is still noticed by its exit (`death_during_a_turn_ends_it_and_exits`).
+#[cfg(unix)]
 #[test]
 fn an_agent_that_closes_its_stdout_is_killed() {
     let sb = Sandbox::new("hung");

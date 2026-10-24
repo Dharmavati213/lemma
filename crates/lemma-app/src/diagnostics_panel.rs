@@ -2565,7 +2565,7 @@ mod tests {
     fn problems_are_grouped_sorted_and_moved_to_the_root() {
         let dir = std::env::temp_dir().join(format!("lemma-diag-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let dir = lemma_core::canonicalize(&dir).unwrap();
         let root = dir.join("main.tex");
         let chapter = dir.join("chapters/a.tex");
         let diagnostics = vec![
@@ -2591,8 +2591,9 @@ mod tests {
         let summary: Vec<(String, Option<u32>, &str)> = problems
             .iter()
             .map(|p| {
-                let name = p.path.strip_prefix(&dir).unwrap().display().to_string();
-                (name, p.line, p.message.as_str())
+                let name = p.path.strip_prefix(&dir).unwrap().to_string_lossy();
+                // `/` on Windows too, as below.
+                (name.replace('\\', "/"), p.line, p.message.as_str())
             })
             .collect();
         assert_eq!(
@@ -2616,7 +2617,7 @@ mod tests {
     fn output_directories_holding_the_sources_and_file_order() {
         let dir = std::env::temp_dir().join(format!("lemma-diag-out-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let dir = lemma_core::canonicalize(&dir).unwrap();
         let root = dir.join("main.tex");
         let chapter = dir.join("chapters/a.tex");
         let other = dir.join("chapters/b.tex");

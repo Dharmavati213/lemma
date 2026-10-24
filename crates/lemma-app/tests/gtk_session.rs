@@ -283,6 +283,7 @@ fn round_trip() {
     assert!((split - 0.62).abs() < 0.01, "split {split}");
     assert_eq!(saved.root, dir.to_string_lossy());
     // Private: the file names the user's documents.
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(session::state_file(&a).unwrap())

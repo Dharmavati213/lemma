@@ -1,4 +1,5 @@
-//! Agent thread (ACP client over futures_executor::block_on, no tokio) + in-process MCP server on a unix socket.
+//! Agent thread (ACP client over futures_executor::block_on, no tokio) + in-process MCP server on a unix socket
+//! (a loopback port on Windows, see `transport.rs`).
 //! ALL agent-client-protocol usage lives in acp.rs; nothing else in the workspace imports that crate.
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ pub mod keys;
 pub mod mcp;
 /// The API-key backend (WP5.1): Anthropic's Messages API, same [`AgentHandle`] as [`spawn`].
 pub mod messages;
+mod transport;
 
 pub use acp::{
     ELEVATED_MODES, EXIT_GRACE, INSTRUCTIONS_TAG, OFFERED_MODES, STDERR_RING_BYTES, TERM_GRACE,
@@ -29,8 +31,8 @@ pub struct AgentConfig {
     pub env: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,        // project root
     pub mcp_bridge: PathBuf, // the lemma-mcp binary next to `lemma`
-    pub mcp_socket: PathBuf, // $XDG_RUNTIME_DIR/lemma/mcp-<pid>.sock (dir 0700)
-    pub mcp_token: String,   // 32 hex chars from /dev/urandom
+    pub mcp_socket: PathBuf, // $XDG_RUNTIME_DIR/lemma/mcp-<pid>.sock (dir 0700); a port file on Windows
+    pub mcp_token: String,   // 32 hex chars from the system's random generator
     /// Lemma's instructions for the agent (see [`AcpFlavor`] for how they reach it).
     pub system_prompt_append: String,
     pub raw_log: Option<PathBuf>, // debug only; contains account info, never commit

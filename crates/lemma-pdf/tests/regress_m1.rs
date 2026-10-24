@@ -11,11 +11,12 @@ use lemma_pdf::{PageKey, PdfCmd, PdfEvent, RenderReq, page_pixels, tile_grid};
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn fixture(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(rel)
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
+    lemma_core::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
 }
 
 fn next(rx: &Receiver<PdfEvent>) -> PdfEvent {
@@ -37,7 +38,7 @@ fn temp_dir(name: &str) -> PathBuf {
         .join(format!("lemma-pdf-regress-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
+    lemma_core::canonicalize(&dir).unwrap()
 }
 
 /// Set in the child process of [`regress_worker_shutdown_races_process_exit`].

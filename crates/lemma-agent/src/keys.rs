@@ -19,6 +19,13 @@
 //! key back to confirm, since `security -i` does not report a failed command in its exit status.
 //! Items `security` created are readable by `security` without a prompt.
 //!
+//! # Windows
+//!
+//! On Windows the key is a generic credential in the user's Credential Manager (target
+//! [`WINDOWS_TARGET`], user name `anthropic-api-key`), read, written and deleted with
+//! `CredReadW`, `CredWriteW` and `CredDeleteW`: no program runs, so nothing can see the key in a
+//! command line. The credential is kept on this computer only (`CRED_PERSIST_LOCAL_MACHINE`).
+//!
 //! # Secrecy
 //!
 //! The key lives only in an [`ApiKey`], whose `Debug` and `Display` print `<redacted>`: it is
@@ -32,7 +39,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,12 +51,16 @@ pub const LABEL: &str = "Lemma Anthropic API key";
 pub const ATTRIBUTES: [&str; 4] = ["service", "lemma", "kind", "anthropic-api-key"];
 /// The macOS keychain item's service and account (`security -s … -a …`).
 pub const KEYCHAIN_ITEM: [&str; 4] = ["-s", "lemma", "-a", "anthropic-api-key"];
+/// The Windows Credential Manager's target name for the key.
+pub const WINDOWS_TARGET: &str = "lemma/anthropic-api-key";
 /// `security`'s exit status when no item matches (`errSecItemNotFound`).
 const SECURITY_NOT_FOUND: i32 = 44;
-/// Where the key is kept, for messages: "the GNOME keyring (secret-tool)" or "the macOS
-/// Keychain".
+/// Where the key is kept, for messages: "the GNOME keyring (secret-tool)", "the macOS
+/// Keychain" or "the Windows Credential Manager".
 pub const KEYRING_DESCRIPTION: &str = if cfg!(target_os = "macos") {
     "the macOS Keychain"
+} else if cfg!(windows) {
+    "the Windows Credential Manager"
 } else {
     "the GNOME keyring (secret-tool)"
 };
@@ -106,11 +117,13 @@ pub enum KeySource {
 }
 
 impl KeySource {
-    /// "from ANTHROPIC_API_KEY" / "from GNOME keyring" ("from macOS Keychain").
+    /// "from ANTHROPIC_API_KEY" / "from GNOME keyring" ("from macOS Keychain", "from Windows
+    /// Credential Manager").
     pub fn describe(self) -> &'static str {
         match self {
             Self::Env => "from ANTHROPIC_API_KEY",
             Self::Keyring if cfg!(target_os = "macos") => "from macOS Keychain",
+            Self::Keyring if cfg!(windows) => "from Windows Credential Manager",
             Self::Keyring => "from GNOME keyring",
         }
     }
@@ -123,9 +136,12 @@ enum Protocol {
     SecretTool,
     /// macOS's `security`.
     MacSecurity,
+    /// The Windows Credential Manager (no program).
+    WindowsCredentials,
 }
 
-/// The keyring program to run: `secret-tool`, or `security` on macOS.
+/// The keyring program to run: `secret-tool`, or `security` on macOS. For the Windows
+/// Credential Manager no program runs, and `program` is the credential's target name instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keyring {
     program: PathBuf,
@@ -133,10 +149,13 @@ pub struct Keyring {
 }
 
 impl Default for Keyring {
-    /// `secret-tool`, found on `PATH`; on macOS `/usr/bin/security`.
+    /// `secret-tool`, found on `PATH`; on macOS `/usr/bin/security`; on Windows the
+    /// Credential Manager.
     fn default() -> Self {
         if cfg!(target_os = "macos") {
             Self::macos_keychain("/usr/bin/security")
+        } else if cfg!(windows) {
+            Self::windows_credentials(WINDOWS_TARGET)
         } else {
             Self::with_program("secret-tool")
         }
@@ -161,6 +180,15 @@ impl Keyring {
         }
     }
 
+    /// The Windows Credential Manager's generic credential `target` (normally
+    /// [`WINDOWS_TARGET`]; see the module docs). Only usable on Windows.
+    pub fn windows_credentials(target: &str) -> Self {
+        Self {
+            program: PathBuf::from(target),
+            protocol: Protocol::WindowsCredentials,
+        }
+    }
+
     /// `secret-tool` from the first directory of `path` (a `PATH`-style list) that holds an
     /// executable one; `None` when none does.
     pub fn on_path(path: &OsStr) -> Option<Self> {
@@ -170,8 +198,12 @@ impl Keyring {
             .map(Self::with_program)
     }
 
-    /// Whether the program can be found (on `PATH` for the default one).
+    /// Whether the program can be found (on `PATH` for the default one). The Windows
+    /// Credential Manager always is.
     pub fn available(&self) -> bool {
+        if self.protocol == Protocol::WindowsCredentials {
+            return true;
+        }
         if self.program.components().count() > 1 {
             return is_executable(&self.program);
         }
@@ -184,6 +216,9 @@ impl Keyring {
     pub fn lookup(&self) -> io::Result<Option<ApiKey>> {
         if self.protocol == Protocol::MacSecurity {
             return self.lookup_macos();
+        }
+        if self.protocol == Protocol::WindowsCredentials {
+            return credentials::read(&self.target());
         }
         let mut args = vec!["lookup"];
         args.extend(ATTRIBUTES);
@@ -206,6 +241,9 @@ impl Keyring {
         if self.protocol == Protocol::MacSecurity {
             return self.store_macos(key);
         }
+        if self.protocol == Protocol::WindowsCredentials {
+            return credentials::write(&self.target(), key);
+        }
         let label = format!("--label={LABEL}");
         let mut args = vec!["store", label.as_str()];
         args.extend(ATTRIBUTES);
@@ -225,6 +263,9 @@ impl Keyring {
         if self.protocol == Protocol::MacSecurity {
             return self.clear_macos();
         }
+        if self.protocol == Protocol::WindowsCredentials {
+            return credentials::delete(&self.target());
+        }
         let mut args = vec!["clear"];
         args.extend(ATTRIBUTES);
         let out = self.run(&args, None)?;
@@ -236,6 +277,11 @@ impl Keyring {
                 out.stderr.trim()
             )))
         }
+    }
+
+    /// The Credential Manager target of [`Keyring::windows_credentials`].
+    fn target(&self) -> String {
+        self.program.to_string_lossy().into_owned()
     }
 
     /// [`Keyring::lookup`] in the macOS keychain: `security find-generic-password -w` prints the
@@ -300,7 +346,7 @@ impl Keyring {
     }
 
     fn run(&self, args: &[&str], stdin: Option<&str>) -> io::Result<Output> {
-        let mut child = Command::new(&self.program)
+        let mut child = lemma_core::process::command(&self.program)
             .args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -373,10 +419,141 @@ fn wait_with_timeout(
     }
 }
 
+#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Windows has no execute bit: any file counts.
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Without the Windows Credential Manager (any other system), the protocol never reaches it.
+#[cfg(not(windows))]
+mod credentials {
+    use super::ApiKey;
+    use std::io;
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the Windows Credential Manager exists only on Windows",
+        )
+    }
+
+    pub(super) fn read(_target: &str) -> io::Result<Option<ApiKey>> {
+        Err(unsupported())
+    }
+
+    pub(super) fn write(_target: &str, _key: &ApiKey) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(super) fn delete(_target: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+}
+
+/// The key as a generic credential in the Windows Credential Manager (see the module docs).
+#[cfg(windows)]
+mod credentials {
+    use super::{ApiKey, LABEL};
+    use std::io;
+    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
+        CredReadW, CredWriteW,
+    };
+
+    /// The credential's user name, which the Credential Manager shows.
+    const USER_NAME: &str = "anthropic-api-key";
+
+    /// `text` as a NUL-terminated UTF-16 string.
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    pub(super) fn read(target: &str) -> io::Result<Option<ApiKey>> {
+        let target = wide(target);
+        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: `target` is NUL-terminated; on success the system allocates `credential`,
+        // which is freed with CredFree below.
+        let found =
+            unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) } != 0;
+        if !found {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    e.kind(),
+                    format!("the Credential Manager could not be read: {e}"),
+                ))
+            };
+        }
+        // SAFETY: CredReadW succeeded, so `credential` points at a valid CREDENTIALW whose blob
+        // holds `CredentialBlobSize` bytes; both live until CredFree.
+        let key = unsafe {
+            let blob = std::slice::from_raw_parts(
+                (*credential).CredentialBlob,
+                (*credential).CredentialBlobSize as usize,
+            );
+            let key = String::from_utf8(blob.to_vec()).ok();
+            CredFree(credential.cast());
+            key
+        };
+        Ok(key.as_deref().and_then(ApiKey::new))
+    }
+
+    pub(super) fn write(target: &str, key: &ApiKey) -> io::Result<()> {
+        let mut target = wide(target);
+        let mut comment = wide(LABEL);
+        let mut user = wide(USER_NAME);
+        let mut blob = key.expose().as_bytes().to_vec();
+        // SAFETY: an all-zero CREDENTIALW is valid (no attributes, no alias).
+        let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
+        credential.Type = CRED_TYPE_GENERIC;
+        credential.TargetName = target.as_mut_ptr();
+        credential.Comment = comment.as_mut_ptr();
+        credential.UserName = user.as_mut_ptr();
+        credential.CredentialBlob = blob.as_mut_ptr();
+        credential.CredentialBlobSize = u32::try_from(blob.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the key is too long"))?;
+        credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+        // SAFETY: every pointer in `credential` points into a buffer that outlives the call.
+        let written = unsafe { CredWriteW(&raw const credential, 0) } != 0;
+        blob.fill(0);
+        if written {
+            Ok(())
+        } else {
+            let e = io::Error::last_os_error();
+            Err(io::Error::new(
+                e.kind(),
+                format!("the Credential Manager could not store the key: {e}"),
+            ))
+        }
+    }
+
+    pub(super) fn delete(target: &str) -> io::Result<()> {
+        let target = wide(target);
+        // SAFETY: `target` is NUL-terminated.
+        if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                e.kind(),
+                format!("the Credential Manager could not remove the key: {e}"),
+            ))
+        }
+    }
 }
 
 /// The key and where it came from: `env_value` (pass `std::env::var_os(ENV_VAR)`) first, then
@@ -399,12 +576,37 @@ pub fn lookup() -> Option<(ApiKey, KeySource)> {
     lookup_with(std::env::var_os(ENV_VAR).as_deref(), &Keyring::default())
 }
 
-/// Stores `key` in the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS).
+/// Stores `key` in the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS, the
+/// Credential Manager on Windows).
 pub fn store(key: &ApiKey) -> io::Result<()> {
     Keyring::default().store(key)
 }
 
-/// Removes the key from the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS).
+/// Removes the key from the GNOME keyring (`secret-tool` on `PATH`; the Keychain on macOS, the
+/// Credential Manager on Windows).
 pub fn clear() -> io::Result<()> {
     Keyring::default().clear()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_credential_manager_stores_reads_and_removes_a_key() {
+        // A target of this test's own, so a key the user stored is never touched.
+        let keyring = Keyring::windows_credentials(&format!("lemma-test/{}", std::process::id()));
+        assert!(keyring.available());
+        keyring.clear().unwrap();
+        assert_eq!(keyring.lookup().unwrap(), None);
+        let key = ApiKey::new("sk-ant-test-0123456789").unwrap();
+        keyring.store(&key).unwrap();
+        assert_eq!(keyring.lookup().unwrap(), Some(key));
+        let other = ApiKey::new("sk-ant-test-replaced").unwrap();
+        keyring.store(&other).unwrap();
+        assert_eq!(keyring.lookup().unwrap(), Some(other));
+        keyring.clear().unwrap();
+        assert_eq!(keyring.lookup().unwrap(), None);
+        keyring.clear().unwrap();
+    }
 }

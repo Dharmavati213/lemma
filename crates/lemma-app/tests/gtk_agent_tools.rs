@@ -84,6 +84,7 @@ fn main() -> ExitCode {
         ("e2e_errors_scenario_exact_texts", e2e_errors),
         ("e2e_long_scenario_chunk_cost", e2e_long),
         ("e2e_demo_agent_snapshot", e2e_demo),
+        #[cfg(unix)]
         (
             "runtime_files_of_killed_runs_and_stopped_agents_go",
             runtime_files_cleaned_up,
@@ -718,11 +719,14 @@ fn render_page() {
         png,
         "the copy is the same image"
     );
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     let mode = std::fs::metadata(copy.parent().unwrap())
         .unwrap()
         .permissions()
         .mode();
+    #[cfg(unix)]
     assert_eq!(mode & 0o777, 0o700, "the runtime directory is private");
 
     assert_eq!(
@@ -1877,6 +1881,7 @@ fn e2e_demo() {
 /// The MCP sockets of runs that were killed (their process is gone) are removed when an agent
 /// starts; those of live processes stay. The agent's own socket and the `render_page` copies go
 /// when it stops, and when its window leaves the application (the app quitting).
+#[cfg(unix)]
 fn runtime_files_cleaned_up() {
     use std::os::unix::net::UnixListener;
     require_binaries();

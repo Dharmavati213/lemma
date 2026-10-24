@@ -1158,11 +1158,11 @@ fn apply_as_agent(doc: &DocRef, text: &str, charset: Option<String>, disk: DiskS
 /// tracked), read on the jobs thread.
 async fn git_head_text(root: PathBuf, rel: String) -> Option<String> {
     gio::spawn_blocking(move || {
-        let out = std::process::Command::new("git")
+        let out = lemma_core::process::command("git")
             .arg("-C")
             .arg(&root)
             .arg("show")
-            .arg(format!("HEAD:./{rel}"))
+            .arg(format!("HEAD:./{}", crate::git_gutter::git_path(&rel)))
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()

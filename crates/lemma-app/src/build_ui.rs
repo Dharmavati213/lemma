@@ -853,14 +853,8 @@ fn read_index(path: &Path) -> FileIndex {
 /// whole file. `None` for anything but a regular file: a FIFO would block and a device such as
 /// /dev/zero never ends.
 fn read_text(path: &Path, cap: u64) -> Option<(String, bool)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer. It does not
-    // change reads from a regular file.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
+    // Not blocking: opening a FIFO for reading would otherwise wait for a writer.
+    let file = crate::fsutil::open_nonblocking(path).ok()?;
     if !file.metadata().is_ok_and(|m| m.is_file()) {
         return None;
     }
@@ -1115,7 +1109,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lemma-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let dir = lemma_core::canonicalize(&dir).unwrap();
         let main = "\\documentclass{book}\n\\usepackage{fontspec}\n\\begin{document}\n\
                     \\include{chapters/one}\n\\input{sec}\n\\end{document}\n";
         std::fs::write(dir.join("main.tex"), main).unwrap();
@@ -1217,17 +1211,20 @@ mod tests {
         );
 
         // Not regular files: never read (a FIFO would block, /dev/zero never ends).
-        let fifo = dir.join("fifo.tex");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success());
-        assert_eq!(read_text(&fifo, 1024), None);
-        let zero = dir.join("zero.tex");
-        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
-        assert_eq!(read_text(&zero, 1024), None);
-        assert_eq!(read_index(&zero), FileIndex::default());
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("fifo.tex");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            assert_eq!(read_text(&fifo, 1024), None);
+            let zero = dir.join("zero.tex");
+            std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+            assert_eq!(read_text(&zero, 1024), None);
+            assert_eq!(read_index(&zero), FileIndex::default());
+        }
         assert_eq!(read_text(&dir, 1024), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1239,7 +1236,7 @@ mod tests {
         for sub in ["a/notes", "b"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let dir = dir.canonicalize().unwrap();
+        let dir = lemma_core::canonicalize(&dir).unwrap();
         let root = dir.join("b/thesis.tex");
         std::fs::write(
             &root,

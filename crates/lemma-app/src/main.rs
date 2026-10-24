@@ -1,4 +1,7 @@
 //! The `lemma` binary: process-wide set-up, then [`lemma_app::app::run`].
+// On Windows a GUI program, which opens no console window (`lemma_app::windows` attaches to the
+// console of a terminal that starts it).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -10,6 +13,9 @@ fn main() -> ExitCode {
     // must be named, and PATH lacks Homebrew, MacTeX and the user's own tools.
     #[cfg(target_os = "macos")]
     lemma_app::macos::prepare_environment();
+    // A terminal's console for the output, and the TeX, Node.js and Git directories on PATH.
+    #[cfg(windows)]
+    lemma_app::windows::prepare_environment();
     init_tracing();
     quiet_environment_noise();
 
@@ -44,8 +50,10 @@ fn init_tracing() {
 
 /// Drops the GLib warnings that describe the machine rather than Lemma and passes everything else
 /// to GLib's default writer: enchant (spell checking) warns once per process about every optional
-/// provider plugin whose library is not installed (`Error loading plugin: libvoikko.so.1: …`).
-/// GLib allows one writer per process, so this is the only place that can filter them.
+/// provider plugin whose library is not installed (`Error loading plugin: libvoikko.so.1: …`),
+/// and on Windows GApplication looks for a D-Bus session bus, which Lemma (one window per
+/// process) does not use, and warns that it has no `gdbus.exe` to start one. GLib allows one
+/// writer per process, so this is the only place that can filter them.
 fn quiet_environment_noise() {
     glib::log_set_writer_func(|level, fields| {
         let field = |key: &str| {
@@ -56,6 +64,12 @@ fn quiet_environment_noise() {
         };
         if field("GLIB_DOMAIN") == Some("libenchant")
             && field("MESSAGE").is_some_and(|m| m.contains("Error loading plugin"))
+        {
+            return glib::LogWriterOutput::Handled;
+        }
+        if cfg!(windows)
+            && field("GLIB_DOMAIN") == Some("GLib-GIO")
+            && field("MESSAGE").is_some_and(|m| m.contains("session dbus binary not found"))
         {
             return glib::LogWriterOutput::Handled;
         }

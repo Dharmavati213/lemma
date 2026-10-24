@@ -7,6 +7,7 @@ use lemma_core::{DiagSource, Diagnostic, Severity};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Time between SIGTERM and SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(500);
 /// How long [`Build::wait`] waits for a cancelled process group to disappear.
 const GROUP_EXIT_LIMIT: Duration = Duration::from_millis(1500);
@@ -27,10 +29,14 @@ const MAX_SOURCE_BYTES: u64 = 4 << 20;
 const LATEXMK_TAIL_BYTES: u64 = 4096;
 const LATEXMK_TAIL_LINES: usize = 5;
 
-/// The process group of one build: latexmk and every TeX, biber or bibtex it starts.
+/// The process group of one build: latexmk and every TeX, biber or bibtex it starts. On Windows
+/// it is a job object instead ([`lemma_core::process::Job`]).
 #[derive(Debug)]
 struct Group {
-    pgid: libc::pid_t,
+    /// latexmk's pid, which is also the group id.
+    pgid: i32,
+    #[cfg(windows)]
+    job: lemma_core::process::Job,
     cancelled: AtomicBool,
     timed_out: AtomicBool,
     /// Set once [`Build::wait`] has reaped latexmk; later cancels do nothing.
@@ -38,6 +44,7 @@ struct Group {
 }
 
 impl Group {
+    #[cfg(unix)]
     fn new(pgid: libc::pid_t) -> Self {
         Group {
             pgid,
@@ -47,8 +54,20 @@ impl Group {
         }
     }
 
+    #[cfg(windows)]
+    fn new(pid: u32, job: lemma_core::process::Job) -> Self {
+        Group {
+            pgid: i32::try_from(pid).unwrap_or(i32::MAX),
+            job,
+            cancelled: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        }
+    }
+
     /// SIGTERM to the whole group now, SIGKILL after [`KILL_GRACE`] if anything survived.
-    /// Signalling latexmk alone leaves pdflatex running as an orphan.
+    /// Signalling latexmk alone leaves pdflatex running as an orphan. On Windows, which has no
+    /// SIGTERM for these programs, the whole job ends at once.
     fn stop(self: &Arc<Self>, timed_out: bool) {
         if self.finished.load(Ordering::SeqCst) || self.cancelled.swap(true, Ordering::SeqCst) {
             return;
@@ -56,6 +75,14 @@ impl Group {
         if timed_out {
             self.timed_out.store(true, Ordering::SeqCst);
         }
+        #[cfg(windows)]
+        self.job.terminate(1);
+        #[cfg(unix)]
+        self.escalate();
+    }
+
+    #[cfg(unix)]
+    fn escalate(self: &Arc<Self>) {
         self.signal(libc::SIGTERM);
         let group = Arc::clone(self);
         let escalate = thread::Builder::new()
@@ -71,6 +98,7 @@ impl Group {
         }
     }
 
+    #[cfg(unix)]
     fn signal(&self, signal: libc::c_int) {
         // A group id of 0 or 1 would signal our own group or init; ours is always latexmk's pid.
         if self.pgid > 1 {
@@ -82,6 +110,7 @@ impl Group {
     }
 
     /// Whether any process (zombies included) is still in the group.
+    #[cfg(unix)]
     fn alive(&self) -> bool {
         if self.pgid <= 1 {
             return false;
@@ -89,6 +118,12 @@ impl Group {
         // SAFETY: signal 0 only checks that the group exists; no memory is involved.
         let result = unsafe { libc::killpg(self.pgid, 0) };
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// Whether any process is still in the job.
+    #[cfg(windows)]
+    fn alive(&self) -> bool {
+        self.job.has_processes()
     }
 
     fn wait_until_gone(&self, limit: Duration) {
@@ -106,8 +141,8 @@ pub struct Canceller {
 }
 
 impl Canceller {
-    /// killpg(pgid, SIGTERM); SIGKILL after 500 ms if still alive. Idempotent; does nothing once
-    /// the build has finished.
+    /// killpg(pgid, SIGTERM); SIGKILL after 500 ms if still alive (on Windows: ends the job).
+    /// Idempotent; does nothing once the build has finished.
     pub fn cancel(&self) {
         self.group.stop(false);
     }
@@ -172,8 +207,8 @@ impl BuildOutcome {
 
 impl Build {
     /// Creates the output and mirror directories, then spawns latexmk ([`command_line`]) in the
-    /// root's directory as the leader of a new process group, with stdin from /dev/null. Its
-    /// output goes to `<outdir>/<stem>.latexmk.log`.
+    /// root's directory as the leader of a new process group (on Windows: in a new job), with
+    /// stdin from /dev/null. Its output goes to `<outdir>/<stem>.latexmk.log`.
     pub fn start(req: &BuildRequest) -> io::Result<Build> {
         let (root_dir, stem) = root_parts(&req.root)?;
         let out_dir = root_dir.join(&req.outdir);
@@ -192,26 +227,36 @@ impl Build {
         };
         let (args, env) = command_line(req);
         let started = Instant::now();
-        let child = Command::new(&req.latexmk)
+        let mut command = Command::new(&req.latexmk);
+        command
             .args(&args)
             .envs(env)
             .current_dir(&root_dir)
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(stderr)
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("cannot run {}: {e}", req.latexmk.display()),
-                )
-            })?;
-        let pgid = libc::pid_t::try_from(child.id())
-            .map_err(|_| io::Error::other("latexmk's pid does not fit in pid_t"))?;
+            .stderr(stderr);
+        let cannot_run = |e: io::Error| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot run {}: {e}", req.latexmk.display()),
+            )
+        };
+        #[cfg(unix)]
+        let (child, group) = {
+            let child = command.process_group(0).spawn().map_err(cannot_run)?;
+            let pgid = libc::pid_t::try_from(child.id())
+                .map_err(|_| io::Error::other("latexmk's pid does not fit in pid_t"))?;
+            (child, Group::new(pgid))
+        };
+        #[cfg(windows)]
+        let (child, group) = {
+            let (child, job) = lemma_core::process::Job::spawn(&mut command).map_err(cannot_run)?;
+            let pid = child.id();
+            (child, Group::new(pid, job))
+        };
         Ok(Build {
             child: Some(child),
-            group: Arc::new(Group::new(pgid)),
+            group: Arc::new(group),
             started,
             req: req.clone(),
         })
@@ -384,14 +429,16 @@ fn is_plain_relative(dir: &Path) -> bool {
 /// Only regular files are read (symlinks are followed): a FIFO would block, and a device such as
 /// /dev/zero never ends.
 pub(crate) fn read_capped(path: &Path, cap: u64) -> Option<String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
     // O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer. It does not
-    // change reads from a regular file.
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
+    // change reads from a regular file. (Windows has no FIFOs in the file system.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
     if !file.metadata().is_ok_and(|m| m.is_file()) {
         return None;
     }

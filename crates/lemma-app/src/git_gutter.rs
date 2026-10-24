@@ -53,7 +53,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -441,7 +441,7 @@ struct RepoInfo {
 /// start, else whether it succeeded and its standard output.
 fn git(dir: &Path, args: &[&str]) -> Option<(bool, Vec<u8>)> {
     GIT_RUNS.fetch_add(1, Ordering::SeqCst);
-    let out = Command::new("git")
+    let out = lemma_core::process::command("git")
         .arg("-C")
         .arg(dir)
         .args(["--literal-pathspecs", "-c", "core.fsmonitor=false"])
@@ -486,7 +486,7 @@ fn discover(dir: &Path) -> Result<Option<RepoInfo>, ()> {
         // A bare repository or inside the git directory.
         return Ok(None);
     }
-    let top = top.canonicalize().unwrap_or(top);
+    let top = lemma_core::canonicalize(&top).unwrap_or(top);
     Ok(Some(RepoInfo {
         top,
         git_dir,
@@ -502,6 +502,16 @@ fn resolve_head(top: &Path) -> Result<Option<String>, ()> {
 }
 
 /// The base text of a file (see [`Base`]), on the jobs thread.
+/// `rel` as git names a path in a tree (`HEAD:<path>`): with `/` between the directories, also
+/// on Windows, where git takes no `\` there. (On Unix a `\` is part of a file name.)
+pub(crate) fn git_path(rel: &str) -> String {
+    if cfg!(windows) {
+        rel.replace('\\', "/")
+    } else {
+        rel.to_owned()
+    }
+}
+
 fn read_base(top: &Path, rel: &str, head: Option<&str>, charset: Option<&str>) -> Base {
     if let Some(head) = head
         && let Some((true, bytes)) = git(top, &["cat-file", "blob", &format!("{head}:./{rel}")])
@@ -867,7 +877,7 @@ impl Gutter {
             .strip_prefix(&info.top)
             .ok()
             .and_then(Path::to_str)
-            .map(str::to_owned)
+            .map(git_path)
         else {
             // Not below the work tree's top (a path git cannot name): nothing to compare.
             tracked.outside.set(true);
@@ -1339,6 +1349,13 @@ impl Tracked {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_paths_separate_directories_with_slashes() {
+        assert_eq!(git_path("ch/a.tex"), "ch/a.tex");
+        #[cfg(windows)]
+        assert_eq!(git_path(r"ch\sub\a.tex"), "ch/sub/a.tex");
+    }
 
     fn kinds(marks: &Marks, lines: u32) -> String {
         (0..=lines)

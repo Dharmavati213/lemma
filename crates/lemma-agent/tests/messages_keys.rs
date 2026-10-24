@@ -1,5 +1,6 @@
 //! `keys.rs` (WP5.1) against a fake `secret-tool` on a temporary PATH, and against a fake macOS
 //! `security`. Never the real keyring.
+#![cfg(unix)]
 
 use lemma_agent::keys::{self, ApiKey, KeySource, Keyring};
 use std::ffi::OsStr;

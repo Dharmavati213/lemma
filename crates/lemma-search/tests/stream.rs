@@ -34,7 +34,8 @@ fn rel(root: &Path, files: &[FileMatches]) -> Vec<String> {
         .map(|f| {
             f.path.strip_prefix(root).map_or_else(
                 |_| f.path.display().to_string(),
-                |p| p.display().to_string(),
+                // `/` on Windows too, as the expected names below have it.
+                |p| p.to_string_lossy().replace('\\', "/"),
             )
         })
         .collect()
@@ -60,6 +61,8 @@ fn scope_order_filters_and_live_text() {
     write(&root, "big.tex", "needle ".repeat(400));
     write(&root, "latin.tex", b"caf\xe9 needle \xa4\n");
     write(&outside, "o.tex", "needle outside\n");
+    // Windows needs a privilege to make symbolic links.
+    #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("main.tex"), root.join("link.tex")).unwrap();
 
     let scope = Scope {

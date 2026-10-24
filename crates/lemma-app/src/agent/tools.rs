@@ -334,14 +334,21 @@ pub(crate) fn runtime_dir(state: &WindowState) -> PathBuf {
     )
 }
 
-/// Creates `dir` (and its parents) readable by the user only (mode 0700). Blocking.
+/// Creates `dir` (and its parents) readable by the user only (mode 0700; on Windows the
+/// user's profile is private already, see [`crate::fsutil`]). Blocking.
 pub(crate) fn create_private_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    crate::fsutil::private_dir_builder()
         .create(dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    make_private(dir)?;
+    Ok(())
+}
+
+/// Sets `dir` to mode 0700 unless it has that mode already.
+#[cfg(unix)]
+fn make_private(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .permissions()
@@ -1502,7 +1509,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lemma-graph-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let dir = lemma_core::canonicalize(&dir).unwrap();
         std::fs::write(
             dir.join("main.tex"),
             "\\documentclass{article}\n\\addbibresource{refs.bib}\n\\begin{document}\n\

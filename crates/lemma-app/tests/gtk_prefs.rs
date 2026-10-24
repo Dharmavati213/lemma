@@ -93,6 +93,7 @@ fn fixture(name: &str, text: &str, link: bool) -> Fixture {
         std::fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join("lemma.toml");
         std::fs::write(&target, text).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &config).unwrap();
         target
     } else {
@@ -301,7 +302,10 @@ fn round_trip() {
                 assert_eq!(get(&f.state.config), wanted, "{section}.{key} applied");
             }
             Kind::Font => {
-                assert_eq!(prefs::font_value(&f.state).as_deref(), Some("Monospace 11"));
+                assert_eq!(
+                    prefs::font_value(&f.state).as_deref(),
+                    Some(lemma_config::DEFAULT_FONT)
+                );
                 assert!(prefs::set_font(&f.state, "DejaVu Sans Mono 13"));
                 assert_eq!(f.file_config().editor.font, "DejaVu Sans Mono 13");
                 assert_eq!(f.state.config.editor.font, "DejaVu Sans Mono 13");

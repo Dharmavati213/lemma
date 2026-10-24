@@ -69,6 +69,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1646,12 +1647,12 @@ struct RawLog(Arc<Mutex<File>>);
 
 impl RawLog {
     fn create(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(Self(Arc::new(Mutex::new(file))))
     }

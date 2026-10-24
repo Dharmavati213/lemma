@@ -14,11 +14,12 @@ const LETTER: (f64, f64) = (612.0, 792.0);
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn fixture(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(rel)
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
+    lemma_core::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
 }
 
 fn try_next(rx: &Receiver<PdfEvent>, timeout: Duration) -> Result<PdfEvent, TryRecvError> {

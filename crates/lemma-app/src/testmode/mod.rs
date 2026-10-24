@@ -121,7 +121,9 @@ pub fn sibling_binary(name: &str) -> Option<PathBuf> {
 
 fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {
     let dir = exe.parent()?;
-    let candidates = [Some(dir.join(name)), dir.parent().map(|d| d.join(name))];
+    // `lemma-mcp.exe` on Windows.
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let candidates = [Some(dir.join(&name)), dir.parent().map(|d| d.join(&name))];
     candidates
         .into_iter()
         .flatten()
@@ -129,9 +131,7 @@ fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    crate::fsutil::is_executable(path)
 }
 
 /// The `lemma-fake-agent` binary: `$LEMMA_FAKE_AGENT` when set (it must name an executable
@@ -345,7 +345,7 @@ fn popover_anchor(widget: &gtk::Widget, popover: &gtk::Popover) -> Option<gtk::g
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -20,10 +20,7 @@ fn repo() -> PathBuf {
 }
 
 fn fixture(rel: &str) -> PathBuf {
-    repo()
-        .join("tests/fixtures")
-        .join(rel)
-        .canonicalize()
+    lemma_core::canonicalize(repo().join("tests/fixtures").join(rel))
         .unwrap_or_else(|e| panic!("fixture {rel}: {e}"))
 }
 

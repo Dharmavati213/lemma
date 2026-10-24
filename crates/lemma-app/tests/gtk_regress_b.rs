@@ -472,6 +472,7 @@ fn regress_fifo_input_does_not_wedge_root_detection() {
     });
     // Clean up either way: release a reader blocked in open(), replace the FIFO by a file and
     // stop any build.
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         let _ = std::fs::OpenOptions::new()

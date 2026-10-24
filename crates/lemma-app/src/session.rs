@@ -1146,7 +1146,6 @@ impl Writer {
         skip_identical: bool,
     ) -> Result<(), String> {
         use std::io::Write as _;
-        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         let mut committed = self
             .committed
             .lock()
@@ -1166,9 +1165,7 @@ impl Writer {
         }
         let shown = |e: std::io::Error| format!("{}: {e}", file.display());
         if let Some(dir) = file.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
+            crate::fsutil::private_dir_builder()
                 .create(dir)
                 .map_err(shown)?;
         }
@@ -1176,11 +1173,10 @@ impl Writer {
         static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = file.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
-        let written = std::fs::OpenOptions::new()
+        let written = crate::fsutil::private_file_options()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&tmp)
             .and_then(|mut f| f.write_all(bytes))
             .and_then(|()| std::fs::rename(&tmp, file));
@@ -1253,6 +1249,41 @@ mod tests {
         assert!(parse(b"{oops").is_err());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_paths() {
+        let root = Path::new(r"C:\Users\u\thesis");
+        assert_eq!(
+            stored_path(Path::new(r"C:\Users\u\thesis\ch\a.tex"), root).as_deref(),
+            Some(r"ch\a.tex")
+        );
+        assert_eq!(
+            stored_path(Path::new(r"D:\macros.tex"), root).as_deref(),
+            Some(r"D:\macros.tex")
+        );
+        assert_eq!(
+            absolute(root, r"ch\a.tex"),
+            PathBuf::from(r"C:\Users\u\thesis\ch\a.tex")
+        );
+        // A session written on Windows before, with `/`, reads the same.
+        assert_eq!(
+            absolute(root, "ch/a.tex"),
+            PathBuf::from(r"C:\Users\u\thesis\ch\a.tex")
+        );
+        let snapshot = SessionFile {
+            tabs: vec![TabState {
+                path: r"ch\a.tex".into(),
+                ..TabState::default()
+            }],
+            active: Some(0),
+            ..SessionFile::default()
+        };
+        let last = last_session_of(&snapshot, root).unwrap();
+        assert_eq!(last.root, r"C:\Users\u\thesis");
+        assert_eq!(last.file.as_deref(), Some(r"C:\Users\u\thesis\ch\a.tex"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn stored_paths_are_relative_inside_the_root() {
         let root = Path::new("/home/u/thesis");
@@ -1270,6 +1301,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn writes_are_atomic_private_and_ordered() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1307,6 +1339,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_last_session_is_the_selected_tab_of_a_window_with_tabs() {
         let root = Path::new("/home/u/thesis");

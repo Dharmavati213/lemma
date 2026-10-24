@@ -18,8 +18,10 @@ lemma-build = { workspace = true }
 poppler = { workspace = true }
 cairo = { workspace = true }
 glib = { workspace = true }
-libc = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

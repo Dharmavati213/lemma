@@ -53,6 +53,14 @@ ureq = { workspace = true }
 # M5 review: latexindent's private working directory (format.rs)
 tempfile = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# the MCP token (BCryptGenRandom) and the console of a terminal that started Lemma (windows.rs)
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+] }
+
 # GTK integration tests run on the main thread with their own `main` (ARCHITECTURE §10.1).
 [[test]]
 name = "gtk_document"

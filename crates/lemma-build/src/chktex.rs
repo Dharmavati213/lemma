@@ -155,7 +155,7 @@ pub fn run(
 /// The command [`run`] runs (tests change its environment, e.g. `HOME`, so a user's
 /// `~/.chktexrc` does not change their results).
 pub fn command(program: &Path, cwd: &Path, name: &str) -> Command {
-    let mut command = Command::new(program);
+    let mut command = lemma_core::process::command(program);
     command.args(args(name)).current_dir(cwd);
     command
 }

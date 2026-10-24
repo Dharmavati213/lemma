@@ -578,7 +578,7 @@ impl Previewer {
             let Some(path) = find_program(&self.pdflatex) else {
                 return 0;
             };
-            let real = fs::canonicalize(&path).unwrap_or(path);
+            let real = lemma_core::canonicalize(&path).unwrap_or(path);
             let meta = fs::metadata(&real).ok();
             let (size, mtime) = meta.map_or((0, 0), |m| (m.len(), mtime_ns(&m)));
             fnv1a64(&[
@@ -1031,10 +1031,22 @@ INPUT {0}\nINPUT {0}\nINPUT /home/u/.texlive2026/texmf-var/web2c/x\nOUTPUT lemma
         let keep = dirs[0].clone();
         let leftover = keep.join("run-1-1");
         fs::create_dir_all(&leftover).unwrap();
-        fs::File::open(&leftover)
-            .unwrap()
+        #[cfg(unix)]
+        let leftover_dir = fs::File::open(&leftover).unwrap();
+        // Windows opens a directory only with FILE_FLAG_BACKUP_SEMANTICS.
+        #[cfg(windows)]
+        let leftover_dir = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0200_0000)
+                .open(&leftover)
+                .unwrap()
+        };
+        leftover_dir
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
+        drop(leftover_dir);
         let fresh = keep.join("run-2-2");
         fs::create_dir_all(&fresh).unwrap();
         prune(cache.path(), &keep);

@@ -89,8 +89,11 @@ fn fixture(name: &str, text: &str, latexindent: Option<&str>) -> Fixture {
         Some(script) => {
             let path = dir.join("fake-latexindent");
             std::fs::write(&path, script).unwrap();
+            #[cfg(unix)]
             let mut perm = std::fs::metadata(&path).unwrap().permissions();
+            #[cfg(unix)]
             std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            #[cfg(unix)]
             std::fs::set_permissions(&path, perm).unwrap();
             path
         }

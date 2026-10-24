@@ -15,8 +15,9 @@
 //!    [`AgentController::scenario`], `node` is the fake agent,
 //!    [`crate::testmode::fake_agent_binary`], and `adapter_js` the scenario; the real adapter is
 //!    never involved); `lemma-mcp` from [`crate::testmode::sibling_binary`]; a socket
-//!    `mcp-<pid>-<n>.sock` in `paths.runtime_dir` (created with mode 0700); a 32-hex token from
-//!    `/dev/urandom`; [`APPEND`]. Sockets of that form left behind by a run that was killed
+//!    `mcp-<pid>-<n>.sock` in `paths.runtime_dir` (created with mode 0700; on Windows a file
+//!    naming a loopback port, see `lemma_agent`'s transport); a 32-hex token from the system's
+//!    random generator; [`APPEND`]. Sockets of that form left behind by a run that was killed
 //!    (their process is gone) are removed first ([`remove_stale_sockets`]); ours goes when the
 //!    session stops (`McpServer::stop`);
 //! 2. start the `McpServer` on that socket;
@@ -163,6 +164,7 @@ const TOOL_RECORDS_KEPT: usize = 64;
 /// Event handling times remembered by [`Bridge::event_durations`].
 const EVENT_DURATIONS_KEPT: usize = 4096;
 /// Unix socket paths must be shorter than this (`sun_path`).
+#[cfg(unix)]
 const MAX_SOCKET_PATH: usize = 107;
 
 const STOPPED: &str = "The agent was stopped";
@@ -915,6 +917,7 @@ fn resolve(
         std::process::id(),
         NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
     ));
+    #[cfg(unix)]
     if socket.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(format!(
             "the socket path {} is too long for a unix socket",
@@ -936,7 +939,6 @@ fn resolve(
 /// killed could not remove its own. Only sockets named that way are touched, and those of live
 /// processes (other Lemma windows and instances) stay. Blocking (jobs thread).
 pub fn remove_stale_sockets(dir: &Path) {
-    use std::os::unix::fs::FileTypeExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -946,7 +948,7 @@ pub fn remove_stale_sockets(dir: &Path) {
             continue;
         };
         let alive = pid == std::process::id() || process_exists(pid);
-        if alive || !entry.file_type().is_ok_and(|t| t.is_socket()) {
+        if alive || !is_socket(&entry) {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -956,8 +958,33 @@ pub fn remove_stale_sockets(dir: &Path) {
     }
 }
 
+/// Whether `entry` is a socket (on Windows: a port file, which holds a loopback address).
+fn is_socket(entry: &std::fs::DirEntry) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        entry.file_type().is_ok_and(|t| t.is_socket())
+    }
+    #[cfg(windows)]
+    {
+        entry.file_type().is_ok_and(|t| t.is_file())
+            && std::fs::read_to_string(entry.path()).is_ok_and(|text| {
+                text.trim()
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|a| a.ip().is_loopback())
+            })
+    }
+}
+
+/// True if process `pid` exists and is running.
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    lemma_core::process::is_running(pid)
+}
+
 /// True if process `pid` exists (`kill(pid, 0)`; works where there is no `/proc`, as on macOS).
 /// Ids that `kill` would read as a process group (0, or too large for a `pid_t`) never do.
+#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -1011,12 +1038,36 @@ fn root_changed(state: &Rc<WindowState>) {
 }
 
 /// 32 hex digits from `/dev/urandom`.
+#[cfg(unix)]
 fn random_token() -> Result<String, String> {
     use std::io::Read;
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// 32 hex digits from the system's preferred random generator (`BCryptGenRandom`).
+#[cfg(windows)]
+fn random_token() -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let mut bytes = [0u8; 16];
+    // SAFETY: the buffer is valid for `bytes.len()` bytes; no algorithm handle is needed with
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(format!("cannot get random bytes (status {status:#x})"));
+    }
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -1848,6 +1899,7 @@ mod tests {
         assert_eq!(socket_pid("page-2.png"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_sockets_of_dead_processes_are_removed() {
         use std::os::unix::net::UnixListener;

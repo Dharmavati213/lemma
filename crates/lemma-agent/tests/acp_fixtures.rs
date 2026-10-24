@@ -7,6 +7,7 @@ mod acp_support;
 
 use acp_support::*;
 use lemma_agent::{AgentEvent, EditorRequest, StopReason, ToolReply};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -192,6 +193,7 @@ fn errors_expects_the_exact_refusal_texts() {
 }
 
 #[test]
+#[cfg(unix)]
 fn bypass_writes_files_behind_the_editors_back() {
     let sb = Sandbox::new("fx-bypass");
     sb.copy_fixture_project();

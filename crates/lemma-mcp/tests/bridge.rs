@@ -1,11 +1,15 @@
 //! End-to-end tests of the `lemma-mcp` binary against an in-test unix-socket server.
 //!
 //! Unix socket paths must be shorter than 108 bytes, so sockets live in a fresh directory under
-//! `$XDG_RUNTIME_DIR` (or the temp dir), and one test hands the bridge a relative path.
+//! `$XDG_RUNTIME_DIR` (or the temp dir), and one test hands the bridge a relative path. On Windows
+//! the server is a loopback TCP listener whose address is written to the "socket" file, as the
+//! editor does.
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener as Listener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,7 +43,11 @@ impl SocketDir {
             if dir.join(SOCKET_NAME).as_os_str().len() >= MAX_SOCKET_PATH {
                 continue;
             }
-            if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
+            #[allow(unused_mut)] // only Unix sets a mode
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            if builder.create(&dir).is_ok() {
                 return Self(dir);
             }
         }
@@ -56,6 +64,23 @@ impl Drop for SocketDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Binds the fake editor's listener at `socket`.
+#[cfg(unix)]
+fn bind(socket: &Path) -> Listener {
+    Listener::bind(socket).unwrap()
+}
+
+/// Binds a loopback port and writes its address to `socket`, as the editor does on Windows.
+#[cfg(windows)]
+fn bind(socket: &Path) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(socket, listener.local_addr().unwrap().to_string()).unwrap();
+    listener
+}
+
+#[cfg(windows)]
+use std::net::TcpListener as Listener;
 
 /// What the fake editor saw on its single connection.
 #[derive(Debug, Default)]
@@ -76,7 +101,7 @@ enum Behaviour {
 }
 
 /// Accepts one connection. A bad token closes it without a reply, like the real MCP server.
-fn spawn_server(listener: UnixListener, behaviour: Behaviour) -> JoinHandle<ServerLog> {
+fn spawn_server(listener: Listener, behaviour: Behaviour) -> JoinHandle<ServerLog> {
     thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
         let mut writer = stream.try_clone().expect("clone");
@@ -204,10 +229,7 @@ impl Drop for Bridge {
 #[test]
 fn relays_two_requests_and_exits_when_stdin_closes() {
     let dir = SocketDir::new();
-    let server = spawn_server(
-        UnixListener::bind(dir.socket()).unwrap(),
-        Behaviour::EchoUntilEof,
-    );
+    let server = spawn_server(bind(&dir.socket()), Behaviour::EchoUntilEof);
     let mut bridge = Bridge::spawn(&dir.socket(), TOKEN, None);
 
     let first = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
@@ -232,10 +254,7 @@ fn relays_two_requests_and_exits_when_stdin_closes() {
 #[test]
 fn accepts_a_relative_socket_path() {
     let dir = SocketDir::new();
-    let server = spawn_server(
-        UnixListener::bind(dir.socket()).unwrap(),
-        Behaviour::EchoUntilEof,
-    );
+    let server = spawn_server(bind(&dir.socket()), Behaviour::EchoUntilEof);
     let mut bridge = Bridge::spawn(Path::new(SOCKET_NAME), TOKEN, Some(&dir.0));
 
     bridge.send(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
@@ -251,10 +270,7 @@ fn accepts_a_relative_socket_path() {
 #[test]
 fn stops_relaying_after_a_bad_token() {
     let dir = SocketDir::new();
-    let server = spawn_server(
-        UnixListener::bind(dir.socket()).unwrap(),
-        Behaviour::EchoUntilEof,
-    );
+    let server = spawn_server(bind(&dir.socket()), Behaviour::EchoUntilEof);
     let mut bridge = Bridge::spawn(&dir.socket(), "not-the-token", None);
     // Racing with the refusal, so the write itself may fail once the bridge is gone.
     let _ = bridge.try_send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
@@ -271,10 +287,7 @@ fn stops_relaying_after_a_bad_token() {
 #[test]
 fn exits_when_the_editor_hangs_up() {
     let dir = SocketDir::new();
-    let server = spawn_server(
-        UnixListener::bind(dir.socket()).unwrap(),
-        Behaviour::HangUpAfterOne,
-    );
+    let server = spawn_server(bind(&dir.socket()), Behaviour::HangUpAfterOne);
     let mut bridge = Bridge::spawn(&dir.socket(), TOKEN, None);
 
     bridge.send(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
@@ -310,11 +323,12 @@ fn fails_without_environment_or_server() {
     assert!(String::from_utf8_lossy(&no_server.stderr).contains("cannot connect"));
 }
 
+#[cfg(unix)]
 #[test]
 fn socket_dir_paths_fit_in_sun_path() {
     let dir = SocketDir::new();
     assert!(dir.socket().as_os_str().len() < MAX_SOCKET_PATH);
     // Binding proves the path is accepted by the kernel.
-    let _listener = UnixListener::bind(dir.socket()).unwrap();
+    let _listener = Listener::bind(dir.socket()).unwrap();
     UnixStream::connect(dir.socket()).unwrap();
 }

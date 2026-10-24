@@ -568,14 +568,14 @@ async fn read(path: &Path) -> Result<(saver::Decoded, DiskState), String> {
 /// exist yet is resolved through its parent directory; relative paths are taken against the
 /// current directory.
 pub fn normalize(path: &Path) -> PathBuf {
-    if let Ok(p) = path.canonicalize() {
+    if let Ok(p) = lemma_core::canonicalize(path) {
         return p;
     }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     match (absolute.parent(), absolute.file_name()) {
-        (Some(parent), Some(name)) => parent
-            .canonicalize()
-            .map_or_else(|_| absolute.clone(), |p| p.join(name)),
+        (Some(parent), Some(name)) => {
+            lemma_core::canonicalize(parent).map_or_else(|_| absolute.clone(), |p| p.join(name))
+        }
         _ => absolute,
     }
 }
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn normalize_resolves_dots_and_missing_files() {
         let dir = std::env::temp_dir();
-        let canonical = dir.canonicalize().unwrap();
+        let canonical = lemma_core::canonicalize(&dir).unwrap();
         assert_eq!(normalize(&dir.join(".")), canonical);
         assert_eq!(
             normalize(&dir.join("lemma-no-such-file.tex")),
@@ -604,7 +604,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        dir.canonicalize().unwrap()
+        lemma_core::canonicalize(&dir).unwrap()
     }
 
     #[test]
@@ -621,13 +621,20 @@ mod tests {
                 (".hidden.tex", ""),
             ],
         );
+        #[cfg(unix)]
         std::os::unix::fs::symlink("/etc", dir.join("etc-link")).unwrap();
         let skip = [dir.join("out")];
         let walk = walk_project(&dir, &skip, 100, 100);
         let rel = |paths: &[PathBuf]| -> Vec<String> {
             paths
                 .iter()
-                .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+                // `/` on Windows too, as below.
+                .map(|p| {
+                    p.strip_prefix(&dir)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
                 .collect()
         };
         assert_eq!(

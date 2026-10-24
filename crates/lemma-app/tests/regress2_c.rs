@@ -5,6 +5,7 @@
 use lemma_app::agent::install;
 use lemma_app::agent::markdown::{Block, Incremental, render};
 use lemma_config::{AgentCfg, Paths};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ fn temp(name: &str) -> PathBuf {
 fn script(path: &Path, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
@@ -152,6 +154,7 @@ fn regress2_claude_version_of_npm_claude_under_mise_node() {
     script(&cli, "echo '2.0.5 (Claude Code)'");
     std::fs::create_dir_all(node.join("bin")).unwrap();
     let claude = node.join("bin/claude");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(
         "../lib/node_modules/@anthropic-ai/claude-code/cli.js",
         &claude,
@@ -182,6 +185,7 @@ fn regress2_store_paths_keeps_a_symlinked_config() {
     std::fs::write(&dotfiles, "# my settings\n[editor]\nvim = true\n").unwrap();
     let config = home.join(".config/lemma/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&dotfiles, &config).unwrap();
     let env = install::Env {
         path: bin.clone().into_os_string(),

@@ -3,6 +3,7 @@
 //! the adapter), because these cases need wire-level timing that `lemma-fake-agent` cannot
 //! script: several messages in one write right after `session/new`, a `$/cancel_request` for a
 //! permission request, and a burst of updates.
+#![cfg(unix)]
 
 mod acp_support;
 

@@ -132,7 +132,15 @@ fn ours(root: &Path, case: &Case) -> BTreeSet<String> {
     let summary = summary.expect("the search finished");
     let mut out = BTreeSet::new();
     for file in &files {
-        let rel = file.path.strip_prefix(root).unwrap().display().to_string();
+        // `/` between the components, as rg prints them (and the golden file has them).
+        let rel = file
+            .path
+            .strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         for line in &file.lines {
             assert_eq!(line.text_start, 0);
             assert_eq!(line.ranges.len(), line.matches);

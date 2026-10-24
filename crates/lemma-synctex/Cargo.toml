@@ -12,10 +12,12 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
+# canonical paths without Windows' `\\?\` prefix
+lemma-core = { workspace = true }
 
 [build-dependencies]
 pkg-config = { workspace = true }
-# the bundled SyncTeX parser (vendor/synctex, macOS and LEMMA_SYNCTEX_BUNDLED=1)
+# the bundled SyncTeX parser (vendor/synctex: macOS, Windows and LEMMA_SYNCTEX_BUNDLED=1)
 cc = { workspace = true }
 
 [dev-dependencies]

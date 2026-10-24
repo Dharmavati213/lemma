@@ -2537,13 +2537,8 @@ fn bibliographies(path: &Path, file: &FileIndex) -> Vec<PathBuf> {
 /// The text of the regular file at `path` (lossy UTF-8), when it is at most `cap` bytes.
 fn read_text(path: &Path, cap: u64) -> Option<String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK: opening a FIFO must not wait for a writer.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
+    // Not blocking: opening a FIFO must not wait for a writer.
+    let file = crate::fsutil::open_nonblocking(path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > cap {
         return None;

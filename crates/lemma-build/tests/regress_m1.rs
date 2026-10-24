@@ -1,9 +1,12 @@
 //! Regression tests for verified M1 defects in the build pipeline (review area B). Each test
 //! fails until its defect is fixed. Tests that run latexmk print `SKIP` and pass when it is not
 //! installed.
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 
+#[cfg(unix)]
+use lemma_build::RootSource;
 use lemma_build::{
-    Build, BuildOutcome, BuildRequest, BuildStatus, Engine, RootSource, command_line, detect_root,
+    Build, BuildOutcome, BuildRequest, BuildStatus, Engine, command_line, detect_root,
 };
 use lemma_core::DiagSource;
 use lemma_syntax::{ProjectIndex, index_file};
@@ -12,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 fn have_latexmk() -> bool {
     let found = Command::new("latexmk")
@@ -193,6 +198,7 @@ fn regress_stale_blg_is_not_reported_after_the_bibliography_is_removed() {
 // ----- B15: unbounded reads during root detection -----
 
 /// Runs `f` on a thread; `None` if it has not returned after `limit`.
+#[cfg(unix)]
 fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -203,6 +209,7 @@ fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'st
 
 /// Opens `fifo` for writing without blocking and closes it, so a reader blocked in `open`
 /// sees end of file.
+#[cfg(unix)]
 fn release_fifo(fifo: &Path) {
     use std::os::unix::fs::OpenOptionsExt;
     let _ = fs::OpenOptions::new()
@@ -211,6 +218,7 @@ fn release_fifo(fifo: &Path) {
         .open(fifo);
 }
 
+#[cfg(unix)]
 fn mkfifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL");
@@ -223,9 +231,10 @@ fn mkfifo(path: &Path) {
 /// unbounded `read_to_string` and no regular-file check. A FIFO named `*.fls` blocks root
 /// detection forever (a symlink to /dev/zero exhausts memory instead, see the next test).
 #[test]
+#[cfg(unix)]
 fn regress_fifo_fls_does_not_block_root_detection() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let d = fs::canonicalize(dir.path()).expect("canonical");
+    let d = lemma_core::canonicalize(dir.path()).expect("canonical");
     let file = d.join("chapter.tex");
     fs::write(&file, "\\section{A}\n").expect("write");
     let fifo = d.join("old.fls");
@@ -246,6 +255,7 @@ fn regress_fifo_fls_does_not_block_root_detection() {
 /// allocation as an error, which `fls_root` skips, so the child survives. Its peak RSS shows
 /// how much was read: a bounded read stays far below 256 MiB.
 #[test]
+#[cfg(unix)]
 fn regress_dev_zero_fls_does_not_exhaust_memory() {
     if let Some(dir) = std::env::var_os("LEMMA_REGRESS_DEV_ZERO_CHILD") {
         let file = PathBuf::from(dir).join("chapter.tex");
@@ -254,7 +264,7 @@ fn regress_dev_zero_fls_does_not_exhaust_memory() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let d = fs::canonicalize(dir.path()).expect("canonical");
+    let d = lemma_core::canonicalize(dir.path()).expect("canonical");
     fs::write(d.join("chapter.tex"), "\\section{A}\n").expect("write");
     std::os::unix::fs::symlink("/dev/zero", d.join("zero.fls")).expect("symlink");
     let exe = std::env::current_exe().expect("test binary");

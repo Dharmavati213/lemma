@@ -1,14 +1,13 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+use std::fmt;
 use std::os::raw::c_int;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::{Mutex, PoisonError};
-use std::{fmt, fs};
 
-use crate::inputs::{Input, common_suffix_len, normalize};
+use crate::inputs::{Input, c_path, common_suffix_len, normalize};
 use crate::{SyncBox, SyncTarget, ffi};
 
 /// Serializes every call into libsynctex.
@@ -54,14 +53,14 @@ impl Scanner {
     pub fn open(pdf: &Path) -> Option<Self> {
         // The library recommends full paths; it replaces the last extension itself.
         let pdf = std::path::absolute(pdf).ok()?;
-        let c_pdf = CString::new(pdf.as_os_str().as_bytes()).ok()?;
+        let c_pdf = c_path(&pdf)?;
         // SAFETY: `c_pdf` is NUL-terminated and outlives the call; a null build directory is
         // documented as "ignored".
         let raw = with_library(|| unsafe {
             ffi::synctex_scanner_new_with_output_file(c_pdf.as_ptr(), ptr::null(), 1)
         });
         let raw = NonNull::new(raw)?;
-        let pdf_dir = fs::canonicalize(&pdf)
+        let pdf_dir = lemma_core::canonicalize(&pdf)
             .unwrap_or_else(|_| normalize(&pdf))
             .parent()
             .map(Path::to_path_buf)
@@ -185,7 +184,7 @@ impl Scanner {
             return Box::default();
         };
         // Canonicalized as given: resolving `..` lexically first could step out of a symlink.
-        if let Ok(want_canonical) = fs::canonicalize(file) {
+        if let Ok(want_canonical) = lemma_core::canonicalize(file) {
             let exact: Vec<usize> = (0..self.inputs.len())
                 .filter(|&i| self.location_of(i) == Some(&want_canonical))
                 .collect();
@@ -233,12 +232,12 @@ impl Scanner {
     /// Where `input` is on disk now (canonical), if it exists.
     fn location(&self, input: &Input) -> Option<PathBuf> {
         if let (Some(cwd), Some(rel)) = (&self.tex_cwd, &input.rel)
-            && let Ok(path) = fs::canonicalize(cwd.join(rel))
+            && let Ok(path) = lemma_core::canonicalize(cwd.join(rel))
         {
             return Some(path);
         }
         if input.path.is_absolute() {
-            fs::canonicalize(&input.path).ok()
+            lemma_core::canonicalize(&input.path).ok()
         } else {
             None
         }

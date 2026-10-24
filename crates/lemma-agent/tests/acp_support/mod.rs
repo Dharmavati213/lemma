@@ -6,13 +6,46 @@ use lemma_agent::{
     AgentCmd, AgentConfig, AgentEvent, AgentHandle, EditorRequest, ToolCall, ToolContent, ToolReply,
 };
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// The MCP socket's stream: a unix socket, or on Windows a loopback TCP connection to the port
+/// that the socket file names (see `lemma_agent`'s `transport.rs`).
+#[cfg(unix)]
+pub type Stream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub type Stream = std::net::TcpStream;
+
+/// Connects to the MCP socket `socket`.
+pub fn connect(socket: &Path) -> std::io::Result<Stream> {
+    #[cfg(unix)]
+    return Stream::connect(socket);
+    #[cfg(windows)]
+    {
+        let address: std::net::SocketAddr = std::fs::read_to_string(socket)?
+            .trim()
+            .parse()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        Stream::connect(address)
+    }
+}
+
+/// Binds a server at the MCP socket `socket` (on Windows: a loopback port named by the file).
+#[cfg(unix)]
+fn bind(socket: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(socket).unwrap()
+}
+
+#[cfg(windows)]
+fn bind(socket: &Path) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(socket, listener.local_addr().unwrap().to_string()).unwrap();
+    listener
+}
 
 /// Generous timeout for start-up and turns on a loaded machine.
 pub const SLOW: Duration = Duration::from_secs(20);
@@ -69,8 +102,12 @@ pub fn bins() -> &'static Bins {
             );
         }
         let bins = Bins {
-            fake_agent: fake.unwrap_or_else(|| profile_dir.join("lemma-fake-agent")),
-            mcp_bridge: bridge.unwrap_or_else(|| profile_dir.join("lemma-mcp")),
+            fake_agent: fake.unwrap_or_else(|| {
+                profile_dir.join(format!("lemma-fake-agent{}", std::env::consts::EXE_SUFFIX))
+            }),
+            mcp_bridge: bridge.unwrap_or_else(|| {
+                profile_dir.join(format!("lemma-mcp{}", std::env::consts::EXE_SUFFIX))
+            }),
         };
         assert!(
             bins.fake_agent.is_file(),
@@ -108,7 +145,7 @@ impl Sandbox {
         let dir = base.join(leaf);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("proj")).expect("create sandbox");
-        let dir = dir.canonicalize().expect("canonical sandbox");
+        let dir = lemma_core::canonicalize(&dir).expect("canonical sandbox");
         Self { dir }
     }
 
@@ -337,7 +374,7 @@ pub const TOOL_NAMES: &[&str] = &[
 impl RecordingMcpServer {
     pub fn start(socket: &Path) -> Self {
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(socket).unwrap();
+        let listener = bind(socket);
         let lines: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorded = lines.clone();
         let accept = thread::spawn(move || {
@@ -365,7 +402,7 @@ impl RecordingMcpServer {
 impl Drop for RecordingMcpServer {
     fn drop(&mut self) {
         // A `{"stop":true}` line ends the accept loop.
-        if let Ok(mut s) = UnixStream::connect(&self.socket) {
+        if let Ok(mut s) = connect(&self.socket) {
             let _ = s.write_all(b"{\"stop\":true}\n");
         }
         if let Some(t) = self.accept.take() {
@@ -376,7 +413,7 @@ impl Drop for RecordingMcpServer {
 }
 
 /// Serves one connection; false when asked to stop.
-fn serve_connection(stream: UnixStream, recorded: &Mutex<Vec<String>>) -> bool {
+fn serve_connection(stream: Stream, recorded: &Mutex<Vec<String>>) -> bool {
     let mut out = stream.try_clone().unwrap();
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };

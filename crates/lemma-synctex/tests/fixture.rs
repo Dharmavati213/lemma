@@ -1,7 +1,10 @@
 //! WP1.4 acceptance tests on `tests/fixtures/proj`.
 //!
 //! The fixture was built in another directory, so its synctex file records absolute paths that
-//! do not point into this repository (and need not exist).
+//! do not point into this repository (and need not exist). They are Unix paths, which have no
+//! drive and so are not absolute on Windows: the tests that resolve them run on Unix only
+//! (`paths.rs` covers Windows names).
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,10 +13,10 @@ use std::time::{Duration, Instant};
 use lemma_synctex::{Scanner, SyncBox};
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/proj")
-        .canonicalize()
-        .expect("tests/fixtures/proj exists")
+    lemma_core::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/proj"),
+    )
+    .expect("tests/fixtures/proj exists")
 }
 
 fn open_fixture() -> (PathBuf, Scanner) {
@@ -33,7 +36,7 @@ fn near(b: &SyncBox, page: u32, h: f32, v_top: f32, width: f32, height: f32) -> 
 
 /// `target` relative to the current directory.
 fn relative_from_cwd(target: &Path) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let cwd = lemma_core::canonicalize(std::env::current_dir().unwrap()).unwrap();
     let common = cwd.ancestors().find(|a| target.starts_with(a)).unwrap();
     let ups = cwd.strip_prefix(common).unwrap().components().count();
     let mut rel: PathBuf = std::iter::repeat_n("..", ups).collect();
@@ -84,6 +87,7 @@ fn forward_reports_every_page_of_a_line() {
 }
 
 #[test]
+#[cfg(unix)]
 fn inverse_main_and_input_file() {
     let (dir, mut s) = open_fixture();
     let t = s.inverse(2, 200.0, 420.0).expect("a line at (200, 420)");
@@ -98,6 +102,7 @@ fn inverse_main_and_input_file() {
 }
 
 #[test]
+#[cfg(unix)]
 fn inverse_of_a_forward_box_returns_the_line() {
     let (dir, mut s) = open_fixture();
     let b = s.forward(&dir.join("main.tex"), 66)[0];
@@ -125,6 +130,7 @@ fn missing_data_gives_nothing() {
 }
 
 #[test]
+#[cfg(unix)]
 fn relative_paths_are_resolved_against_the_current_directory() {
     let dir = fixture();
     let rel = relative_from_cwd(&dir);
@@ -136,9 +142,10 @@ fn relative_paths_are_resolved_against_the_current_directory() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_copied_project_maps_to_the_copy() {
     let tmp = tempfile::tempdir().unwrap();
-    let copy = tmp.path().canonicalize().unwrap().join("copy");
+    let copy = lemma_core::canonicalize(tmp.path()).unwrap().join("copy");
     fs::create_dir_all(copy.join("chapters")).unwrap();
     for f in [
         "main.pdf",

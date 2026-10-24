@@ -62,7 +62,9 @@ fn touch(dir: &Path, files: &[&str]) {
 /// scanner's search above the PDF never leaves the temporary directory.
 fn tempdir() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().canonicalize().unwrap().join("w/x/y/z");
+    let path = lemma_core::canonicalize(tmp.path())
+        .unwrap()
+        .join("w/x/y/z");
     fs::create_dir_all(&path).unwrap();
     (tmp, path)
 }
@@ -141,6 +143,7 @@ fn regress_outdir_outside_project_reanchors_at_unrelated_file() {
 /// `<cwd>/./link.tex`; the editor sends the canonical path `real/chap.tex`. Inverse search maps
 /// the text to `real/chap.tex`, so forward search from that file must find the same boxes.
 #[test]
+#[cfg(unix)]
 fn regress_forward_through_renamed_symlink() {
     let (_tmp, dir) = tempdir();
     touch(&dir, &["main.tex", "real/chap.tex"]);

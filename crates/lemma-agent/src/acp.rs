@@ -90,8 +90,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::panic::AssertUnwindSafe;
 use std::pin::{Pin, pin};
@@ -194,10 +195,14 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
         .current_dir(&cfg.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let spawned = command.process_group(0).spawn();
+    // On Windows the agent and everything it starts run in a job object instead.
+    #[cfg(windows)]
+    let spawned = lemma_core::process::Job::spawn(&mut command);
+    let leader = match spawned {
+        Ok(leader) => leader,
         Err(e) => {
             if let Some(server) = &mcp_server {
                 server.stop();
@@ -208,26 +213,41 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
             ));
         }
     };
+    #[cfg(unix)]
+    let mut child = leader;
+    #[cfg(windows)]
+    let (mut child, job) = leader;
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         unreachable!("all three pipes were requested");
     };
-    let pid = child.id() as libc::pid_t;
-    // `child` is never waited on through std: the wait thread reaps the pid itself.
-    drop(child);
+    #[cfg(unix)]
+    let leader = {
+        let pid = child.id() as libc::pid_t;
+        // `child` is never waited on through std: the wait thread reaps the pid itself.
+        drop(child);
+        pid
+    };
+    #[cfg(windows)]
+    let leader = Leader { child, job };
 
     // From here on, a failure (no thread could be started) must not leave the process behind:
     // dropping `process` kills its group and lets the wait thread reap it.
     let (exit_tx, exit_rx) = async_channel::bounded::<ProcSignal>(2);
-    let process = match AgentProcess::watch(pid, exit_tx) {
+    #[cfg(unix)]
+    let pid = leader;
+    let process = match AgentProcess::watch(leader, exit_tx) {
         Ok(process) => process,
         Err(e) => {
             // SAFETY: plain syscalls on our own, not yet reaped child.
+            #[cfg(unix)]
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
+            #[cfg(unix)]
             reap(pid);
+            // On Windows the job, dropped with the leader, has ended the processes.
             return Err(e);
         }
     };
@@ -287,7 +307,7 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
 
 /// True when something accepts connections on `socket` (the caller started its own server).
 fn mcp_server_listening(socket: &std::path::Path) -> bool {
-    UnixStream::connect(socket).is_ok()
+    crate::transport::connect(socket).is_ok()
 }
 
 fn named(name: &str, f: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle<()>> {
@@ -1895,12 +1915,12 @@ struct RawLog(Arc<Mutex<File>>);
 
 impl RawLog {
     fn create(path: &std::path::Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(Self(Arc::new(Mutex::new(file))))
     }
@@ -2052,8 +2072,13 @@ enum ProcSignal {
 /// The wait thread waits with `WNOWAIT`, so the exited leader stays a zombie until it is allowed
 /// to reap it: until then its pid, which is also the process group id, cannot be reused, and
 /// signalling the group can never hit an unrelated process.
+///
+/// On Windows the group is a job object ([`lemma_core::process::Job`]), which names no pid, and
+/// the wait thread holds the leader's process handle until it may "reap" it by closing it.
 struct AgentProcess {
-    pid: libc::pid_t,
+    pid: Pid,
+    #[cfg(windows)]
+    job: Arc<lemma_core::process::Job>,
     shared: Arc<(Mutex<ProcState>, Condvar)>,
     exited_flag: Arc<AtomicBool>,
     waiter: Option<JoinHandle<()>>,
@@ -2067,15 +2092,42 @@ struct ProcState {
     reaped: bool,
 }
 
+/// A process id.
+#[cfg(unix)]
+type Pid = libc::pid_t;
+#[cfg(windows)]
+type Pid = u32;
+
+/// The agent process as [`spawn`] hands it to [`AgentProcess::watch`]: its pid, or on Windows
+/// the process itself and its job.
+#[cfg(unix)]
+type Leader = Pid;
+#[cfg(windows)]
+struct Leader {
+    child: std::process::Child,
+    job: lemma_core::process::Job,
+}
+
+/// The exit code of processes that [`AgentProcess`] ends on Windows.
+#[cfg(windows)]
+const KILLED_EXIT_CODE: u32 = 1;
+
 impl AgentProcess {
-    fn watch(pid: libc::pid_t, exit_tx: async_channel::Sender<ProcSignal>) -> io::Result<Self> {
+    fn watch(leader: Leader, exit_tx: async_channel::Sender<ProcSignal>) -> io::Result<Self> {
+        #[cfg(unix)]
+        let pid = leader;
+        #[cfg(windows)]
+        let (pid, job, mut child) = (leader.child.id(), Arc::new(leader.job), leader.child);
         let shared: Arc<(Mutex<ProcState>, Condvar)> = Arc::default();
         let exited_flag = Arc::new(AtomicBool::new(false));
         let waiter = {
             let shared = shared.clone();
             let flag = exited_flag.clone();
             named("lemma-agent-wait", move || {
+                #[cfg(unix)]
                 let code = wait_exited(pid);
+                #[cfg(windows)]
+                let code = child.wait().ok().and_then(|status| status.code());
                 flag.store(true, Ordering::SeqCst);
                 {
                     let mut st = lock(&shared.0);
@@ -2097,13 +2149,19 @@ impl AgentProcess {
                 while !st.reap_allowed {
                     st = shared.1.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
+                #[cfg(unix)]
                 reap(pid);
+                // Closing the process handle lets Windows reuse the pid.
+                #[cfg(windows)]
+                drop(child);
                 st.reaped = true;
                 shared.1.notify_all();
             })?
         };
         Ok(Self {
             pid,
+            #[cfg(windows)]
+            job,
             shared,
             exited_flag,
             waiter: Some(waiter),
@@ -2139,7 +2197,25 @@ impl AgentProcess {
         }
     }
 
+    /// Asks the whole process group to stop (SIGTERM). Windows has no such request for these
+    /// programs: there the job ends at once.
+    fn stop_group(&self) {
+        #[cfg(unix)]
+        self.signal_group(libc::SIGTERM);
+        #[cfg(windows)]
+        self.job.terminate(KILLED_EXIT_CODE);
+    }
+
+    /// Ends the whole process group (SIGKILL; on Windows the job).
+    fn kill_group(&self) {
+        #[cfg(unix)]
+        self.signal_group(libc::SIGKILL);
+        #[cfg(windows)]
+        self.job.terminate(KILLED_EXIT_CODE);
+    }
+
     /// Signals the whole process group, unless the leader was reaped already.
+    #[cfg(unix)]
     fn signal_group(&self, signal: libc::c_int) {
         let st = lock(&self.shared.0);
         if !st.reaped {
@@ -2153,7 +2229,10 @@ impl AgentProcess {
 
     /// True while the leader runs or any other member of its group is alive.
     fn group_alive(&self) -> bool {
-        !self.has_exited() || group_has_members(self.pid)
+        #[cfg(unix)]
+        return !self.has_exited() || group_has_members(self.pid);
+        #[cfg(windows)]
+        return !self.has_exited() || self.job.has_processes();
     }
 
     /// Ends the process group: `grace` for the leader to exit by itself, then SIGTERM to the
@@ -2162,7 +2241,7 @@ impl AgentProcess {
     fn terminate(&mut self, grace: Duration) -> Option<i32> {
         self.wait_exit(grace);
         if self.group_alive() {
-            self.signal_group(libc::SIGTERM);
+            self.stop_group();
             let deadline = Instant::now() + TERM_GRACE;
             while self.group_alive() && Instant::now() < deadline {
                 if !self.has_exited() {
@@ -2172,7 +2251,7 @@ impl AgentProcess {
                 }
             }
         }
-        self.signal_group(libc::SIGKILL);
+        self.kill_group();
         let code = self.wait_exit(KILL_WAIT).flatten();
         {
             let mut st = lock(&self.shared.0);
@@ -2209,7 +2288,7 @@ impl Drop for AgentProcess {
         if self.waiter.is_some() {
             // `terminate` did not run (`spawn` failed half-way, or a panic): kill the group and
             // let the wait thread reap the leader.
-            self.signal_group(libc::SIGKILL);
+            self.kill_group();
             let mut st = lock(&self.shared.0);
             st.reap_allowed = true;
             self.shared.1.notify_all();
@@ -2218,6 +2297,7 @@ impl Drop for AgentProcess {
 }
 
 /// Waits for `pid` to exit without reaping it; its exit code (`None` for a signal).
+#[cfg(unix)]
 fn wait_exited(pid: libc::pid_t) -> Option<i32> {
     loop {
         // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
@@ -2245,6 +2325,7 @@ fn wait_exited(pid: libc::pid_t) -> Option<i32> {
     }
 }
 
+#[cfg(unix)]
 fn reap(pid: libc::pid_t) {
     loop {
         let mut status = 0;
@@ -2257,7 +2338,7 @@ fn reap(pid: libc::pid_t) {
 }
 
 /// True if a live (non-zombie) process is in process group `pgid`. Reads `/proc/*/stat`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn group_has_members(pgid: libc::pid_t) -> bool {
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return false;
@@ -2548,6 +2629,7 @@ mod tests {
         assert_eq!(got, expected, "every line, in order");
     }
 
+    #[cfg(unix)]
     #[test]
     fn group_membership_is_read_from_proc() {
         // SAFETY: getpgrp has no preconditions.

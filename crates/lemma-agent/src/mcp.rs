@@ -7,8 +7,9 @@
 //! server. The bridge connects to [`McpServer::socket`], sends `{"lemma_token":"<token>"}` and
 //! then relays JSON-RPC lines both ways. This module is the editor's end of that socket:
 //!
-//! - **`mcp-accept` thread**: a blocking [`UnixListener`]; one `mcp-conn-<n>` thread per
-//!   connection (at most [`MAX_CONNECTIONS`]).
+//! - **`mcp-accept` thread**: a blocking `UnixListener` (on Windows a loopback TCP listener, see
+//!   [`crate::transport`]); one `mcp-conn-<n>` thread per connection (at most
+//!   [`MAX_CONNECTIONS`]).
 //! - **Connection thread**: checks the token line (constant-time compare; anything else closes
 //!   the connection without a reply), then reads one JSON-RPC message per line. Everything but
 //!   `tools/call` is answered by the pure [`handle_basic`]. A `tools/call` is parsed with
@@ -34,14 +35,16 @@
 //! rest of the session).
 
 use super::{EditorRequest, ToolCall, ToolContent, ToolReply};
+use crate::transport::{self, Listener, Stream};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -879,12 +882,42 @@ fn read_line_capped(r: &mut impl BufRead, out: &mut Vec<u8>, max: usize) -> io::
     }
 }
 
+/// What tells the socket file we bound from another one at the same path: `(st_dev, st_ino)`,
+/// or on Windows the port file's text (the address of our own listener).
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(windows)]
+type FileId = String;
+
 /// `(st_dev, st_ino)` of a path, without following a final symlink.
-fn file_id(path: &Path) -> Option<(u64, u64)> {
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
     fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
+/// The port file's text.
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<FileId> {
+    fs::read_to_string(path).ok()
+}
+
+/// Creates the socket's directory (on Windows it is private by being in the user's profile).
+#[cfg(windows)]
+fn prepare_socket_dir(socket: &Path) -> io::Result<()> {
+    match socket.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => fs::create_dir_all(dir),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "MCP socket {} must name its (private) directory",
+                socket.display()
+            ),
+        )),
+    }
+}
+
 /// Creates the socket's directory with mode 0700, or tightens an existing one of ours to 0700.
+#[cfg(unix)]
 fn prepare_socket_dir(socket: &Path) -> io::Result<()> {
     let dir = match socket.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -935,8 +968,9 @@ fn prepare_socket_dir(socket: &Path) -> io::Result<()> {
 
 /// Binds `socket`, replacing a stale socket file (nobody accepts on it) but never another file
 /// or a live server's socket.
-fn bind_socket(socket: &Path) -> io::Result<UnixListener> {
-    match UnixListener::bind(socket) {
+#[cfg(unix)]
+fn bind_socket(socket: &Path) -> io::Result<Listener> {
+    match Listener::bind(socket) {
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
             let meta = fs::symlink_metadata(socket)?;
             if !meta.file_type().is_socket() {
@@ -945,14 +979,39 @@ fn bind_socket(socket: &Path) -> io::Result<UnixListener> {
                     format!("{} exists and is not a socket", socket.display()),
                 ));
             }
-            if UnixStream::connect(socket).is_ok() {
+            if Stream::connect(socket).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("a server is already listening on {}", socket.display()),
                 ));
             }
             fs::remove_file(socket)?;
-            UnixListener::bind(socket)
+            Listener::bind(socket)
+        }
+        other => other,
+    }
+}
+
+/// Binds a loopback port named by the port file `socket` (see [`crate::transport`]), replacing
+/// a stale port file (nobody accepts on its port) but never another file or a live server's.
+#[cfg(windows)]
+fn bind_socket(socket: &Path) -> io::Result<Listener> {
+    match transport::bind_new(socket) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if transport::read_address(socket).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a socket", socket.display()),
+                ));
+            }
+            if transport::connect(socket).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("a server is already listening on {}", socket.display()),
+                ));
+            }
+            fs::remove_file(socket)?;
+            transport::bind_new(socket)
         }
         other => other,
     }
@@ -967,7 +1026,7 @@ struct Shared {
     timeouts: Mutex<Timeouts>,
     stopping: AtomicBool,
     /// A handle on each live connection, so that `stop` can shut it down.
-    conns: Mutex<HashMap<u64, UnixStream>>,
+    conns: Mutex<HashMap<u64, Stream>>,
 }
 
 impl Shared {
@@ -986,10 +1045,10 @@ pub struct McpServer {
     pub socket: PathBuf,
     shared: Arc<Shared>,
     /// Kept open (and its fd valid) until the accept thread has been joined.
-    listener: Mutex<Option<Arc<UnixListener>>>,
+    listener: Mutex<Option<Arc<Listener>>>,
     accept: Mutex<Option<JoinHandle<()>>>,
-    /// `(st_dev, st_ino)` of the socket file we bound, so we never remove someone else's.
-    socket_id: Option<(u64, u64)>,
+    /// The identity of the socket file we bound ([`FileId`]), so we never remove someone else's.
+    socket_id: Option<FileId>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -1020,7 +1079,8 @@ impl McpServer {
     /// - `token` must not be empty.
     /// - The socket's directory is created with mode 0700; an existing one that belongs to the
     ///   user is set to 0700, one that belongs to someone else is refused. The socket itself gets
-    ///   mode 0600. The path must be shorter than 108 bytes (`sun_path`).
+    ///   mode 0600. The path must be shorter than 108 bytes (`sun_path`). On Windows the socket is
+    ///   a loopback port named by a file at the path ([`crate::transport`]).
     /// - A stale socket file at `socket` (nobody listening) is replaced; a live one gives
     ///   `AddrInUse`, any other file `AlreadyExists`.
     pub fn start_with(
@@ -1044,6 +1104,7 @@ impl McpServer {
             }
             e
         };
+        #[cfg(unix)]
         fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).map_err(unbind)?;
         let shared = Arc::new(Shared {
             token: token.into_bytes().into_boxed_slice(),
@@ -1094,6 +1155,7 @@ impl McpServer {
     pub fn stop(&self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         let listener = lock(&self.listener).clone();
+        #[cfg(unix)]
         if let Some(listener) = &listener {
             // Wakes the blocked accept() (Linux: it fails with EINVAL) and refuses new clients.
             // SAFETY: the fd belongs to `listener`, which this Arc keeps open.
@@ -1102,13 +1164,19 @@ impl McpServer {
         self.shared.close_all_connections();
         let accept = lock(&self.accept).take();
         if let Some(accept) = accept {
+            // Only a connection wakes a blocked accept() on Windows: the accept thread then sees
+            // the stop and ends.
+            #[cfg(windows)]
+            if let Some(address) = listener.as_ref().and_then(|l| l.local_addr().ok()) {
+                let _ = Stream::connect_timeout(&address, Duration::from_secs(1));
+            }
             let deadline = Instant::now() + Duration::from_millis(500);
             while !accept.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }
             if !accept.is_finished() && file_id(&self.socket) == self.socket_id {
                 // Fallback for kernels where shutdown() does not wake accept().
-                let _ = UnixStream::connect(&self.socket);
+                let _ = transport::connect(&self.socket);
             }
             if accept.join().is_err() {
                 tracing::error!("mcp: the accept thread panicked");
@@ -1127,7 +1195,7 @@ impl Drop for McpServer {
     }
 }
 
-fn accept_loop(shared: &Arc<Shared>, listener: &UnixListener) {
+fn accept_loop(shared: &Arc<Shared>, listener: &Listener) {
     let mut next_conn = 0u64;
     let mut threads: Vec<JoinHandle<()>> = Vec::new();
     let mut consecutive_errors = 0u32;
@@ -1206,7 +1274,7 @@ fn accept_loop(shared: &Arc<Shared>, listener: &UnixListener) {
 
 /// The write half of a connection; replies come from the connection thread and the call threads.
 struct Conn {
-    out: Mutex<UnixStream>,
+    out: Mutex<Stream>,
     broken: AtomicBool,
     /// Calls waiting for the editor, by JSON id, with their cancellation flag.
     in_flight: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -1237,28 +1305,68 @@ impl Conn {
 /// The read half of a connection. While `deadline` is set (the handshake), every read waits at
 /// most until then, so the deadline bounds the whole token line, not each read(2): a client that
 /// sends it a byte at a time cannot hold the connection open.
+///
+/// On Windows, shutting a socket down does not wake a read blocked on it, so reads there wait
+/// at most [`POLL_SLICE`] at a time and end (as at end of file) once the server stops.
 struct ConnReader {
-    stream: UnixStream,
+    stream: Stream,
     deadline: Option<Instant>,
+    #[cfg(windows)]
+    shared: Arc<Shared>,
+}
+
+impl ConnReader {
+    /// How long the next read may wait: until the handshake's deadline (an error once it has
+    /// passed), else as long as it takes.
+    fn wait_left(&self) -> io::Result<Option<Duration>> {
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the handshake took too long",
+            ));
+        }
+        Ok(Some(left))
+    }
 }
 
 impl io::Read for ConnReader {
+    #[cfg(unix)]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(deadline) = self.deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the handshake took too long",
-                ));
-            }
+        if let Some(left) = self.wait_left()? {
             self.stream.set_read_timeout(Some(left))?;
         }
         io::Read::read(&mut self.stream, buf)
     }
+
+    #[cfg(windows)]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let slice = self
+                .wait_left()?
+                .map_or(POLL_SLICE, |left| left.min(POLL_SLICE));
+            self.stream.set_read_timeout(Some(slice))?;
+            match io::Read::read(&mut self.stream, buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if self.shared.stopping() {
+                        return Ok(0);
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
 }
 
-fn serve_connection(shared: &Arc<Shared>, stream: UnixStream) {
+fn serve_connection(shared: &Arc<Shared>, stream: Stream) {
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
@@ -1267,6 +1375,8 @@ fn serve_connection(shared: &Arc<Shared>, stream: UnixStream) {
         ConnReader {
             stream: read_half,
             deadline: Some(Instant::now() + shared.handshake_timeout),
+            #[cfg(windows)]
+            shared: Arc::clone(shared),
         },
     );
     let mut line = Vec::new();
@@ -1769,7 +1879,7 @@ mod tests {
     fn a_client_that_never_sends_its_token_is_dropped_after_the_handshake_timeout() {
         use std::io::Read;
         let (shared, _rx) = test_shared(Duration::from_millis(150));
-        let (server_end, mut client) = UnixStream::pair().unwrap();
+        let (server_end, mut client) = transport::pair().unwrap();
         let start = Instant::now();
         let t = thread::spawn(move || serve_connection(&shared, server_end));
         client
@@ -1790,7 +1900,7 @@ mod tests {
     fn a_connection_answers_after_the_token_line() {
         use std::io::BufRead;
         let (shared, _rx) = test_shared(Duration::from_secs(5));
-        let (server_end, client) = UnixStream::pair().unwrap();
+        let (server_end, client) = transport::pair().unwrap();
         let t = thread::spawn(move || serve_connection(&shared, server_end));
         let mut writer = client.try_clone().unwrap();
         // Token and first request in one write: the request must not be lost in the buffer.

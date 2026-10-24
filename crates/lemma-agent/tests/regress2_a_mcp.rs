@@ -8,7 +8,6 @@ use lemma_agent::{EditorRequest, ToolContent, ToolReply};
 use mcp_support::{RawClient, TIMEOUT, spawn_editor, start_server, text_reply};
 use serde_json::json;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -106,7 +105,7 @@ fn regress2_render_page_may_wait_for_a_running_build() {
 #[test]
 fn regress2_handshake_timeout_bounds_the_whole_token_line() {
     let (_dir, server, _rx) = start_server(Timeouts::default());
-    let mut stream = UnixStream::connect(&server.socket).unwrap();
+    let mut stream = mcp_support::connect(&server.socket).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
@@ -140,7 +139,7 @@ fn regress2_handshake_timeout_bounds_the_whole_token_line() {
 
 /// True when the peer closed `stream` (a read returns 0 or a reset; the server never writes
 /// before the token line is complete).
-fn closed(mut stream: &UnixStream) -> bool {
+fn closed(mut stream: &mcp_support::Stream) -> bool {
     let mut buf = [0u8; 1];
     match stream.read(&mut buf) {
         Ok(0) => true,

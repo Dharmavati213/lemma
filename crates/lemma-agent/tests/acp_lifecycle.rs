@@ -1,6 +1,7 @@
 //! Process lifecycle of the ACP client: a killed agent gives `Exited` and leaves no thread,
 //! process or zombie behind; `Shutdown` joins within a second and the thread count returns to
 //! its baseline. One test, so that nothing else runs in this process while threads are counted.
+#![cfg(unix)]
 
 mod acp_support;
 
@@ -81,6 +82,7 @@ fn lifecycle_leaves_no_threads_processes_or_zombies() {
     }
 
     // --- 2. Killing the agent gives Exited, and nothing is left.
+    #[cfg(unix)]
     {
         let sb = Sandbox::new("life-kill");
         let scenario = fixtures().join("agent/cancel.json");

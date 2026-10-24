@@ -13,13 +13,14 @@ use mcp_support::{
     result_text, spawn_editor, start_server, text_reply, tool_call, wait_until,
 };
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 fn mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -589,6 +590,7 @@ fn too_many_calls_in_flight_on_one_connection_are_refused() {
 // Socket file and directory
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn the_socket_lives_in_a_private_directory() {
     // A missing directory (and its missing parent) is created with mode 0700.
@@ -646,7 +648,13 @@ fn stale_sockets_are_replaced_but_live_ones_and_other_files_are_not() {
     std::fs::remove_file(&socket).unwrap();
 
     // A stale socket (its listener is gone) is replaced.
-    drop(UnixListener::bind(&socket).unwrap());
+    #[cfg(unix)]
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    #[cfg(windows)]
+    {
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(&socket, gone.local_addr().unwrap().to_string()).unwrap();
+    }
     assert!(socket.exists());
     let first = McpServer::start(&socket, TOKEN.into(), tx.clone()).unwrap();
 
@@ -690,7 +698,7 @@ fn stop_unblocks_the_accept_thread_and_closes_every_connection() {
     let mut busy = Bridge::spawn(&socket, TOKEN);
     busy.send(&tool_call(1, "compile", json!({})));
     let held = next_call(&rx);
-    let mut silent = UnixStream::connect(&socket).unwrap();
+    let mut silent = mcp_support::connect(&socket).unwrap();
     silent.set_read_timeout(Some(TIMEOUT)).unwrap();
 
     let start = Instant::now();
@@ -699,7 +707,7 @@ fn stop_unblocks_the_accept_thread_and_closes_every_connection() {
     assert!(took < Duration::from_secs(1), "stop took {took:?}");
     assert!(server.is_stopped());
     assert!(!socket.exists(), "the socket file is removed");
-    assert!(UnixStream::connect(&socket).is_err());
+    assert!(mcp_support::connect(&socket).is_err());
 
     // Every bridge exits because its socket closed (stdin is still open), and the in-flight
     // call gets no reply.

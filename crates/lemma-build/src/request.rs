@@ -2,7 +2,7 @@
 
 use crate::Engine;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// One latexmk run.
@@ -41,7 +41,9 @@ const LOG_ENV: [(&str, &str); 3] = [
 /// [`Engine::Latexmkrc`] passes no engine flag. The root is passed by file name because latexmk
 /// runs in the root's directory, prefixed with `./` so that a name starting with `-` (such as
 /// `-notes.tex` or `-pdflatex=<command>.tex`) is never parsed as an option, by latexmk or by the
-/// TeX engine it runs. The job name, and so the output file names, stay the file's stem.
+/// TeX engine it runs. The job name, and so the output file names, stay the file's stem. The
+/// prefix is `./` on Windows too, which TeX takes there: with `.\main.tex` it would read `\main`
+/// as a command.
 pub fn command_line(req: &BuildRequest) -> (Vec<OsString>, Vec<(String, String)>) {
     let mut args: Vec<OsString> = Vec::with_capacity(7);
     if let Some(flag) = engine_flag(req.engine) {
@@ -60,7 +62,11 @@ pub fn command_line(req: &BuildRequest) -> (Vec<OsString>, Vec<(String, String)>
     outdir.push(&req.outdir);
     args.push(outdir);
     args.push(match req.root.file_name() {
-        Some(name) => Path::new(".").join(name).into_os_string(),
+        Some(name) => {
+            let mut arg = OsString::from("./");
+            arg.push(name);
+            arg
+        }
         None => req.root.clone().into_os_string(),
     });
     let env = LOG_ENV

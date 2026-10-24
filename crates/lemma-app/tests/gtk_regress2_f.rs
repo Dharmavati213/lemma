@@ -326,6 +326,7 @@ fn regress2_symlinked_config_reloads() {
     std::fs::create_dir_all(&conf).unwrap();
     std::fs::create_dir_all(&dots).unwrap();
     std::fs::write(dots.join("config.toml"), "[editor]\nwrap = true\n").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(dots.join("config.toml"), conf.join("config.toml")).unwrap();
     let files = SettingsFiles::next_to(conf.join("config.toml"));
     let seen: Rc<RefCell<Vec<ConfigFile>>> = Rc::default();
@@ -790,8 +791,8 @@ fn regress2_closed_large_tab_gives_memory_back() {
     );
     let _main = f.open("main.tex");
     common::pump_for(Duration::from_millis(300));
-    // SAFETY: malloc_trim only returns free heap pages to the system.
-    unsafe { libc::malloc_trim(0) };
+    // Free heap pages go back to the system (malloc_trim on glibc).
+    lemma_app::heap::trim();
     let base = rss_kb();
     let editor = f.open("large.tex");
     let drawn = Rc::new(Cell::new(false));

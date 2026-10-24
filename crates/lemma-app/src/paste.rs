@@ -346,7 +346,15 @@ pub fn drop_kind(path: &Path) -> Option<DropKind> {
 /// `to` relative to the directory `from_dir` (both absolute), with `..` where needed.
 pub fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
     let from: Vec<Component> = from_dir.components().collect();
-    let to: Vec<Component> = to.components().collect();
+    let to_components: Vec<Component> = to.components().collect();
+    // On another drive (Windows) no relative path leads there.
+    if let (Some(Component::Prefix(a)), Some(Component::Prefix(b))) =
+        (from.first(), to_components.first())
+        && a != b
+    {
+        return to.to_path_buf();
+    }
+    let to = to_components;
     let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
     let mut out = PathBuf::new();
     for _ in common..from.len() {
@@ -365,6 +373,11 @@ pub fn drop_command(current: &Path, file: &Path, biblatex: bool) -> Option<Strin
     let dir = current.parent().unwrap_or(Path::new("/"));
     let rel = relative_path(dir, file);
     let rel = rel.to_str()?;
+    // LaTeX separates directories with `/`, on Windows too.
+    #[cfg(windows)]
+    let slashed = rel.replace('\\', "/");
+    #[cfg(windows)]
+    let rel = slashed.as_str();
     if unsafe_in_latex(rel) {
         return None;
     }
@@ -515,6 +528,20 @@ mod tests {
         assert_eq!(
             relative_path(&p("/a/b"), &p("/x/y.tex")),
             p("../../x/y.tex")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drop_commands_use_slashes() {
+        let cur = Path::new(r"C:\Users\u\thesis\chapters\intro.tex");
+        assert_eq!(
+            drop_command(cur, Path::new(r"C:\Users\u\thesis\figures\plot.png"), false).as_deref(),
+            Some("\\includegraphics[width=0.8\\textwidth]{../figures/plot.png}")
+        );
+        assert_eq!(
+            drop_command(cur, Path::new(r"D:\shared\refs.bib"), true).as_deref(),
+            Some("\\addbibresource{D:/shared/refs.bib}")
         );
     }
 

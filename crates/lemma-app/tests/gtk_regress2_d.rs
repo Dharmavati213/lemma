@@ -61,6 +61,7 @@ fn main() -> ExitCode {
             regress2_persist_snapshot_does_not_stall,
         ),
         // D-6 / D-17
+        #[cfg(unix)]
         (
             "regress2_non_utf8_root_keeps_reviews",
             regress2_non_utf8_root_keeps_reviews,
@@ -480,6 +481,7 @@ fn regress2_persist_snapshot_does_not_stall() {
 /// A project in a directory whose name is not UTF-8 (a Latin-1 name from an old archive): the
 /// root does not serialize, `unwrap_or_default` turns that into an empty file, and nothing is
 /// restored in the next session.
+#[cfg(unix)]
 fn regress2_non_utf8_root_keeps_reviews() {
     use std::os::unix::ffi::OsStrExt as _;
     let paths = temp_paths("r2-latin1");

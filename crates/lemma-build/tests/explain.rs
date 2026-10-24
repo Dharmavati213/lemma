@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 fn fixtures() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/logs");
-    fs::canonicalize(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+    lemma_core::canonicalize(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
 }
 
 fn data() -> PathBuf {

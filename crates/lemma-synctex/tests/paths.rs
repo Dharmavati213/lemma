@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use lemma_synctex::{Scanner, SyncTarget};
 
 /// A recorded path prefix that does not exist on any machine running the tests.
+#[cfg(unix)]
 const GONE: &str = "/nonexistent-lemma-synctex/proj";
+/// TeX on Windows records names with a drive, and `/` between the directories.
+#[cfg(windows)]
+const GONE: &str = "C:/nonexistent-lemma-synctex/proj";
 
 /// Baseline (bp) of the `k`-th node written by [`write_synctex`].
 fn baseline(k: usize) -> f32 {
@@ -65,7 +69,9 @@ fn touch(dir: &Path, files: &[&str]) {
 /// never looks outside the temporary directory, e.g. at a stray `/tmp/main.tex`.
 fn tempdir() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().canonicalize().unwrap().join("w/x/y/z");
+    let path = lemma_core::canonicalize(tmp.path())
+        .unwrap()
+        .join("w/x/y/z");
     fs::create_dir_all(&path).unwrap();
     (tmp, path)
 }
@@ -329,6 +335,7 @@ fn a_file_recorded_under_two_names_gives_the_boxes_of_both() {
 }
 
 #[test]
+#[cfg(unix)]
 fn symlinked_paths_match_their_target() {
     let (_tmp, dir) = tempdir();
     let proj = dir.join("proj");

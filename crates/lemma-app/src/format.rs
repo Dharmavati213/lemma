@@ -23,7 +23,7 @@ use adw::prelude::*;
 use lemma_core::{Origin, TextEdit};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -142,10 +142,15 @@ pub fn install(state: &Rc<WindowState>) {
 /// when it cannot start, fails or outlives `timeout` (it is killed then).
 fn run(program: &Path, args: &[&str], input: &str, timeout: Duration) -> Result<String, String> {
     // A random name, mode 0700 and created anew: never a directory another user made in /tmp.
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::Builder::new()
-        .prefix("lemma-latexindent-")
-        .permissions(std::fs::Permissions::from_mode(0o700))
+    // (Windows' temporary directory is the user's own.)
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("lemma-latexindent-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder
         .tempdir()
         .map_err(|e| format!("cannot create a temporary directory: {e}"))?;
     run_in(program, args, input, timeout, dir.path())
@@ -159,7 +164,7 @@ fn run_in(
     dir: &Path,
 ) -> Result<String, String> {
     let name = program.display();
-    let mut child = Command::new(program)
+    let mut child = lemma_core::process::command(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -404,6 +409,7 @@ mod tests {
         assert_eq!(fit("x\n", "x\n", true), "x\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn running_a_program() {
         let sh = Path::new("/bin/sh");
@@ -422,6 +428,7 @@ mod tests {
 
     /// latexindent writes `indent.log` in its working directory: that must be a fresh private
     /// directory, never one another user could have made (or planted a symlink in) under /tmp.
+    #[cfg(unix)]
     #[test]
     fn regress5_format_private_tempdir() {
         let planted: Vec<_> = (0..64)

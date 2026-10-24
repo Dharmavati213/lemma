@@ -1,8 +1,10 @@
-//! Running a TeX process: in its own process group, with stdin from `/dev/null` and its output
-//! discarded (TeX writes a log), killed with the whole group when it outlives its timeout.
+//! Running a TeX process: in its own process group (on Windows: a job), with stdin from
+//! `/dev/null` and its output discarded (TeX writes a log), killed with the whole group when it
+//! outlives its timeout.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -17,6 +19,9 @@ pub(crate) enum RunError {
     Timeout,
 }
 
+/// The separator of kpathsea's path lists: `;` on Windows, where `:` belongs to drive names.
+pub(crate) const LIST_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
 /// Runs `program args…` in `cwd` with `texinputs` prepended to the TeX search path, waiting at
 /// most `timeout`.
 pub(crate) fn run(
@@ -26,7 +31,8 @@ pub(crate) fn run(
     texinputs: &OsStr,
     timeout: Duration,
 ) -> Result<ExitStatus, RunError> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .env("TEXINPUTS", texinputs)
@@ -36,10 +42,21 @@ pub(crate) fn run(
         .env("half_error_line", "238")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(RunError::Spawn)?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    let mut child = command.process_group(0).spawn().map_err(RunError::Spawn)?;
+    #[cfg(windows)]
+    let (mut child, job) =
+        lemma_core::process::Job::spawn(&mut command).map_err(RunError::Spawn)?;
+    let kill_group = |child: &std::process::Child| {
+        #[cfg(unix)]
+        kill_group(child.id());
+        #[cfg(windows)]
+        {
+            let _ = child;
+            job.terminate(1);
+        }
+    };
     let deadline = Instant::now() + timeout;
     // TeX runs take tens of milliseconds: poll finely at first, then less often.
     let mut nap = Duration::from_micros(500);
@@ -48,14 +65,14 @@ pub(crate) fn run(
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
             Err(e) => {
-                kill_group(child.id());
+                kill_group(&child);
                 let _ = child.wait();
                 return Err(RunError::Spawn(e));
             }
         }
         let now = Instant::now();
         if now >= deadline {
-            kill_group(child.id());
+            kill_group(&child);
             let _ = child.wait();
             return Err(RunError::Timeout);
         }
@@ -65,6 +82,7 @@ pub(crate) fn run(
 }
 
 /// SIGKILL to the process group `pid` leads (TeX starts no children here, but a package may).
+#[cfg(unix)]
 fn kill_group(pid: u32) {
     if let Ok(pgid) = libc::pid_t::try_from(pid) {
         // SAFETY: killpg only sends a signal; the group is the child's own (process_group(0)).
@@ -76,17 +94,20 @@ fn kill_group(pid: u32) {
 
 /// The TeX search path for a run whose own files are in the working directory and whose
 /// project lives in `project_dir`: `.`, the project directory (unless its name would confuse
-/// kpathsea), then what `TEXINPUTS` already says (or the default path).
+/// kpathsea), then what `TEXINPUTS` already says (or the default path). The entries are separated
+/// by [`LIST_SEPARATOR`].
 pub(crate) fn texinputs(project_dir: Option<&Path>, inherited: Option<&OsStr>) -> OsString {
-    let mut s = OsString::from(".:");
+    let mut s = OsString::from(".");
+    s.push(LIST_SEPARATOR);
     if let Some(dir) = project_dir {
         let text = dir.as_os_str().as_encoded_bytes();
-        let unsafe_for_kpathsea = text
-            .iter()
-            .any(|b| matches!(b, b':' | b';' | b'$' | b'{' | b'}' | b',' | b'!'));
+        // On Windows a colon belongs to the drive name, not to the list.
+        let unsafe_for_kpathsea = text.iter().any(|b| {
+            matches!(b, b';' | b'$' | b'{' | b'}' | b',' | b'!') || (*b == b':' && !cfg!(windows))
+        });
         if !unsafe_for_kpathsea && dir.is_absolute() {
             s.push(dir.as_os_str());
-            s.push(":");
+            s.push(LIST_SEPARATOR);
         }
     }
     if let Some(inherited) = inherited.filter(|t| !t.is_empty()) {
@@ -99,6 +120,25 @@ pub(crate) fn texinputs(project_dir: Option<&Path>, inherited: Option<&OsStr>) -
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_texinputs_are_separated_by_semicolons() {
+        assert_eq!(texinputs(None, None), OsString::from(".;"));
+        assert_eq!(
+            texinputs(
+                Some(Path::new(r"C:\Users\u\thesis")),
+                Some(OsStr::new("D:/tex//;"))
+            ),
+            OsString::from(r".;C:\Users\u\thesis;D:/tex//;")
+        );
+        assert_eq!(
+            texinputs(Some(Path::new(r"C:\Users\u\a;b")), None),
+            OsString::from(".;"),
+            "a semicolon would split the path"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn texinputs_keep_the_project_and_the_default() {
         assert_eq!(texinputs(None, None), OsString::from(".:"));
@@ -124,6 +164,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_slow_process_is_killed_at_its_timeout() {
         let dir = crate::test_dir();
@@ -152,6 +193,29 @@ mod tests {
         assert!(matches!(r, Err(RunError::Spawn(_))), "{r:?}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_slow_windows_process_is_killed_at_its_timeout() {
+        let dir = crate::test_dir();
+        let started = Instant::now();
+        let r = run(
+            OsStr::new("cmd"),
+            &[
+                "/c".into(),
+                "ping".into(),
+                "-n".into(),
+                "6".into(),
+                "127.0.0.1".into(),
+            ],
+            dir.path(),
+            OsStr::new(".;"),
+            Duration::from_millis(200),
+        );
+        assert!(matches!(r, Err(RunError::Timeout)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn exit_statuses_come_back() {
         let dir = crate::test_dir();

@@ -278,7 +278,7 @@ fn bib_candidates(written: PathBuf) -> Vec<PathBuf> {
 
 /// A previous build's `.fls` that lists `file` as an input names the root: `<PWD>/<stem>.tex`.
 fn fls_root(file: &Path) -> Option<PathBuf> {
-    let target = fs::canonicalize(file).unwrap_or_else(|_| normalize(file));
+    let target = lemma_core::canonicalize(file).unwrap_or_else(|_| normalize(file));
     let dir = file.parent()?;
     for ancestor in dir.ancestors().take(FLS_SEARCH_DEPTH) {
         for fls_dir in [ancestor.join(".build"), ancestor.to_path_buf()] {
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn root_from_previous_build_fls() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let p = fs::canonicalize(dir.path()).expect("canonical tempdir");
+        let p = lemma_core::canonicalize(dir.path()).expect("canonical tempdir");
         fs::create_dir_all(p.join(".build")).expect("mkdir");
         fs::create_dir_all(p.join("chapters")).expect("mkdir");
         fs::write(p.join("thesis.tex"), "\\documentclass{book}").expect("write");

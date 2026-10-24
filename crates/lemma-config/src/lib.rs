@@ -60,6 +60,14 @@ pub struct Config {
     pub session: SessionCfg,
 }
 
+/// The default editor font: Pango's `Monospace`, except on Windows, where that alias names
+/// Courier New and Consolas (there since Windows Vista) is the system's own monospaced font.
+pub const DEFAULT_FONT: &str = if cfg!(windows) {
+    "Consolas 11"
+} else {
+    "Monospace 11"
+};
+
 /// `[editor]`: the text view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -142,7 +150,7 @@ impl Default for EditorCfg {
     fn default() -> Self {
         Self {
             vim: false,
-            font: "Monospace 11".into(),
+            font: DEFAULT_FONT.into(),
             scheme_light: "Adwaita".into(),
             scheme_dark: "Adwaita-dark".into(),
             math_envs: Vec::new(),
@@ -722,6 +730,8 @@ mod tests {
         let c = Config::default();
         assert!(!c.editor.vim);
         assert_eq!(c.editor.renderer, Renderer::Auto);
+        assert_eq!(c.editor.font, DEFAULT_FONT);
+        #[cfg(not(windows))]
         assert_eq!(c.editor.font, "Monospace 11");
         assert_eq!(c.editor.scheme_light, "Adwaita");
         assert_eq!(c.editor.scheme_dark, "Adwaita-dark");

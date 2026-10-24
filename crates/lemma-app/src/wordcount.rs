@@ -26,7 +26,7 @@ use lemma_build::BuildStatus;
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -200,7 +200,7 @@ pub fn count_document(
         .ok_or_else(|| CountError::Failed("no file name".into()))?;
     let mut file = std::ffi::OsString::from("./");
     file.push(name);
-    let mut child = Command::new(program)
+    let mut child = lemma_core::process::command(program)
         .args(["-merge", "-sum", "-sub=section"])
         .arg(&file)
         .current_dir(dir)
@@ -244,7 +244,7 @@ fn total_size(files: &[PathBuf]) -> u64 {
 
 /// Counts the words of `text` (a selection; blocking).
 pub fn count_text(program: &Path, text: &str) -> Result<u64, CountError> {
-    let mut child = Command::new(program)
+    let mut child = lemma_core::process::command(program)
         .args(["-1", "-sum", "-utf8", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

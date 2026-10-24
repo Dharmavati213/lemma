@@ -1573,8 +1573,15 @@ impl TurnCtx<'_> {
                     let guard = lock(&self.agent.out.stdout);
                     // SAFETY: fd 1 is our stdout; it is not used again (the lock is never
                     // released).
+                    #[cfg(unix)]
                     drop(unsafe {
                         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(1)
+                    });
+                    // SAFETY: as above, for the standard output handle.
+                    #[cfg(windows)]
+                    drop(unsafe {
+                        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+                        OwnedHandle::from_raw_handle(io::stdout().as_raw_handle())
                     });
                     std::mem::forget(guard);
                     loop {

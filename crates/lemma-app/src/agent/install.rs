@@ -37,6 +37,14 @@
 //! **only when the user clicks Install**. Afterwards the `package.json` version is checked.
 //! Tests use a fake `npm` and `claude` on a temporary `PATH`; the real npm is never run.
 //!
+//! # Windows
+//!
+//! A program is found by its name plus an extension of `PATHEXT` (`node.exe`, `claude.exe`,
+//! npm's `.cmd` shims; [`crate::fsutil::program_file`]). npm is run as `node npm-cli.js` from
+//! node's own `node_modules/npm` when it is there, so that no `cmd.exe` stands in between, and
+//! through `std::process` in a job object rather than GSubprocess: GLib starts console programs
+//! from a GUI program with a console window of their own.
+//!
 //! # Pi (WP5.2)
 //!
 //! The `pi` backend runs the pi coding agent through **`@openma/pi-acp`** ([`PI_ADAPTER_PACKAGE`],
@@ -340,10 +348,7 @@ pub fn detect_pi_in(
 /// global package: `node/latest/bin/pi`, else the newest `node/<x.y.z>/bin/pi`).
 pub fn find_pi(_paths: &Paths, env: &Env) -> Option<PathBuf> {
     search_path(&env.path, "pi", &env.mise_installs)
-        .or_else(|| {
-            let latest = env.mise_installs.join("node/latest/bin/pi");
-            is_executable(&latest).then_some(latest)
-        })
+        .or_else(|| program_file(&env.mise_installs.join("node/latest/bin/pi")))
         .or_else(|| newest_version(&env.mise_installs.join("node"), Path::new("bin/pi")))
 }
 
@@ -532,7 +537,11 @@ pub fn find_command(command: &Path, paths: &Paths, env: &Env) -> Option<PathBuf>
         return find_tool(command.to_str()?, paths, env);
     }
     let path = paths.expand(command);
-    (path.is_absolute() && is_executable(&path)).then_some(path)
+    if path.is_absolute() {
+        program_file(&path)
+    } else {
+        None
+    }
 }
 
 /// The command line tool `name` (`grok`, `gemini`, …): on `PATH` (mise shims skipped), else in
@@ -550,8 +559,8 @@ pub fn find_tool(name: &str, paths: &Paths, env: &Env) -> Option<PathBuf> {
                 installs.join(name).join("latest/bin").join(name),
                 installs.join(name).join("latest").join(name),
             ]
-            .into_iter()
-            .find(|p| is_executable(p))
+            .iter()
+            .find_map(|p| program_file(p))
         })
         .or_else(|| newest_version(&installs.join("node"), &Path::new("bin").join(name)))
         .or_else(|| {
@@ -559,8 +568,7 @@ pub fn find_tool(name: &str, paths: &Paths, env: &Env) -> Option<PathBuf> {
                 .ok()?
                 .filter_map(Result::ok)
                 .filter(|e| e.file_name().to_string_lossy().starts_with("npm-"))
-                .map(|e| e.path().join("latest/node_modules/.bin").join(name))
-                .filter(|p| is_executable(p))
+                .filter_map(|e| program_file(&e.path().join("latest/node_modules/.bin").join(name)))
                 .collect();
             npm.sort();
             npm.into_iter().next()
@@ -571,10 +579,11 @@ pub fn find_tool(name: &str, paths: &Paths, env: &Env) -> Option<PathBuf> {
 /// `~/.codex/packages/standalone/current/bin/codex`.
 pub fn find_codex(paths: &Paths, env: &Env) -> Option<PathBuf> {
     find_tool("codex", paths, env).or_else(|| {
-        let standalone = paths
-            .home
-            .join(".codex/packages/standalone/current/bin/codex");
-        is_executable(&standalone).then_some(standalone)
+        program_file(
+            &paths
+                .home
+                .join(".codex/packages/standalone/current/bin/codex"),
+        )
     })
 }
 
@@ -691,11 +700,19 @@ pub fn find_claude(cfg: &AgentCfg, paths: &Paths, env: &Env) -> Option<Found> {
     )
 }
 
-/// `npm` for `node`: next to it, else on `PATH`.
+/// `npm` for `node`: next to it, else on `PATH`. On Windows npm's own script next to node
+/// (`node_modules/npm/bin/npm-cli.js`, which [`run_npm`] runs with node) comes first.
 pub fn find_npm(node: &Path, env: &Env) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(script) = node
+        .parent()
+        .map(|dir| dir.join(r"node_modules\npm\bin\npm-cli.js"))
+        .filter(|p| p.is_file())
+    {
+        return Some(script);
+    }
     node.parent()
-        .map(|dir| dir.join("npm"))
-        .filter(|p| is_executable(p))
+        .and_then(|dir| program_file(&dir.join("npm")))
         .or_else(|| search_path(&env.path, "npm", &env.mise_installs))
 }
 
@@ -710,7 +727,9 @@ fn find_program(
 ) -> Option<Found> {
     if !configured.as_os_str().is_empty() {
         let path = paths.expand(configured);
-        if path.is_absolute() && is_executable(&path) {
+        if path.is_absolute()
+            && let Some(path) = program_file(&path)
+        {
             return Some(Found {
                 path,
                 from_config: true,
@@ -722,7 +741,7 @@ fn find_program(
         );
     }
     let found = search_path(&env.path, name, &env.mise_installs)
-        .or_else(|| fixed.iter().find(|p| is_executable(p)).cloned())
+        .or_else(|| fixed.iter().find_map(|p| program_file(p)))
         .or_else(|| newest_version(versions_dir, in_version))?;
     Some(Found {
         path: prefer_mise_latest(&found, &env.mise_installs),
@@ -737,8 +756,7 @@ fn search_path(search: &OsStr, name: &str, mise_installs: &Path) -> Option<PathB
     std::env::split_paths(search)
         .filter(|dir| dir.is_absolute())
         .filter(|dir| shims.as_deref() != Some(dir.as_path()))
-        .map(|dir| dir.join(name))
-        .find(|p| is_executable(p))
+        .find_map(|dir| program_file(&dir.join(name)))
 }
 
 /// `dir/<highest x.y.z>/in_version` when it is executable.
@@ -748,9 +766,11 @@ fn newest_version(dir: &Path, in_version: &Path) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            Some((parse_version(&name)?, e.path().join(in_version)))
+            Some((
+                parse_version(&name)?,
+                program_file(&e.path().join(in_version))?,
+            ))
         })
-        .filter(|(_, p)| is_executable(p))
         .max_by_key(|(v, _)| *v)
         .map(|(_, p)| p)
 }
@@ -771,16 +791,18 @@ fn prefer_mise_latest(path: &Path, installs: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     let latest = installs.join(tool).join("latest").join(parts.as_path());
-    match (latest.canonicalize(), path.canonicalize()) {
+    match (
+        lemma_core::canonicalize(&latest),
+        lemma_core::canonicalize(path),
+    ) {
         (Ok(a), Ok(b)) if a == b => latest,
         _ => path.to_path_buf(),
     }
 }
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+/// The program `path` names (see [`crate::fsutil::program_file`]).
+fn program_file(path: &Path) -> Option<PathBuf> {
+    crate::fsutil::program_file(path)
 }
 
 /// Writes `agent.node` and `agent.claude` into the config file (created if missing), keeping the
@@ -789,7 +811,7 @@ fn is_executable(path: &Path) -> bool {
 /// permissions, so the link stays.
 fn store_paths(config: &Path, node: &Path, claude: &Path) -> Result<(), String> {
     let target = match std::fs::symlink_metadata(config) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(config)
+        Ok(m) if m.file_type().is_symlink() => lemma_core::canonicalize(config)
             .map_err(|e| format!("the config file is a symlink that cannot be followed: {e}"))?,
         _ => config.to_path_buf(),
     };
@@ -851,8 +873,7 @@ fn package_version(path: &Path) -> Option<String> {
 /// installer's `…/claude/versions/<x.y.z>`), else from `claude --version`. Any other `x.y.z`
 /// in the path is not claude's (an npm-installed claude lives under node's version directory).
 pub fn claude_version(path: &Path) -> Option<String> {
-    if let Some(version) = path
-        .canonicalize()
+    if let Some(version) = lemma_core::canonicalize(path)
         .ok()
         .and_then(|canonical| version_in_claude_layout(&canonical))
     {
@@ -885,7 +906,7 @@ fn version_in_claude_layout(path: &Path) -> Option<String> {
 
 /// Runs `program args`, returning its stdout when it exits with success within `timeout`.
 fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    let mut child = std::process::Command::new(program)
+    let mut child = lemma_core::process::command(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -993,7 +1014,7 @@ pub fn install_adapter<F: Fn(&str) + 'static>(
 
 /// Runs `npm args` in `adapter_dir` (see the module docs), then `check`s the result.
 #[allow(clippy::too_many_arguments)]
-fn run_npm<F, C>(
+async fn run_npm<F, C>(
     node: Option<PathBuf>,
     npm: Option<PathBuf>,
     search: OsString,
@@ -1002,73 +1023,161 @@ fn run_npm<F, C>(
     cancel: gio::Cancellable,
     on_line: F,
     check: C,
-) -> impl Future<Output = Result<(), String>> + use<F, C>
+) -> Result<(), String>
 where
     F: Fn(&str) + 'static,
     C: FnOnce(&Path) -> Result<(), String> + 'static,
 {
+    let node = node.ok_or("node was not found, so npm cannot run")?;
+    let npm = npm.ok_or_else(|| format!("npm was not found next to {}", node.display()))?;
+    std::fs::create_dir_all(&adapter_dir)
+        .map_err(|e| format!("cannot create {}: {e}", adapter_dir.display()))?;
+    // npm's `#!/usr/bin/env node` must find this node.
+    let mut dirs: Vec<PathBuf> = node.parent().map(Path::to_path_buf).into_iter().collect();
+    dirs.extend(std::env::split_paths(&search));
+    let joined = std::env::join_paths(dirs).map_err(|e| e.to_string())?;
+    // npm's own script runs with node (Windows, see `find_npm`).
+    let mut argv: Vec<OsString> = if npm.extension().is_some_and(|e| e == "js") {
+        vec![node.into_os_string(), npm.into_os_string()]
+    } else {
+        vec![npm.into_os_string()]
+    };
+    argv.extend(args);
+    #[cfg(windows)]
+    run_streaming(argv, joined, &adapter_dir, &cancel, &on_line).await?;
+    #[cfg(unix)]
+    run_subprocess(argv, joined, &adapter_dir, &cancel, &on_line).await?;
+    check(&adapter_dir)
+}
+
+/// Runs `argv` in `cwd` with `PATH` set to `path`, calling `on_line` with every line of its
+/// output (stdout and stderr), until it exits; cancelling `cancel` kills it.
+#[cfg(unix)]
+async fn run_subprocess(
+    argv: Vec<OsString>,
+    path: OsString,
+    cwd: &Path,
+    cancel: &gio::Cancellable,
+    on_line: &impl Fn(&str),
+) -> Result<(), String> {
     use gio::prelude::*;
-    async move {
-        let node = node.ok_or("node was not found, so npm cannot run")?;
-        let npm = npm.ok_or_else(|| format!("npm was not found next to {}", node.display()))?;
-        std::fs::create_dir_all(&adapter_dir)
-            .map_err(|e| format!("cannot create {}: {e}", adapter_dir.display()))?;
-        let launcher = gio::SubprocessLauncher::new(
-            gio::SubprocessFlags::STDOUT_PIPE
-                | gio::SubprocessFlags::STDERR_MERGE
-                | gio::SubprocessFlags::STDIN_INHERIT,
-        );
-        // npm's `#!/usr/bin/env node` must find this node.
-        let mut dirs: Vec<PathBuf> = node.parent().map(Path::to_path_buf).into_iter().collect();
-        dirs.extend(std::env::split_paths(&search));
-        let joined = std::env::join_paths(dirs).map_err(|e| e.to_string())?;
-        launcher.setenv("PATH", &joined, true);
-        launcher.setenv("NO_UPDATE_NOTIFIER", "1", true);
-        launcher.setenv("npm_config_update_notifier", "false", true);
-        launcher.set_cwd(&adapter_dir);
-        let mut argv: Vec<OsString> = vec![npm.into_os_string()];
-        argv.extend(args);
-        let argv: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
-        let process = launcher
-            .spawn(&argv)
-            .map_err(|e| format!("cannot run npm: {e}"))?;
-        let killer = process.clone();
-        let handler = cancel.connect_cancelled_local(move |_| killer.force_exit());
-        let stdout = process.stdout_pipe().ok_or("npm has no output pipe")?;
-        let lines = gio::DataInputStream::new(&stdout);
-        loop {
-            match lines.read_line_utf8_future(glib::Priority::DEFAULT).await {
-                Ok(Some(line)) => on_line(line.trim_end_matches('\r')),
-                Ok(None) => break,
-                Err(e) => {
-                    on_line(&format!("(could not read npm's output: {e})"));
-                    break;
-                }
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_PIPE
+            | gio::SubprocessFlags::STDERR_MERGE
+            | gio::SubprocessFlags::STDIN_INHERIT,
+    );
+    launcher.setenv("PATH", &path, true);
+    launcher.setenv("NO_UPDATE_NOTIFIER", "1", true);
+    launcher.setenv("npm_config_update_notifier", "false", true);
+    launcher.set_cwd(cwd);
+    let argv: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
+    let process = launcher
+        .spawn(&argv)
+        .map_err(|e| format!("cannot run npm: {e}"))?;
+    let killer = process.clone();
+    let handler = cancel.connect_cancelled_local(move |_| killer.force_exit());
+    let stdout = process.stdout_pipe().ok_or("npm has no output pipe")?;
+    let lines = gio::DataInputStream::new(&stdout);
+    loop {
+        match lines.read_line_utf8_future(glib::Priority::DEFAULT).await {
+            Ok(Some(line)) => on_line(line.trim_end_matches('\r')),
+            Ok(None) => break,
+            Err(e) => {
+                on_line(&format!("(could not read npm's output: {e})"));
+                break;
             }
         }
-        let waited = process.wait_future().await;
-        if let Some(handler) = handler {
-            cancel.disconnect_cancelled(handler);
+    }
+    let waited = process.wait_future().await;
+    if let Some(handler) = handler {
+        cancel.disconnect_cancelled(handler);
+    }
+    if cancel.is_cancelled() {
+        return Err("the installation was cancelled".into());
+    }
+    waited.map_err(|e| format!("npm failed: {e}"))?;
+    if !process.has_exited() || process.exit_status() != 0 {
+        return Err(format!(
+            "npm failed (exit status {})",
+            if process.has_exited() {
+                process.exit_status().to_string()
+            } else {
+                "unknown".into()
+            }
+        ));
+    }
+    Ok(())
+}
+
+/// [`run_subprocess`] for Windows: `std::process` in a job object, its output read on a thread
+/// (see "Windows" in the module docs). stdin is empty.
+#[cfg(windows)]
+async fn run_streaming(
+    argv: Vec<OsString>,
+    path: OsString,
+    cwd: &Path,
+    cancel: &gio::Cancellable,
+    on_line: &impl Fn(&str),
+) -> Result<(), String> {
+    use gio::prelude::*;
+    use std::io::BufRead as _;
+    let cannot_run = |e: std::io::Error| format!("cannot run npm: {e}");
+    let (reader, writer) = std::io::pipe().map_err(cannot_run)?;
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .env("PATH", &path)
+        .env("NO_UPDATE_NOTIFIER", "1")
+        .env("npm_config_update_notifier", "false")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(writer.try_clone().map_err(cannot_run)?)
+        .stderr(writer);
+    let (mut child, job) = lemma_core::process::Job::spawn(&mut command).map_err(cannot_run)?;
+    // The command holds the pipe's write ends: without them, the reader sees the end of the
+    // output once npm (and whatever it started) is done.
+    drop(command);
+    let job = std::sync::Arc::new(job);
+    let killer = job.clone();
+    let handler = cancel.connect_cancelled_local(move |_| killer.terminate(1));
+    let (lines_tx, lines) = async_channel::unbounded::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(reader).split(b'\n') {
+            let Ok(line) = line else { break };
+            if lines_tx
+                .send_blocking(String::from_utf8_lossy(&line).into_owned())
+                .is_err()
+            {
+                break;
+            }
         }
-        if cancel.is_cancelled() {
-            return Err("the installation was cancelled".into());
-        }
-        waited.map_err(|e| format!("npm failed: {e}"))?;
-        if !process.has_exited() || process.exit_status() != 0 {
-            return Err(format!(
-                "npm failed (exit status {})",
-                if process.has_exited() {
-                    process.exit_status().to_string()
-                } else {
-                    "unknown".into()
-                }
-            ));
-        }
-        check(&adapter_dir)
+    });
+    while let Ok(line) = lines.recv().await {
+        on_line(line.trim_end_matches('\r'));
+    }
+    let status = gio::spawn_blocking(move || child.wait()).await;
+    if let Some(handler) = handler {
+        cancel.disconnect_cancelled(handler);
+    }
+    drop(job);
+    if cancel.is_cancelled() {
+        return Err("the installation was cancelled".into());
+    }
+    match status {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!(
+            "npm failed (exit status {})",
+            status
+                .code()
+                .map_or_else(|| "unknown".into(), |c| c.to_string())
+        )),
+        Ok(Err(e)) => Err(format!("npm failed: {e}")),
+        Err(_) => Err("npm failed: its waiter panicked".into()),
     }
 }
 
-#[cfg(test)]
+// The tests run fake `node`, `npm` and `claude` shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

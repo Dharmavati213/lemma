@@ -37,6 +37,7 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        #[cfg(unix)]
         if let Ok(pid) = i32::try_from(self.child.id()) {
             // SAFETY: kill(2) on our own child process, which has not been reaped yet.
             unsafe {

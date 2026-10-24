@@ -10,7 +10,7 @@ use std::time::Instant;
 
 fn fixtures() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
-    fs::canonicalize(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+    lemma_core::canonicalize(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
 }
 
 fn variant_dir(variant: &str) -> PathBuf {
@@ -67,8 +67,15 @@ fn parsed(variant: &str, log: &str) -> (LogReport, PathBuf) {
     (report, dir)
 }
 
+/// `path` relative to `dir`, with `/` between the components on Windows too (as the snapshots
+/// have them).
 fn rel(path: &Path, dir: &Path) -> String {
-    path.strip_prefix(dir).unwrap_or(path).display().to_string()
+    let rel = path.strip_prefix(dir).unwrap_or(path);
+    if cfg!(windows) && rel.is_relative() {
+        rel.to_string_lossy().replace('\\', "/")
+    } else {
+        rel.display().to_string()
+    }
 }
 
 fn line(d: &Diagnostic) -> String {

@@ -402,6 +402,7 @@ fn fake_agent_pids() -> Vec<i32> {
     pids
 }
 
+#[cfg(unix)]
 fn signal(pids: &[i32], sig: i32) {
     for pid in pids {
         // SAFETY: plain kill(2) on our own child.
@@ -442,6 +443,7 @@ fn regress2_late_cancel_does_not_end_the_next_turn() {
     let pids = fake_agent_pids();
     assert_eq!(pids.len(), 1, "one fake agent");
     // The agent stops answering for a while.
+    #[cfg(unix)]
     signal(&pids, libc::SIGSTOP);
     agent.cancel();
     common::pump_until(TIMEOUT, || !agent.is_running());
@@ -455,6 +457,7 @@ fn regress2_late_cancel_does_not_end_the_next_turn() {
         "  second prompt refused by the agent: {refused}; app state then: {:?}",
         agent.state()
     );
+    #[cfg(unix)]
     signal(&pids, libc::SIGCONT);
     common::pump_for(Duration::from_millis(1500));
     println!(
@@ -712,6 +715,7 @@ fn regress2_render_page_outlasts_a_long_build() {
     // A build that takes 35 s (a thesis with biber and TikZ), then the real latexmk.
     let slow = dir.join("slow-latexmk");
     std::fs::write(&slow, "#!/bin/sh\nsleep 35\nexec latexmk \"$@\"\n").unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1218,8 +1222,8 @@ fn regress2_big_file_written_in_a_turn_does_not_freeze() {
 
 /// Anonymous memory of this process in KiB, after giving freed memory back.
 fn anon_kib() -> u64 {
-    // SAFETY: plain libc call.
-    unsafe { libc::malloc_trim(0) };
+    // Free heap pages go back to the system (malloc_trim on glibc).
+    lemma_app::heap::trim();
     let text = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
     text.lines()
         .find(|l| l.starts_with("Anonymous:"))

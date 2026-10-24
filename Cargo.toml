@@ -46,6 +46,8 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 libc           = "0.2.190"
 tracing        = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Windows: job objects, the Credential Manager, the console (already in the tree through tempfile)
+windows-sys = "0.61.2"
 # build / tools / tests
 pkg-config = "0.3.34"
 # compiles the bundled SyncTeX parser (lemma-synctex, macOS); already in the tree through ring

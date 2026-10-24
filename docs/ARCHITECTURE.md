@@ -1120,3 +1120,68 @@ its behaviour is unchanged. The differences:
   CI starts the app with Homebrew renamed (`smoke-test.sh`) and keeps snapshots of its window.
   `install.sh` is the one-command installer: the release's DMG (or a build from source), a
   `lemma` command and TeX (BasicTeX plus Lemma's tools and common packages, or MacTeX).
+
+## 13. Windows (2026-10-24)
+
+Lemma builds and runs on Windows 10 (1903 or later) and 11, x86_64, against MSYS2's CLANG64
+packages (at the time of the port GTK 4.24, libadwaita 1.10, GtkSourceView 5.22, libspelling
+0.4.10, poppler 26.08), for the `x86_64-pc-windows-gnullvm` target. It is built and packaged on the developer's
+machine, natively in MSYS2 or as a cross build from Linux, never in CI. Linux and macOS keep
+their behaviour; the Windows paths are `cfg`-gated. The differences:
+
+- **Process groups → job objects** (`lemma-core/src/process.rs`): `Job::spawn` starts a program
+  suspended, puts it in a new job object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) and resumes it,
+  so nothing it starts escapes. latexmk (`lemma-build`), the math preview's TeX runs
+  (`lemma-preview`), the agent (`acp.rs`) and npm run in one. Windows has no SIGTERM for these
+  programs: stopping ends the job at once (exit code 1), after the agent's stdin was closed and
+  `EXIT_GRACE` passed. `acp.rs`'s wait thread holds the agent's process handle until it may
+  "reap" it by closing it, which keeps the pid from being reused as the zombie does on Unix.
+  Every program Lemma starts gets `CREATE_NO_WINDOW` (`lemma_core::process::command`): Lemma is
+  a GUI-subsystem program, and console programs would open windows of their own.
+- **MCP transport** (`lemma-agent/src/transport.rs`): std has no unix sockets on Windows. The
+  socket path names a file holding the loopback TCP address the server listens on
+  (`127.0.0.1:<port>`); `lemma-mcp` reads it the same way. The token line, stale-file
+  replacement (a file whose port no longer answers) and removal of files of dead instances work
+  as before. A blocked socket read is not woken by `shutdown` on Windows, so connection reads
+  wait `POLL_SLICE` at a time and see `stop`.
+- **Paths**: `lemma_core::canonicalize` drops the `\\?\` prefix `fs::canonicalize` returns on
+  Windows when the plain path names the same file; every canonical path in the workspace goes
+  through it (workspace keys, `ProjectRoot`, SyncTeX matches). Windows resolves `..` by name
+  before it looks at the disk, so `ProjectRoot::resolve` accepts `new/../x.tex` there (it is
+  `x.tex`, still inside the root). latexmk gets `./<root>.tex` with `/` (TeX would read
+  `\main` in `.\main.tex` as a command); drops insert `/`-separated paths; `TEXINPUTS` uses `;`.
+  SyncTeX's `<cwd>/./<rel>` names may use either slash.
+- **Per-user directories** (`lemma-config/src/paths.rs`): `%APPDATA%\lemma` for the settings,
+  `%LOCALAPPDATA%\lemma\{state,data,cache}` for the rest; an absolute `XDG_*` still wins (the
+  tests rely on it). The default editor font is Consolas (Pango's `Monospace` alias is Courier
+  New there).
+- **API key** (`keys.rs`): a generic credential (`lemma/anthropic-api-key`) in the Credential
+  Manager through `CredReadW`/`CredWriteW`/`CredDeleteW`; no program runs. The MCP token comes
+  from `BCryptGenRandom`.
+- **Programs** (`lemma-app/src/fsutil.rs`, `agent/install.rs`): a program is a file with an
+  extension of `PATHEXT` (`node` → `node.exe`; npm's extensionless `sh` shims are skipped). npm
+  runs as `node npm-cli.js` from node's own folder, through `std::process` in a job rather than
+  GSubprocess, whose Windows spawn helper gives console programs a console window.
+- **Process environment** (`lemma-app/src/windows.rs`, first thing in `main`): attaches to the
+  console of a terminal that started Lemma (`--help`, the log) and appends TeX Live's, MiKTeX's,
+  Strawberry Perl's, Node.js's, npm's, Git's and `%USERPROFILE%\.local\bin` to PATH when they
+  exist and are missing. GTK finds its data next to its DLLs; nothing else is set.
+- **The executable** (`lemma-app/build.rs`): the icon, version information and a manifest
+  (`packaging/windows/lemma.manifest`: the UTF-8 code page, so the SyncTeX parser's narrow
+  `fopen` opens any path, and long paths) are compiled with `windres` and linked into
+  `lemma.exe`. The SyncTeX parser is the bundled one, as on macOS, linked with `shlwapi`.
+- **poppler-glib** declares `poppler_certificate_info_new` but does not export it from its
+  DLL; poppler-rs refers to it, and Windows linkers report it even unused. `lemma-core` defines
+  a stand-in that nobody calls (`poppler_exports.rs`).
+- **Not ported**: `--mem-report` (reads `/proc`). An agent that closes its stdout but keeps
+  running is not noticed, because its children inherit the pipe's handle on Windows; an agent
+  that dies is. The GTK tests run on Linux only (Broadway); the other crates' tests, and the
+  app's unit tests, run on Windows (`packaging/windows/build.sh --test`, under Wine on Linux),
+  with the Unix-only cases (shell scripts, `/proc`, symlinks, FIFOs, file modes) gated.
+- **Packaging** (`packaging/windows/`): `build.sh` builds the release, gathers the DLLs by
+  their import tables (`bundle_dlls.py`), the compiled schemas, icons, GtkSourceView data,
+  pixbuf loaders with a relocatable `loaders.cache`, enchant (Hunspell and Windows' spell
+  checker), fontconfig's configuration and the licences of the MSYS2 packages into
+  `dist/Lemma`, zips it and makes an Inno Setup installer (`lemma.iss`). On Linux it downloads
+  llvm-mingw, MSYS2's packages (`msys2.py`), a portable Wine and Inno Setup, each checked
+  against a SHA-256, and Wine runs the Windows tools.

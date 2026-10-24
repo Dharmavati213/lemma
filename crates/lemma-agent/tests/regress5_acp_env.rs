@@ -4,6 +4,7 @@
 //!
 //! The only test in this binary: it sets the variable in its own environment before any thread
 //! that reads the environment runs.
+#![cfg(unix)]
 
 mod acp_support;
 

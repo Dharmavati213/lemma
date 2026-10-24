@@ -10,6 +10,9 @@ mod edit;
 mod hash;
 mod latest_slot;
 mod line_index;
+#[cfg(windows)]
+mod poppler_exports;
+pub mod process;
 mod project_root;
 
 pub use diagnostic::{DiagSource, Diagnostic, Severity};
@@ -17,4 +20,4 @@ pub use edit::{Origin, TextEdit, apply_all};
 pub use hash::fnv1a64;
 pub use latest_slot::LatestSlot;
 pub use line_index::LineIndex;
-pub use project_root::{PathError, ProjectRoot};
+pub use project_root::{PathError, ProjectRoot, canonicalize};

@@ -15,6 +15,17 @@ const APP_DIR: &str = "lemma";
 ///
 /// As the XDG base-directory spec requires, relative `XDG_*` values are ignored. Nothing is
 /// created on disk.
+///
+/// On Windows an absolute `XDG_*` value still wins, but the defaults are Windows' own folders,
+/// and the home directory is `%USERPROFILE%` unless `HOME` is set:
+///
+/// | Field | Default on Windows |
+/// |---|---|
+/// | `config_dir` | `%APPDATA%\lemma` |
+/// | `state_dir` | `%LOCALAPPDATA%\lemma\state` |
+/// | `data_dir` | `%LOCALAPPDATA%\lemma\data` |
+/// | `runtime_dir` | `cache_dir\run` |
+/// | `cache_dir` | `%LOCALAPPDATA%\lemma\cache` |
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -34,6 +45,7 @@ impl Paths {
 
     /// Computes the paths from `var`, a lookup of environment variables (`HOME`, `XDG_*`).
     /// `None` when `HOME` is missing or not absolute.
+    #[cfg(not(windows))]
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Option<Self> {
         let home = var("HOME").map(PathBuf::from).filter(|p| p.is_absolute())?;
         let base = |name: &str, fallback: &str| {
@@ -52,6 +64,31 @@ impl Paths {
             config_dir: base("XDG_CONFIG_HOME", ".config"),
             state_dir: base("XDG_STATE_HOME", ".local/state"),
             data_dir: base("XDG_DATA_HOME", ".local/share"),
+            runtime_dir,
+            cache_dir,
+            home,
+        })
+    }
+
+    /// Computes the paths from `var`, a lookup of environment variables (`HOME` or
+    /// `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `XDG_*`). `None` when there is no absolute home
+    /// directory.
+    #[cfg(windows)]
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Option<Self> {
+        let absolute = |name: &str| var(name).map(PathBuf::from).filter(|p| p.is_absolute());
+        let home = absolute("HOME").or_else(|| absolute("USERPROFILE"))?;
+        let roaming = absolute("APPDATA").unwrap_or_else(|| home.join(r"AppData\Roaming"));
+        let local = absolute("LOCALAPPDATA")
+            .unwrap_or_else(|| home.join(r"AppData\Local"))
+            .join(APP_DIR);
+        let base =
+            |name: &str, fallback: PathBuf| absolute(name).map_or(fallback, |p| p.join(APP_DIR));
+        let cache_dir = base("XDG_CACHE_HOME", local.join("cache"));
+        let runtime_dir = base("XDG_RUNTIME_DIR", cache_dir.join("run"));
+        Some(Self {
+            config_dir: base("XDG_CONFIG_HOME", roaming.join(APP_DIR)),
+            state_dir: base("XDG_STATE_HOME", local.join("state")),
+            data_dir: base("XDG_DATA_HOME", local.join("data")),
             runtime_dir,
             cache_dir,
             home,
@@ -134,6 +171,7 @@ mod tests {
         move |k| map.get(k).cloned()
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn defaults_hang_off_home() {
         let p = Paths::from_vars(vars(&[("HOME", "/home/u")])).unwrap();
@@ -181,6 +219,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn xdg_variables_win_when_absolute() {
         let p = Paths::from_vars(vars(&[
@@ -199,6 +238,7 @@ mod tests {
         assert_eq!(p.runtime_dir, PathBuf::from("/run/user/1000/lemma"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn relative_xdg_values_are_ignored() {
         let p = Paths::from_vars(vars(&[
@@ -211,12 +251,65 @@ mod tests {
         assert_eq!(p.runtime_dir, PathBuf::from("/home/u/.cache/lemma/run"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn missing_or_relative_home_gives_none() {
         assert!(Paths::from_vars(vars(&[])).is_none());
         assert!(Paths::from_vars(vars(&[("HOME", "home/u")])).is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_defaults_are_appdata_and_localappdata() {
+        let p = Paths::from_vars(vars(&[
+            ("USERPROFILE", r"C:\Users\u"),
+            ("APPDATA", r"C:\Users\u\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\u\AppData\Local"),
+        ]))
+        .unwrap();
+        assert_eq!(p.home, PathBuf::from(r"C:\Users\u"));
+        assert_eq!(
+            p.config_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\lemma")
+        );
+        assert_eq!(
+            p.state_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Local\lemma\state")
+        );
+        assert_eq!(
+            p.data_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Local\lemma\data")
+        );
+        assert_eq!(
+            p.cache_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Local\lemma\cache")
+        );
+        assert_eq!(
+            p.runtime_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Local\lemma\cache\run")
+        );
+        assert_eq!(
+            p.config_file(),
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\lemma\config.toml")
+        );
+        // HOME and absolute XDG values win, as on Linux (the tests rely on it).
+        let p = Paths::from_vars(vars(&[
+            ("HOME", r"D:\home"),
+            ("USERPROFILE", r"C:\Users\u"),
+            ("XDG_CONFIG_HOME", r"D:\cfg"),
+            ("XDG_STATE_HOME", "relative"),
+        ]))
+        .unwrap();
+        assert_eq!(p.home, PathBuf::from(r"D:\home"));
+        assert_eq!(p.config_dir, PathBuf::from(r"D:\cfg\lemma"));
+        assert_eq!(
+            p.state_dir,
+            PathBuf::from(r"D:\home\AppData\Local\lemma\state")
+        );
+        assert!(Paths::from_vars(vars(&[("USERPROFILE", "relative")])).is_none());
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn tilde_expansion() {
         let home = Path::new("/home/u");

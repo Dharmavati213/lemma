@@ -681,7 +681,8 @@ mod tests {
             .iter()
             .map(|d| {
                 (
-                    d.path.display().to_string(),
+                    // `/` on Windows too, where the expected paths below are built with `\`.
+                    d.path.to_string_lossy().replace('\\', "/"),
                     d.line,
                     d.severity,
                     d.message.as_str(),
@@ -706,6 +707,33 @@ mod tests {
                 ),
                 (
                     "/w/main.tex".into(),
+                    Some(9),
+                    Severity::Warning,
+                    "Reference `y' on page 1 undefined on input line 9."
+                ),
+            ]
+        );
+    }
+
+    /// Windows: MiKTeX quotes the paths of its own files, with backslashes in them; TeX Live
+    /// writes them with a drive and forward slashes.
+    #[test]
+    fn windows_file_names() {
+        let log = "(./main.tex (\"C:\\Program Files\\MiKTeX\\tex/latex/base\\article.cls\" \
+                   (C:/texlive/2026/texmf-dist/tex/latex/base/size10.sty))\n\
+                   (./ch/a.tex\n\nLaTeX Warning: Citation `x' on page 1 undefined on input line 3.\n\n)\n\n\
+                   LaTeX Warning: Reference `y' on page 1 undefined on input line 9.\n\n)\n";
+        assert_eq!(
+            located(&parse(log)),
+            [
+                (
+                    "/w/ch/a.tex".to_owned(),
+                    Some(3),
+                    Severity::Warning,
+                    "Citation `x' on page 1 undefined on input line 3."
+                ),
+                (
+                    "/w/main.tex".to_owned(),
                     Some(9),
                     Severity::Warning,
                     "Reference `y' on page 1 undefined on input line 9."

@@ -8,12 +8,17 @@
 //! - the CLI closes stdin: half-close the socket and forward replies still in flight until the
 //!   editor closes its side, for at most [`DRAIN_GRACE`].
 //!
+//! On Windows, whose standard library has no unix sockets, `LEMMA_MCP_SOCKET` names a file holding
+//! the loopback address (`127.0.0.1:<port>`) of the editor's TCP listener instead, and the bridge
+//! connects there; everything else is the same.
+//!
 //! std only, so the binary stays small and starts fast. Exit status 0 on a clean close, 1 when the
 //! environment is incomplete or the socket cannot be reached.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -46,8 +51,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let socket = env_var(SOCKET_ENV)?;
     let token = env_var(TOKEN_ENV)?;
-    let mut upstream =
-        UnixStream::connect(&socket).map_err(|e| format!("cannot connect to {socket}: {e}"))?;
+    let mut upstream = connect(&socket).map_err(|e| format!("cannot connect to {socket}: {e}"))?;
     upstream
         .write_all(handshake_line(&token).as_bytes())
         .map_err(|e| format!("cannot send the token to {socket}: {e}"))?;
@@ -76,6 +80,26 @@ fn run() -> Result<(), String> {
         let _ = closed_rx.recv_timeout(DRAIN_GRACE);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn connect(socket: &str) -> io::Result<UnixStream> {
+    UnixStream::connect(socket)
+}
+
+/// Connects to the loopback address in the port file `socket` (only a loopback one is used).
+#[cfg(windows)]
+fn connect(socket: &str) -> io::Result<std::net::TcpStream> {
+    let text = std::fs::read_to_string(socket)?;
+    match text.trim().parse::<std::net::SocketAddr>() {
+        Ok(address) if address.ip().is_loopback() => {
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the file does not name the editor's MCP port",
+        )),
+    }
 }
 
 fn env_var(name: &str) -> Result<String, String> {

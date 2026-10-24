@@ -1181,6 +1181,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1220,6 +1221,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1259,6 +1261,7 @@ dependencies = [
  "proptest",
  "serde",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1339,6 +1342,7 @@ name = "lemma-synctex"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "lemma-core",
  "pkg-config",
  "tempfile",
 ]

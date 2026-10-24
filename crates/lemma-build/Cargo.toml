@@ -13,6 +13,8 @@ workspace = true
 lemma-core = { workspace = true }
 lemma-syntax = { workspace = true }
 regex = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]

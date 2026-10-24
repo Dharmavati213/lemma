@@ -13,6 +13,7 @@ pub mod cli;
 pub mod diagnostics_panel;
 pub mod document;
 pub mod editor;
+pub mod fsutil;
 pub mod heap;
 pub mod hooks;
 #[cfg(target_os = "macos")]
@@ -52,6 +53,9 @@ pub mod format;
 
 // M5 (WP5.4): timing measurements on the real display (`LEMMA_PERF`, scripts/perf-wayland.sh)
 pub mod perf;
+
+#[cfg(windows)]
+pub mod windows;
 
 /// The GApplication id (ARCHITECTURE §10.5).
 pub const APP_ID: &str = "io.github.lemma_editor.Lemma";

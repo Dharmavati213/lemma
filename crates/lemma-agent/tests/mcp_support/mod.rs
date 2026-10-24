@@ -7,8 +7,8 @@ use lemma_agent::mcp::{McpServer, Timeouts};
 use lemma_agent::{ToolCall, ToolContent, ToolReply};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -16,6 +16,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// The MCP socket's stream: a unix socket, or on Windows a loopback TCP connection to the port
+/// that the socket file names (see `lemma_agent`'s `transport.rs`).
+#[cfg(unix)]
+pub type Stream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub type Stream = std::net::TcpStream;
+
+/// Connects to the MCP socket `socket`.
+pub fn connect(socket: &Path) -> std::io::Result<Stream> {
+    #[cfg(unix)]
+    return Stream::connect(socket);
+    #[cfg(windows)]
+    {
+        let address: std::net::SocketAddr = std::fs::read_to_string(socket)?
+            .trim()
+            .parse()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        Stream::connect(address)
+    }
+}
 
 pub const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 pub const SOCKET_NAME: &str = "mcp.sock";
@@ -54,12 +75,20 @@ impl SocketDir {
     }
 
     pub fn create(&self, mode: u32) {
-        std::fs::DirBuilder::new()
-            .mode(mode)
+        #[allow(unused_mut)] // only Unix sets a mode
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(mode);
+        builder
             .create(&self.0)
             .expect("create the socket directory");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(mode)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -153,14 +182,14 @@ pub fn result_text(response: &Value) -> (String, bool) {
 
 /// A client that talks to the server's socket directly (no bridge).
 pub struct RawClient {
-    stream: UnixStream,
+    stream: Stream,
     lines: Receiver<String>,
 }
 
 impl RawClient {
     /// Connects and sends `first_line` (normally the token line).
     pub fn connect_with(socket: &Path, first_line: &str) -> Self {
-        let mut stream = UnixStream::connect(socket).expect("connect");
+        let mut stream = connect(socket).expect("connect");
         stream
             .write_all(format!("{first_line}\n").as_bytes())
             .expect("send the first line");
@@ -230,7 +259,7 @@ impl RawClient {
 /// the connection (a reset, which Linux reports when the server closes with unread input,
 /// counts as closing).
 pub fn raw_exchange(socket: &Path, payload: &[u8]) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket).expect("connect");
+    let mut stream = connect(socket).expect("connect");
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     // The server may close before it has read everything.
     let _ = stream.write_all(payload);
@@ -279,7 +308,7 @@ pub fn bridge_binary() -> &'static Path {
             }
         }
         let out = cmd.output().expect("run cargo build -p lemma-mcp");
-        let bin = profile_dir.join("lemma-mcp");
+        let bin = profile_dir.join(format!("lemma-mcp{}", std::env::consts::EXE_SUFFIX));
         assert!(
             out.status.success() && bin.is_file(),
             "building lemma-mcp failed ({}):\n{}",
