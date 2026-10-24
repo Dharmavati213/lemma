@@ -1,6 +1,6 @@
 # Lemma
 
-Lemma is a LaTeX editor for Linux and macOS (GTK 4 / libadwaita) built around reviewing an AI agent's
+Lemma is a LaTeX editor for Linux, macOS and Windows (GTK 4 / libadwaita) built around reviewing an AI agent's
 edits. When the agent changes your document, every change shows up inline as a red/green hunk
 that you accept or reject on its own, like a code review, before anything is final.
 
@@ -57,7 +57,8 @@ and Pi backends need `node` and `npm`, plus the agent itself, logged in (the `cl
 `codex` CLI). The other agents only need their own command line tool.
 
 Arch Linux ships all of these. Other distributions may not have libraries this new yet. On
-macOS, Homebrew has them all (see [macOS](#macos) below).
+macOS, Homebrew has them all (see [macOS](#macos) below). On Windows, MSYS2 has them all, and
+the installer and the zip bring them along (see [Windows](#windows) below).
 
 ## Installation
 
@@ -217,6 +218,66 @@ missing `.sty` file when a build needs one.
 - Shortcuts use **Ctrl**, as on Linux, not Cmd. macOS reserves some Ctrl shortcuts (Ctrl+arrow
   keys for Mission Control, Ctrl+Space for input sources) until you turn them off in **System
   Settings → Keyboard → Keyboard Shortcuts**.
+
+### Windows
+
+Lemma runs on Windows 10 (version 1903 or later) and Windows 11, on 64-bit Intel and AMD
+processors. Windows support is new, so please report what does not work. There are three ways to
+install it.
+
+#### Option 1: the installer
+
+1. Download `Lemma-…-windows-x86_64-setup.exe` from the
+   [releases](https://github.com/dharmavati213/lemma/releases).
+2. Run it. The installer is not code-signed, so Windows SmartScreen may say "Windows protected
+   your PC": click **More info**, then **Run anyway**.
+3. It installs Lemma for you alone, without administrator rights (or, if you choose, for
+   everyone in Program Files) and adds it to the Start menu. Optional: a desktop icon, Lemma
+   under **Open with** for `.tex` and `.bib` files, and the `lemma` command in terminals.
+4. Install TeX to build documents (see [TeX on Windows](#tex-on-windows) below).
+
+To open `.tex` files with Lemma by double-clicking them, right-click one, choose **Open with →
+Choose another app**, pick Lemma and tick **Always**. Uninstall Lemma in **Settings → Apps**;
+your settings stay.
+
+#### Option 2: the zip
+
+Unzip `Lemma-…-windows-x86_64.zip` anywhere (your Documents, a USB stick) and start
+`Lemma\bin\lemma.exe`. Nothing is installed; delete the folder to remove Lemma.
+
+#### Option 3: build it yourself
+
+`packaging/windows/build.sh` builds Lemma and makes the folder, the zip and the installer, either
+on Windows in [MSYS2](https://www.msys2.org)'s CLANG64 shell or on Linux as a cross build (it
+downloads what it needs once). See [`packaging/windows/README.md`](packaging/windows/README.md).
+
+#### TeX on Windows
+
+Either distribution works; Lemma finds both in their usual folders even when they are not on
+PATH:
+
+- [MiKTeX](https://miktex.org/download) installs missing LaTeX packages when a document needs
+  them; in **MiKTeX Console → Settings**, set that to happen always, so a build is never held
+  up by a question. MiKTeX's `latexmk` needs Perl: install
+  [Strawberry Perl](https://strawberryperl.com) as well.
+- [TeX Live](https://tug.org/texlive/windows.html) (`install-tl-windows.exe`) has everything
+  Lemma uses, Perl included.
+
+#### Using Lemma on Windows
+
+- Settings are in `%APPDATA%\lemma\config.toml`; sessions, review state and local history in
+  `%LOCALAPPDATA%\lemma\state`.
+- From a terminal: `lemma path\to\main.tex` (with the installer's PATH option), or run
+  `lemma.exe` from the app's `bin` folder with the options under [Usage](#usage); `--help`
+  prints in the terminal.
+- The API key is stored in the Windows Credential Manager.
+- Claude Code: install it with its installer (`irm https://claude.ai/install.ps1 | iex` in
+  PowerShell) and [Node.js](https://nodejs.org) for the ACP adapter, which the agent pane's
+  **Install** button sets up. The other agents are found as on Linux, also as npm's `.cmd`
+  launchers, but have seen less testing on Windows.
+- English spell checking is included; Windows' own spell checker covers the languages installed
+  in Windows (**Settings → Time & language → Language & region**).
+- The git gutter needs [Git for Windows](https://git-scm.com/download/win).
 
 ### From source (any distribution)
 

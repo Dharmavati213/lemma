@@ -4,6 +4,15 @@ Releases are named after Greek letters; the version number is in `Cargo.toml`. E
 notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 [releases page](https://github.com/dharmavati213/lemma/releases).
 
+## Unreleased
+
+### Added
+
+- Windows support (Windows 10 1903+ and 11, x86_64): an installer and a portable zip, built
+  locally with `packaging/windows/build.sh`, natively in MSYS2 or as a cross build from Linux.
+  The API key is kept in the Windows Credential Manager, settings in `%APPDATA%\lemma`; TeX
+  Live and MiKTeX are found in their usual folders.
+
 ## epsilon (0.1.0), 2026-10-20
 
 The first release.
