@@ -23,8 +23,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   that the agent opens itself. With the API backend everything travels inside the request, so
   PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
-  place, supports dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways
-  (Ctrl+Alt+J forward, Ctrl+click in the PDF for inverse).
+  place when a build writes a new PDF, keeping your place even with a search open. It supports
+  dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways (Ctrl+Alt+J forward,
+  Ctrl+click in the PDF for inverse).
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
   explanations and quick fixes for common errors, plus optional `chktex` lint.
 - **Writing help.** Completion for commands, environments, labels, citations and Unicode math

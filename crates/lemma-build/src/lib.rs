@@ -18,7 +18,7 @@ mod texlog;
 
 pub use blg::parse_blg;
 pub use detect::{Engine, RootGuess, RootSource, detect_engine, detect_root};
-pub use process::{Build, BuildOutcome, BuildStatus, Canceller};
+pub use process::{Build, BuildOutcome, BuildStatus, Canceller, PdfStamp};
 pub use queue::BuildQueue;
 pub use request::{BuildRequest, command_line};
 pub use runaway::{locate_runaway, locate_runaways};

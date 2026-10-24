@@ -1,6 +1,7 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
-//! `--demo pdf`, scrolling cost and the cache cap, reload anchors, anchored zoom, dark mode,
-//! save → build → diagnostics, stopping a build, and SyncTeX in both directions.
+//! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
+//! reloaded, anchored zoom, dark mode, save → build → diagnostics (and a build with nothing to
+//! do), stopping a build, and SyncTeX in both directions.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -15,7 +16,7 @@ use lemma_app::diagnostics_panel::{ERROR_CATEGORY, ERROR_TAG};
 use lemma_app::pdf::pdf_view::{self, PdfView};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
-use lemma_build::BuildStatus;
+use lemma_build::{BuildStatus, PdfStamp};
 use lemma_config::Config;
 use lemma_core::{ProjectRoot, Severity};
 use sourceview5::prelude::*;
@@ -23,13 +24,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 fn main() -> ExitCode {
     common::run(&[
         ("demo_snapshot_shows_three_pages", demo_snapshot),
         ("scrolling_pdf50_is_fast_and_bounded", scrolling_pdf50),
         ("reload_keeps_the_scroll_anchor", reload_keeps_anchor),
+        ("an_unchanged_pdf_is_not_reloaded", unchanged_pdf),
         ("ctrl_wheel_zoom_is_anchored_at_the_pointer", anchored_zoom),
         ("dark_mode_toggle_inverts_the_pages", dark_toggle),
         (
@@ -354,6 +356,38 @@ fn reload_keeps_anchor() {
     state.window.destroy();
 }
 
+/// A build that wrote no new PDF reports the stamp of the PDF shown (size and modification
+/// time): `open_if_changed` opens nothing, so no page is rendered again. A PDF written since,
+/// or one without a stamp, is opened as a new generation.
+fn unchanged_pdf() {
+    let dir = copy_proj("unchanged", true);
+    let pdf = dir.join("main.pdf");
+    let state = window(&dir, config());
+    let controller = state.pdf.get().unwrap();
+    let stamp = PdfStamp::of(&pdf);
+    assert!(stamp.is_some(), "a stamp of {}", pdf.display());
+    assert!(controller.open_if_changed(&pdf, stamp));
+    wait_for_pages(&state);
+    let view = view(&state);
+    let shown = controller.generation();
+
+    assert!(!controller.open_if_changed(&pdf, stamp), "the same stamp");
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(controller.generation(), shown);
+    assert_eq!(view.generation(), shown);
+    assert!(controller.shows_requested());
+
+    std::fs::copy(common::fixtures().join("proj/main.pdf"), &pdf).unwrap();
+    let rewritten = PdfStamp::of(&pdf);
+    assert!(rewritten.is_some_and(|r| Some(r) != stamp), "{rewritten:?}");
+    assert!(controller.open_if_changed(&pdf, rewritten));
+    common::pump_until(TIMEOUT, || controller.generation() > shown);
+    let shown = controller.generation();
+    assert!(controller.open_if_changed(&pdf, None), "no stamp");
+    common::pump_until(TIMEOUT, || controller.generation() > shown);
+    state.window.destroy();
+}
+
 /// Acceptance: Ctrl+wheel zoom keeps the point under the pointer; textures are re-rendered at
 /// the new scale after the delay; the log names the surface scale.
 fn anchored_zoom() {
@@ -546,7 +580,9 @@ fn follow_cursor() {
 }
 
 /// Acceptance: save → build → diagnostics in the Problems panel, gutter marks and underlines;
-/// the PDF reloads (TeX errors with output); a fixed document clears them.
+/// the PDF reloads (TeX errors with output); a fixed document clears them. A build with nothing
+/// to do (latexmk: "All targets are up-to-date") reloads nothing; one after the PDF changed
+/// does.
 fn save_build_diagnostics() {
     if !have_latexmk() {
         return;
@@ -653,6 +689,34 @@ fn save_build_diagnostics() {
     assert!(state.status.build.text().starts_with("Built in"));
     common::pump_until(TIMEOUT, || controller.generation() > generation);
     review_snapshot(&state, "build-clean");
+
+    // F5 with nothing changed: latexmk runs no TeX, and its log still says "Output written".
+    let shown = controller.generation();
+    activate(&state, "win.build");
+    common::pump_until(BUILD_TIMEOUT, || outcomes.borrow().len() == 3);
+    let again = outcomes.borrow()[2].clone();
+    assert_eq!(again.status, BuildStatus::Success, "{again:?}");
+    assert_eq!(again.pdf, outcome.pdf);
+    assert!(again.pdf_stamp.is_some());
+    assert_eq!(again.pdf_stamp, outcome.pdf_stamp);
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(
+        controller.generation(),
+        shown,
+        "the same PDF is not reloaded"
+    );
+    assert!(controller.shows_requested());
+    // After the PDF changed on disk, the next build reloads it.
+    let pdf = dir.join(".build/main.pdf");
+    std::fs::File::options()
+        .write(true)
+        .open(&pdf)
+        .and_then(|f| f.set_modified(SystemTime::now()))
+        .unwrap();
+    activate(&state, "win.build");
+    common::pump_until(BUILD_TIMEOUT, || outcomes.borrow().len() == 4);
+    assert_ne!(outcomes.borrow()[3].pdf_stamp, again.pdf_stamp);
+    common::pump_until(TIMEOUT, || controller.generation() > shown);
     state.window.destroy();
 }
 

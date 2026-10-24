@@ -18,7 +18,11 @@
 //! - **Vim style:** opened with `/` from the view (as in zathura or less), Enter runs the search
 //!   and gives the focus back to the view, where `n` / `N` go on; opened with Ctrl+F or the
 //!   button, Enter goes to the next match and the focus stays in the entry (GNOME style).
-//! - A rebuilt PDF is searched again with the same query.
+//! - A rebuilt PDF is searched again with the same query, without moving the view: the match
+//!   that was current stays current while the new PDF still has it, else the first match at or
+//!   below the top of the view becomes current once every page has been searched. Only the
+//!   searches the user starts (and Enter, n, N) scroll to their match, also when the PDF is
+//!   rebuilt before they found one.
 //!
 //! Hooks: [`install`] once per window (after `pdf_controller::install`); [`show`] is
 //! `win.pdf-search`. The shell enables that action only while the keyboard focus is inside
@@ -74,6 +78,11 @@ struct Query {
     options: SearchOptions,
     /// Every page has been searched.
     done: bool,
+    /// Run again for a new generation, not by the user: it never scrolls the view.
+    rerun: bool,
+    /// For a re-run on a rebuilt PDF, the match (page, index) that was current before: it is
+    /// made current again when the new generation has it.
+    kept: Option<(u32, usize)>,
 }
 
 impl Search {
@@ -94,6 +103,11 @@ impl Search {
 
     /// Searches for `text` (cancels the search shown when it is blank).
     fn start(&self, text: &str) {
+        self.run(text, false, None);
+    }
+
+    /// Searches for `text` as [`Search::start`] does; `rerun` and `kept` as in [`Query`].
+    fn run(&self, text: &str, rerun: bool, kept: Option<(u32, usize)>) {
         let options = self.options();
         if self
             .query
@@ -112,6 +126,8 @@ impl Search {
                     text: text.to_string(),
                     options,
                     done: true,
+                    rerun: false,
+                    kept: None,
                 }));
             }
             self.refresh_count();
@@ -119,22 +135,15 @@ impl Search {
         }
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
-        let anchor = self.view.anchor();
-        let start = self.view.current_page();
-        let top = match anchor {
-            Some(a) if a.page == start => self
-                .view
-                .layout()
-                .and_then(|l| l.page_size(start))
-                .map_or(0.0, |(_, h)| a.frac.max(0.0) * h),
-            _ => 0.0,
-        };
+        let (start, top) = self.view_top();
         self.origin.set((start, top));
         self.query.replace(Some(Query {
             id,
             text: text.to_string(),
             options,
             done: false,
+            rerun,
+            kept,
         }));
         self.send(PdfCmd::Search {
             id,
@@ -143,6 +152,41 @@ impl Search {
             start,
         });
         self.refresh_count();
+    }
+
+    /// The page the view shows and the top of the view on it (bp; 0 when the view's top is
+    /// on another page).
+    fn view_top(&self) -> (u32, f64) {
+        let page = self.view.current_page();
+        let top = match self.view.anchor() {
+            Some(a) if a.page == page => self
+                .view
+                .layout()
+                .and_then(|l| l.page_size(page))
+                .map_or(0.0, |(_, h)| a.frac.max(0.0) * h),
+            _ => 0.0,
+        };
+        (page, top)
+    }
+
+    /// The first match at or below the top of the view, else the first on a later page,
+    /// wrapping around.
+    fn first_from_view(&self) -> Option<(u32, usize)> {
+        let (page, top) = self.view_top();
+        let below = self
+            .view
+            .search_matches(page)
+            .iter()
+            .position(|m| m.first().is_some_and(|r| r.1 + r.3 > top));
+        if let Some(index) = below {
+            return Some((page, index));
+        }
+        let counts = self.counts.borrow();
+        let next = counts
+            .range(page + 1..)
+            .next()
+            .or_else(|| counts.iter().next());
+        next.map(|(&p, _)| (p, 0))
     }
 
     /// Forgets the search shown: cancels it and removes the highlights.
@@ -162,8 +206,16 @@ impl Search {
         page: u32,
         matches: Vec<SearchMatch>,
     ) {
-        let current = self.query.borrow().as_ref().is_some_and(|q| q.id == id);
-        if !current || Some(generation) != self.view.generation() || matches.is_empty() {
+        let Some((rerun, kept)) = self
+            .query
+            .borrow()
+            .as_ref()
+            .filter(|q| q.id == id)
+            .map(|q| (q.rerun, q.kept))
+        else {
+            return;
+        };
+        if Some(generation) != self.view.generation() || matches.is_empty() {
             return;
         }
         let n = matches.len();
@@ -180,29 +232,49 @@ impl Search {
         };
         self.view.set_search_matches(page, matches);
         self.counts.borrow_mut().insert(page, n);
-        if self.view.current_match().is_none() {
+        if self.view.current_match().is_some() {
+            self.refresh_count();
+        } else if !rerun {
             self.select(page, first);
         } else {
+            // A re-run: the match that was current, in place, if this page still has it.
+            if kept.is_some_and(|(p, index)| p == page && index < n) {
+                self.view.set_current_match(kept);
+            }
             self.refresh_count();
         }
     }
 
     /// Every page has been searched for `id` (`PdfEvent::SearchDone`).
     pub(super) fn search_done(&self, id: u64, _generation: u64) {
-        if let Some(q) = self.query.borrow_mut().as_mut().filter(|q| q.id == id) {
-            q.done = true;
+        let rerun = match self.query.borrow_mut().as_mut().filter(|q| q.id == id) {
+            Some(q) => {
+                q.done = true;
+                q.rerun
+            }
+            None => false,
+        };
+        // A re-run whose match is gone: the first from the view on, in place.
+        if rerun && self.view.current_match().is_none() {
+            self.view.set_current_match(self.first_from_view());
         }
         self.refresh_count();
     }
 
-    /// A new generation (or another PDF) is shown: the query is searched again.
-    pub(super) fn document_changed(&self, _generation: u64) {
-        let text = self.query.borrow().as_ref().map(|q| q.text.clone());
-        if let Some(text) = text {
-            self.query.take();
+    /// A new generation (`rebuilt`) or another PDF is shown: the query is searched again,
+    /// without scrolling (see the module docs).
+    pub(super) fn document_changed(&self, _generation: u64, rebuilt: bool) {
+        let query = self.query.take();
+        if let Some(query) = query {
+            let current = self.view.current_match();
+            // A search the user started that has not found a match yet still goes to it.
+            let rerun = query.rerun || query.done || current.is_some();
+            // A re-run still waiting for its match goes on waiting for it.
+            let waiting = query.kept.filter(|_| query.rerun && !query.done);
+            let kept = current.or(waiting).filter(|_| rebuilt);
             self.counts.borrow_mut().clear();
             self.view.clear_search_matches();
-            self.start(&text);
+            self.run(&query.text, rerun, kept);
         }
     }
 

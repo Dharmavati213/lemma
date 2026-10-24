@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Time between SIGTERM and SIGKILL.
 #[cfg(unix)]
@@ -188,6 +188,10 @@ pub struct BuildOutcome {
     pub report: LogReport,
     /// Set when the log says "Output written" (also on exit code 12).
     pub pdf: Option<PathBuf>,
+    /// The stamp of `pdf` when the build ended. A build that wrote no new PDF (latexmk's "All
+    /// targets are up-to-date" leaves the last run's log, which still says "Output written")
+    /// reports the stamp of the one before.
+    pub pdf_stamp: Option<PdfStamp>,
     pub synctex: Option<PathBuf>,
 }
 
@@ -200,8 +204,31 @@ impl BuildOutcome {
             elapsed: Duration::ZERO,
             report: LogReport::default(),
             pdf: None,
+            pdf_stamp: None,
             synctex: None,
         }
+    }
+}
+
+/// Identifies one version of a PDF: its size and its modification time, to the nanosecond.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PdfStamp {
+    pub len: u64,
+    pub modified: SystemTime,
+}
+
+impl PdfStamp {
+    /// The stamp of `pdf` (blocking: call it off the main thread). `None` when it cannot be
+    /// read, and when its modification time is a whole second: a file system that keeps
+    /// whole seconds only (FAT, HFS+) would give two builds within a second the same stamp.
+    pub fn of(pdf: &Path) -> Option<PdfStamp> {
+        let meta = fs::metadata(pdf).ok()?;
+        let modified = meta.modified().ok()?;
+        let fraction = modified.duration_since(UNIX_EPOCH).ok()?.subsec_nanos();
+        (fraction != 0).then_some(PdfStamp {
+            len: meta.len(),
+            modified,
+        })
     }
 }
 
@@ -367,6 +394,7 @@ impl Build {
             .as_ref()
             .map(|(path, _)| path.with_extension("pdf"))
             .filter(|path| path.is_file());
+        let pdf_stamp = pdf.as_deref().and_then(PdfStamp::of);
         let synctex = pdf
             .as_ref()
             .map(|path| path.with_extension("synctex.gz"))
@@ -377,6 +405,7 @@ impl Build {
             elapsed,
             report,
             pdf,
+            pdf_stamp,
             synctex,
         }
     }
@@ -541,6 +570,38 @@ fn latexmk_failure(root: PathBuf, exit_code: Option<i32>, tail: Option<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_stamps_tell_versions_apart_but_not_within_a_whole_second() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pdf = dir.path().join("main.pdf");
+        assert_eq!(PdfStamp::of(&pdf), None, "no file");
+        fs::write(&pdf, "%PDF-1.5 one").unwrap();
+        let at = |nanos| UNIX_EPOCH + Duration::new(1_800_000_000, nanos);
+        let touch = |nanos| {
+            let file = File::options().write(true).open(&pdf).unwrap();
+            file.set_modified(at(nanos)).unwrap();
+        };
+        touch(250_000_000);
+        let first = PdfStamp::of(&pdf).expect("a stamp");
+        assert_eq!(
+            first,
+            PdfStamp {
+                len: 12,
+                modified: at(250_000_000)
+            }
+        );
+        assert_eq!(PdfStamp::of(&pdf), Some(first), "an untouched file");
+        // The same size a microsecond later (NTFS keeps 100 ns), or another size at the same time.
+        touch(250_001_000);
+        assert_ne!(PdfStamp::of(&pdf), Some(first));
+        fs::write(&pdf, "%PDF-1.5 two!").unwrap();
+        touch(250_000_000);
+        assert_ne!(PdfStamp::of(&pdf), Some(first));
+        // Whole seconds: perhaps a file system that keeps no fractions.
+        touch(0);
+        assert_eq!(PdfStamp::of(&pdf), None);
+    }
 
     #[test]
     fn root_parts_of_bare_and_nested_names() {

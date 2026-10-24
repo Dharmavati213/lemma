@@ -8,15 +8,17 @@
 //! one runs, one more may wait, and a newer request replaces the waiting one. Each build runs on
 //! its own thread; its outcome comes back over a channel. After a build that wrote a PDF (success,
 //! or TeX errors with output) the preview reloads it as a new generation, and the diagnostics
-//! replace the previous ones.
+//! replace the previous ones. A build that left the PDF as it was (latexmk found nothing to do)
+//! reloads nothing: the build thread stamps the PDF ([`lemma_build::PdfStamp`]), and the preview
+//! compares the stamp with the one of the PDF it opened last.
 
 use crate::diagnostics_panel::{self, DiagnosticsPanel, EditJournal, Problem};
 use crate::saver::SaveError;
 use crate::window::WindowState;
 use adw::prelude::*;
 use lemma_build::{
-    Build, BuildOutcome, BuildQueue, BuildRequest, BuildStatus, Canceller, Engine, RootGuess,
-    RootSource, detect_engine, detect_root,
+    Build, BuildOutcome, BuildQueue, BuildRequest, BuildStatus, Canceller, Engine, PdfStamp,
+    RootGuess, RootSource, detect_engine, detect_root,
 };
 use lemma_syntax::{FileIndex, IncludeKind, ProjectIndex, index_file};
 use std::cell::{Cell, RefCell};
@@ -462,7 +464,7 @@ impl Inner {
         let has_output = outcome.status == BuildStatus::Success
             || (outcome.status == BuildStatus::Errors && outcome.exit_code == Some(12));
         if has_output && let (Some(pdf), Some(controller)) = (&outcome.pdf, state.pdf.get()) {
-            controller.open(pdf);
+            controller.open_if_changed(pdf, outcome.pdf_stamp);
         }
         self.last.replace(Some(outcome.clone()));
         let next = self.queue.borrow_mut().finished();
@@ -496,18 +498,20 @@ impl Inner {
             self.remembered_root.replace(Some(root.clone()));
         }
         let outdir = state.config.build.outdir.clone();
-        let (pdf, modified) = gio::spawn_blocking(move || {
+        let (pdf, modified, stamp) = gio::spawn_blocking(move || {
             let pdf = existing_pdf(&root, &outdir)?;
             let modified = std::fs::metadata(&pdf).and_then(|m| m.modified()).ok();
-            Some((pdf, modified))
+            let stamp = PdfStamp::of(&pdf);
+            Some((pdf, modified, stamp))
         })
         .await
         .ok()
         .flatten()
         .ok_or("no PDF from an earlier build")?;
         let controller = state.pdf.get().ok_or("no PDF preview")?;
+        // With its stamp, so that a first build that finds nothing to do does not reload it.
         if controller.requested_pdf().as_deref() != Some(pdf.as_path()) {
-            controller.open(&pdf);
+            controller.open_if_changed(&pdf, stamp);
         }
         // Until this session builds, say where the PDF on screen comes from.
         let idle = self.last.borrow().is_none()
@@ -1076,6 +1080,7 @@ mod tests {
             elapsed: Duration::from_millis(ms),
             report: LogReport::default(),
             pdf: None,
+            pdf_stamp: None,
             synctex: None,
         }
     }

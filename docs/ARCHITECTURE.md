@@ -1081,6 +1081,13 @@ they conflict with the sections above, this section wins.
   - Vim mode is off by default.
   - The default renderer is cairo (`[editor] renderer`).
   - The memory budgets are re-based on real-Wayland measurements (`scripts/budgets.toml`).
+- **Reload after a build (§6), 2026-10-25:** the PDF is reopened with a new generation only when
+  it changed. latexmk with nothing to do ("All targets are up-to-date": a save without changes,
+  an agent's repeated `compile`) runs no TeX and leaves the last run's log, which still says
+  `Output written`. So the build thread stamps the PDF (`BuildOutcome::pdf_stamp`: its size and
+  its modification time to the nanosecond; none when that time is a whole second, as on FAT or
+  HFS+), and `PdfController::open_if_changed` skips the open when the latest open asked for the
+  same file with the same stamp. The main thread reads no file for it.
 
 ## 12. macOS (2026-10-19)
 

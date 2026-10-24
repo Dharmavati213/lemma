@@ -2,7 +2,7 @@
 //! prints `SKIP` and passes when latexmk is not installed.
 #![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 
-use lemma_build::{Build, BuildOutcome, BuildRequest, BuildStatus, Engine};
+use lemma_build::{Build, BuildOutcome, BuildRequest, BuildStatus, Engine, PdfStamp};
 use lemma_core::Severity;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -161,6 +161,34 @@ fn proj_builds_with_pdf_and_synctex() {
     );
     assert!(out.join("main.latexmk.log").is_file());
     assert!(!outcome.report.fatal);
+}
+
+#[test]
+fn an_up_to_date_build_reports_the_stamp_of_the_pdf_before() {
+    if !have_latexmk() {
+        return;
+    }
+    let text = |body: &str| {
+        format!("\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+    };
+    let dir = project(&[("main.tex", &text("Hello."))]);
+    let req = request(dir.path().join("main.tex"), Duration::from_secs(120));
+    let first = build(&req);
+    assert_eq!(first.status, BuildStatus::Success, "{:?}", errors(&first));
+    let stamp = first.pdf_stamp.expect("a stamp of the PDF");
+    assert_eq!(first.pdf.as_deref().and_then(PdfStamp::of), Some(stamp));
+
+    // Nothing changed: latexmk runs no TeX, and the log it leaves still says "Output written".
+    let second = build(&req);
+    assert_eq!(second.status, BuildStatus::Success);
+    assert_eq!(second.pdf, first.pdf);
+    assert_eq!(second.pdf_stamp, Some(stamp));
+
+    // A changed source writes a new PDF.
+    fs::write(dir.path().join("main.tex"), text("Hello again.")).unwrap();
+    let third = build(&req);
+    assert_eq!(third.status, BuildStatus::Success);
+    assert!(third.pdf_stamp.is_some_and(|s| s != stamp), "{third:?}");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! screen, so a snapshot shows the preview and the diagnostics.
 //!
 //! - After a build that wrote a PDF, the run waits until the preview shows the new PDF with its
-//!   visible pages rendered.
+//!   visible pages rendered (a build that found nothing to do leaves the PDF shown in place).
 //! - After TeX errors, the first error is opened at its line, as clicking its row on the
 //!   Problems page would (`--sidebar problems` shows that page).
 //!
@@ -26,7 +26,6 @@ const SHOW_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn run_build(state: Rc<WindowState>) -> Result<(), String> {
     let build = state.build.get().ok_or("there is no build controller")?;
     let pdf = state.pdf.get();
-    let shown_before = pdf.and_then(|p| p.generation());
 
     let (tx, rx) = async_channel::bounded::<BuildOutcome>(1);
     build.connect_finished(move |outcome| {
@@ -64,7 +63,7 @@ pub async fn run_build(state: Rc<WindowState>) -> Result<(), String> {
         let view = controller.view();
         wait_until(SHOW_TIMEOUT, "the new PDF to render", || {
             let visible = view.visible_pages();
-            controller.generation() != shown_before
+            controller.shows_requested()
                 && controller.pdf().as_deref() == Some(new_pdf.as_path())
                 && !visible.is_empty()
                 && visible.into_iter().all(|p| view.is_page_rendered(p))

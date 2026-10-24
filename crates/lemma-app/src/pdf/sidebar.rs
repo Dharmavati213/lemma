@@ -14,8 +14,11 @@
 //!   thread between page renders. The thumbnails have their own byte budget,
 //!   [`thumbnail_budget`] (an eighth of `[pdf] cache_mib`), **inside** the shared cache: while
 //!   the strip is shown the view's page cache gets the rest; when it is hidden the thumbnails are
-//!   dropped and the view gets the whole cache back. A rebuilt PDF keeps the old thumbnails on
-//!   screen until the new ones arrive.
+//!   dropped and the view gets the whole cache back. The bound rows' thumbnails are never evicted
+//!   for each other: while they need more than the budget (a HiDPI screen, a small
+//!   `cache_mib`), the cache holds just them, as the view's cache does with the pages on screen,
+//!   and a row that shows a current thumbnail is never rendered again. A rebuilt PDF keeps the
+//!   old thumbnails on screen until the new ones arrive.
 //! - **Bookmarks:** the PDF's outline (hyperref's bookmarks) as a tree (`gtk::TreeListModel`),
 //!   with each entry's page label. It is read when the strip is first shown and after each
 //!   rebuild; the entries that were expanded stay expanded (otherwise the PDF's own `/Count`
@@ -98,6 +101,23 @@ struct Thumb {
     /// The width it was rendered at, in device pixels.
     width: u16,
     texture: gdk::Texture,
+    /// The size of its bitmap.
+    bytes: usize,
+}
+
+/// A bound thumbnail row.
+struct Row {
+    picture: PagePicture,
+    /// The generation and width of the thumbnail the picture shows.
+    shows: Option<(u64, u16)>,
+}
+
+impl Row {
+    /// Shows `thumb` (or the blank page).
+    fn show(&mut self, thumb: Option<&Thumb>) {
+        self.picture.set_texture(thumb.map(|t| &t.texture));
+        self.shows = thumb.map(|t| (t.generation, t.width));
+    }
 }
 
 /// A thumbnail the user chose: the page, and the view's scroll position once it got there
@@ -129,9 +149,14 @@ pub struct Strip {
     thumbs: gtk::ListView,
     thumbs_model: gtk::StringList,
     thumbs_selection: gtk::SingleSelection,
-    /// The pictures of the bound rows, by page.
-    bound: RefCell<HashMap<u32, PagePicture>>,
+    /// The bound rows, by page.
+    bound: RefCell<HashMap<u32, Row>>,
+    /// The thumbnails, within [`thumbnail_budget`] unless the bound rows need more (see
+    /// [`Strip::cache_thumbnail`]).
     cache: RefCell<ByteLru<u32, Thumb>>,
+    /// The thumbnails that arrived from the PDF thread (tests check that a strip that has all
+    /// it needs asks for no more).
+    arrived: Cell<usize>,
     generation: Cell<u64>,
     sizes: RefCell<Vec<(f64, f64)>>,
     labels: RefCell<Vec<String>>,
@@ -210,8 +235,8 @@ impl Strip {
         } else {
             self.view.set_cache_cap(self.total);
             self.cache.borrow_mut().retain(|_| false);
-            for picture in self.bound.borrow().values() {
-                picture.set_texture(None);
+            for row in self.bound.borrow_mut().values_mut() {
+                row.show(None);
             }
             self.set_wants(Vec::new());
         }
@@ -277,9 +302,9 @@ impl Strip {
         // Until the page labels come: the old ones where they still fit, else numbers.
         let labels: Vec<String> = (0..n as u32).map(|p| self.page_label(p)).collect();
         self.set_labels(labels);
-        for (page, picture) in self.bound.borrow().iter() {
+        for (page, row) in self.bound.borrow().iter() {
             if let Some(size) = self.sizes.borrow().get(*page as usize) {
-                picture.set_page_size(*size);
+                row.picture.set_page_size(*size);
             }
         }
         self.labels_generation.set(0);
@@ -321,23 +346,22 @@ impl Strip {
         }
         picture.set_dark(self.view.is_dark());
         label.set_text(&self.page_label(page));
-        let texture = self
-            .cache
-            .borrow_mut()
-            .get(&page)
-            .map(|t| t.texture.clone());
-        picture.set_texture(texture.as_ref());
+        let mut row = Row {
+            picture: picture.clone(),
+            shows: None,
+        };
+        row.show(self.cache.borrow_mut().get(&page));
         picture.update_property(&[gtk::accessible::Property::Label(&format!(
             "Page {}",
             self.page_label(page)
         ))]);
-        self.bound.borrow_mut().insert(page, picture.clone());
+        self.bound.borrow_mut().insert(page, row);
         self.schedule_wants();
     }
 
     fn unbind_thumbnail(&self, page: u32, picture: &PagePicture) {
         let mut bound = self.bound.borrow_mut();
-        if bound.get(&page) == Some(picture) {
+        if bound.get(&page).is_some_and(|row| row.picture == *picture) {
             bound.remove(&page);
         }
         picture.set_texture(None);
@@ -348,11 +372,11 @@ impl Strip {
     /// Gives the bound rows the textures the cache has (after the strip was hidden).
     fn restore_textures(&self) {
         let mut cache = self.cache.borrow_mut();
-        for (page, picture) in self.bound.borrow().iter() {
-            if picture.texture().is_none()
+        for (page, row) in self.bound.borrow_mut().iter_mut() {
+            if row.shows.is_none()
                 && let Some(t) = cache.get(page)
             {
-                picture.set_texture(Some(&t.texture));
+                row.show(Some(t));
             }
         }
     }
@@ -375,7 +399,8 @@ impl Strip {
     }
 
     /// The thumbnails the bound rows lack (none while the thumbnails are not shown), nearest
-    /// the page shown first.
+    /// the page shown first. A row whose picture shows a thumbnail of the current generation,
+    /// at least as wide as the row needs, lacks nothing.
     fn update_wants(&self) {
         if !self.active.get() || self.page() != Page::Thumbnails || !self.thumbs.is_mapped() {
             self.set_wants(Vec::new());
@@ -388,24 +413,22 @@ impl Strip {
             .and_then(|n| n.surface())
             .map_or(1.0, |s| s.scale());
         let current = self.view.current_page();
-        let mut wants: Vec<ThumbReq> = {
-            let mut cache = self.cache.borrow_mut();
-            self.bound
-                .borrow()
-                .iter()
-                .filter_map(|(&page, picture)| {
-                    let width = render_width(picture.width(), scale)?;
-                    let have = cache
-                        .get(&page)
-                        .is_some_and(|t| t.generation == generation && t.width >= width);
-                    (!have).then_some(ThumbReq {
-                        generation,
-                        page,
-                        width,
-                    })
+        let mut wants: Vec<ThumbReq> = self
+            .bound
+            .borrow()
+            .iter()
+            .filter_map(|(&page, row)| {
+                let width = render_width(row.picture.width(), scale)?;
+                let have = row
+                    .shows
+                    .is_some_and(|(g, w)| g == generation && w >= width);
+                (!have).then_some(ThumbReq {
+                    generation,
+                    page,
+                    width,
                 })
-                .collect()
-        };
+            })
+            .collect();
         wants.sort_by_key(|r| (r.page.abs_diff(current), r.page));
         self.set_wants(wants);
     }
@@ -420,11 +443,17 @@ impl Strip {
 
     /// A page rendered for a thumbnail request (`PdfEvent::Thumbnail`).
     pub(super) fn thumbnail(&self, req: ThumbReq, texture: &gdk::Texture, bytes: usize) {
+        self.arrived.set(self.arrived.get() + 1);
         if req.generation != self.generation.get() || !self.active.get() {
             return;
         }
         // Only for a row that wants it (the link preview's pages come here too).
-        let Some(picture) = self.bound.borrow().get(&req.page).cloned() else {
+        let Some(picture) = self
+            .bound
+            .borrow()
+            .get(&req.page)
+            .map(|r| r.picture.clone())
+        else {
             return;
         };
         let scale = self
@@ -435,17 +464,36 @@ impl Strip {
         if render_width(picture.width(), scale) != Some(req.width) {
             return;
         }
-        self.cache.borrow_mut().insert(
-            req.page,
-            Thumb {
-                generation: req.generation,
-                width: req.width,
-                texture: texture.clone(),
-            },
+        let thumb = Thumb {
+            generation: req.generation,
+            width: req.width,
+            texture: texture.clone(),
             bytes,
-        );
-        picture.set_texture(Some(texture));
+        };
+        if let Some(row) = self.bound.borrow_mut().get_mut(&req.page) {
+            row.show(Some(&thumb));
+        }
+        self.cache_thumbnail(req.page, thumb);
         self.schedule_wants();
+    }
+
+    /// Caches `thumb`, the thumbnail of the bound row of `page`. The other bound rows'
+    /// thumbnails are never evicted for it: while the bound rows need more than the budget, the
+    /// cache grows to hold them (like the view's `TextureCache::insert_keeping`), so the rows do
+    /// not take turns pushing each other out and asking again. Other thumbnails go first, the
+    /// least recently used first, and the cache shrinks back to the budget as rows unbind.
+    fn cache_thumbnail(&self, page: u32, thumb: Thumb) {
+        let bytes = thumb.bytes;
+        let mut cache = self.cache.borrow_mut();
+        let mut needed = bytes;
+        for other in self.bound.borrow().keys().filter(|p| **p != page) {
+            // Also makes them the most recently used, so the others are evicted first.
+            if let Some(t) = cache.get(other) {
+                needed += t.bytes;
+            }
+        }
+        cache.set_cap(thumbnail_budget(self.total).max(needed));
+        cache.insert(page, thumb, bytes);
     }
 
     // ----- bookmarks -----
@@ -925,6 +973,7 @@ pub fn install(state: &Rc<WindowState>) {
             thumbs_selection,
             bound: RefCell::new(HashMap::new()),
             cache: RefCell::new(ByteLru::new(thumbnail_budget(total))),
+            arrived: Cell::new(0),
             generation: Cell::new(0),
             sizes: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
@@ -1005,8 +1054,8 @@ pub fn install(state: &Rc<WindowState>) {
             strip.shown_changed();
             strip.follow_view();
             let dark = view.is_dark();
-            for picture in strip.bound.borrow().values() {
-                picture.set_dark(dark);
+            for row in strip.bound.borrow().values() {
+                row.picture.set_dark(dark);
             }
         }
     });
@@ -1032,15 +1081,21 @@ pub fn visible_page(state: &WindowState) -> Option<Page> {
     strip_of(state).map(|s| s.page())
 }
 
-/// Bytes of the cached thumbnails, and their budget.
+/// Bytes of the cached thumbnails, and their budget (more are cached only while the bound rows
+/// need more).
 pub fn thumbnail_bytes(state: &WindowState) -> Option<(usize, usize)> {
     let strip = strip_of(state)?;
-    let cache = strip.cache.borrow();
-    Some((cache.used(), cache.cap()))
+    let used = strip.cache.borrow().used();
+    Some((used, thumbnail_budget(strip.total)))
 }
 
-/// The pages whose thumbnail rows are bound and laid out, with whether each has a thumbnail of
-/// the current generation at its width.
+/// The thumbnails that have arrived from the PDF thread since the window opened.
+pub fn thumbnails_arrived(state: &WindowState) -> usize {
+    strip_of(state).map_or(0, |s| s.arrived.get())
+}
+
+/// The pages whose thumbnail rows are bound and laid out, with whether each shows a thumbnail of
+/// the current generation at its width, which the cache holds too.
 pub fn thumbnail_rows(state: &WindowState) -> Vec<(u32, bool)> {
     let Some(strip) = strip_of(state) else {
         return Vec::new();
@@ -1056,13 +1111,15 @@ pub fn thumbnail_rows(state: &WindowState) -> Vec<(u32, bool)> {
         .bound
         .borrow()
         .iter()
-        .filter(|(_, picture)| picture.width() > 0)
-        .map(|(&page, picture)| {
-            let ready = render_width(picture.width(), scale).is_some_and(|w| {
-                cache
-                    .get(&page)
-                    .is_some_and(|t| t.generation == generation && t.width >= w)
-            }) && picture.texture().is_some();
+        .filter(|(_, row)| row.picture.width() > 0)
+        .map(|(&page, row)| {
+            let ready = render_width(row.picture.width(), scale).is_some_and(|w| {
+                let current = |(g, width): (u64, u16)| g == generation && width >= w;
+                row.shows.is_some_and(current)
+                    && cache
+                        .get(&page)
+                        .is_some_and(|t| current((t.generation, t.width)))
+            }) && row.picture.texture().is_some();
             (page, ready)
         })
         .collect();

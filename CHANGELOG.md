@@ -13,6 +13,16 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   The API key is kept in the Windows Credential Manager, settings in `%APPDATA%\lemma`; TeX
   Live and MiKTeX are found in their usual folders.
 
+### Fixed
+
+- A build that writes no new PDF (latexmk finds nothing to do, as after saving without changes
+  or a repeated `compile` from the agent) no longer reloads the PDF: its pages, thumbnails,
+  links and an open search are not redone, and a link preview stays open.
+- With the PDF search bar open, a rebuild no longer scrolls the PDF away from where you are
+  reading. The current match stays current; only a search you start scrolls to its match.
+- The PDF strip no longer renders its thumbnails over and over when the rows on screen need
+  more than their share of the cache (HiDPI screens, a small `[pdf] cache_mib`).
+
 ## epsilon (0.1.0), 2026-10-20
 
 The first release.

@@ -1,7 +1,8 @@
 //! WP3.4: PDF links (geometry, hover preview, jumps and Back, the cursor, web links behind a
 //! confirmation), search (counts against `pdftotext`, navigation, case and whole words,
-//! cancellation and latest wins, highlights, a rebuilt PDF), the strip (lazy thumbnails within
-//! their budget, the current page, the bookmark tree), detaching the PDF into its own window
+//! cancellation and latest wins, highlights, a rebuilt PDF that keeps the reading place), the
+//! strip (lazy thumbnails within their budget, bound rows that need more than it, the current
+//! page, the bookmark tree), detaching the PDF into its own window
 //! and back (anchor, search, SyncTeX, dark pages, reloads), and `--demo pdf-search`.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf_m3`. The pdf50
@@ -41,6 +42,10 @@ fn main() -> ExitCode {
         ),
         ("search_highlights_are_drawn", search_highlights),
         ("thumbnails_are_lazy_within_their_budget", thumbnails),
+        (
+            "thumbnails_settle_when_the_rows_need_more_than_the_budget",
+            thumbnails_beyond_the_budget,
+        ),
         ("bookmark_tree_matches_the_golden_tree", bookmarks),
         ("detach_and_reattach_keep_the_anchor", detach_reattach),
         ("demo_pdf_search_snapshot", demo_pdf_search),
@@ -509,7 +514,8 @@ fn search_counts() {
 }
 
 /// Match Case and Whole Words; a new query replaces the search in progress; closing cancels it
-/// and removes the highlights; a rebuilt PDF is searched again.
+/// and removes the highlights; a rebuilt PDF is searched again, keeping the current match and
+/// the scroll position.
 fn search_behaviour() {
     let Some(pdf50) = pdf50() else {
         return;
@@ -590,6 +596,63 @@ fn search_behaviour() {
         search::status(&state).is_some_and(|s| s.done && s.total == before)
     });
     assert!(view.current_match().is_some());
+
+    // The search a rebuild runs again keeps the reading place. A word on a few pages only: the
+    // user goes to the match on the second of them, then reads on a page without one.
+    search_all(&state, "potenti");
+    let pages = view.pages_with_matches();
+    assert!(pages.len() >= 3, "{pages:?}");
+    while view.current_match().map(|(p, _)| p) != Some(pages[1]) {
+        assert!(search::step(&state, true));
+    }
+    let kept = view.current_match();
+    let reading = (pages[1] + 1..pages[2])
+        .next()
+        .expect("a page without a match between");
+    view.goto_page(reading);
+    wait_for_pages(&state);
+    let place = view.scroll_position();
+    let rebuild = || {
+        let generation = controller.generation();
+        controller.open(&pdf);
+        common::pump_until(TIMEOUT, || controller.generation() > generation);
+        common::pump_until(TIMEOUT, || search::status(&state).is_some_and(|s| s.done));
+        common::pump_for(Duration::from_millis(100));
+        let moved = (view.scroll_position().1 - place.1).abs();
+        assert!(moved <= 1.0, "{place:?} -> {:?}", view.scroll_position());
+    };
+    rebuild();
+    assert_eq!(
+        view.current_match(),
+        kept,
+        "the current match stays current"
+    );
+    assert_eq!(view.pages_with_matches(), pages);
+    // Without a current match, the first one after the view becomes current, in place.
+    view.set_current_match(None);
+    rebuild();
+    assert_eq!(view.current_match(), Some((pages[2], 0)));
+    let before_it: usize = pages[..2]
+        .iter()
+        .map(|p| view.search_matches(*p).len())
+        .sum();
+    assert_eq!(search::status(&state).unwrap().current, Some(before_it + 1));
+    // A search the user starts still goes to its match.
+    search::close(&state);
+    search_all(&state, "potenti");
+    assert_eq!(view.current_match(), Some((pages[2], 0)));
+    assert!(view.visible_pages().contains(&pages[2]));
+    // So does one the PDF is rebuilt under before it found its match.
+    search::close(&state);
+    view.goto_page(reading);
+    wait_for_pages(&state);
+    search::search_now(&state, "potenti");
+    let generation = controller.generation();
+    controller.open(&pdf);
+    common::pump_until(TIMEOUT, || controller.generation() > generation);
+    common::pump_until(TIMEOUT, || search::status(&state).is_some_and(|s| s.done));
+    assert_eq!(view.current_match(), Some((pages[2], 0)));
+    assert!(view.visible_pages().contains(&pages[2]));
     state.window.destroy();
 }
 
@@ -791,6 +854,63 @@ fn thumbnails() {
             .iter()
             .all(|(_, ready)| !ready)
     );
+    state.window.destroy();
+}
+
+/// The bound thumbnail rows need more than the thumbnails' budget (`pdf.cache_mib = 1`: 128
+/// KiB, two thumbnails at this width; a HiDPI screen with the default budget is the same): the
+/// rows keep their thumbnails, the strip settles and nothing more is rendered, and scrolling it
+/// gives back the thumbnails of the rows that left.
+fn thumbnails_beyond_the_budget() {
+    let Some(pdf) = pdf50() else {
+        return;
+    };
+    let dir = common::temp_dir("thumbs-budget");
+    let state = window_with(&dir, false, |config| config.pdf.cache_mib = 1);
+    show_pdf(&state, &pdf);
+    activate(&state, "win.toggle-pdf-sidebar");
+    common::pump_until(TIMEOUT, || sidebar::is_ready(&state));
+    let rows = sidebar::thumbnail_rows(&state);
+    let (used, budget) = sidebar::thumbnail_bytes(&state).unwrap();
+    println!(
+        "  {} rows bound: {used} bytes of thumbnails, budget {budget}",
+        rows.len()
+    );
+    assert_eq!(budget, 128 << 10);
+    assert!(used > budget, "the bound rows need more than the budget");
+    let arrived = sidebar::thumbnails_arrived(&state);
+    common::pump_for(Duration::from_secs(1));
+    assert_eq!(
+        sidebar::thumbnails_arrived(&state),
+        arrived,
+        "a settled strip renders nothing"
+    );
+    assert!(sidebar::is_ready(&state));
+
+    // The rows bound at the end settle too; the thumbnails of the rows that left are evicted.
+    let (list, _) = sidebar::thumbnail_list(&state).unwrap();
+    list.scroll_to(49, gtk::ListScrollFlags::NONE, None);
+    common::pump_until(TIMEOUT, || {
+        sidebar::thumbnail_rows(&state)
+            .iter()
+            .any(|(p, _)| *p == 49)
+            && sidebar::is_ready(&state)
+    });
+    let rows_end = sidebar::thumbnail_rows(&state);
+    let (used_end, _) = sidebar::thumbnail_bytes(&state).unwrap();
+    println!(
+        "  {} rows bound at the end: {used_end} bytes",
+        rows_end.len()
+    );
+    let each = used / rows.len();
+    assert!(
+        used_end <= (rows_end.len() + 2) * each,
+        "{used_end} bytes for {} rows",
+        rows_end.len()
+    );
+    let arrived = sidebar::thumbnails_arrived(&state);
+    common::pump_for(Duration::from_millis(500));
+    assert_eq!(sidebar::thumbnails_arrived(&state), arrived);
     state.window.destroy();
 }
 

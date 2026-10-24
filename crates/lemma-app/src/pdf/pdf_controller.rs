@@ -5,7 +5,10 @@
 //! out/in, fit width, dark pages) above the [`PdfView`]. The PDF thread starts with the first
 //! [`PdfController::open`]. Every open gets a new generation; the view keeps showing the previous
 //! generation until the new one has opened, and a PDF that fails to open leaves it in place. A
-//! new generation of the PDF shown keeps the scroll position; another PDF starts at the top.
+//! new generation of the PDF shown keeps the scroll position; another PDF starts at the top. A
+//! build whose PDF has not changed since the last open (the same size and modification time)
+//! opens nothing ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the
+//! links, a search and a SyncTeX highlight stay as they are.
 //!
 //! M3 (WP3.4): the controller also dispatches the PDF thread's answers to the [`links`],
 //! [`search`] and [`sidebar`] modules (each registers itself here when it installs), sends their
@@ -24,6 +27,7 @@ use crate::diagnostics_panel;
 use crate::window::WindowState;
 use adw::prelude::*;
 use gtk::gdk;
+use lemma_build::PdfStamp;
 use lemma_pdf::{PdfCmd, PdfEvent, PdfHandle, SyncBox, ThumbReq, Thumbnail};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
@@ -88,6 +92,8 @@ struct Inner {
     pending_opens: RefCell<Vec<(u64, PathBuf)>>,
     /// The latest `Open` sent.
     requested: RefCell<Option<(u64, PathBuf)>>,
+    /// The stamp of the file the latest `Open` asked for, when it is known.
+    requested_stamp: Cell<Option<PdfStamp>>,
     /// The PDF the view shows.
     shown: RefCell<Option<(u64, PathBuf)>>,
     /// Per-document dark-mode choices (Ctrl+Shift+I), overriding the system style.
@@ -118,7 +124,28 @@ impl PdfController {
     /// Opens (or reloads) `pdf` as a new generation. The view keeps its scroll anchor when it
     /// already shows `pdf`.
     pub fn open(&self, pdf: &Path) {
-        self.inner.open(pdf);
+        self.inner.open(pdf, None);
+    }
+
+    /// Opens `pdf` like [`PdfController::open`] unless the latest open asked for the same file
+    /// with the same `stamp`, which a build that wrote no new PDF reports. The stamp is taken off
+    /// the main thread (the build thread's [`lemma_build::BuildOutcome::pdf_stamp`]); `None`
+    /// always opens. Returns whether it opened.
+    pub fn open_if_changed(&self, pdf: &Path, stamp: Option<PdfStamp>) -> bool {
+        let unchanged = stamp.is_some()
+            && self.inner.requested_stamp.get() == stamp
+            && self.requested_pdf().as_deref() == Some(pdf);
+        if !unchanged {
+            self.inner.open(pdf, stamp);
+        }
+        !unchanged
+    }
+
+    /// True when the view shows the generation the latest open asked for (false while it loads,
+    /// and after it failed to open).
+    pub fn shows_requested(&self) -> bool {
+        let requested = self.inner.requested.borrow().as_ref().map(|(g, _)| *g);
+        requested.is_some() && requested == self.generation()
     }
 
     /// The PDF the latest [`PdfController::open`] asked for.
@@ -273,11 +300,12 @@ impl Inner {
         }
     }
 
-    fn open(&self, pdf: &Path) {
+    fn open(&self, pdf: &Path, stamp: Option<PdfStamp>) {
         let generation = self.last_generation.get() + 1;
         self.last_generation.set(generation);
         self.requested
             .replace(Some((generation, pdf.to_path_buf())));
+        self.requested_stamp.set(stamp);
         self.pending_opens
             .borrow_mut()
             .push((generation, pdf.to_path_buf()));
@@ -461,13 +489,22 @@ impl Inner {
             s.document_changed(generation, rebuilt);
         }
         if let Some(s) = self.search.get() {
-            s.document_changed(generation);
+            s.document_changed(generation, rebuilt);
         }
     }
 
     fn open_failed(&self, generation: u64, error: &str) {
         tracing::warn!("cannot open the PDF of generation {generation}: {error}");
         self.take_pending(generation);
+        // The next build opens the file again, even unchanged.
+        if self
+            .requested
+            .borrow()
+            .as_ref()
+            .is_some_and(|(g, _)| *g == generation)
+        {
+            self.requested_stamp.set(None);
+        }
         if self.shown.borrow().is_none() {
             self.placeholder.set_title("Cannot Show the PDF");
             self.placeholder.set_description(Some(error));
@@ -731,6 +768,7 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         last_generation: Cell::new(0),
         pending_opens: RefCell::new(Vec::new()),
         requested: RefCell::new(None),
+        requested_stamp: Cell::new(None),
         shown: RefCell::new(None),
         dark_overrides: RefCell::new(HashMap::new()),
         forward_reveal: Cell::new(None),
