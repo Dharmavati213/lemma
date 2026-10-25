@@ -15,7 +15,7 @@ use labels_common::{
 };
 use lemma_app::editor::goto::{self, GotoTarget};
 use lemma_app::editor::hover::{self, HoverContent, HoverCtx};
-use lemma_app::editor::{Editor, TextPoint, Trigger};
+use lemma_app::editor::{Editor, TexView, TextPoint, Trigger};
 use lemma_app::workspace::normalize;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -41,6 +41,10 @@ fn main() -> ExitCode {
         ("hover_label_citation_and_missing_names", hover_names),
         ("hover_user_macro_definition_and_math", hover_macro),
         ("hover_popover_shows_the_reference", hover_popover),
+        (
+            "hover_popover_goes_with_its_view",
+            popover_goes_with_its_view,
+        ),
         ("hover_reference_shows_the_pdf_crop", hover_crop),
     ])
 }
@@ -582,6 +586,16 @@ fn hover_popover() {
     hover::hide(&view);
     common::pump_for(Duration::from_millis(20));
     assert!(!hover::is_shown(&view));
+}
+
+/// A view that goes with a popover still on it (the hover's stays as long as the view) lets the
+/// popover go first: GtkTextView's own dispose loops forever on a child it did not add.
+fn popover_goes_with_its_view() {
+    let view: TexView = gtk::glib::Object::new();
+    let popover = gtk::Popover::new();
+    view.adopt_popover(&popover);
+    drop(view);
+    assert!(popover.parent().is_none());
 }
 
 /// The crop shown in a hover's widget, if any.

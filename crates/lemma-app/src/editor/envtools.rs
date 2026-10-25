@@ -426,7 +426,7 @@ fn open_prompt(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         .build();
     popover.add_css_class("lemma-change-env");
     let view = editor.view();
-    popover.set_parent(view);
+    view.adopt_popover(&popover);
     if let Some(rect) = editor.range_rect(span.begin.clone(), span.begin.start) {
         let x = rect.x().clamp(0, (view.width() - 1).max(0));
         let y = rect.y().clamp(0, (view.height() - 1).max(0));

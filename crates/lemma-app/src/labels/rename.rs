@@ -143,7 +143,7 @@ fn open(state: &Rc<WindowState>, editor: &Rc<Editor>, range: Range<usize>, old: 
         .build();
     popover.add_css_class("lemma-rename");
     let view = editor.view();
-    popover.set_parent(view);
+    view.adopt_popover(&popover);
     if let Some(rect) = editor.range_rect(range.clone(), range.start) {
         let x = rect.x().clamp(0, (view.width() - 1).max(0));
         let y = rect.y().clamp(0, (view.height() - 1).max(0));

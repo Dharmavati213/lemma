@@ -25,6 +25,8 @@ mod imp {
         pub review: RefCell<Option<Rc<ViewReview>>>,
         /// The key layer (`editor::keys`), set by `Editor::new`.
         pub keys: RefCell<Option<Rc<KeyLayer>>>,
+        /// Lemma's popovers on the view ([`super::TexView::adopt_popover`]).
+        pub popovers: RefCell<Vec<glib::WeakRef<gtk::Popover>>>,
     }
 
     #[glib::object_subclass]
@@ -34,7 +36,21 @@ mod imp {
         type ParentType = sourceview5::View;
     }
 
-    impl ObjectImpl for TexView {}
+    impl ObjectImpl for TexView {
+        fn dispose(&self) {
+            // GtkTextView's own dispose removes only the children it added itself: on any other
+            // it warns "not a child" in an endless loop. Popovers still on the view (the hover's
+            // lives as long as the view) go first.
+            let view = self.obj();
+            for popover in self.popovers.take() {
+                if let Some(popover) = popover.upgrade()
+                    && popover.parent().as_ref() == Some(view.upcast_ref::<gtk::Widget>())
+                {
+                    popover.unparent();
+                }
+            }
+        }
+    }
     impl WidgetImpl for TexView {}
 
     impl TextViewImpl for TexView {
@@ -93,6 +109,19 @@ impl TexView {
         // Dropped outside the borrow: dropping a layer removes its controller.
         let old = self.imp().keys.replace(layer);
         drop(old);
+    }
+
+    /// Parents `popover` to the view (`set_parent`), and unparents it when the view goes if it is
+    /// still there then. Lemma's popovers on the view all come through here.
+    pub fn adopt_popover(&self, popover: &gtk::Popover) {
+        popover.set_parent(self);
+        let mut popovers = self.imp().popovers.borrow_mut();
+        let view = self.upcast_ref::<gtk::Widget>();
+        popovers.retain(|p| {
+            p.upgrade()
+                .is_some_and(|p| p.parent().as_ref() == Some(view))
+        });
+        popovers.push(popover.downgrade());
     }
 
     /// Applies the editor settings: monospace font (CSS class `lemma-editor`, see

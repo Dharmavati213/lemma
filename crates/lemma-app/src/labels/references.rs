@@ -337,7 +337,7 @@ fn show(
         .build();
     popover.add_css_class("lemma-references");
     let view = editor.view();
-    popover.set_parent(view);
+    view.adopt_popover(&popover);
     if let Some(rect) = editor
         .range_rect(range.clone(), range.start)
         .map(|r| clamp_rect(r, view.width(), view.height()))

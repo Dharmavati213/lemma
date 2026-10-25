@@ -110,6 +110,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Fixed
 
+- An editor that went away with its hover popover still on it no longer hangs Lemma in an
+  endless loop of "GtkPopover is not a child of LemmaTexView" warnings (seen with GTK's own
+  input method, when no IBus or Fcitx module is installed).
 - With an input method that composes text (Japanese, Chinese or Korean input through IBus,
   Fcitx, macOS or Windows; dead keys), Enter in the agent's prompt box confirms the conversion
   instead of sending the prompt without the text being composed. Up, Down, Tab and Escape go to

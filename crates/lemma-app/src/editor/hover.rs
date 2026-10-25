@@ -520,7 +520,7 @@ fn ensure_popover(vh: &Rc<ViewHover>, view: &TexView) -> Popover {
         .focusable(false)
         .build();
     popover.add_css_class(CSS_CLASS);
-    popover.set_parent(view);
+    view.adopt_popover(&popover);
     // The pointer may move onto the popover (to read a long one) without it going away.
     let motion = gtk::EventControllerMotion::new();
     let weak = Rc::downgrade(vh);

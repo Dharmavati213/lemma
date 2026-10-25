@@ -215,7 +215,7 @@ pub fn open(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         .build();
     popover.add_css_class(POPOVER_CSS_CLASS);
     let view = editor.view();
-    popover.set_parent(view);
+    view.adopt_popover(&popover);
 
     let session = Rc::new(Session {
         editor: Rc::downgrade(editor),
