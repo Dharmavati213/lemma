@@ -1075,6 +1075,13 @@ fn regress2_root_move_keeps_the_agent_in_the_project() {
 
 // ----- B-18: list_files on a large root -----
 
+/// The walk of 5000 files on the main thread, with a key made (`canonicalize`) for each of its
+/// paths there, kept the main thread 145–215 ms in a debug build. What it does there now takes
+/// under 1 ms: the jobs thread also writes the reply, whose 5000 paths took 30–50 ms of the main
+/// thread in a debug build, right at the limit. Time that is not list_files' is left out: the
+/// window's first frame (45–60 ms under Broadway in a debug build, more on a loaded machine) is
+/// drawn before the request, and the iterations are timed without the time the main thread
+/// waited for a CPU ([`common::timed_iteration`]).
 fn regress2_list_files_does_not_stall_the_main_thread() {
     let dir = common::temp_dir("list-big");
     for i in 0..5000 {
@@ -1084,6 +1091,10 @@ fn regress2_list_files_does_not_stall_the_main_thread() {
     }
     std::fs::write(dir.join("main.tex"), "\\documentclass{article}\n").unwrap();
     let f = window_on(dir, |_| {});
+    assert!(block_on(lemma_app::testmode::wait_for_frames(
+        &f.state.window,
+        1
+    )));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     glib::spawn_future_local(tools::handle(
         f.state.clone(),
@@ -1093,14 +1104,11 @@ fn regress2_list_files_does_not_stall_the_main_thread() {
             reply: tx,
         },
     ));
-    let context = glib::MainContext::default();
     let mut longest = Duration::ZERO;
     let deadline = Instant::now() + TIMEOUT;
     while rx.try_recv().is_err() {
         assert!(Instant::now() < deadline, "timed out");
-        let started = Instant::now();
-        context.iteration(false);
-        longest = longest.max(started.elapsed());
+        longest = longest.max(common::timed_iteration());
         std::thread::sleep(Duration::from_millis(1));
     }
     println!("  longest main-loop iteration during list_files: {longest:?}");
@@ -1170,16 +1178,14 @@ fn regress2_agent_save_inside_an_insert_keeps_modified_honest() {
 
 // ----- B-12: a large text file written during a turn -----
 
-/// Runs the main loop until `done`, returning the longest single iteration.
+/// Runs the main loop until `done`, returning the longest single iteration (without the time
+/// the main thread waited for a CPU, see [`common::timed_iteration`]).
 fn longest_iteration_until(mut done: impl FnMut() -> bool) -> Duration {
-    let context = glib::MainContext::default();
     let mut longest = Duration::ZERO;
     let deadline = Instant::now() + Duration::from_secs(60);
     while !done() {
         assert!(Instant::now() < deadline, "timed out");
-        let started = Instant::now();
-        context.iteration(false);
-        longest = longest.max(started.elapsed());
+        longest = longest.max(common::timed_iteration());
         std::thread::sleep(Duration::from_millis(1));
     }
     longest
@@ -1200,12 +1206,21 @@ fn regress2_big_file_written_in_a_turn_does_not_freeze() {
         ));
         i += 1;
     }
+    // The window's first frame is not the monitor's work (see the list_files test).
+    assert!(block_on(lemma_app::testmode::wait_for_frames(
+        &f.state.window,
+        1
+    )));
     let started = Instant::now();
     std::fs::write(f.path("results.txt"), &text).unwrap();
-    // Handled when it is reviewed, or (a size cap) when the monitor is done with it.
-    common::pump_for(Duration::from_millis(300));
-    let longest =
-        longest_iteration_until(|| hunks(&f, "results.txt") > 0 || watcher::is_idle(&f.state));
+    // Handled when it is reviewed, or (a size cap) when the monitor is done with it, which it
+    // also is before it sees the file: every iteration from the write on is timed, for at least
+    // 300 ms.
+    let written = Instant::now();
+    let longest = longest_iteration_until(|| {
+        written.elapsed() >= Duration::from_millis(300)
+            && (hunks(&f, "results.txt") > 0 || watcher::is_idle(&f.state))
+    });
     println!(
         "  25 MB results.txt handled after {:.2?} (reviewed: {}); longest main-loop iteration \
          {longest:?}",

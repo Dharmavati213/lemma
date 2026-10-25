@@ -471,7 +471,13 @@ impl Inner {
         });
     }
 
+    /// A latexmk of the running build started (the build's, or `latexmk -c` before it).
     fn started(&self, canceller: Canceller) {
+        // A latexmk runs, so a missing one is worth explaining again. Only a start says so: a
+        // build that ends without one (no build thread, an output directory that cannot be
+        // created, a latexmk that cannot be executed) says nothing about whether it is
+        // installed.
+        self.latexmk_missing_told.set(false);
         let mut running = self.running.borrow_mut();
         if let Some(running) = running.as_mut() {
             if running.stop_requested {
@@ -714,15 +720,22 @@ impl Inner {
         i.warnings.set_visible(show_warnings);
 
         // Without latexmk every save would toast the same advice: F5 shows it each time, the
-        // automatic builds once (until a latexmk starts again). Otherwise the status bar says
-        // it, and a toast still showing it stays.
+        // automatic builds once (until a latexmk starts again, see `started`). Otherwise the
+        // status bar says it, and a toast still showing it stays; another build's (a latexmk
+        // that could not be executed) is replaced by none, as by any build.
         if missing {
             let told = self.latexmk_missing_told.replace(true);
             if told && reason != Reason::Manual {
+                let stale = self
+                    .toast
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|t| t.title().as_deref() != Some(LATEXMK_MISSING));
+                if stale {
+                    self.replace_toast(state, None);
+                }
                 return;
             }
-        } else {
-            self.latexmk_missing_told.set(false);
         }
         let toast = match &outcome.status {
             BuildStatus::Errors => Some((

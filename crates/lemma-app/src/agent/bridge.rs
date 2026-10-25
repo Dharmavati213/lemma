@@ -112,10 +112,14 @@
 //! the id to `lemma_agent` ([`AgentConfig::load_session`]), which loads the session instead of
 //! starting a new one, without reporting the conversation the agent replays. The first session
 //! that becomes ready takes it (a start that fails leaves it for the next); if it is the loaded
-//! one, the mode, model and effort it had are chosen again (not the configured ones). An agent
-//! whose conversation the next start could not continue (it cannot load sessions, or
-//! `config.toml` chose another backend while it ran) is stopped only while no prompt went to it,
-//! so that nothing is lost; otherwise it keeps running.
+//! one, the mode, model and effort it had are chosen again (not the configured ones). The idle
+//! stop's notice promised to resume the conversation, so a session that started in another
+//! directory (the project root moved meanwhile) gets a `Notice` after its `Ready` that says why
+//! it is a new one. An agent that could not load it says so itself; a switch of backend stops
+//! the agent first, which forgets the conversation ([`stop`]), and the pane says that the other
+//! agent starts a new one. An agent whose conversation the next start could not continue (it
+//! cannot load sessions, or `config.toml` chose another backend while it ran) is stopped only
+//! while no prompt went to it, so that nothing is lost; otherwise it keeps running.
 
 use super::{
     AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, history, install, panel,
@@ -1373,11 +1377,25 @@ pub fn handle_event(controller: &Rc<AgentController>, event: AgentEvent) {
             Bridge::clear_timer(&bridge.start_timer);
             // A session that continues the conversation an idle stop left (it has its id)
             // chooses again what it had chosen; any other forgets that conversation.
-            let resumed = bridge.resume.take().filter(|r| r.session == *session);
+            let (resumed, forgotten) = match bridge.resume.take() {
+                Some(r) if r.session == *session => (Some(r), None),
+                other => (None, other),
+            };
+            let mut notice = None;
             if let Some(s) = bridge.session.borrow_mut().as_mut() {
                 s.loadable = loadable.then(|| session.clone());
                 s.conversation |= resumed.is_some();
                 s.preferences = Preferences::of(mode, options);
+                // The idle stop's notice promised to resume it: say why this start did not.
+                // (An agent that could not load it says so itself.)
+                notice = forgotten.filter(|r| r.cwd != s.cwd).map(|r| {
+                    format!(
+                        "The conversation was in {}; the project folder is now {}, so this is \
+                         a new conversation.",
+                        r.cwd.display(),
+                        s.cwd.display()
+                    )
+                });
             }
             if let Some(resumed) = &resumed {
                 tracing::info!("the agent continues session {}", resumed.session);
@@ -1396,6 +1414,13 @@ pub fn handle_event(controller: &Rc<AgentController>, event: AgentEvent) {
                 apply_preferences(controller, modes, mode, options, &wanted);
             }
             arm_idle_stop(controller);
+            // After the `Ready`, as `lemma_agent`'s own notice about a conversation it could
+            // not load.
+            controller.emit_event(&event);
+            if let Some(notice) = notice {
+                controller.emit_event(&AgentEvent::Notice(notice));
+            }
+            return;
         }
         AgentEvent::ModeChanged(mode) => {
             if let Some(s) = bridge.session.borrow_mut().as_mut() {

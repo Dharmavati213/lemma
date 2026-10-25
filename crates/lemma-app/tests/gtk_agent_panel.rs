@@ -135,6 +135,10 @@ fn main() -> ExitCode {
             "e2e_idle_stop_resumes_the_conversation",
             e2e_idle_stop_resumes,
         ),
+        (
+            "e2e_idle_stop_then_another_folder_is_a_new_conversation",
+            e2e_idle_stop_elsewhere,
+        ),
     ];
     if ignored {
         tests.push(("perf_streamed_table", perf_streamed_table));
@@ -3724,6 +3728,102 @@ fn e2e_idle_stop_resumes() {
     assert_eq!(lemma_app::review_ui::summary(&f.state.workspace).1, hunks);
     assert_eq!(panel.usage(), Some((53_000, 200_000)));
     f.agent().disconnect(id);
+    bridge.set_idle_stop(None);
+    agent.stop();
+}
+
+/// The idle stop promised to resume the conversation, but the project root moved while the
+/// agent was stopped: the next start, in the new root, is a new conversation, and the transcript
+/// says why before the message. Then a switch of backend says that the other agent starts a
+/// new conversation.
+fn e2e_idle_stop_elsewhere() {
+    let f = proj_fixture("e2e-idle-elsewhere");
+    let events: Rc<RefCell<Vec<AgentEvent>>> = Rc::default();
+    let sink = events.clone();
+    let id = f
+        .agent()
+        .connect_event(move |e| sink.borrow_mut().push(e.clone()));
+    if start_fake_agent(&f, "resume.json").is_none() {
+        return;
+    }
+    let agent = f.agent();
+    let bridge = agent.bridge();
+    let panel = f.panel();
+    let sessions = |events: &[AgentEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Ready { session, .. } => Some(session.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = sessions(&events.borrow())[0].clone();
+    let old = f.state.workspace.root().path().to_path_buf();
+    bridge.set_idle_stop(Some(IDLE));
+    assert!(panel::send_prompt(
+        &f.state,
+        vec![PromptBlock::Text("Hello".into())],
+        PromptOrigin::Panel
+    ));
+    assert_eq!(wait_turn_end(&f, TIMEOUT), Some(StopReason::EndTurn));
+    common::pump_until(TIMEOUT, || agent.state() == AgentState::Stopped);
+    assert_eq!(bridge.resumable_session(), Some(first.clone()));
+    // No document is open: the first one opened elsewhere moves the root there. Nothing runs,
+    // so nothing is stopped or said yet.
+    let other = common::temp_dir("e2e-idle-elsewhere-other")
+        .canonicalize()
+        .unwrap();
+    std::fs::write(other.join("notes.tex"), "Notes.\n").unwrap();
+    let before = notices(&panel).len();
+    block_on(f.state.open_file(&other.join("notes.tex"))).unwrap();
+    assert_eq!(f.state.workspace.root().path(), other);
+    assert_eq!(notices(&panel).len(), before);
+
+    events.borrow_mut().clear();
+    assert!(panel::send_prompt(
+        &f.state,
+        vec![PromptBlock::Text("Are you still there?".into())],
+        PromptOrigin::Panel
+    ));
+    assert_eq!(wait_turn_end(&f, TIMEOUT), Some(StopReason::EndTurn));
+    let second = sessions(&events.borrow());
+    assert_eq!(second.len(), 1);
+    assert_ne!(second[0], first, "a new session");
+    panel.flush();
+    let entries = panel.entries();
+    let notice = format!(
+        "The conversation was in {}; the project folder is now {}, so this is a new conversation.",
+        old.display(),
+        other.display()
+    );
+    let said = entries
+        .iter()
+        .position(|e| *e == Entry::Notice(notice.clone()))
+        .unwrap_or_else(|| panic!("{notice:?} in {entries:#?}"));
+    let asked = entries
+        .iter()
+        .rposition(|e| matches!(e, Entry::User { .. }))
+        .unwrap();
+    assert!(said < asked, "said before the message: {entries:#?}");
+    assert_eq!(
+        notices(&panel).iter().filter(|n| **n == notice).count(),
+        1,
+        "said once"
+    );
+
+    // Idle again, with the new conversation to resume; another backend cannot.
+    common::pump_until(TIMEOUT, || agent.state() == AgentState::Stopped);
+    assert_eq!(bridge.resumable_session(), Some(second[0].clone()));
+    let mut config = (*f.state.config.get()).clone();
+    config.agent.backend = AgentBackend::Pi;
+    f.state.set_config(Rc::new(config));
+    assert_eq!(bridge.resumable_session(), None);
+    assert_eq!(
+        notices(&panel).last().map(String::as_str),
+        Some("Switched to Pi. It starts a new conversation with your next prompt.")
+    );
+    agent.disconnect(id);
     bridge.set_idle_stop(None);
     agent.stop();
 }

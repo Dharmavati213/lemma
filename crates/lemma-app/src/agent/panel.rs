@@ -5728,6 +5728,10 @@ impl Inner {
         // A start still running belongs to the old backend.
         self.start_gen.set(self.start_gen.get() + 1);
         self.starting.set(false);
+        // An idle stop promised to resume the conversation; the other agent cannot.
+        let resumable = self
+            .controller()
+            .is_some_and(|c| c.bridge().resumable_session().is_some());
         if self.command(&PanelCommand::SwitchBackend(backend))
             && let Some(controller) = self.controller()
         {
@@ -5743,8 +5747,9 @@ impl Inner {
         self.hint.set_reveal_child(false);
         self.show_setup(SetupState::Hidden);
         self.push(Entry::Notice(format!(
-            "Switched to {}. It starts with your next prompt.",
-            super::bridge::backend_name(backend, &self.agent_cfg())
+            "Switched to {}. It starts {}with your next prompt.",
+            super::bridge::backend_name(backend, &self.agent_cfg()),
+            if resumable { "a new conversation " } else { "" }
         )));
         self.refresh_header();
         self.refresh_key_status();

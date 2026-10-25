@@ -149,6 +149,34 @@ pub fn pump_for(duration: Duration) {
     });
 }
 
+/// Runs one iteration of the default main context (without blocking) and returns how long it
+/// kept the main thread: its wall time less the time the thread was ready to run but waited for
+/// a CPU, from Linux's scheduler statistics. On a loaded machine the scheduler can leave a ready
+/// thread waiting for tens of milliseconds, which nothing in Lemma causes; work and blocking
+/// (reading files, waiting for a process or another thread) count in full. Where the system
+/// keeps no such statistics, this is the wall time.
+pub fn timed_iteration() -> Duration {
+    let started = Instant::now();
+    let waited_before = run_queue_wait();
+    glib::MainContext::default().iteration(false);
+    // Read before the clock stops, so that every wait it counts lies within the wall time.
+    let waited = run_queue_wait()
+        .zip(waited_before)
+        .map_or(Duration::ZERO, |(after, before)| {
+            after.saturating_sub(before)
+        });
+    started.elapsed().saturating_sub(waited)
+}
+
+/// How long the calling thread has waited for a CPU while ready to run, in all (the second
+/// field of `/proc/thread-self/schedstat`, in nanoseconds); `None` where the system does not
+/// say.
+fn run_queue_wait() -> Option<Duration> {
+    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let nanos = stat.split_whitespace().nth(1)?.parse().ok()?;
+    Some(Duration::from_nanos(nanos))
+}
+
 /// A fresh, empty directory for one test under cargo's per-test temp dir.
 pub fn temp_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

@@ -81,7 +81,8 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   leave a train of stale "Build failed" toasts.
 - Without latexmk, a build says what to install (TeX Live, MacTeX or MiKTeX, with Perl on
   Windows) and that `[build] latexmk` can point at it: F5 every time, saves and the agent once
-  per window; the status bar says "latexmk not found".
+  per window, and again only after a build that ran latexmk; the status bar says "latexmk not
+  found".
 - Auto-saving several documents requests one build once they are all written, not one per
   document, which ran latexmk a second time for nothing and wrote the documents twice.
 - In dark mode the PDF strip's thumbnails (and link previews) are rendered dark by the PDF
@@ -194,6 +195,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   starts it again, and an agent that can resume conversations (ACP `session/load`, as Claude
   Code's adapter can) continues this one, with the mode, model and effort it had, without
   showing the conversation again. One that cannot is only stopped before the first message.
+  When the next start cannot continue it after all, a note in the transcript says why, also
+  when the project folder changed meanwhile (a file opened in another folder after every tab
+  was closed) or another agent was chosen.
 - An ACP agent other than Claude Code (Pi, Codex, Gemini CLI, …) that answered the first
   prompt with an error (a quota, an expired login) went without Lemma's instructions for the
   rest of the session; the next prompt now carries them.

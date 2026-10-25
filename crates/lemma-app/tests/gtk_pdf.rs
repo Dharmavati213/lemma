@@ -1306,17 +1306,47 @@ fn missing_latexmk() {
     let manual = build.toast().expect("F5 explains");
     assert_eq!(manual.title().as_deref(), Some(LATEXMK_MISSING));
 
+    // A build that fails without starting a latexmk (this one cannot be executed) does not
+    // bring the advice back: the save after it withdraws that build's toast and says nothing new.
+    let unrunnable = fake.with_file_name("latexmk-not-executable");
+    std::fs::write(&unrunnable, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut refused = config.clone();
+    refused.build.latexmk = unrunnable;
+    state.set_config(Rc::new(refused));
+    build.request(Reason::Save);
+    built(6);
+    assert!(
+        matches!(&outcomes.borrow()[5].status, BuildStatus::SpawnFailed(e) if e != LATEXMK_MISSING),
+        "{:?}",
+        outcomes.borrow()[5].status
+    );
+    let could_not = build.toast().expect("the failure is toasted");
+    assert!(
+        could_not
+            .title()
+            .is_some_and(|t| t.starts_with("Could not build: cannot run ")),
+        "{:?}",
+        could_not.title()
+    );
+    let withdrawn = count_dismissals(&could_not);
+    state.set_config(Rc::new(config.clone()));
+    build.request(Reason::Save);
+    built(7);
+    assert_eq!(state.status.build.text(), missing_text);
+    assert!(build.toast().is_none(), "nothing new: {:?}", build.toast());
+    assert_eq!(withdrawn.get(), 1, "the failure before is withdrawn");
+
     // Once a latexmk runs, a missing one is explained again.
     let mut working = config.clone();
     working.build.latexmk = fake;
     state.set_config(Rc::new(working));
     build.request(Reason::Save);
-    built(6);
-    assert_eq!(outcomes.borrow()[5].status, BuildStatus::Success);
+    built(8);
+    assert_eq!(outcomes.borrow()[7].status, BuildStatus::Success);
     assert!(build.toast().is_none(), "the success withdraws the advice");
     state.set_config(Rc::new(config));
     build.request(Reason::Save);
-    built(7);
+    built(9);
     let again = build.toast().expect("explained again");
     assert_eq!(again.title().as_deref(), Some(LATEXMK_MISSING));
     assert!(!missing.exists());

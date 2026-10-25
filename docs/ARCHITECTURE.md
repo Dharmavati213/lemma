@@ -1149,7 +1149,9 @@ they conflict with the sections above, this section wins.
   - Each build's toast replaces the previous build's (a success or Stop withdraws it).
   - A latexmk that does not start with `NotFound` is explained (`build_ui::LATEXMK_MISSING`:
     what to install, `[build] latexmk`): F5 every time, the other triggers once per window
-    until a latexmk starts; the status bar says "Not built: latexmk not found".
+    until a latexmk starts (the build thread reports it, also for `latexmk -c`; a build that
+    ends without starting one does not count); the status bar says "Not built: latexmk not
+    found".
   - Auto-save saves its documents together and then requests one `Save` build.
 - **Project index (§5, 2026-10-25):**
   - The file monitor passes the changes of project sources and documents it sees to the
@@ -1303,6 +1305,12 @@ they conflict with the sections above, this section wins.
     `config.toml` chose another backend while it ran) is stopped only while no prompt went to
     it. Any other stop forgets the session. The pane keeps the context usage when `Ready`
     names the session it showed last.
+  - The idle stop's `Notice` promised to resume the conversation, so a `Ready` that does not
+    continue it says why: after a start in another root (the root moved while the agent was
+    stopped), the bridge emits a `Notice` after that `Ready` naming both directories; a load
+    the agent refused, or an agent that cannot load, gets `lemma_agent`'s own `Notice`; a
+    switch of backend stops the agent (which forgets the session), and the pane's notice says
+    "It starts a new conversation with your next prompt".
   - Each `ToolRecord` keeps at most `TOOL_RECORD_TEXT` (2 KiB) of its reply's text, cut at a
     character boundary with `…`, and the whole length in `bytes`; a stop clears the records.
   - The API backend appends streamed text, thinking and signature deltas to their block in

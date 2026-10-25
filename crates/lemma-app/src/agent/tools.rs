@@ -32,7 +32,7 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use lemma_agent::{EditorRequest, PromptBlock, ToolCall, ToolContent, ToolReply};
 use lemma_build::{BuildOutcome, BuildStatus};
-use lemma_core::{PathError, Severity};
+use lemma_core::{PathError, ProjectRoot, Severity};
 use lemma_review::unified_diff;
 use lemma_syntax::{FileIndex, IncludeKind, ProjectIndex, index_file, parse_magic};
 use std::collections::{HashMap, HashSet};
@@ -606,7 +606,7 @@ fn find_main_file(project: &Path, text_of: &dyn Fn(&Path) -> Option<String>) -> 
 // ----- list_files -----
 
 async fn list_files(state: &Rc<WindowState>) -> Result<String, String> {
-    let root = state.workspace.root().path().to_path_buf();
+    let root = state.workspace.root().clone();
     let skip = output_dirs(state);
     let graph = project_graph(state).await;
     // (path, note): the files the includes name, root first; those that could not be read are
@@ -626,24 +626,34 @@ async fn list_files(state: &Rc<WindowState>) -> Result<String, String> {
                 (p.clone(), note)
             })
             .chain(graph.bibs.iter().map(|p| (p.clone(), "")))
-            .filter(|(p, _)| p.starts_with(&root))
+            .filter(|(p, _)| p.starts_with(root.path()))
             .collect()
     });
     // The walk and the keys that tell the same file apart (symbolic links, `..`) are file
-    // system work: the jobs thread does it. The walk's own paths are real paths under the
-    // canonical root (it follows no links), so they are their own keys.
-    let walk_root = root.clone();
-    let paths: Vec<PathBuf> = documented.iter().map(|(p, _)| p.clone()).collect();
-    let (walk, keys) = gio::spawn_blocking(move || {
-        let walk = workspace::walk_project(&walk_root, &skip, WALK_MAX_FILES, WALK_MAX_DIRS);
-        let keys: Vec<PathBuf> = paths.iter().map(|p| normalize(p)).collect();
-        (walk, keys)
+    // system work, and the reply goes through up to `WALK_MAX_FILES` paths (about 50 ms in a
+    // debug build): the jobs thread does both.
+    gio::spawn_blocking(move || {
+        let walk = workspace::walk_project(root.path(), &skip, WALK_MAX_FILES, WALK_MAX_DIRS);
+        let keys: Vec<PathBuf> = documented.iter().map(|(p, _)| normalize(p)).collect();
+        list_reply(&root, &documented, keys, walk)
     })
     .await
-    .map_err(|_| "listing the project failed".to_owned())?;
+    .map_err(|_| "listing the project failed".to_owned())
+}
 
+/// The reply of [`list_files`] (blocking: the jobs thread): the `documented` files, with their
+/// `keys` in the same order, then the other files of `walk`. The walk's own paths are real
+/// paths under the canonical root (it follows no links), so they are their own keys.
+fn list_reply(
+    root: &ProjectRoot,
+    documented: &[(PathBuf, &str)],
+    keys: Vec<PathBuf>,
+    walk: workspace::ProjectWalk,
+) -> String {
+    // As `review_ui::relative_name` names them, against the root that was walked.
+    let relative = |path: &Path| root.relative(path).unwrap_or(path).display().to_string();
     let mut listed: HashSet<PathBuf> = HashSet::new();
-    let mut out = format!("Project root: {}\n", root.display());
+    let mut out = format!("Project root: {}\n", root.path().display());
     let mut count = 0usize;
     let mut omitted = 0usize;
     if !documented.is_empty() {
@@ -658,7 +668,7 @@ async fn list_files(state: &Rc<WindowState>) -> Result<String, String> {
             continue;
         }
         count += 1;
-        let _ = writeln!(out, "{}{note}", relative(state, path));
+        let _ = writeln!(out, "{}{note}", relative(path));
     }
     let graph_listed = count;
     let mut others = String::new();
@@ -675,7 +685,7 @@ async fn list_files(state: &Rc<WindowState>) -> Result<String, String> {
             continue;
         }
         count += 1;
-        let _ = writeln!(others, "{}", relative(state, &path));
+        let _ = writeln!(others, "{}", relative(&path));
     }
     if !others.is_empty() {
         out.push_str(if graph_listed > 0 {
@@ -699,7 +709,7 @@ async fn list_files(state: &Rc<WindowState>) -> Result<String, String> {
             }
         );
     }
-    Ok(out)
+    out
 }
 
 // ----- outline -----

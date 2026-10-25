@@ -68,11 +68,13 @@ user or system git configuration and no enclosing repository is read).
 
 **A fake latexmk:** build behaviour that does not depend on TeX is tested without it, with a
 shell script as `[build] latexmk` (copied into place with `cp`, so no forked child holds it open
-for writing): `gtk_pdf` (the build toasts replace each other, a missing latexmk is explained once,
-Clean Build Files and Rebuild stops the build and runs `-c` with the build's engine flag and
-output directory, and Stop stops the clean-up) and `gtk_qol` (auto-saving several documents
-builds once). `lemma-build`'s `tests/build.rs` runs the real `latexmk -c` (`Build::clean`) with
-`outdir` `.build` and `.`, and with a stale `.bbl` and one that is a source.
+for writing): `gtk_pdf` (the build toasts replace each other; a missing latexmk is explained once,
+and again only after a latexmk started: a build that could not execute one does not count, and
+the next save withdraws its toast; Clean Build Files and Rebuild stops the build and runs `-c`
+with the build's engine flag and output directory, and Stop stops the clean-up) and `gtk_qol`
+(auto-saving several documents builds once). `lemma-build`'s `tests/build.rs` runs the real
+`latexmk -c` (`Build::clean`) with `outdir` `.build` and `.`, and with a stale `.bbl` and one
+that is a source.
 
 **State and settings in tests:** every test window gets `Paths` in a temporary directory (or
 none) and an in-memory `Config`; binary runs get `LEMMA_CONFIG=/dev/null` (or a temporary
@@ -129,7 +131,9 @@ Where the agent is tested:
   (also set while the timer runs), a backend that `config.toml` replaced, the API backend; e2e
   with `basic`, `permission`, `cancel`, and `resume`: an idle stop with the pane hidden ends the
   fake agent's process, a start that fails keeps the conversation, and the next message loads
-  the same session in a new one, in the mode it had, without the replayed conversation):
+  the same session in a new one, in the mode it had, without the replayed conversation; after
+  the project root moved, the next message starts a new conversation and the transcript says
+  why first, and a switch of backend says that the other agent starts a new one):
   in-process. `gtk_agent_panel` also types into the prompt box on real key events
   (`prompt_box_on_real_key_events`: a dead key's preedit keeps Enter from sending, and Up and
   Down recall earlier prompts through the text view's own cursor moves; the binary sets
@@ -310,6 +314,14 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep
   test logs under `target/`, not in `/tmp` (a tmpfs with a quota).
+- **Main-loop stalls:** the tests that bound one main-loop iteration (`gtk_regress2_b`'s
+  `regress2_list_files_does_not_stall_the_main_thread`, 50 ms, and
+  `regress2_big_file_written_in_a_turn_does_not_freeze`, 100 ms) time it with
+  `common::timed_iteration`: the wall time less the time the main thread waited for a CPU
+  (`/proc/thread-self/schedstat`; the wall time where there is none), which a loaded machine
+  adds and nothing in Lemma causes. Work and blocking count in full. The window draws a frame
+  before the measurement starts (`testmode::wait_for_frames`): a debug build takes 45–60 ms for
+  the first one under Broadway.
 
 ## Performance tests
 

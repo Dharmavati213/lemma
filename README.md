@@ -364,7 +364,8 @@ permission prompts (`bypassPermissions`, `yolo`, Codex's full access, …).
 An ACP agent that sits idle for 10 minutes is stopped to free its memory (Claude Code takes
 about 360 MB), unless the agent pane is open in the focused window, its prompt box has text or
 a permission request waits. Your next message (or opening the pane) starts it again, and it
-continues the conversation where it left off, in the mode and with the model you had chosen.
+continues the conversation where it left off, in the mode and with the model you had chosen
+(after a switch to another agent or project folder, a note says that a new one starts).
 An agent that cannot resume conversations is only stopped before your first message to it.
 `[agent] idle_stop_min` sets the minutes; 0 keeps the agent running.
 
