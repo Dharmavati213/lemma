@@ -1923,6 +1923,10 @@ mod real_keys {
             );
             assert!(editor.document().text().contains(command), "{action}");
         }
+        // Each is one undo step; the find bar's steps below count on the text as it was.
+        editor.buffer().undo();
+        editor.buffer().undo();
+        assert_eq!(editor.document().text(), long);
 
         step!("Ctrl+B, Ctrl+I and Ctrl+/ in the agent's prompt");
         // In another text field the keys are the field's: they do not change the document out
