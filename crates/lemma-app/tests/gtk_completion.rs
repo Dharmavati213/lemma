@@ -63,6 +63,10 @@ fn main() -> ExitCode {
             "the_project_feed_reads_local_packages",
             project_feed_reads_local_packages,
         ),
+        (
+            "the_project_feed_follows_files_outside_the_folder",
+            project_feed_outside_the_folder,
+        ),
         ("triggers_on_the_scanners_contexts", triggers),
         ("accepting_each_kind_of_proposal", accepting),
         ("accepted_proposals_rank_higher", recency),
@@ -639,7 +643,8 @@ fn project_feed_follows_the_disk() {
 /// At the cap of files read from disk (300, `MAX_DISK_FILES`), a file of the index that another
 /// program changes is still read again, and the files past the cap stay out: the file read
 /// again does not give its place to them. The 40 packages of the preamble, looked for next to
-/// the root, take no place from the chapters either.
+/// the root, take no place from the chapters either, and after a build the main thread looks
+/// them up without the file system (`workspace::normalizations`).
 fn project_feed_at_its_cap() {
     let dir = common::temp_dir("feed-cap");
     // 300 includes: `aaa.tex`, whose own includes are past the cap (and listed first, as the
@@ -673,6 +678,12 @@ fn project_feed_at_its_cap() {
     assert!(has("c:298") && !has("s:0"), "the cap");
     let packages = completion::loaded_packages(&f.state);
     assert!(packages.contains(&"tikz"), "{packages:?}");
+    // After a build the packages are looked for again, on the jobs thread: the main thread
+    // resolves none of their paths on the file system (it did 52 times).
+    let normalized = lemma_app::workspace::normalizations();
+    completion::refresh_after_build(&f.state, None);
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(lemma_app::workspace::normalizations(), normalized);
     std::fs::write(
         dir.join("c/c150.tex"),
         "\\section{Changed}\\label{c:changed}\n",
@@ -799,6 +810,93 @@ fn project_feed_reads_local_packages() {
         !completion::project_busy(&f.state) && indexed() == ["main.tex", "mythesis.cls"]
     });
     assert!(!f.labels("\\myd").contains(&"\\mydef".to_owned()));
+}
+
+/// Files of the index outside the workspace folder that other programs change reach it
+/// without a build, as the files inside do: a central bibliography (`../central/refs.bib`) and
+/// a chapter included through `../`, changed, deleted and written again. The file monitor
+/// watches their directories for the index only while the index has files there (at most 32
+/// of them), not the folder's own.
+fn project_feed_outside_the_folder() {
+    let base = common::temp_dir("feed-outside");
+    let dir = base.join("thesis");
+    for sub in ["thesis", "central", "shared"] {
+        std::fs::create_dir_all(base.join(sub)).unwrap();
+    }
+    std::fs::write(
+        dir.join("main.tex"),
+        "\\documentclass{article}\n\\addbibresource{../central/refs.bib}\n\\begin{document}\n\
+         \\input{../shared/intro}\nPROBE\n\\printbibliography\n\\end{document}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("central/refs.bib"),
+        "@book{Old, title = {Old}, year = {2000}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("shared/intro.tex"),
+        "\\section{Intro}\\label{sec:intro}\n",
+    )
+    .unwrap();
+    let f = fixture_at(&dir, "main.tex", false);
+    let base = lemma_app::workspace::normalize(&base);
+    let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
+    let cites = || -> Vec<String> {
+        let index = f.state.workspace.index.borrow();
+        index.all_bib().iter().map(|e| e.key.clone()).collect()
+    };
+    assert!(has("sec:intro"));
+    assert_eq!(cites(), ["Old"]);
+    let watched = || lemma_app::agent::watcher::watched_outside(&f.state);
+    assert_eq!(watched(), [base.join("central"), base.join("shared")]);
+    std::fs::write(
+        base.join("central/refs.bib"),
+        "@book{Old, title = {Old}, year = {2000}}\n@book{New, title = {New}, year = {2026}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("shared/intro.tex"),
+        "\\section{Intro}\\label{sec:outside}\n",
+    )
+    .unwrap();
+    f.wait("the files outside written elsewhere", || {
+        has("sec:outside") && !has("sec:intro") && cites() == ["Old", "New"]
+    });
+    assert!(f.labels("\\cite{Ne").contains(&"New".to_owned()));
+    // Deleted, then written again (the `\input` still names it).
+    std::fs::remove_file(base.join("shared/intro.tex")).unwrap();
+    f.wait("the chapter outside deleted", || !has("sec:outside"));
+    std::fs::write(
+        base.join("shared/intro.tex"),
+        "\\section{Back}\\label{sec:back}\n",
+    )
+    .unwrap();
+    f.wait("the chapter outside written again", || has("sec:back"));
+    // Without the `\input`, its directory is no longer watched.
+    let buffer = f.buffer();
+    let text = f.text();
+    let at = i32::try_from(text.find("\\input{../shared/intro}\n").unwrap()).unwrap();
+    let (mut start, mut end) = (buffer.iter_at_offset(at), buffer.iter_at_offset(at + 24));
+    buffer.delete(&mut start, &mut end);
+    f.wait("the directory outside no longer watched", || {
+        !has("sec:back") && watched() == [base.join("central")]
+    });
+    // Forty directories outside: the first 32 are watched.
+    for i in 0..40 {
+        std::fs::create_dir_all(base.join(format!("o{i:02}"))).unwrap();
+    }
+    let inputs: String = (0..40)
+        .map(|i| format!("\\input{{../o{i:02}/c}}\n"))
+        .collect();
+    let mut at = buffer.iter_at_offset(at);
+    buffer.insert(&mut at, &inputs);
+    f.wait("32 directories outside watched", || {
+        let watched = watched();
+        watched.len() == 32
+            && watched.first() == Some(&base.join("central"))
+            && watched.last() == Some(&base.join("o30"))
+    });
 }
 
 /// Opening only a chapter: the root next to it is found (it includes the chapter), with its

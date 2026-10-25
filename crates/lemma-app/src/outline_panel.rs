@@ -28,8 +28,9 @@
 //!   since gets none until the next build;
 //! - figures and tables take theirs from the lists of figures and tables the same way.
 //!
-//! **Captions** come from the live text of open documents ([`caption_in`]), else from the
-//! title of a `\label` in the float, else from the list of figures or tables.
+//! **Captions** come from the project index (`EnvPair::caption`: the float's first `\caption`
+//! outside a subfigure, its short form first), else from the title of a `\label` in the float,
+//! else from the list of figures or tables.
 //!
 //! # Behaviour
 //!
@@ -55,14 +56,18 @@
 //! page): the page is brought up to date when it is mapped. While it is shown:
 //! - a keystroke costs a few microseconds: a document change only (re)arms a 100 ms watch, a
 //!   change of the line count shifts the lines of that file's rows (so a click lands on the right
-//!   line before the project index catches up), and a cursor move queues one idle `follow`;
+//!   line before the project index catches up; once it has, the rows that moved take its lines
+//!   again, even when its entries came back the same), and a cursor move queues one idle
+//!   `follow`;
 //! - the watch compares the project index's per-file `Arc`s (`state.workspace.index`, kept by
-//!   completion's project feed on the jobs thread 300 ms after typing stops) and the `.aux`
-//!   generation with what the page shows, and only on a change recomputes the outline (no GTK)
-//!   and **patches** the list models: unchanged rows keep their objects (and so their expanded
-//!   state and selection), changed rows are updated in place, and only rows that appeared are
-//!   created. The watch stops when the project index is idle (`completion::index_busy`: the
-//!   word list rebuilt later does not count) and nothing changed for two ticks.
+//!   completion's project feed on the jobs thread 300 ms after typing stops; a file whose index
+//!   comes out the same, as after typing prose, keeps its `Arc`) and the `.aux` generation with
+//!   what the page shows, and only on a change recomputes the outline (no GTK: the captions are
+//!   in the index too) and **patches** the list models: unchanged rows keep their objects (and
+//!   so their expanded state and selection), changed rows are updated in place, and only rows
+//!   that appeared are created. The watch stops when the project index is idle
+//!   (`completion::index_busy`: the word list rebuilt later does not count) and nothing changed
+//!   for two ticks.
 //!
 //! The project index has no change signal, so the watch is armed by the events that change it:
 //! document changes, tabs opened, closed and selected, the project root moving, finished
@@ -77,7 +82,7 @@
 //! [`is_expanded`], [`set_filter`], [`filter_results`], [`activate_filter`], [`page_state`],
 //! [`refresh`], [`is_settled`], [`stats`], [`root`], [`page`], [`row_line`]; the model is
 //! GUI-free and public too ([`build_outline`], [`parse_aux_text`], [`read_aux`],
-//! [`aux_candidates`], [`caption_in`], [`pretty_title`], [`tree_text_of`]).
+//! [`aux_candidates`], [`pretty_title`], [`tree_text_of`]).
 //!
 //! **Known limit:** rows that follow an `\input` in the including file nest under the including
 //! file's open headings, not under a section the included file opened (which LaTeX continues):
@@ -88,7 +93,9 @@ use crate::editor::completion;
 use crate::editor::goto::{self, GotoTarget};
 use crate::window::{PAGE_OUTLINE, WindowState};
 use adw::prelude::*;
-use lemma_syntax::{FileIndex, Include, IncludeKind, OutlineItem, ProjectIndex, parse_aux};
+use lemma_syntax::{
+    EnvPair, FileIndex, Include, IncludeKind, OutlineItem, ProjectIndex, parse_aux,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -128,9 +135,6 @@ const TOC_KINDS: [&str; 7] = [
     "paragraph",
     "subparagraph",
 ];
-
-/// How many lines after a float's `\begin` are searched for its caption.
-const CAPTION_LINES: u32 = 40;
 
 /// How many entries ahead [`align`] looks for a title.
 const ALIGN_WINDOW: usize = 8;
@@ -514,106 +518,6 @@ fn list_of(name: Option<&str>) -> FloatList {
     }
 }
 
-/// The caption of a float whose source from its `\begin` on is `text`: the short form of the
-/// first `\caption[short]{long}` that is not inside a `sub…` environment (a subfigure), else
-/// its long form; readable ([`pretty_title`]).
-pub fn caption_in(text: &str) -> Option<String> {
-    let clean: Vec<&str> = text.lines().map(strip_comment).collect();
-    let s = clean.join("\n");
-    let mut sub = 0usize;
-    let mut i = 0;
-    while let Some(off) = s[i..].find('\\') {
-        let at = i + off;
-        let name_end = s[at + 1..]
-            .find(|c: char| !c.is_ascii_alphabetic())
-            .map_or(s.len(), |n| at + 1 + n);
-        let name = &s[at + 1..name_end];
-        match name {
-            "" => {
-                // A control symbol (`\\`, `\{`): skip it whole.
-                i = at + 1 + s[at + 1..].chars().next().map_or(0, char::len_utf8);
-                continue;
-            }
-            "begin" | "end" => {
-                if let Some((env, end)) = group(&s, name_end) {
-                    if s[env].trim().starts_with("sub") {
-                        if name == "begin" {
-                            sub += 1;
-                        } else {
-                            sub = sub.saturating_sub(1);
-                        }
-                    }
-                    i = end;
-                    continue;
-                }
-            }
-            "caption" if sub == 0 => {
-                let mut j = name_end;
-                if s[j..].starts_with('*') {
-                    j += 1;
-                }
-                let short = bracket(&s, j);
-                if let Some((_, end)) = &short {
-                    j = *end;
-                }
-                let long = group(&s, j);
-                let text = short
-                    .map(|(r, _)| &s[r])
-                    .filter(|t| !t.trim().is_empty())
-                    .or_else(|| long.map(|(r, _)| &s[r]))?;
-                let title = pretty_title(&remove_commands(text, &["label", "index"]));
-                return (!title.is_empty()).then_some(title);
-            }
-            _ => {}
-        }
-        i = name_end;
-    }
-    None
-}
-
-/// The line without its `%` comment (an unescaped `%` and what follows).
-fn strip_comment(line: &str) -> &str {
-    let b = line.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => i += 2,
-            b'%' => return &line[..i],
-            _ => i += 1,
-        }
-    }
-    line
-}
-
-/// `text` without the commands `names` and their braced argument.
-fn remove_commands(text: &str, names: &[&str]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while let Some(off) = text[i..].find('\\') {
-        let at = i + off;
-        out.push_str(&text[i..at]);
-        let name_end = text[at + 1..]
-            .find(|c: char| !c.is_ascii_alphabetic())
-            .map_or(text.len(), |n| at + 1 + n);
-        let name = &text[at + 1..name_end];
-        if names.contains(&name)
-            && let Some((_, end)) = group(text, name_end)
-        {
-            i = end;
-            continue;
-        }
-        let end = if name.is_empty() {
-            (at + 1 + text[at + 1..].chars().next().map_or(0, char::len_utf8)).min(text.len())
-        } else {
-            name_end
-        };
-        out.push_str(&text[at..end]);
-        i = end;
-    }
-    out.push_str(&text[i..]);
-    out
-}
-
 /// A heading, theorem or float title made readable: font commands (`\emph{x}`, `\textbf{x}`)
 /// give their argument, `\texorpdfstring{tex}{text}` its text, accents and `~`, `--`, quotes
 /// their characters, `\&` and friends their symbol; math (`$…$`) and other commands stay as
@@ -914,20 +818,13 @@ enum Ev {
     Leave,
 }
 
-/// Builds the outline of `root`'s project from the project index, the `.aux` of the last build
-/// and `caption(path, begin_line, end_line)`, which gives a float's caption from the live text
-/// of an open document (or `None`).
-pub fn build_outline(
-    index: &ProjectIndex,
-    root: &Path,
-    aux: &AuxData,
-    caption: &dyn Fn(&Path, u32, u32) -> Option<String>,
-) -> Vec<Entry> {
+/// Builds the outline of `root`'s project from the project index and the `.aux` of the last
+/// build.
+pub fn build_outline(index: &ProjectIndex, root: &Path, aux: &AuxData) -> Vec<Entry> {
     let root_dir = root.parent().map(lexical_normalize).unwrap_or_default();
     let mut builder = Builder {
         index,
         aux,
-        caption,
         theorem_names: theorem_names(index),
         root_dir: root_dir.clone(),
         seen: HashSet::from([root.to_path_buf(), lexical_normalize(root)]),
@@ -940,7 +837,6 @@ pub fn build_outline(
 struct Builder<'a> {
     index: &'a ProjectIndex,
     aux: &'a AuxData,
-    caption: &'a dyn Fn(&Path, u32, u32) -> Option<String>,
     theorem_names: HashMap<String, String>,
     root_dir: PathBuf,
     seen: HashSet<PathBuf>,
@@ -1001,7 +897,7 @@ impl Builder<'_> {
             if in_preamble(env.begin_line) {
                 continue;
             }
-            let entry = self.float(path, &idx, &env.name, name, env.begin_line, env.end_line);
+            let entry = self.float(path, &idx, env, name);
             float_items.push((env.begin_line, Ev::Item(entry)));
         }
         // Included files.
@@ -1144,15 +1040,8 @@ impl Builder<'_> {
         }
     }
 
-    fn float(
-        &self,
-        path: &Path,
-        idx: &FileIndex,
-        env: &str,
-        name: &str,
-        begin: u32,
-        end: Option<u32>,
-    ) -> Entry {
+    fn float(&self, path: &Path, idx: &FileIndex, pair: &EnvPair, name: &str) -> Entry {
+        let (env, begin, end) = (pair.name.as_str(), pair.begin_line, pair.end_line);
         let from = idx.labels.partition_point(|l| l.line < begin);
         let label = idx.labels[from..]
             .iter()
@@ -1167,8 +1056,11 @@ impl Builder<'_> {
                 })
             });
         let number = label.and_then(|l| self.label_number(&l.name));
-        let last = end.unwrap_or(begin).min(begin + CAPTION_LINES);
-        let title = (self.caption)(path, begin, last)
+        let title = pair
+            .caption
+            .as_deref()
+            .map(pretty_title)
+            .filter(|title| !title.is_empty())
             .or_else(|| {
                 // A label's title is the caption when the caption came first.
                 let title = label?.title.as_deref()?;
@@ -1483,11 +1375,6 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// The braced group at `s[from..]` after blanks: its contents and where it ends.
 fn group(s: &str, from: usize) -> Option<(Range<usize>, usize)> {
     delimited(s, from, b'{', b'}')
-}
-
-/// The bracketed optional argument at `s[from..]` after blanks (braces nest inside it).
-fn bracket(s: &str, from: usize) -> Option<(Range<usize>, usize)> {
-    delimited(s, from, b'[', b']')
 }
 
 fn delimited(s: &str, from: usize, open: u8, close: u8) -> Option<(Range<usize>, usize)> {
@@ -2034,6 +1921,10 @@ struct Panel {
     aux_hint: RefCell<Option<PathBuf>>,
     /// Rows per file in line order (headings, theorems, floats), and file rows by path.
     by_file: RefCell<HashMap<PathBuf, Vec<Rc<Node>>>>,
+    /// Rows were moved by `shift_lines` since the last sync. When the project index catches up
+    /// with the same entries (the lines were put back as they were: a deletion undone), the
+    /// outline is computed again anyway, so the rows go back to the index's lines.
+    drifted: Cell<bool>,
     file_nodes: RefCell<HashMap<PathBuf, Rc<Node>>>,
     collapsed: RefCell<HashSet<NodeKey>>,
     /// The watch timer and its quiet ticks.
@@ -2222,6 +2113,7 @@ impl Panel {
                 aux_stale: Cell::new(false),
                 aux_hint: RefCell::new(None),
                 by_file: RefCell::new(HashMap::new()),
+                drifted: Cell::new(false),
                 file_nodes: RefCell::new(HashMap::new()),
                 collapsed: RefCell::new(HashSet::new()),
                 watch: RefCell::new(None),
@@ -2562,8 +2454,12 @@ impl Panel {
             }
         };
         for node in nodes {
-            node.line.set(shift(node.line.get()));
-            node.end_line.set(node.end_line.get().map(shift));
+            let (line, end_line) = (node.line.get(), node.end_line.get());
+            node.line.set(shift(line));
+            node.end_line.set(end_line.map(shift));
+            if node.line.get() != line || node.end_line.get() != end_line {
+                self.drifted.set(true);
+            }
         }
     }
 
@@ -2633,7 +2529,9 @@ impl Panel {
                 self.aux_generation.get(),
             )
         });
-        if unchanged {
+        // Rows moved ahead of the index go back to its lines once it has caught up.
+        let drifted = self.drifted.get() && !completion::index_busy(&state);
+        if unchanged && !drifted {
             return false;
         }
         let index = state.workspace.index.borrow();
@@ -2713,12 +2611,11 @@ impl Panel {
 
     fn sync(self: &Rc<Self>, state: &Rc<WindowState>) {
         let started = Instant::now();
+        self.drifted.set(false);
         let entries = match self.root.borrow().clone() {
             Some(root) => {
                 let aux = self.aux.borrow().clone();
-                let caption =
-                    |path: &Path, begin: u32, end: u32| live_caption(state, path, begin, end);
-                build_outline(&state.workspace.index.borrow(), &root, &aux, &caption)
+                build_outline(&state.workspace.index.borrow(), &root, &aux)
             }
             None => Vec::new(),
         };
@@ -3405,17 +3302,6 @@ fn top_heading_level(entries: &[Entry]) -> u8 {
     if top == u8::MAX { 2 } else { top }
 }
 
-/// The caption of the float on lines `begin..=end` of `path`, read from its open document.
-fn live_caption(state: &WindowState, path: &Path, begin: u32, end: u32) -> Option<String> {
-    let doc = state.workspace.get(path).filter(|d| d.is_open())?;
-    let mut text = String::new();
-    for line in begin..=end {
-        text.push_str(&doc.line_text(line)?);
-        text.push('\n');
-    }
-    caption_in(&text)
-}
-
 /// The root of the active document's project: the build's root when its project holds the
 /// document, else the outermost indexed root that does, else the LaTeX document itself (a
 /// chapter whose root is not known yet, a document of its own). For another kind of file (a
@@ -3707,9 +3593,9 @@ pub fn is_settled(state: &WindowState) -> bool {
             panel.aux_generation.get(),
         )
     });
-    if !current {
+    if !current || panel.drifted.get() {
         // Something changed the index without an event the page watches (a test's
-        // `completion::refresh_project`): look again.
+        // `completion::refresh_project`), or rows moved ahead of it: look again.
         panel.poke();
         return false;
     }
@@ -3860,17 +3746,6 @@ mod tests {
         assert_eq!(norm_words("Filler subsection 1"), "filler subsection 1");
     }
 
-    #[test]
-    fn captions_from_source() {
-        let text = "\\begin{figure}[ht]\n\\centering % \\caption{no}\n\
-                    \\begin{subfigure}{.4\\textwidth}\\caption{sub}\\end{subfigure}\n\
-                    \\caption[Short form]{Long \\emph{form}\n with a break}\\label{fig:a}\n\\end{figure}";
-        assert_eq!(caption_in(text).as_deref(), Some("Short form"));
-        let text = "\\begin{table}\n\\caption{A \\textbf{bold}\n table\\label{t}}\n\\end{table}";
-        assert_eq!(caption_in(text).as_deref(), Some("A bold table"));
-        assert_eq!(caption_in("\\begin{figure}\n\\end{figure}"), None);
-    }
-
     fn key(level: u8, words: &str, unnumbered: bool) -> AlignKey {
         AlignKey {
             level,
@@ -3933,11 +3808,11 @@ mod tests {
             ("/p/empty.tex", "Just text.\n"),
             ("/p/plot.tex", "\\draw (0,0);\n"),
         ]);
-        let tree = build_outline(&index, &root, &AuxData::default(), &|_, _, _| None);
+        let tree = build_outline(&index, &root, &AuxData::default());
         assert_eq!(
             tree_text_of(&tree),
             "One\n  Intro\n  [sec.tex]\n    Second\n      Lemma\n[ch2.tex]\n  Two\n    ∗ Notes\n\
-             [empty.tex]\nFigure\n"
+             [empty.tex]\nFigure P\n"
         );
     }
 
@@ -3961,7 +3836,7 @@ mod tests {
             line("subsection", Some("2.1"), "Deep"),
         ];
         aux.lof = vec![line("figure", Some("1"), r"{\ignorespaces Cap}")];
-        let tree = build_outline(&index, &root, &aux, &|_, _, _| None);
+        let tree = build_outline(&index, &root, &aux);
         assert_eq!(
             tree_text_of(&tree),
             "1 First\n  Theorem 1.1 (Big)\n2 Second\n  2.1 Deep\n    Remark\n    Figure 1 Cap\n\
@@ -3985,7 +3860,7 @@ mod tests {
             ],
             ..AuxData::default()
         };
-        let tree = build_outline(&index, &root, &aux, &|_, _, _| None);
+        let tree = build_outline(&index, &root, &aux);
         assert_eq!(
             tree_text_of(&tree),
             "Part I Base\n  ∗ Preface\n  1 Start\n    ∗ Unnumbered\n      ∗ Mini\n"
@@ -4034,12 +3909,7 @@ mod fixture_tests {
             let text = std::fs::read_to_string(dir.join(file)).unwrap();
             index.update_file(dir.join(file), Arc::new(index_file(&text)));
         }
-        let tree = build_outline(
-            &index,
-            &dir.join("main.tex"),
-            &AuxData::default(),
-            &|_, _, _| None,
-        );
+        let tree = build_outline(&index, &dir.join("main.tex"), &AuxData::default());
         fn find<'a>(entries: &'a [Entry], title: &str) -> Option<&'a Entry> {
             entries.iter().find_map(|e| {
                 (e.title == title)

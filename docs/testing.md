@@ -329,10 +329,27 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   collected on the next build's pass, and, in `the_project_feed_reads_local_packages`, that a local `.sty` (and what it loads) and the
   root's `.cls` reach the index and completion and leave it with their `\usepackage`;
   `gtk_outline` `theorems_declared_in_a_preamble_file` that a preamble's (or a local package's
-  or class's) `\newtheorem` names the rows of chapters read before it, `gtk_goto` that F12 on a
+  or class's) `\newtheorem` names the rows of chapters read before it, and of an open chapter
+  whose own re-index runs while the declaration is merged (its index comes out the same, yet
+  it is indexed again with the new name), `gtk_goto` that F12 on a
   local package's macro goes to its `.sty`, and `gtk_labels`
   `undefined_shows_without_waiting_for_the_words` that the check runs while the words timer
-  still waits (in a release build, under 1.2 s after the edit).
+  still waits (in a release build, under 1.2 s after the edit). `gtk_completion`'s test at the
+  cap also checks that a build's pass over the 40 distribution packages makes the main thread
+  resolve no path on the file system (`workspace::normalizations`, a per-thread count of
+  `normalize`), and `the_project_feed_follows_files_outside_the_folder` writes a bibliography
+  and a chapter outside the workspace folder (`../central/refs.bib`, `\input{../shared/intro}`)
+  as another program would: changed, deleted and written again, they reach the index through
+  the directories the file monitor watches for it (`watcher::watched_outside`), which go when
+  the `\input` does; of 40 such directories the first 32 are watched.
+- **The Outline and typing:** `gtk_outline` `prose_typed_recomputes_nothing_a_caption_its_row`
+  types words into a paragraph with a pause after each (the document is indexed again each
+  time) and checks that the outline is not recomputed (`outline::stats(…).syncs`); two lines
+  deleted and put back before the index catches up leave no row on a shifted line; a caption
+  of a float without a label (only the structure pass records it, `EnvPair::caption`) and an
+  emptied short form update their rows. `lemma-syntax` `structure_index` `float_captions`
+  checks what the structure pass records (subfigures, `\caption*`, an empty short form,
+  verbatim).
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep
@@ -372,7 +389,7 @@ check the budgets only in release builds:
 | `lemma-agent` `perf_text_deltas_append_in_place` | the API backend's streamed deltas appended to their block: 32k deltas of 16 bytes ≤ 20 ms, and twice the deltas ≤ 3× the time (measured 0.8 ms; 230 ms when every delta copied the block) |
 | `gtk_agent_panel` `perf_streamed_table` | a 60-row, 5-column table streaming in 10-byte chunks: each chunk's re-render and layout of the table ≤ 2 ms p99, and the table is never built again |
 | `lemma-syntax` `perf_index_pathological` | `index_file` on 14 pathological shapes (unclosed groups, stray `\end`, unterminated `\iffalse`, …) stays linear: twice the size ≤ 3× the time, ≤ 200 ms per MB |
-| `gtk_outline` `perf_outline_keystroke` | the outline's work per keystroke on the 7k-line corpus (first 7000 lines of `large.tex`) ≤ 1 ms (p99 and mean); `perf_outline_large_tex` prints the first outline and a patch on `large.tex` |
+| `gtk_outline` `perf_outline_keystroke` | the outline's work per keystroke on the 7k-line corpus (first 7000 lines of `large.tex`) ≤ 1 ms (p99 and mean); `perf_outline_large_tex` prints the first outline and a patch on `large.tex` and the first outline of 2000 floats, and checks that prose typed with three pauses recomputes neither (before: 3 recomputations, 16 ms in all on `large.tex`, 87 ms with the floats) |
 | `gtk_pairs` `perf_pairs_cursor_moves_large_tex` | delimiter-pair highlight per cursor move on `large.tex` ≤ 0.5 ms p99 |
 | `gtk_git_gutter` `perf_git_gutter_keystrokes_large_tex` | the git gutter's main-thread cost per keystroke on `large.tex` (with against without the gutter) and per diff |
 | `gtk_search` `perf_search_10k_frame_budget` | the Search page's work per main-loop step while 10 000 matches stream in ≤ 4 ms |

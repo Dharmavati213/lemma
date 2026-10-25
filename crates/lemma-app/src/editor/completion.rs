@@ -66,8 +66,12 @@
 //! changes, creates or deletes (a re-exported `.bib`, a `git checkout`, a chapter edited
 //! elsewhere, a file an `\input` named before it existed) are read again as the file monitor
 //! reports them ([`disk_changed`]; a file that is gone leaves the index), and the file list is
-//! made again when files come or go ([`files_moved`]). The monitor watches the workspace folder
-//! only: a `.bib` outside it is read again after a build. When the project's theorem environments
+//! made again when files come or go ([`files_moved`]). Outside the workspace folder (a central
+//! `.bib`, a chapter included through `../`, a root above the folder) the monitor watches the
+//! directories of those files for the index (`watcher::watch_outside`, at most
+//! `watcher::MAX_OUTSIDE_DIRS`). A re-index that gives a document the index it had (prose
+//! typed: the same lines, titles, labels and captions) keeps the index's entry, so the Outline
+//! sees no change, and only the words are rebuilt. When the project's theorem environments
 //! change (a preamble file read after the chapters that use its `\newtheorem`s, a declaration
 //! typed or removed), the files whose environments use a changed name are indexed again, so
 //! their theorem rows and label titles follow. A `.tex` file next to an open document joins the
@@ -101,7 +105,7 @@ use lemma_syntax::{
 use sourceview5::prelude::*;
 use sourceview5::subclass::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
@@ -526,10 +530,11 @@ fn shared_for(state: &Rc<WindowState>) -> Rc<Shared> {
         }
     });
     let weak = Rc::downgrade(&shared);
-    let root = state.connect_root_changed(move |_| {
+    let root = state.connect_root_changed(move |state| {
         if let Some(shared) = weak.upgrade() {
             shared.feed.walked_dir.replace(None);
             shared.discover();
+            shared.watch_outside(state);
         }
     });
     shared.hooks.replace(vec![config, root]);
@@ -1736,11 +1741,13 @@ pub fn index_busy(state: &WindowState) -> bool {
     shared_of(state).is_some_and(|s| s.feed.index_busy())
 }
 
-/// The file monitor saw the file at `path` (normalized) change, appear or go, by another
-/// program. When the project index has it from disk (an included file that is not open, a
-/// bibliography, open or not) or could not read it before (an `\input` written before its
-/// file), it is read again on the jobs thread (a file that is gone leaves the index), and the
-/// label checks and the Outline follow once the index has caught up. True when that happens.
+/// The file monitor saw the file at `path` change, appear or go, by another program: `path` is
+/// normalized, or, outside the workspace folder, as the index names it (the monitor watches
+/// those directories by the index's paths). When the project index has it from disk (an
+/// included file that is not open, a bibliography, open or not) or could not read it before (an
+/// `\input` written before its file), it is read again on the jobs thread (a file that is gone
+/// leaves the index), and the label checks and the Outline follow once the index has caught up.
+/// True when that happens.
 /// Open LaTeX documents are indexed from their live text and need nothing. `own_write`: Lemma
 /// wrote the file (a save), whose text the index has already (`labels::saved`), so it is read
 /// only when the index could not read it before (deleted by another program, then saved).
@@ -1810,8 +1817,9 @@ struct Feed {
     /// A discovery pass is running; `again` asks for another one when it ends.
     discovering: Cell<bool>,
     again: Cell<bool>,
-    /// Paths that could not be read (retried after a build, or when the file monitor sees them
-    /// change).
+    /// Paths that could not be read, or that name an open document through a symbolic link
+    /// (its live text is indexed under its own name): not read again until a build, or until
+    /// the file monitor sees them change.
     unreadable: RefCell<HashSet<PathBuf>>,
     /// Directories already searched for `.tex` files.
     searched: RefCell<HashSet<PathBuf>>,
@@ -1826,6 +1834,13 @@ struct Feed {
     stale: RefCell<HashSet<PathBuf>>,
     /// The document classes of indexed files (`\documentclass{…}`).
     classes: RefCell<HashMap<PathBuf, String>>,
+    /// What the last [`Shared::index_changed`] followed besides the index: a re-index that
+    /// leaves a document's index as it was skips it only while these are the same.
+    followed: RefCell<Option<Followed>>,
+    /// The directories of the files the index reads from disk, or would read (an `\input` of
+    /// a file that does not exist yet), as the last [`Shared::prune`] kept them: those outside
+    /// the workspace folder are watched for the index ([`Shared::watch_outside`]).
+    disk_dirs: RefCell<BTreeSet<PathBuf>>,
     /// The root whose `.aux` is loaded.
     aux_root: RefCell<Option<PathBuf>>,
     /// The `.aux` beside the PDF of the last build, read before the usual places.
@@ -1909,14 +1924,21 @@ type Theorems = Arc<Vec<String>>;
 /// A possible root found next to an open document: its index and document class.
 type Candidate = (Arc<FileIndex>, Option<String>);
 
+/// What [`Shared::index_changed`] follows besides the index: the project root and the open
+/// LaTeX documents (their candidates are promoted, their roots' packages and `.aux` loaded).
+type Followed = (Option<PathBuf>, HashSet<PathBuf>);
+
 /// What the base words are built from: the dictionary, and the `.tex` files read from disk with
 /// the hashes of their texts, by path.
 type BaseInputs = (Arc<WordList>, Vec<(PathBuf, u64)>);
 
-/// A file a discovery job read: `listed` when it was found by listing a directory (a possible
-/// root), not through an include; `hash`, of its text ([`text_hash`]).
+/// A file a discovery job read: `key`, its path normalized on the jobs thread (the key of the
+/// document it would be, when it was read; else the path); `listed` when it was found by
+/// listing a directory (a possible root), not through an include; `hash`, of its text
+/// ([`text_hash`]).
 struct ReadFile {
     path: PathBuf,
+    key: PathBuf,
     read: IndexedFile,
     listed: bool,
     hash: u64,
@@ -2000,12 +2022,16 @@ impl Shared {
         let text = doc.text();
         let theorems = self.current_theorems(&state.workspace.index.borrow());
         let used = theorems.clone();
+        // The index's entry now: the job tells whether the new one is the same.
+        let old = state.workspace.index.borrow().files.get(&path).cloned();
         let weak = Rc::downgrade(self);
         self.feed.jobs.set(self.feed.jobs.get() + 1);
         glib::spawn_future_local(async move {
             let indexed = gio::spawn_blocking(move || {
                 let class = document_class(&text).map(str::to_owned);
-                (index_file_with_theorems(&text, &used), class)
+                let index = index_file_with_theorems(&text, &used);
+                let same = old.filter(|old| **old == index);
+                (index, class, same)
             })
             .await;
             let Some(shared) = weak.upgrade() else {
@@ -2024,7 +2050,8 @@ impl Shared {
                 .borrow()
                 .get(&path)
                 .is_some_and(|merged| *merged > generation);
-            if let Ok((index, class)) = indexed
+            if let Ok((index, class, same)) = indexed
+                && let Some(state) = shared.state()
                 && open.is_some()
                 && !newer_merged
             {
@@ -2033,18 +2060,62 @@ impl Shared {
                     .merged_generation
                     .borrow_mut()
                     .insert(path.clone(), generation);
+                let unchanged =
+                    shared.unchanged(&state, &path, same.as_ref(), class.as_deref(), &theorems);
                 shared
                     .feed
                     .indexed_with
                     .borrow_mut()
                     .insert(path.clone(), theorems);
-                shared.merge_file(path, index, class);
-                shared.index_changed(false);
+                if unchanged {
+                    // Prose typed: the structure is as it was. The index keeps the file's entry,
+                    // so the Outline and the label checks have nothing to look at again; only
+                    // the words follow the text.
+                    shared.schedule_words();
+                } else {
+                    shared.merge_file(path, index, class);
+                    shared.index_changed(false);
+                }
             }
             if again && let Some(doc) = open {
                 shared.index_document(&doc);
             }
         });
+    }
+
+    /// Whether a re-index of the open document at `path` changes nothing: its new index is the
+    /// same as `same` (the entry the job compared it with), which the index still holds, with
+    /// the same document class, the job ran with the project's current theorem environments
+    /// (`used`: names that changed while it ran made [`Self::follow_theorems`] leave the
+    /// running job to its merge), and the project root and the open documents are what the
+    /// last [`Self::index_changed`] followed (a tab just opened, or another root made current,
+    /// still has its candidates promoted and its packages and `.aux` loaded).
+    fn unchanged(
+        &self,
+        state: &WindowState,
+        path: &Path,
+        same: Option<&Arc<FileIndex>>,
+        class: Option<&str>,
+        used: &Theorems,
+    ) -> bool {
+        let Some(same) = same else {
+            return false;
+        };
+        state
+            .workspace
+            .index
+            .borrow()
+            .files
+            .get(path)
+            .is_some_and(|now| Arc::ptr_eq(now, same))
+            && self.feed.classes.borrow().get(path).map(String::as_str) == class
+            && Arc::ptr_eq(used, &self.feed.theorems.borrow())
+            && self.feed.followed.borrow().as_ref() == Some(&self.followed(state))
+    }
+
+    /// What [`Self::index_changed`] follows now besides the index (see [`Followed`]).
+    fn followed(&self, state: &WindowState) -> Followed {
+        (self.project_root(state), open_latex_documents(state))
     }
 
     fn merge_file(&self, path: PathBuf, index: FileIndex, class: Option<String>) {
@@ -2099,6 +2170,7 @@ impl Shared {
             self.walk_files();
         }
         self.discover();
+        self.watch_outside(&state);
         if !disk {
             self.schedule_words();
         } else if self.base_words_current() {
@@ -2107,6 +2179,24 @@ impl Shared {
         } else {
             self.rebuild_base_words();
         }
+        self.feed.followed.replace(Some(self.followed(&state)));
+    }
+
+    /// Has the file monitor watch the directories outside the workspace folder that hold files
+    /// the index reads from disk ([`Feed::disk_dirs`]): a central `.bib`, a chapter included
+    /// through `../`, a root above the folder. Their changes then reach the index as those of
+    /// the files inside it do.
+    fn watch_outside(&self, state: &Rc<WindowState>) {
+        let root = state.workspace.root().path().to_path_buf();
+        let dirs: BTreeSet<PathBuf> = self
+            .feed
+            .disk_dirs
+            .borrow()
+            .iter()
+            .filter(|dir| !dir.starts_with(&root))
+            .cloned()
+            .collect();
+        crate::agent::watcher::watch_outside(state, &dirs);
     }
 
     /// The project's theorem environments in `index`, shared with the files already indexed
@@ -2244,11 +2334,16 @@ impl Shared {
             budget,
             ..Wanted::default()
         };
+        // Open documents are indexed from their live text. They are looked up by the path as the
+        // index names it, without the file system (`Workspace::get` would resolve the path of
+        // every package of the distribution after each build); one reached through a symbolic
+        // link is told by the job's `key` (see `merge_discovered`).
+        let open = open_documents(state);
         let mut seen = HashSet::new();
         let mut want_file = |path: PathBuf, wanted: &mut Wanted| {
             if (!index.files.contains_key(&path) || stale.contains(&path))
                 && !unreadable.contains(&path)
-                && state.workspace.get(&path).is_none_or(|d| !d.is_open())
+                && !open.contains(&path)
                 && seen.insert(path.clone())
             {
                 wanted.files.push(path);
@@ -2364,16 +2459,23 @@ impl Shared {
         };
         let mut changed = false;
         self.feed.searched.borrow_mut().extend(found.searched);
+        let open = open_documents(&state);
         for ReadFile {
             path,
+            key,
             read,
             listed,
             hash,
         } in found.files
         {
             self.feed.stale.borrow_mut().remove(&path);
-            if state.workspace.get(&path).is_some_and(|d| d.is_open()) {
-                continue; // The live text is indexed instead.
+            if open.contains(&key) {
+                // The live text is indexed instead. A path that names it through a symbolic
+                // link is not read again on every pass.
+                if key != path {
+                    self.feed.unreadable.borrow_mut().insert(path);
+                }
+                continue;
             }
             match read {
                 Some((index, class)) => {
@@ -2543,6 +2645,16 @@ impl Shared {
             .collect();
         index.bibs.retain(|path, _| bibs.contains(path));
         drop(index);
+        // Where what is read from disk lives: the files kept but the open documents (and the
+        // includes not read yet), and the bibliographies.
+        let disk_dirs: BTreeSet<PathBuf> = keep
+            .iter()
+            .filter(|path| !open.contains(*path))
+            .chain(&bibs)
+            .filter_map(|path| path.parent())
+            .map(Path::to_path_buf)
+            .collect();
+        self.feed.disk_dirs.replace(disk_dirs);
         // The `.aux` of a root that is no longer the project's goes too.
         let root = self.project_root(state);
         let aux_kept = self
@@ -2927,6 +3039,18 @@ fn keys_naming<'a>(keys: impl Iterator<Item = &'a PathBuf>, path: &Path) -> Vec<
     .collect()
 }
 
+/// The paths of the open documents of `state`'s window (of any kind), as the workspace keys
+/// them.
+fn open_documents(state: &WindowState) -> HashSet<PathBuf> {
+    state
+        .workspace
+        .documents()
+        .iter()
+        .filter(|d| d.is_open())
+        .map(|d| d.path().to_path_buf())
+        .collect()
+}
+
 /// The open LaTeX documents of `state`'s window.
 fn open_latex_documents(state: &WindowState) -> HashSet<PathBuf> {
     state
@@ -3082,12 +3206,17 @@ fn read_wanted(wanted: Wanted) -> Discovered {
             continue;
         }
         let hash = text.as_deref().map(text_hash).unwrap_or_default();
+        let key = match text {
+            Some(_) => crate::workspace::normalize(&path),
+            None => path.clone(),
+        };
         let read = text.map(|text| {
             let class = document_class(&text).map(str::to_owned);
             (index_file_with_theorems(&text, &wanted.theorems), class)
         });
         found.files.push(ReadFile {
             path,
+            key,
             read,
             listed,
             hash,

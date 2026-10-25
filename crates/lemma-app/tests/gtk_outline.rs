@@ -63,6 +63,10 @@ fn main() -> ExitCode {
             a_chapter_changed_on_disk,
         ),
         (
+            "prose_typed_recomputes_nothing_a_caption_its_row",
+            prose_and_captions,
+        ),
+        (
             "clicks_on_rows_and_arrows_with_a_real_pointer",
             real_clicks::parent,
         ),
@@ -864,7 +868,9 @@ const THEOREMS_TREE: &str = "Results\n  [parts/later.tex]\n    Later\n      Main
 /// typed after the chapter was indexed; and declared in a local package or class
 /// (`\usepackage{mythms}` with `mythms.sty`, `\documentclass{mythesis}` with `mythesis.cls`).
 /// Nothing but the feed itself indexes the files again (the page is shown without
-/// `completion::refresh_project`).
+/// `completion::refresh_project`), except at the end: a declaration typed in the root while the
+/// open chapter is indexed again (`refresh_project` starts both jobs at once) still reaches the
+/// chapter, whose own index came out as it was.
 fn theorems_from_a_preamble_file() {
     let files = [
         ("main.tex", THEOREMS_MAIN),
@@ -933,6 +939,35 @@ fn theorems_from_a_preamble_file() {
     f.wait_tree("no theorem once the preamble is gone", |t| {
         t == "Results\n  [parts/later.tex]\n    Later\n"
     });
+    // Declared while the open chapter is indexed again (both documents at once, the long
+    // chapter last): the chapter's index comes out as it was, yet it is indexed again with the
+    // new name.
+    let later = format!(
+        "{THEOREMS_LATER}{}",
+        "Words of a long chapter.\n".repeat(20_000)
+    );
+    let f = fixture(
+        "theorems-racing",
+        None,
+        &[
+            (
+                "main.tex",
+                &THEOREMS_MAIN.replace("\\input{preamble}\n", ""),
+            ),
+            ("parts/later.tex", &later),
+        ],
+    );
+    let main = f.open("main.tex");
+    f.open("parts/later.tex");
+    f.state.sidebar.show_page(PAGE_OUTLINE);
+    f.wait_tree("no theorem before the declaration", |t| {
+        t == "Results\n  [parts/later.tex]\n    Later\n"
+    });
+    insert_at_line(&main, 1, THEOREMS_PREAMBLE);
+    completion::refresh_project(&f.state);
+    f.wait_tree("the theorem declared while the chapter is indexed", |t| {
+        t == THEOREMS_TREE
+    });
 }
 
 /// Another program changes a chapter that is not open (a `git checkout`, another editor): the
@@ -955,6 +990,78 @@ fn a_chapter_changed_on_disk() {
         );
         common::pump_for(Duration::from_millis(20));
     }
+}
+
+const PROSE_MAIN: &str = "\\documentclass{article}\n\\begin{document}\n\\section{Plots}\n\
+We plot the data.\n\\begin{table}\n  \\caption{Numbers \\emph{and} words}\n\\end{table}\n\
+\\begin{figure}\n  \\begin{subfigure}{.4\\textwidth}\\caption{Left}\\end{subfigure}\n\
+  \\caption[Short]{A long caption}\n\\end{figure}\n\\end{document}\n";
+
+/// Prose typed in a paragraph leaves the project index's structure as it was: the document is
+/// indexed again after each pause, the index keeps the file's entry and the outline is not
+/// recomputed. A caption edited in a float without a label (which only the structure pass
+/// records) updates its row, and a short form emptied shows the long one.
+fn prose_and_captions() {
+    let f = fixture("prose", None, &[("main.tex", PROSE_MAIN)]);
+    let main = f.open("main.tex");
+    f.show_outline();
+    f.wait_tree("the floats", |tree| {
+        tree == "Plots\n  Table Numbers and words\n  Figure Short\n"
+    });
+    let state = f.state.clone();
+    let indexed = || !completion::index_busy(&state) && outline::is_settled(&state);
+    let before = f.stats();
+    let prose = f.line_of("main.tex", "We plot the data.");
+    for word in ["really ", "x", "y"] {
+        let offset = main.document().line_index().line_start(prose) + 3;
+        let buffer = main.buffer();
+        let mut at = main.iter_near(offset).unwrap();
+        buffer.begin_user_action();
+        buffer.insert(&mut at, word);
+        buffer.end_user_action();
+        // The document is indexed again (300 ms after the change).
+        assert!(completion::index_busy(&f.state));
+        common::pump_until(TIMEOUT, indexed);
+    }
+    assert!(
+        main.document()
+            .text()
+            .contains("We yxreally plot the data.")
+    );
+    assert_eq!(f.stats().syncs, before.syncs, "{:?}", f.stats());
+    // Two lines deleted and put back before the index catches up: it comes back the same, and
+    // the rows the deletion moved go back to its lines.
+    let table = f.line_of("main.tex", "\\begin{table}");
+    let (start, end) = {
+        let lines = main.document().line_index();
+        (lines.line_start(table - 1), lines.line_start(table + 1))
+    };
+    let deleted = main.document().text()[start..end].to_owned();
+    let buffer = main.buffer();
+    let (mut a, mut b) = (main.iter_near(start).unwrap(), main.iter_near(end).unwrap());
+    buffer.delete(&mut a, &mut b);
+    let mut at = main.iter_near(start).unwrap();
+    buffer.insert(&mut at, &deleted);
+    assert_ne!(
+        outline::row_line(&f.state, "Table Numbers and words"),
+        Some(table)
+    );
+    common::pump_until(TIMEOUT, indexed);
+    assert_eq!(
+        outline::row_line(&f.state, "Table Numbers and words"),
+        Some(table)
+    );
+    // A caption edited: its row follows.
+    replace(&main, "\\caption{Numbers", "\\caption{Counts");
+    f.wait_tree("the edited caption", |tree| {
+        tree == "Plots\n  Table Counts and words\n  Figure Short\n"
+    });
+    assert!(f.stats().syncs > before.syncs);
+    // The short form emptied: the long one shows.
+    replace(&main, "[Short]", "[]");
+    f.wait_tree("the long form", |tree| {
+        tree.ends_with("  Figure A long caption\n")
+    });
 }
 
 fn which(program: &str) -> Option<PathBuf> {
@@ -1077,6 +1184,63 @@ fn perf_large() {
             "{patched:?}"
         );
     }
+    // Prose typed (no line added or removed), with a pause after each word: the document is
+    // indexed again each time, its structure is the same, and the outline has nothing to do.
+    let prose = prose_typing(&f, &main, "Line 5 with math");
+    println!(
+        "perf_outline_large_tex: prose typed with 3 pauses: {} recomputations, {:?} in all",
+        prose.0, prose.1
+    );
+    drop(f);
+    // 2000 floats with captions: the first outline (no caption is read from the buffer).
+    let mut text = String::from("\\documentclass{article}\n\\begin{document}\n");
+    for i in 0..2000 {
+        text += &format!(
+            "\\section{{S{i}}}\nText {i}.\n\\begin{{figure}}\n  \\centering\n  \\includegraphics{{p{i}}}\n  \
+             \\caption{{Plot number {i}}}\n\\end{{figure}}\n"
+        );
+    }
+    text += "\\end{document}\n";
+    let f = fixture("perf-floats", None, &[("main.tex", &text)]);
+    let main = f.open("main.tex");
+    f.show_outline();
+    f.wait_tree("the floats", |tree| {
+        tree.contains("  Figure Plot number 1999\n")
+    });
+    let first = f.stats();
+    let floats = prose_typing(&f, &main, "Text 1000.");
+    println!(
+        "perf_outline_large_tex: 2000 floats: first outline {:?} (outline {:?}); prose typed with \
+         3 pauses: {} recomputations, {:?} in all",
+        first.max_sync, first.last_build, floats.0, floats.1
+    );
+    assert_eq!((prose.0, floats.0), (0, 0));
+}
+
+/// Types three words before the first `needle` in `main`, each after the project index and the
+/// outline settled: how many recomputations of the outline that caused, and their time.
+fn prose_typing(f: &Fixture, main: &Editor, needle: &str) -> (u64, Duration) {
+    let state = f.state.clone();
+    let indexed = || !completion::index_busy(&state) && outline::is_settled(&state);
+    common::pump_until(TIMEOUT, indexed);
+    let before = f.stats();
+    let mut spent = Duration::ZERO;
+    for word in ["very ", "much ", "so "] {
+        let text = main.document().text();
+        let at = text.find(needle).expect("the prose line");
+        let buffer = main.buffer();
+        let mut iter = main.iter_near(at).unwrap();
+        buffer.begin_user_action();
+        buffer.insert(&mut iter, word);
+        buffer.end_user_action();
+        let syncs = f.stats().syncs;
+        common::pump_for(Duration::from_millis(50));
+        common::pump_until(TIMEOUT, indexed);
+        if f.stats().syncs > syncs {
+            spent += f.stats().last_sync;
+        }
+    }
+    (f.stats().syncs - before.syncs, spent)
 }
 
 mod real_clicks {

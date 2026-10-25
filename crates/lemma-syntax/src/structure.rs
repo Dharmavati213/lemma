@@ -90,6 +90,12 @@ pub struct EnvPair {
     pub begin_line: u32,
     /// 0-based line of the matching `\end`.
     pub end_line: Option<u32>,
+    /// The caption of the environment (a float's): the first `\caption[short]{long}` (or
+    /// `\caption*`) inside it that is not inside a `sub…` environment within it (a subfigure's
+    /// own caption), `short` unless it is empty, else `long`, cleaned as titles are (comments,
+    /// `\label`, `\index`, `\footnote` and `\protect` removed, whitespace collapsed). `None`
+    /// without one, and always for `document`.
+    pub caption: Option<String>,
 }
 
 /// The command that pulled in another file.
@@ -530,15 +536,43 @@ impl<'a> Indexer<'a> {
     }
 
     fn caption(&mut self, after: usize) -> usize {
-        let j = skip_space(self.b, skip_optionals(self.b, after, 1));
-        let Some((content, _)) = brace(self.b, j) else {
+        let b = self.b;
+        let (_, j) = star(b, after);
+        let j = skip_space(b, j);
+        let short = bracket(b, j);
+        let k = skip_space(b, short.as_ref().map_or(j, |(_, end)| *end));
+        let Some((content, _)) = brace(b, k) else {
             return after;
         };
         let title = clean_title(&self.s[content.clone()]);
+        let caption = short
+            .map(|(range, _)| clean_title(&self.s[range]))
+            .filter(|short| !short.is_empty())
+            .unwrap_or_else(|| title.clone());
         if !title.is_empty() {
             self.title = Some(Rc::from(title.as_str()));
         }
+        if !caption.is_empty() {
+            self.set_caption(&caption);
+        }
         content.start
+    }
+
+    /// Makes `caption` the caption of the open environments that have none yet, from the
+    /// innermost out, up to the first `sub…` one (whose caption it is alone) and never
+    /// `document`. The walk stops at an environment that has a caption: the ones around it, up
+    /// to such a `sub…` one, got it at the same time.
+    fn set_caption(&mut self, caption: &str) {
+        for frame in self.stack.iter().rev() {
+            let env = &mut self.out.envs[frame.env];
+            if env.caption.is_some() || env.name == "document" {
+                break;
+            }
+            env.caption = Some(caption.to_owned());
+            if env.name.starts_with("sub") {
+                break;
+            }
+        }
     }
 
     // ----- environments -----
@@ -579,6 +613,7 @@ impl<'a> Indexer<'a> {
                     name,
                     begin_line: line,
                     end_line: Some(end_line),
+                    caption: None,
                 });
                 return close_at + closing.len();
             }
@@ -594,6 +629,7 @@ impl<'a> Indexer<'a> {
             name: name.clone(),
             begin_line: line,
             end_line: None,
+            caption: None,
         });
         if !theorem {
             return end;

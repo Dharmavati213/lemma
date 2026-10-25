@@ -164,6 +164,15 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - With thousands of hunks in a file (a Format Document, a project-wide replace), the review
   overlay re-tags only what moved: with 3000 hunks, its update after a recompute takes 10 ms
   instead of 85 ms, and after a line break above them 36 ms instead of 0.34 s.
+- With the Outline shown, typing prose no longer makes it recompute the whole outline at every
+  pause: a document whose headings, theorems, labels, captions and includes stay as they were
+  keeps its place in the project index, and only the words for completion are collected again.
+  Each pause cost the main thread about 5 ms in a 60 000-line document and about 29 ms in one
+  with 2000 figures; it now costs nothing. Captions are no longer read line by line from the
+  editor when the outline is computed.
+- After a build, Lemma looks for the packages of the distribution again (they may have become
+  local ones) without touching the file system on the main thread: with 40 packages that was 52
+  path lookups each time.
 
 ### Fixed
 
@@ -186,6 +195,15 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   reference manager exports again, a chapter that is not open, edited in another editor or
   changed by `git checkout`, a file that an `\input` named before it existed, and images created
   or deleted (for `\includegraphics{`). A deleted chapter takes its labels with it.
+- The same goes now for files outside the project's folder: a bibliography in a central folder
+  (`\addbibresource{../central/refs.bib}`) or a chapter included through `../` that another
+  program changes, deletes or writes again reaches completion, the undefined-reference check
+  and the Outline without a build (up to 32 such folders are watched). Before, they were read
+  again only after the next build.
+- Figures and tables in chapters that are not open show their captions in the Outline (before,
+  only with a `\label` after the caption, or the build's list of figures), a caption further
+  than 40 lines below its `\begin{figure}` is found, and a `\caption*` gives a label in its float
+  the title that completion and the label's hover show.
 - Undefined references and citations are underlined and listed on the Problems page, and the
   inline equation numbers refreshed, about half a second after typing stops instead of about
   two seconds: the check no longer waits for the project's word list to be rebuilt.

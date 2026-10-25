@@ -566,6 +566,7 @@ fn environment_pair_recovery() {
         name: name.into(),
         begin_line,
         end_line,
+        caption: None,
     };
     assert_eq!(
         idx.envs,
@@ -586,6 +587,53 @@ fn environment_pair_recovery() {
             pair("b", 1, Some(2)),
             pair("c", 3, None)
         ]
+    );
+}
+
+#[test]
+fn float_captions() {
+    let text = r"\begin{document}
+\begin{figure}[ht]
+\centering % \caption{no}
+\begin{subfigure}{.4\textwidth}\caption{sub}\end{subfigure}
+\caption[Short form]{Long \emph{form}
+ with a break}\label{fig:a}
+\caption{second}
+\end{figure}
+\begin{table}
+\begin{minipage}{3cm}\caption{A \textbf{bold}
+ table\label{t}\index{x}}\end{minipage}
+\end{table}
+\begin{figure}\caption*{Starred}\end{figure}
+\begin{figure}\caption[ ]{Empty short}\end{figure}
+\begin{figure}\caption{}\end{figure}
+\begin{verbatim}\caption{verbatim}\end{verbatim}
+\end{document}
+";
+    let idx = index_file(text);
+    let captions: Vec<(&str, Option<&str>)> = idx
+        .envs
+        .iter()
+        .map(|e| (e.name.as_str(), e.caption.as_deref()))
+        .collect();
+    assert_eq!(
+        captions,
+        [
+            ("document", None),
+            ("figure", Some("Short form")),
+            ("subfigure", Some("sub")),
+            ("table", Some("A \\textbf{bold} table")),
+            ("minipage", Some("A \\textbf{bold} table")),
+            ("figure", Some("Starred")),
+            ("figure", Some("Empty short")),
+            ("figure", None),
+            ("verbatim", None),
+        ]
+    );
+    // The label's title is the long form, as before.
+    assert_eq!(
+        idx.labels[0].title.as_deref(),
+        Some("Long \\emph{form} with a break")
     );
 }
 

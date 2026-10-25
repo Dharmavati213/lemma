@@ -1187,6 +1187,37 @@ they conflict with the sections above, this section wins.
     every new text of those files: when such a document closes (it may have been saved or
     reloaded while open) or Lemma saves it closed (an agent's edit, indexed from the saved
     text), the next pass that reads from disk collects the words again.
+  - A re-index of an open document keeps the index's entry (its `Arc`) when the new index is
+    equal to it (the job compares it with the entry the index had when the job started, which
+    must still be there), the document class is the same, the job ran with the project's
+    current theorem names (a declaration merged while it ran left it to its merge), and the
+    project root and the open LaTeX documents are what the last `index_changed` followed:
+    nothing is merged and no pass follows, only the words are rebuilt. The Outline compares
+    the entries' `Arc`s, so prose typed recomputes nothing (2000 floats: 29 ms per pause
+    before; 5 ms on `large.tex`). Rows that line shifts moved ahead of the index are
+    recomputed once it is idle, even when it came back the same (two lines deleted and put
+    back before it caught up).
+  - `EnvPair::caption` (§10.3 addition): the first `\caption[short]{long}` or `\caption*` in
+    the environment that is not inside a `sub…` environment within it, `short` unless it is
+    empty, else `long`, cleaned as titles are. It goes to every open environment around the
+    `\caption` that has none yet, up to the first `sub…` one, never to `document`. The
+    Outline's float captions come from it (then from a label's title, then from the list of
+    figures or tables) for open and closed files alike: no lines of the open document are read
+    and there is no 40-line limit.
+  - Files outside the workspace folder: `prune` records the directories of what is read from
+    disk (the files it keeps but the open documents, unread includes too, and the
+    bibliographies), and after every `index_changed` (and when the root moves) those outside
+    the folder go to `watcher::watch_outside`, which watches the first
+    `watcher::MAX_OUTSIDE_DIRS` (32) for the index only and drops the others. A source file
+    changed, created or deleted there (or the directory deleted) goes to
+    `completion::disk_changed` by the path as the index names it; nothing is reloaded or
+    reviewed outside the folder.
+  - The feed looks open documents up without the file system: `wanted` and
+    `merge_discovered` compare the paths as the index names them with the open documents'
+    keys; the discovery job normalizes each file it read (`ReadFile::key`), and a path that
+    names an open document through a symbolic link goes to `unreadable`. After a build the
+    distribution packages, retried on the jobs thread, cost the main thread no `normalize`
+    (52 with 40 packages before; `workspace::normalizations` counts them per thread).
 - **Batched review feed (§4.1, §10.3, 2026-10-25):**
   - `FileReview::on_edits(edits, origin)` takes the changes of one action at once (in the
     order they are applied, each ending at or before the start of the one before, with the

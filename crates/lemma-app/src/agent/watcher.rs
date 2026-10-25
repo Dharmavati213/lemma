@@ -49,6 +49,10 @@
 //!   of any kind created, deleted or moved in a batch (an image for `\includegraphics`, a
 //!   directory moved out of the project) go to `completion::files_moved` once per batch, which
 //!   lists the project's files again when they changed.
+//! - **Outside the folder**, the directories that hold files the project index reads from disk
+//!   (a central `.bib`, a chapter `\input` through `../`; at most [`MAX_OUTSIDE_DIRS`]) are
+//!   watched for the index only ([`watch_outside`]): a changed, created or deleted source file
+//!   there goes to `completion::disk_changed` and nothing else (no reload, no review).
 
 use super::bridge;
 use crate::document::{DocRef, Document};
@@ -74,6 +78,8 @@ pub const DEBOUNCE: Duration = Duration::from_millis(150);
 const MAX_DELAY: Duration = Duration::from_secs(1);
 /// Most directories watched per window (the root may be a large directory).
 pub const MAX_WATCHED_DIRS: usize = 512;
+/// Most directories outside the project root watched for the project index.
+pub const MAX_OUTSIDE_DIRS: usize = 32;
 /// GIO's rate limit of `CHANGED` events, in ms (its default, 800 ms, would delay reloads).
 const RATE_LIMIT_MS: i32 = 100;
 
@@ -121,6 +127,10 @@ impl Disk {
 pub struct Watcher {
     state: Weak<WindowState>,
     monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
+    /// Directories outside the root watched for the project index ([`watch_outside`]), and
+    /// the source files changed in them, waiting for the debounce.
+    outside: RefCell<BTreeMap<PathBuf, gio::FileMonitor>>,
+    outside_pending: RefCell<BTreeSet<PathBuf>>,
     /// Changed paths waiting for the debounce.
     pending: RefCell<BTreeSet<PathBuf>>,
     /// Paths of any kind created, deleted or moved, waiting for the debounce, and whether each
@@ -181,6 +191,8 @@ pub fn install(state: &Rc<WindowState>) {
     let watcher = Rc::new(Watcher {
         state: Rc::downgrade(state),
         monitors: RefCell::new(HashMap::new()),
+        outside: RefCell::new(BTreeMap::new()),
+        outside_pending: RefCell::new(BTreeSet::new()),
         pending: RefCell::new(BTreeSet::new()),
         moved: RefCell::new(BTreeMap::new()),
         first_pending: Cell::new(None),
@@ -259,6 +271,20 @@ pub fn turn_over(state: &WindowState) {
     }
 }
 
+/// Watches `dirs`, directories outside the project root that hold files of the project index,
+/// for the index (see the module docs): the first [`MAX_OUTSIDE_DIRS`] of them, and no others.
+/// The project feed calls it whenever its index changed.
+pub fn watch_outside(state: &WindowState, dirs: &BTreeSet<PathBuf>) {
+    if let Some(watcher) = watcher_of(state) {
+        watcher.watch_outside(dirs);
+    }
+}
+
+/// The directories outside the project root watched for the project index, sorted (tests).
+pub fn watched_outside(state: &WindowState) -> Vec<PathBuf> {
+    watcher_of(state).map_or_else(Vec::new, |w| w.outside.borrow().keys().cloned().collect())
+}
+
 /// The directories watched, sorted (tests).
 pub fn watched_dirs(state: &WindowState) -> Vec<PathBuf> {
     let Some(watcher) = watcher_of(state) else {
@@ -274,6 +300,7 @@ pub fn is_idle(state: &WindowState) -> bool {
     watcher_of(state).is_none_or(|w| {
         !w.busy.get()
             && w.pending.borrow().is_empty()
+            && w.outside_pending.borrow().is_empty()
             && w.moved.borrow().is_empty()
             && w.timer.borrow().is_none()
     })
@@ -469,10 +496,101 @@ impl Watcher {
         }
     }
 
+    /// Watches the first [`MAX_OUTSIDE_DIRS`] of `dirs` for the project index and stops
+    /// watching the directories that are no longer among them.
+    fn watch_outside(self: &Rc<Self>, dirs: &BTreeSet<PathBuf>) {
+        let wanted: Vec<&PathBuf> = dirs.iter().take(MAX_OUTSIDE_DIRS).collect();
+        let gone: Vec<gio::FileMonitor> = {
+            let mut outside = self.outside.borrow_mut();
+            let gone: Vec<PathBuf> = outside
+                .keys()
+                .filter(|dir| !wanted.contains(dir))
+                .cloned()
+                .collect();
+            gone.iter().filter_map(|dir| outside.remove(dir)).collect()
+        };
+        for monitor in gone {
+            monitor.cancel();
+        }
+        let mut added = false;
+        for dir in wanted {
+            if self.outside.borrow().contains_key(dir) {
+                continue;
+            }
+            added = true;
+            let monitor = match gio::File::for_path(dir)
+                .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            {
+                Ok(monitor) => monitor,
+                Err(e) => {
+                    tracing::warn!("cannot watch {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            monitor.set_rate_limit(RATE_LIMIT_MS);
+            let weak = Rc::downgrade(self);
+            let watched = dir.clone();
+            monitor.connect_changed(move |_, file, other, event| {
+                if let Some(watcher) = weak.upgrade() {
+                    watcher.on_outside_event(&watched, file, other, event);
+                }
+            });
+            self.outside.borrow_mut().insert(dir.clone(), monitor);
+        }
+        if added && dirs.len() > MAX_OUTSIDE_DIRS {
+            tracing::info!(
+                "{} directories outside the project hold files of its index: watching the first \
+                 {MAX_OUTSIDE_DIRS}",
+                dirs.len()
+            );
+        }
+    }
+
+    /// An event of a directory watched for the project index (see [`Self::watch_outside`]):
+    /// source files that changed, came or went, and the directory itself when it goes (its
+    /// files go with it), wait for the debounce.
+    fn on_outside_event(
+        self: &Rc<Self>,
+        dir: &Path,
+        file: &gio::File,
+        other: Option<&gio::File>,
+        event: gio::FileMonitorEvent,
+    ) {
+        use gio::FileMonitorEvent as E;
+        let paths: Vec<PathBuf> = match event {
+            E::Changed
+            | E::ChangesDoneHint
+            | E::Created
+            | E::Deleted
+            | E::MovedIn
+            | E::MovedOut => file.path().into_iter().collect(),
+            E::Renamed | E::Moved => file
+                .path()
+                .into_iter()
+                .chain(other.and_then(|o| o.path()))
+                .collect(),
+            _ => return,
+        };
+        let mut added = false;
+        for path in paths {
+            if workspace::is_source_file(&path) || path == dir {
+                added |= self.outside_pending.borrow_mut().insert(path);
+            }
+        }
+        if added {
+            self.schedule();
+        }
+    }
+
     fn shut_down(&self) {
         self.generation.set(self.generation.get() + 1);
         self.cancel_monitors();
+        let outside = std::mem::take(&mut *self.outside.borrow_mut());
+        for monitor in outside.into_values() {
+            monitor.cancel();
+        }
         self.pending.borrow_mut().clear();
+        self.outside_pending.borrow_mut().clear();
         self.moved.borrow_mut().clear();
         if let Some(id) = self.timer.take() {
             id.remove();
@@ -596,10 +714,18 @@ impl Watcher {
         let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending.borrow_mut())
             .into_iter()
             .collect();
+        let outside = std::mem::take(&mut *self.outside_pending.borrow_mut());
         let moved: Vec<(PathBuf, bool)> = std::mem::take(&mut *self.moved.borrow_mut())
             .into_iter()
             .collect();
         self.first_pending.set(None);
+        // Outside the root only the project index looks: it reads again what it has of them
+        // (by the path its directory is watched under, as the index names it).
+        if let Some(state) = self.state.upgrade() {
+            for path in &outside {
+                completion::disk_changed(&state, path, false);
+            }
+        }
         if paths.is_empty() && moved.is_empty() {
             return;
         }
@@ -616,7 +742,9 @@ impl Watcher {
                 completion::files_moved(&state, &moved);
             }
             watcher.busy.set(false);
-            let more = !watcher.pending.borrow().is_empty() || !watcher.moved.borrow().is_empty();
+            let more = !watcher.pending.borrow().is_empty()
+                || !watcher.outside_pending.borrow().is_empty()
+                || !watcher.moved.borrow().is_empty();
             if more && watcher.timer.borrow().is_none() {
                 watcher.schedule();
             }

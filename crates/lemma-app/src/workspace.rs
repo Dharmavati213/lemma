@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use lemma_core::ProjectRoot;
 use lemma_syntax::{ProjectIndex, ScanConfig};
 use sourceview5::prelude::*;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -565,10 +565,22 @@ async fn read(path: &Path) -> Result<(saver::Decoded, DiskState), String> {
     Ok((decoded, DiskState::of(&bytes, etag)))
 }
 
+thread_local! {
+    static NORMALIZED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many paths [`normalize`] resolved on the calling thread (each costs one or two
+/// `canonicalize` calls). Tests count the main thread's: it should not touch the file system
+/// for paths it only looks up.
+pub fn normalizations() -> u64 {
+    NORMALIZED.with(Cell::get)
+}
+
 /// The workspace key for `path`: absolute, with symlinks and `..` resolved. A file that does not
 /// exist yet is resolved through its parent directory; relative paths are taken against the
 /// current directory.
 pub fn normalize(path: &Path) -> PathBuf {
+    NORMALIZED.with(|n| n.set(n.get() + 1));
     if let Ok(p) = lemma_core::canonicalize(path) {
         return p;
     }
