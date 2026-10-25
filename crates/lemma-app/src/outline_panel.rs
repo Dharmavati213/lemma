@@ -61,11 +61,12 @@
 //!   generation with what the page shows, and only on a change recomputes the outline (no GTK)
 //!   and **patches** the list models: unchanged rows keep their objects (and so their expanded
 //!   state and selection), changed rows are updated in place, and only rows that appeared are
-//!   created. The watch stops when the feed is idle and nothing changed for two ticks.
+//!   created. The watch stops when the project index is idle (`completion::index_busy`: the
+//!   word list rebuilt later does not count) and nothing changed for two ticks.
 //!
 //! The project index has no change signal, so the watch is armed by the events that change it:
-//! document changes, tabs opened, closed and selected, the project root moving, and finished
-//! builds.
+//! document changes, tabs opened, closed and selected, the project root moving, finished
+//! builds, and files of the index that another program changed (`completion::disk_changed`).
 //!
 //! # Hooks
 //!
@@ -2600,7 +2601,7 @@ impl Panel {
         if self.check() {
             self.quiet.set(0);
         }
-        if completion::project_busy(&state) || self.aux_reading.get() {
+        if completion::index_busy(&state) || self.aux_reading.get() {
             self.quiet.set(0);
             return true;
         }
@@ -3684,13 +3685,14 @@ pub fn refresh(state: &WindowState) {
     }
 }
 
-/// True when the page shows what the project index and the `.aux` say: nothing is queued in the
-/// project feed, the `.aux` is read, the outline is current and the cursor followed.
+/// True when the page shows what the project index and the `.aux` say: nothing is queued for
+/// the project index (`completion::index_busy`; the project's words may still be rebuilt), the
+/// `.aux` is read, the outline is current and the cursor followed.
 pub fn is_settled(state: &WindowState) -> bool {
     let Some(panel) = panel_of(state) else {
         return false;
     };
-    if completion::project_busy(state) || panel.aux_reading.get() || panel.aux_stale.get() {
+    if completion::index_busy(state) || panel.aux_reading.get() || panel.aux_stale.get() {
         return false;
     }
     let active = state

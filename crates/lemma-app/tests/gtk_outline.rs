@@ -1,6 +1,7 @@
 //! WP3.1: the Outline page (`outline_panel.rs`): the project tree with `.aux` numbers, click
 //! and Enter navigation across files, following the cursor, the fuzzy filter, incremental
-//! updates that keep the collapse state, figures and included files, and the keystroke cost.
+//! updates that keep the collapse state, figures and included files, theorem environments
+//! declared in a preamble file, chapters changed on disk, and the keystroke cost.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_outline`.
 //! The performance test: `scripts/broadway.sh cargo test --release -p lemma-app --test
@@ -52,6 +53,14 @@ fn main() -> ExitCode {
         (
             "a_file_read_later_moves_and_stays_expanded",
             file_read_later,
+        ),
+        (
+            "theorems_declared_in_a_preamble_file",
+            theorems_from_a_preamble_file,
+        ),
+        (
+            "a_chapter_changed_on_disk_updates_the_tree",
+            a_chapter_changed_on_disk,
         ),
         (
             "clicks_on_rows_and_arrows_with_a_real_pointer",
@@ -840,6 +849,85 @@ fn file_read_later() {
         outline::is_expanded(&f.state, "[chapters/a.tex]"),
         Some(true)
     );
+}
+
+const THEOREMS_MAIN: &str = "\\documentclass{article}\n\\input{preamble}\n\\begin{document}\n\
+\\section{Results}\n\\input{parts/later}\n\\end{document}\n";
+const THEOREMS_PREAMBLE: &str = "\\newtheorem{mainthm}{Main Theorem}\n";
+const THEOREMS_LATER: &str = "\\subsection{Later}\n\\begin{mainthm}[Big]\nx\n\\end{mainthm}\n";
+const THEOREMS_TREE: &str = "Results\n  [parts/later.tex]\n    Later\n      Main Theorem (Big)\n";
+
+/// A theorem environment declared in a preamble file (`mainthm` is none of the common names)
+/// gives the rows of the files that use it, whichever of them the project feed reads first:
+/// the preamble and the chapter read together, the chapter open alone (as a session restores
+/// it; its root and the preamble are found after it was indexed), and the preamble `\input`
+/// typed after the chapter was indexed. Nothing but the feed itself indexes the files again
+/// (the page is shown without `completion::refresh_project`).
+fn theorems_from_a_preamble_file() {
+    let files = [
+        ("main.tex", THEOREMS_MAIN),
+        ("preamble.tex", THEOREMS_PREAMBLE),
+        ("parts/later.tex", THEOREMS_LATER),
+    ];
+    for (name, open) in [
+        ("theorems-root", "main.tex"),
+        ("theorems-chapter", "parts/later.tex"),
+    ] {
+        let f = fixture(name, None, &files);
+        f.open(open);
+        f.state.sidebar.show_page(PAGE_OUTLINE);
+        f.wait_tree(&format!("the preamble's theorem with {open} open"), |t| {
+            t == THEOREMS_TREE
+        });
+    }
+    let f = fixture(
+        "theorems-typed",
+        None,
+        &[
+            (
+                "main.tex",
+                &THEOREMS_MAIN.replace("\\input{preamble}\n", ""),
+            ),
+            ("preamble.tex", THEOREMS_PREAMBLE),
+            ("parts/later.tex", THEOREMS_LATER),
+        ],
+    );
+    let main = f.open("main.tex");
+    f.state.sidebar.show_page(PAGE_OUTLINE);
+    f.wait_tree("no theorem without the preamble", |t| {
+        t == "Results\n  [parts/later.tex]\n    Later\n"
+    });
+    insert_at_line(&main, 1, "\\input{preamble}\n");
+    f.wait_tree("the theorem once the preamble is read", |t| {
+        t == THEOREMS_TREE
+    });
+    // The preamble's declaration goes: the row goes too.
+    replace(&main, "\\input{preamble}\n", "");
+    f.wait_tree("no theorem once the preamble is gone", |t| {
+        t == "Results\n  [parts/later.tex]\n    Later\n"
+    });
+}
+
+/// Another program changes a chapter that is not open (a `git checkout`, another editor): the
+/// page follows without an edit, a build or `outline::is_settled` (which looks at the index
+/// again by itself): only the file monitor and the project feed bring the change.
+fn a_chapter_changed_on_disk() {
+    let f = fixture("disk", Some("proj"), &[]);
+    f.open("main.tex");
+    f.show_outline();
+    f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
+    let chapter = f.path("chapters/yoneda.tex");
+    let text = std::fs::read_to_string(&chapter).unwrap() + "\\section{Written elsewhere}\n";
+    std::fs::write(&chapter, text).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while !outline::tree_text(&f.state).contains("  Written elsewhere\n") {
+        assert!(
+            Instant::now() < deadline,
+            "the chapter's new section; the tree is:\n{}",
+            outline::tree_text(&f.state)
+        );
+        common::pump_for(Duration::from_millis(20));
+    }
 }
 
 fn which(program: &str) -> Option<PathBuf> {

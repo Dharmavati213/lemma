@@ -28,7 +28,9 @@
 //! - **Undefined** references and citations ([`undefined`]) get a wavy underline (tag
 //!   [`UNDEFINED_TAG`]) on the name and a Problems entry with `DiagSource::Labels`. They are
 //!   computed from the project index plus the `.aux` file, so they work before a build too, a
-//!   moment after typing stops (once the project index has caught up). Citations are checked
+//!   moment after typing stops (once the project index has caught up; the project's words,
+//!   rebuilt later, are not waited for), and after another program changed a file the index
+//!   has (a re-exported `.bib`, a chapter changed by `git checkout`). Citations are checked
 //!   only when every bibliography the project names could be read.
 //! - **Unused** labels and bibliography entries ([`unused`]) are listed on demand, never
 //!   underlined: `win.unused-labels` ("Unused Labels and Entries…" in the main menu's Go
@@ -81,7 +83,8 @@ use std::time::Duration;
 /// The tag of the wavy underline on undefined references and citations.
 pub const UNDEFINED_TAG: &str = "lemma-label-undefined";
 /// How long after the last change the checks run (the project index re-indexes a document
-/// 300 ms after its last change; the checks then wait until it is idle).
+/// 300 ms after its last change; the checks then wait until it is idle, `completion::
+/// index_busy`).
 pub const CHECK_DELAY: Duration = Duration::from_millis(450);
 /// How often a check waiting for the project index looks again.
 const BUSY_RETRY: Duration = Duration::from_millis(150);
@@ -295,13 +298,20 @@ fn schedule_check(state: &Rc<WindowState>, delay: Duration) {
         let Some(state) = labels.state.upgrade() else {
             return;
         };
-        if completion::project_busy(&state) {
+        // Only the index counts: the words rebuilt 1.5 s after typing stops do not change it.
+        if completion::index_busy(&state) {
             schedule_check(&state, BUSY_RETRY);
             return;
         }
         check(&state, &labels);
     });
     labels.timer.replace(Some(timer));
+}
+
+/// The project index reads files again that changed on disk (`completion::disk_changed`): the
+/// checks run once it has caught up.
+pub fn index_changing(state: &Rc<WindowState>) {
+    schedule_check(state, BUSY_RETRY);
 }
 
 /// Runs the checks now, whether or not the project index is busy (tests).

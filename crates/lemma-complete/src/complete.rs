@@ -185,6 +185,11 @@ impl Completer {
         self.files = files;
     }
 
+    /// The files [`Self::set_files`] gave (empty until it is called).
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
     /// Clears `out` and fills it with at most [`MAX_ITEMS`] items, best first.
     ///
     /// Score = frizbee score + snippet 20 + user macro 12 + used-in-project 8 + L1 4

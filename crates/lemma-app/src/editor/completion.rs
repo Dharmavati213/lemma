@@ -57,10 +57,18 @@
 //! `.tex` files next to them (to find the root), the bibliographies and the root's `.aux` (in the
 //! build directory or next to it) are read from disk; after each build the `.aux`, the `.bib`
 //! files and the project's file list are read again (and when the root found lives in another
-//! directory than the one listed). A `.tex` file next to an open document joins the index only
-//! when its own includes lead to an open document (sharing a `macros.tex` is not enough), and
-//! whatever no open document reaches any more (a closed tab's project, a removed `\input`)
-//! leaves it. The loaded packages decide which command
+//! directory than the one listed). Files read from disk that another program changes, creates or
+//! deletes (a re-exported `.bib`, a `git checkout`, a chapter edited elsewhere, a file an
+//! `\input` named before it existed) are read again as the file monitor reports them
+//! ([`disk_changed`]; a file that is gone leaves the index), and the file list is made again
+//! when files come or go ([`files_moved`]). The monitor watches the workspace folder only: a
+//! `.bib` outside it is read again after a build. When the project's theorem environments
+//! change (a preamble file read after the chapters that use its `\newtheorem`s, a declaration
+//! typed or removed), the files whose environments use a changed name are indexed again, so
+//! their theorem rows and label titles follow. A `.tex` file next to an open document joins the
+//! index only when its own includes lead to an open document (sharing a `macros.tex` is not
+//! enough), and whatever no open document reaches any more (a closed tab's project, a removed
+//! `\input`) leaves it. The loaded packages decide which command
 //! tables are active (`CompletionDb::load_packages`), the `spell.word_lists` and the project's
 //! text give the words, and the project's macros decide `if_undefined` snippet bodies.
 //!
@@ -1671,6 +1679,49 @@ pub fn project_busy(state: &WindowState) -> bool {
     shared_of(state).is_some_and(|s| s.feed.busy())
 }
 
+/// True while the project index itself has work queued or running: documents waiting to be
+/// re-indexed or being re-indexed, and files being read from disk. What waits for the index
+/// (the label checks, the Outline) waits for this, not for the words, the dictionary or the
+/// file list ([`project_busy`] counts those too).
+pub fn index_busy(state: &WindowState) -> bool {
+    shared_of(state).is_some_and(|s| s.feed.index_busy())
+}
+
+/// The file monitor saw the file at `path` (normalized) change, appear or go, by another
+/// program. When the project index has it from disk (an included file that is not open, a
+/// bibliography, open or not) or could not read it before (an `\input` written before its
+/// file), it is read again on the jobs thread (a file that is gone leaves the index), and the
+/// label checks and the Outline follow once the index has caught up. True when that happens.
+/// Open LaTeX documents are indexed from their live text and need nothing. `own_write`: Lemma
+/// wrote the file (a save), whose text the index has already (`labels::saved`), so it is read
+/// only when the index could not read it before (deleted by another program, then saved).
+pub fn disk_changed(state: &Rc<WindowState>, path: &Path, own_write: bool) -> bool {
+    let Some(shared) = shared_of(state) else {
+        return false;
+    };
+    if !shared.disk_changed(state, path, own_write) {
+        return false;
+    }
+    crate::labels::index_changing(state);
+    crate::outline_panel::refresh(state);
+    true
+}
+
+/// Paths the file monitor saw created, deleted or moved in one batch (`true`: the path exists
+/// now). When the project's file list (file arguments: `\includegraphics{`, `\input{`) lacks
+/// one that exists or lists one that went, the project's files are listed again. A file
+/// replaced by a rename onto it (a save) changes nothing.
+pub fn files_moved(state: &WindowState, moved: &[(PathBuf, bool)]) {
+    if let Some(shared) = shared_of(state) {
+        shared.files_moved(state, moved);
+    }
+}
+
+/// How many times the project's files were listed for file arguments (tests).
+pub fn file_walks(state: &WindowState) -> u64 {
+    shared_of(state).map_or(0, |s| s.feed.walks.get())
+}
+
 /// Reads the `.aux` (first the one beside `pdf`), the bibliographies and the project's file list
 /// again, as every finished build does (`BuildController::connect_finished`).
 pub fn refresh_after_build(state: &WindowState, pdf: Option<&Path>) {
@@ -1704,7 +1755,8 @@ struct Feed {
     /// A discovery pass is running; `again` asks for another one when it ends.
     discovering: Cell<bool>,
     again: Cell<bool>,
-    /// Paths that could not be read (not retried until a build).
+    /// Paths that could not be read (retried after a build, or when the file monitor sees them
+    /// change).
     unreadable: RefCell<HashSet<PathBuf>>,
     /// Directories already searched for `.tex` files.
     searched: RefCell<HashSet<PathBuf>>,
@@ -1714,7 +1766,8 @@ struct Feed {
     /// project: they join the index once they include one of its files (a root of an open
     /// chapter), so unrelated documents never add their labels and macros.
     candidates: RefCell<BTreeMap<PathBuf, Candidate>>,
-    /// Paths to read again even though they are indexed (after a build).
+    /// Paths to read again even though they are indexed (after a build, a change on disk, or
+    /// new theorem environments).
     stale: RefCell<HashSet<PathBuf>>,
     /// The document classes of indexed files (`\documentclass{…}`).
     classes: RefCell<HashMap<PathBuf, String>>,
@@ -1722,8 +1775,10 @@ struct Feed {
     aux_root: RefCell<Option<PathBuf>>,
     /// The `.aux` beside the PDF of the last build, read before the usual places.
     aux_hint: RefCell<Option<PathBuf>>,
-    /// The directory the project's files were listed from (`None`: list them again).
+    /// The directory the project's files were listed from (`None`: list them again), and how
+    /// many times they were listed (only the newest listing is kept).
     walked_dir: RefCell<Option<PathBuf>>,
+    walks: Cell<u64>,
     /// Paths whose re-index job runs; a path in `index_again` is indexed once more when its job
     /// ends (one job per path at a time, so an older text never lands after a newer one).
     indexing: RefCell<HashSet<PathBuf>>,
@@ -1731,6 +1786,11 @@ struct Feed {
     /// Bumped by every re-index job; the generation of the newest result merged per path.
     index_generation: Cell<u64>,
     merged_generation: RefCell<HashMap<PathBuf, u64>>,
+    /// The project's theorem environments as the index last had them, and the ones each file
+    /// (indexed or a candidate) was indexed with: a file indexed without a name it uses is
+    /// indexed again ([`Shared::follow_theorems`]).
+    theorems: RefCell<Theorems>,
+    indexed_with: RefCell<HashMap<PathBuf, Theorems>>,
     /// The package names last loaded into the tables (they are rebuilt when one goes away).
     packages: RefCell<Vec<String>>,
     dictionary_lists: RefCell<Vec<PathBuf>>,
@@ -1747,8 +1807,9 @@ impl Feed {
     /// What keeps the feed busy (for error messages).
     fn describe(&self) -> String {
         format!(
-            "{} jobs, discovering {}, {} re-index timers, words timer {}",
+            "{} jobs, {} re-indexing, discovering {}, {} re-index timers, words timer {}",
             self.jobs.get(),
+            self.indexing.borrow().len(),
             self.discovering.get(),
             self.timers.borrow().len(),
             self.words_timer.borrow().is_some()
@@ -1756,16 +1817,25 @@ impl Feed {
     }
 
     fn busy(&self) -> bool {
-        self.jobs.get() > 0
+        self.index_busy() || self.jobs.get() > 0 || self.words_timer.borrow().is_some()
+    }
+
+    /// Work on the index itself: re-index timers and jobs, and discovery passes (see
+    /// [`index_busy`]).
+    fn index_busy(&self) -> bool {
+        !self.timers.borrow().is_empty()
+            || !self.indexing.borrow().is_empty()
             || !self.index_again.borrow().is_empty()
             || self.discovering.get()
-            || !self.timers.borrow().is_empty()
-            || self.words_timer.borrow().is_some()
     }
 }
 
 /// A file's index and document class (`None`: the file could not be read).
 type IndexedFile = Option<(FileIndex, Option<String>)>;
+
+/// Theorem environment names (`ProjectIndex::theorem_names`), shared by the files indexed with
+/// them.
+type Theorems = Arc<Vec<String>>;
 
 /// A possible root found next to an open document: its index and document class.
 type Candidate = (Arc<FileIndex>, Option<String>);
@@ -1785,6 +1855,8 @@ struct Discovered {
     bibs: Vec<(PathBuf, Option<Vec<BibEntry>>)>,
     aux: Option<(PathBuf, AuxInfo)>,
     searched: Vec<PathBuf>,
+    /// The theorem environments the files were indexed with.
+    theorems: Theorems,
 }
 
 /// What a discovery job should read.
@@ -1800,7 +1872,7 @@ struct Wanted {
     /// The file stems of the open documents: a listed file can only be their root if it names
     /// one of them (`\input{chapters/yoneda}`), so other files are not indexed at all.
     open_stems: Vec<String>,
-    theorems: Vec<String>,
+    theorems: Theorems,
     budget: usize,
 }
 
@@ -1852,13 +1924,14 @@ impl Shared {
         let generation = self.feed.index_generation.get() + 1;
         self.feed.index_generation.set(generation);
         let text = doc.text();
-        let theorems = state.workspace.index.borrow().theorem_names();
+        let theorems = self.current_theorems(&state.workspace.index.borrow());
+        let used = theorems.clone();
         let weak = Rc::downgrade(self);
         self.feed.jobs.set(self.feed.jobs.get() + 1);
         glib::spawn_future_local(async move {
             let indexed = gio::spawn_blocking(move || {
                 let class = document_class(&text).map(str::to_owned);
-                (index_file_with_theorems(&text, &theorems), class)
+                (index_file_with_theorems(&text, &used), class)
             })
             .await;
             let Some(shared) = weak.upgrade() else {
@@ -1886,6 +1959,11 @@ impl Shared {
                     .merged_generation
                     .borrow_mut()
                     .insert(path.clone(), generation);
+                shared
+                    .feed
+                    .indexed_with
+                    .borrow_mut()
+                    .insert(path.clone(), theorems);
                 shared.merge_file(path, index, class);
                 shared.index_changed(false);
             }
@@ -1939,6 +2017,7 @@ impl Shared {
             db.load_packages(&packages);
         }
         self.feed.packages.replace(packages);
+        self.follow_theorems(&state);
         // The root found by now may live elsewhere than the directory listed so far (or the
         // workspace root changed).
         let walked = self.feed.walked_dir.borrow().clone();
@@ -1950,6 +2029,59 @@ impl Shared {
             self.rebuild_base_words();
         } else {
             self.schedule_words();
+        }
+    }
+
+    /// The project's theorem environments in `index`, shared with the files already indexed
+    /// with the same names.
+    fn current_theorems(&self, index: &ProjectIndex) -> Theorems {
+        let names = index.theorem_names();
+        let mut theorems = self.feed.theorems.borrow_mut();
+        if **theorems != names {
+            *theorems = Arc::new(names);
+        }
+        theorems.clone()
+    }
+
+    /// Indexes again the files that were indexed without a theorem environment they use, or
+    /// with one the project no longer declares: a chapter read before (or together with) the
+    /// preamble file that holds its `\newtheorem`s, or a declaration typed or removed. Open
+    /// documents are indexed now, the others on the next discovery pass. This converges: what a
+    /// file declares does not depend on the names it is indexed with.
+    fn follow_theorems(self: &Rc<Self>, state: &WindowState) {
+        let mut open = Vec::new();
+        {
+            let index = state.workspace.index.borrow();
+            let names = self.current_theorems(&index);
+            let mut indexed_with = self.feed.indexed_with.borrow_mut();
+            let mut stale = self.feed.stale.borrow_mut();
+            for (path, file) in &index.files {
+                let Some(with) = indexed_with.get_mut(path) else {
+                    continue;
+                };
+                if Arc::ptr_eq(with, &names) {
+                    continue;
+                }
+                let changed =
+                    |name: &str| with.iter().any(|n| n == name) != names.iter().any(|n| n == name);
+                let uses_changed = file.envs.iter().any(|env| {
+                    changed(&env.name) || env.name.strip_suffix('*').is_some_and(changed)
+                });
+                if !uses_changed {
+                    // Its index is what the current names give.
+                    *with = names.clone();
+                } else if let Some(doc) = state.workspace.get(path).filter(|d| d.is_open()) {
+                    // A running job's result is looked at again when it is merged.
+                    if !self.feed.indexing.borrow().contains(path) {
+                        open.push(doc);
+                    }
+                } else {
+                    stale.insert(path.clone());
+                }
+            }
+        }
+        for doc in open {
+            self.index_document(&doc);
         }
     }
 
@@ -2031,7 +2163,7 @@ impl Shared {
         let stale = self.feed.stale.borrow();
         let budget = MAX_DISK_FILES.saturating_sub(self.feed.disk_files.borrow().len());
         let mut wanted = Wanted {
-            theorems: index.theorem_names(),
+            theorems: self.current_theorems(&index),
             budget,
             ..Wanted::default()
         };
@@ -2059,6 +2191,16 @@ impl Shared {
                 want_file(path.clone(), &mut wanted);
             }
         }
+        // Files read again count against the cap already: they are read first, on a budget of
+        // their own, so that new files never take it and go past the cap.
+        let disk_files = self.feed.disk_files.borrow();
+        wanted.files.sort_by_key(|p| !disk_files.contains(p));
+        wanted.budget += wanted
+            .files
+            .iter()
+            .take_while(|p| disk_files.contains(*p))
+            .count();
+        drop(disk_files);
         // Bibliographies.
         let mut bib_seen = HashSet::new();
         for (path, file) in &index.files {
@@ -2139,18 +2281,37 @@ impl Shared {
                 continue; // The live text is indexed instead.
             }
             match read {
-                Some((index, class)) if listed => {
-                    self.feed
-                        .candidates
-                        .borrow_mut()
-                        .insert(path, (Arc::new(index), class));
-                }
                 Some((index, class)) => {
-                    self.feed.disk_files.borrow_mut().insert(path.clone());
-                    self.merge_file(path, index, class);
-                    changed = true;
+                    self.feed
+                        .indexed_with
+                        .borrow_mut()
+                        .insert(path.clone(), found.theorems.clone());
+                    if listed {
+                        self.feed
+                            .candidates
+                            .borrow_mut()
+                            .insert(path, (Arc::new(index), class));
+                    } else {
+                        self.feed.disk_files.borrow_mut().insert(path.clone());
+                        self.merge_file(path, index, class);
+                        changed = true;
+                    }
                 }
                 None => {
+                    // Gone (deleted, or no longer readable): what it had leaves the index.
+                    if state
+                        .workspace
+                        .index
+                        .borrow_mut()
+                        .files
+                        .remove(&path)
+                        .is_some()
+                    {
+                        self.feed.disk_files.borrow_mut().remove(&path);
+                        self.feed.classes.borrow_mut().remove(&path);
+                        self.feed.indexed_with.borrow_mut().remove(&path);
+                        changed = true;
+                    }
                     self.feed.unreadable.borrow_mut().insert(path);
                 }
             }
@@ -2158,17 +2319,14 @@ impl Shared {
         changed |= self.promote_candidates(&state);
         for (path, entries) in found.bibs {
             self.feed.stale.borrow_mut().remove(&path);
+            let mut index = state.workspace.index.borrow_mut();
             match entries {
                 Some(entries) => {
-                    state
-                        .workspace
-                        .index
-                        .borrow_mut()
-                        .bibs
-                        .insert(path, Arc::new(entries));
+                    index.bibs.insert(path, Arc::new(entries));
                     changed = true;
                 }
                 None => {
+                    changed |= index.bibs.remove(&path).is_some();
                     self.feed.unreadable.borrow_mut().insert(path);
                 }
             }
@@ -2308,6 +2466,11 @@ impl Shared {
         });
         let mut searched = self.feed.searched.borrow_mut();
         searched.retain(|dir| near.iter().any(|n| n == dir) && !gone_dirs.contains(dir));
+        let candidates = self.feed.candidates.borrow();
+        self.feed
+            .indexed_with
+            .borrow_mut()
+            .retain(|p, _| keep.contains(p) || candidates.contains_key(p));
         dropped
     }
 
@@ -2341,6 +2504,72 @@ impl Shared {
         self.discover();
     }
 
+    /// Another program (or Lemma, `own_write`) changed, created or deleted the file at `path`
+    /// (see [`disk_changed`]); true when the index reads it again.
+    fn disk_changed(self: &Rc<Self>, state: &WindowState, path: &Path, own_write: bool) -> bool {
+        let indexed = if own_write {
+            Vec::new()
+        } else {
+            let index = state.workspace.index.borrow();
+            // Open documents are indexed from their live text; bibliographies are read from
+            // disk even while they are open.
+            let mut keys = keys_naming(index.files.keys(), path);
+            keys.retain(|key| state.workspace.get(key).is_none_or(|d| !d.is_open()));
+            keys.extend(keys_naming(index.bibs.keys(), path));
+            keys
+        };
+        let unreadable = keys_naming(self.feed.unreadable.borrow().iter(), path);
+        if indexed.is_empty() && unreadable.is_empty() {
+            return false;
+        }
+        {
+            let mut set = self.feed.unreadable.borrow_mut();
+            for key in &unreadable {
+                set.remove(key);
+            }
+        }
+        self.feed.stale.borrow_mut().extend(indexed);
+        self.discover();
+        true
+    }
+
+    /// Files came or went (see [`files_moved`]): lists the project's files again when the list
+    /// does not say so already.
+    fn files_moved(self: &Rc<Self>, state: &WindowState, moved: &[(PathBuf, bool)]) {
+        let Some(dir) = self.feed.walked_dir.borrow().clone() else {
+            // Not listed since the root moved: list them now.
+            self.walk_files();
+            return;
+        };
+        let skip = dir.join(&state.config.build.outdir);
+        let differs = {
+            let completer = self.completer.borrow();
+            let listed: HashSet<&str> = completer.files().iter().map(String::as_str).collect();
+            moved.iter().any(|(path, exists)| {
+                let Some(rel) = path
+                    .strip_prefix(&dir)
+                    .ok()
+                    .filter(|_| !path.starts_with(&skip))
+                    .and_then(Path::to_str)
+                else {
+                    return false;
+                };
+                let rel = rel.replace('\\', "/");
+                // A directory that went takes its files along (moved out of the project, they
+                // get no events of their own).
+                listed.contains(rel.as_str()) != *exists
+                    || (!exists
+                        && listed.iter().any(|file| {
+                            file.strip_prefix(rel.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                        }))
+            })
+        };
+        if differs {
+            self.walk_files();
+        }
+    }
+
     /// Lists the project's files (for file arguments) on the jobs thread.
     fn walk_files(self: &Rc<Self>) {
         let Some(state) = self.state() else {
@@ -2351,6 +2580,8 @@ impl Shared {
             return;
         }
         self.feed.walked_dir.replace(Some(root_dir.clone()));
+        let walk = self.feed.walks.get() + 1;
+        self.feed.walks.set(walk);
         let skip = vec![root_dir.join(&state.config.build.outdir)];
         let weak = Rc::downgrade(self);
         self.feed.jobs.set(self.feed.jobs.get() + 1);
@@ -2370,7 +2601,10 @@ impl Shared {
                 return;
             };
             shared.feed.jobs.set(shared.feed.jobs.get() - 1);
-            if let Ok(files) = files {
+            // An older listing that ends after a newer one is dropped.
+            if let Ok(files) = files
+                && shared.feed.walks.get() == walk
+            {
                 shared.completer.borrow_mut().set_files(files);
             }
         });
@@ -2509,6 +2743,19 @@ fn lexical_join(dir: &Path, rel: impl AsRef<Path>) -> PathBuf {
     out
 }
 
+/// The keys among `keys` that name the file at the normalized `path` (as the file monitor
+/// reports it), or a file under it (a directory renamed with its files). The index keys files
+/// lexically, so a key with the same file name is also normalized (a directory reached through
+/// a symbolic link); only those touch the file system.
+fn keys_naming<'a>(keys: impl Iterator<Item = &'a PathBuf>, path: &Path) -> Vec<PathBuf> {
+    keys.filter(|key| {
+        key.starts_with(path)
+            || (key.file_name() == path.file_name() && crate::workspace::normalize(key) == path)
+    })
+    .cloned()
+    .collect()
+}
+
 /// The open LaTeX documents of `state`'s window.
 fn open_latex_documents(state: &WindowState) -> HashSet<PathBuf> {
     state
@@ -2571,7 +2818,10 @@ fn read_text(path: &Path, cap: u64) -> Option<String> {
 
 /// The discovery job (jobs thread): reads and indexes `wanted`.
 fn read_wanted(wanted: Wanted) -> Discovered {
-    let mut found = Discovered::default();
+    let mut found = Discovered {
+        theorems: wanted.theorems.clone(),
+        ..Discovered::default()
+    };
     let mut budget = wanted.budget;
     let mut files: Vec<(PathBuf, bool)> = wanted.files.into_iter().map(|p| (p, false)).collect();
     for dir in &wanted.dirs {
@@ -2750,6 +3000,40 @@ mod tests {
             lexical_join(Path::new("/p"), "./a/b.tex"),
             PathBuf::from("/p/a/b.tex")
         );
+    }
+
+    /// The index keys a file changed on disk names: itself, the files under a directory, and a
+    /// key that reaches it through a symbolic link.
+    #[test]
+    fn keys_naming_a_changed_path() {
+        let dir = std::env::temp_dir().join(format!("lemma-keys-naming-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/ch1.tex"), "").unwrap();
+        let dir = crate::workspace::normalize(&dir);
+        let mut keys = vec![
+            dir.join("real/ch1.tex"),
+            dir.join("real/ch2.tex"),
+            dir.join("other/ch1.tex"),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+            keys.push(dir.join("link/ch1.tex"));
+        }
+        let mut named = keys_naming(keys.iter(), &dir.join("real/ch1.tex"));
+        let mut expected = vec![dir.join("real/ch1.tex")];
+        if cfg!(unix) {
+            expected.push(dir.join("link/ch1.tex"));
+        }
+        named.sort();
+        expected.sort();
+        assert_eq!(named, expected);
+        assert_eq!(
+            keys_naming(keys.iter(), &dir.join("real")),
+            [dir.join("real/ch1.tex"), dir.join("real/ch2.tex")]
+        );
+        assert!(keys_naming(keys.iter(), &dir.join("re")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

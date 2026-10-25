@@ -38,12 +38,21 @@
 //!   simply leaves the workspace, to be read again when needed), a dirty one is put on the
 //!   window's conflict bar ("Reload" / "Keep mine"; Keep mine makes the next save overwrite the
 //!   other program's version without asking), and a deleted one is marked modified with a toast
-//!   (saving writes it again). Files that are not loaded need nothing (they are not even read).
-//!   A document on the bar that loses its unsaved changes (undone, or saved over the file) leaves
-//!   it, and its file is looked at again: a clean document then reloads.
+//!   (saving writes it again). Files that are not loaded are not read here. A document on the
+//!   bar that loses its unsaved changes (undone, or saved over the file) leaves it, and its file
+//!   is looked at again: a clean document then reloads.
+//! - **Always**, for the project index (`editor::completion`): a changed, created or deleted
+//!   source file or document that the index read from disk (a chapter that is not open, a
+//!   bibliography) or could not read is read again by it (`completion::disk_changed`, before
+//!   the rules above look at the file, so files that are not loaded count too; after Lemma's
+//!   own writes, whose text the index has, only when it could not read the file before). Files
+//!   of any kind created, deleted or moved in a batch (an image for `\includegraphics`, a
+//!   directory moved out of the project) go to `completion::files_moved` once per batch, which
+//!   lists the project's files again when they changed.
 
 use super::bridge;
 use crate::document::{DocRef, Document};
+use crate::editor::completion;
 use crate::review_ui;
 use crate::saver::{self, DiskState};
 use crate::window::WindowState;
@@ -53,7 +62,7 @@ use lemma_core::TextEdit;
 use lemma_core::{Origin, fnv1a64};
 use lemma_review::minimal_edits;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -114,6 +123,9 @@ pub struct Watcher {
     monitors: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
     /// Changed paths waiting for the debounce.
     pending: RefCell<BTreeSet<PathBuf>>,
+    /// Paths of any kind created, deleted or moved, waiting for the debounce, and whether each
+    /// exists after its last event.
+    moved: RefCell<BTreeMap<PathBuf, bool>>,
     first_pending: Cell<Option<Instant>>,
     timer: RefCell<Option<glib::SourceId>>,
     /// A batch is being processed.
@@ -170,6 +182,7 @@ pub fn install(state: &Rc<WindowState>) {
         state: Rc::downgrade(state),
         monitors: RefCell::new(HashMap::new()),
         pending: RefCell::new(BTreeSet::new()),
+        moved: RefCell::new(BTreeMap::new()),
         first_pending: Cell::new(None),
         timer: RefCell::new(None),
         busy: Cell::new(false),
@@ -259,7 +272,10 @@ pub fn watched_dirs(state: &WindowState) -> Vec<PathBuf> {
 /// True when no change is waiting or being handled (tests wait for it).
 pub fn is_idle(state: &WindowState) -> bool {
     watcher_of(state).is_none_or(|w| {
-        !w.busy.get() && w.pending.borrow().is_empty() && w.timer.borrow().is_none()
+        !w.busy.get()
+            && w.pending.borrow().is_empty()
+            && w.moved.borrow().is_empty()
+            && w.timer.borrow().is_none()
     })
 }
 
@@ -457,6 +473,7 @@ impl Watcher {
         self.generation.set(self.generation.get() + 1);
         self.cancel_monitors();
         self.pending.borrow_mut().clear();
+        self.moved.borrow_mut().clear();
         if let Some(id) = self.timer.take() {
             id.remove();
         }
@@ -499,7 +516,26 @@ impl Watcher {
                 monitor.cancel();
             }
         }
+        // Paths that came or went, of any kind (the project's file list has images too). A
+        // rename onto a file (a save through a temporary file) says that it exists.
+        let moved: Vec<(PathBuf, bool)> = match event {
+            E::Created | E::MovedIn => file.path().map(|p| (p, true)).into_iter().collect(),
+            E::Deleted | E::MovedOut => file.path().map(|p| (p, false)).into_iter().collect(),
+            E::Renamed | E::Moved => file
+                .path()
+                .map(|p| (p, false))
+                .into_iter()
+                .chain(other.and_then(|o| o.path()).map(|p| (p, true)))
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut added = false;
+        for (path, exists) in moved {
+            if in_project(&state, &path) {
+                self.moved.borrow_mut().insert(path, exists);
+                added = true;
+            }
+        }
         for path in paths {
             if self.interesting(&state, &path, event) {
                 added |= self.pending.borrow_mut().insert(path);
@@ -511,19 +547,13 @@ impl Watcher {
     }
 
     /// Whether a change of `path` may matter: a document of the workspace, a project source
-    /// file, or a new directory to watch.
+    /// file, a new directory to watch, or a directory that went (moved out of the project, its
+    /// files get no events of their own: the project index drops them).
     fn interesting(&self, state: &WindowState, path: &Path, event: gio::FileMonitorEvent) -> bool {
         if state.workspace.get(path).is_some() {
             return true;
         }
-        let root = state.workspace.root().path().to_path_buf();
-        if !path.starts_with(&root) || is_hidden(&root, path) {
-            return false;
-        }
-        if super::tools::output_dirs(state)
-            .iter()
-            .any(|d| path.starts_with(d))
-        {
+        if !in_project(state, path) {
             return false;
         }
         workspace::is_source_file(path)
@@ -532,6 +562,8 @@ impl Watcher {
                 gio::FileMonitorEvent::Created
                     | gio::FileMonitorEvent::MovedIn
                     | gio::FileMonitorEvent::Renamed
+                    | gio::FileMonitorEvent::Deleted
+                    | gio::FileMonitorEvent::MovedOut
             ) && path.extension().is_none())
     }
 
@@ -564,8 +596,11 @@ impl Watcher {
         let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending.borrow_mut())
             .into_iter()
             .collect();
+        let moved: Vec<(PathBuf, bool)> = std::mem::take(&mut *self.moved.borrow_mut())
+            .into_iter()
+            .collect();
         self.first_pending.set(None);
-        if paths.is_empty() {
+        if paths.is_empty() && moved.is_empty() {
             return;
         }
         self.busy.set(true);
@@ -574,8 +609,15 @@ impl Watcher {
             for path in paths {
                 watcher.process(&path).await;
             }
+            // Once per batch, however many files came and went (a checkout of another branch).
+            if !moved.is_empty()
+                && let Some(state) = watcher.state.upgrade()
+            {
+                completion::files_moved(&state, &moved);
+            }
             watcher.busy.set(false);
-            if !watcher.pending.borrow().is_empty() && watcher.timer.borrow().is_none() {
+            let more = !watcher.pending.borrow().is_empty() || !watcher.moved.borrow().is_empty();
+            if more && watcher.timer.borrow().is_none() {
                 watcher.schedule();
             }
         });
@@ -596,6 +638,8 @@ impl Watcher {
         }
         let file = gio::File::for_path(&path);
         if state.workspace.get(&path).is_none() {
+            // Not loaded, so not Lemma's write: the project index reads it again if it has it.
+            completion::disk_changed(&state, &path, false);
             let info = file
                 .query_info_future(
                     "standard::type,standard::size",
@@ -662,7 +706,14 @@ impl Watcher {
         }
         let in_turn = in_agent_window(&state);
         match state.workspace.get(&path) {
-            Some(doc) => self.document_changed(&state, &doc, disk, in_turn),
+            Some(doc) => {
+                // Another program's write: the project index reads a closed document's file
+                // (or a bibliography) again. Lemma's own writes it has already, unless it could
+                // not read the file before.
+                let own = disk.hash().is_some_and(|h| doc.is_own_write(h));
+                completion::disk_changed(&state, &path, own);
+                self.document_changed(&state, &doc, disk, in_turn);
+            }
             None if in_turn => self.unloaded_file_changed(&state, &path, disk).await,
             None => {}
         }
@@ -690,11 +741,13 @@ impl Watcher {
             for dir in &walk.dirs {
                 watcher.watch_dir(dir);
             }
-            let mut added = false;
+            let added = !walk.files.is_empty();
             for file in walk.files {
                 if workspace::is_source_file(&file) {
-                    added |= watcher.pending.borrow_mut().insert(file);
+                    watcher.pending.borrow_mut().insert(file.clone());
                 }
+                // New to the project's file list as well.
+                watcher.moved.borrow_mut().insert(file, true);
             }
             if added {
                 watcher.schedule();
@@ -1132,6 +1185,17 @@ fn is_hidden(root: &Path, path: &Path) -> bool {
         rel.components()
             .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
     })
+}
+
+/// True when `path` is under the workspace root, not hidden and not in a build output
+/// directory.
+fn in_project(state: &WindowState, path: &Path) -> bool {
+    let root = state.workspace.root().path().to_path_buf();
+    path.starts_with(&root)
+        && !is_hidden(&root, path)
+        && !super::tools::output_dirs(state)
+            .iter()
+            .any(|d| path.starts_with(d))
 }
 
 /// Replaces `doc`'s text by `text` with the smallest edits, as one undoable change.

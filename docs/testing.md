@@ -262,6 +262,18 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   tab's place, encodings and line breaks, the refusals); `gtk_vim`'s `:w path`, `:wq path` and
   `:sav[eas][!]`; `GotoTarget::LineColumn` in `gtk_shell_m3`, whose real keys check Vim's Ctrl+G
   and Ctrl+N and Ctrl+G in the PDF's search entry; `gtk_keys`, Ctrl+N with Vim in every mode.
+- **The project index and the disk:** `gtk_labels` `undefined_follows_files_changed_on_disk`,
+  `gtk_completion` `the_project_feed_follows_files_on_disk` and `gtk_outline`
+  `a_chapter_changed_on_disk_updates_the_tree` write files with `std::fs` as another program
+  would and then wait only for the result: no build, no `completion::refresh_project` and no
+  `outline::is_settled` (which looks at the page again by itself), so only the file monitor
+  and the project feed can bring it. `gtk_completion` also checks that a save lists no files
+  again and, in `the_project_feed_follows_files_on_disk_at_its_cap`, that a changed file is
+  read again at the cap of 300 files read from disk without letting more files in,
+  `gtk_outline` `theorems_declared_in_a_preamble_file` that a preamble's `\newtheorem` names the
+  rows of chapters read before it, and `gtk_labels`
+  `undefined_shows_without_waiting_for_the_words` that the check runs while the words timer
+  still waits (in a release build, under 1.2 s after the edit).
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep

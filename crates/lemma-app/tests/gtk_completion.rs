@@ -6,8 +6,9 @@
 //!
 //! - **In process:** the proposals in every context, the trigger policy on the scanner's real
 //!   contexts, accepting each kind of proposal, Tab precedence 1–4 through the key layer, the
-//!   project feed (included files, `.bib`, `.aux`, packages), `--demo completion`, and the
-//!   per-keystroke cost (`perf_completion_keystroke`, with `--ignored`).
+//!   project feed (included files, `.bib`, `.aux`, packages, files other programs change),
+//!   `--demo completion`, and the per-keystroke cost (`perf_completion_keystroke`, with
+//!   `--ignored`).
 //! - **Real input** (`popup_on_real_key_events`, see `broadway_input`): the popup opens while
 //!   typing, Enter accepts, Tab moves between the stops GtkSourceView manages, steps out, and
 //!   indents, Escape closes, in plain editing and in Vim insert mode.
@@ -46,6 +47,14 @@ fn main() -> ExitCode {
         ("popup_on_real_key_events", popup_on_real_key_events),
         ("proposals_in_every_context", proposals_in_every_context),
         ("the_project_feed_reads_the_project", project_feed),
+        (
+            "the_project_feed_follows_files_on_disk",
+            project_feed_follows_the_disk,
+        ),
+        (
+            "the_project_feed_follows_files_on_disk_at_its_cap",
+            project_feed_at_its_cap,
+        ),
         (
             "the_project_feed_finds_the_root_of_a_chapter",
             project_feed_from_a_chapter,
@@ -498,6 +507,111 @@ fn project_feed() {
         f.labels("\\includegraphics{")
             .contains(&"figures/new.png".to_owned())
     );
+}
+
+/// Files another program writes reach the feed without a build: a citation key added to the
+/// bibliography, a label added to the chapter (not open), an image created and one deleted
+/// (file arguments). Saving a document (written through a temporary file renamed onto it)
+/// does not list the project's files again.
+fn project_feed_follows_the_disk() {
+    let f = fixture("feed-disk", false);
+    let dir = f.state.workspace.root().path().to_path_buf();
+    let idle =
+        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    common::pump_for(Duration::from_millis(300));
+    common::pump_until(TIMEOUT, idle);
+    let walks = completion::file_walks(&f.state);
+    f.probe("Saved here.", "");
+    block_on(f.editor.document().save()).unwrap();
+    common::pump_for(Duration::from_millis(500));
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(
+        completion::file_walks(&f.state),
+        walks,
+        "a save lists the files"
+    );
+    let bib = std::fs::read_to_string(dir.join("refs.bib")).unwrap()
+        + "\n@book{Lurie, author = {Lurie, Jacob}, title = {Higher Topos Theory}, year = {2009}}\n";
+    std::fs::write(dir.join("refs.bib"), bib).unwrap();
+    let chapter = std::fs::read_to_string(dir.join("chapters/yoneda.tex")).unwrap()
+        + "\\section{Elsewhere}\\label{sec:elsewhere}\n";
+    std::fs::write(dir.join("chapters/yoneda.tex"), chapter).unwrap();
+    std::fs::write(dir.join("figures/drawn.png"), b"").unwrap();
+    std::fs::remove_file(dir.join("figures/plot.pdf")).unwrap();
+    f.wait("the files written elsewhere", || {
+        let index = f.state.workspace.index.borrow();
+        index.find_label("sec:elsewhere").is_some()
+            && index.all_bib().iter().any(|e| e.key == "Lurie")
+    });
+    assert!(f.labels("\\cite{Lur").contains(&"Lurie".to_owned()));
+    assert!(
+        f.labels("\\ref{sec:else")
+            .contains(&"sec:elsewhere".to_owned())
+    );
+    f.wait("the new image", || {
+        let files = f.labels("\\includegraphics{");
+        files.contains(&"figures/drawn.png".to_owned())
+            && !files.contains(&"figures/plot.pdf".to_owned())
+    });
+    assert!(completion::file_walks(&f.state) > walks);
+    // The chapters' directory moved out of the project (`mv`): its files get no events of their
+    // own, yet their labels and their place in the file list go.
+    let outside = common::temp_dir("feed-disk-moved-out");
+    std::fs::remove_dir(&outside).unwrap();
+    std::fs::rename(dir.join("chapters"), &outside).unwrap();
+    f.wait("the chapters moved out", || {
+        f.state
+            .workspace
+            .index
+            .borrow()
+            .find_label("sec:elsewhere")
+            .is_none()
+            && !f
+                .labels("\\input{")
+                .iter()
+                .any(|file| file.starts_with("chapters/"))
+    });
+}
+
+/// At the cap of files read from disk (300, `MAX_DISK_FILES`), a file of the index that another
+/// program changes is still read again, and the files past the cap stay out: the file read
+/// again does not give its place to them.
+fn project_feed_at_its_cap() {
+    let dir = common::temp_dir("feed-cap");
+    // 300 includes: `aaa.tex`, whose own includes are past the cap (and listed first, as the
+    // index orders its files by path), then 299 chapters.
+    let mut main = String::from("\\documentclass{article}\n\\begin{document}\n\\input{aaa}\n");
+    let mut aaa = String::new();
+    std::fs::create_dir_all(dir.join("c")).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    for i in 0..299 {
+        main += &format!("\\input{{c/c{i:03}}}\n");
+        let chapter = format!("\\section{{Chapter {i}}}\\label{{c:{i}}}\n");
+        std::fs::write(dir.join(format!("c/c{i:03}.tex")), chapter).unwrap();
+    }
+    for i in 0..5 {
+        aaa += &format!("\\input{{sub/s{i}}}\n");
+        let sub = format!("\\section{{Sub {i}}}\\label{{s:{i}}}\n");
+        std::fs::write(dir.join(format!("sub/s{i}.tex")), sub).unwrap();
+    }
+    main += "\\end{document}\n";
+    std::fs::write(dir.join("main.tex"), main).unwrap();
+    std::fs::write(dir.join("aaa.tex"), aaa).unwrap();
+    let f = fixture_at(&dir, "main.tex", false);
+    let idle =
+        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
+    common::pump_until(TIMEOUT, idle);
+    assert!(has("c:298") && !has("s:0"), "the cap");
+    std::fs::write(
+        dir.join("c/c150.tex"),
+        "\\section{Changed}\\label{c:changed}\n",
+    )
+    .unwrap();
+    f.wait("the chapter changed on disk", || has("c:changed"));
+    common::pump_until(TIMEOUT, idle);
+    assert!(!has("c:150"));
+    assert!((0..5).all(|i| !has(&format!("s:{i}"))), "past the cap");
 }
 
 /// Opening only a chapter: the root next to it is found (it includes the chapter), with its

@@ -1139,6 +1139,25 @@ they conflict with the sections above, this section wins.
     what to install, `[build] latexmk`): F5 every time, the other triggers once per window
     until a latexmk starts; the status bar says "Not built: latexmk not found".
   - Auto-save saves its documents together and then requests one `Save` build.
+- **Project index (§5, 2026-10-25):**
+  - The file monitor passes the changes of project sources and documents it sees to the
+    project feed, outside turns too, before its own rules (which skip files that are not
+    loaded): `completion::disk_changed` reads a file the index has from disk (not an open
+    document; a bibliography even when it is open), or could not read, again on the jobs
+    thread, and a file that is gone leaves the index (a directory that goes too: moved out of
+    the project, its files get no events). Lemma's own writes (by content hash) are read only
+    when the index could not read the file before. The paths of any kind created, deleted or
+    moved in one debounce batch go to `completion::files_moved` once, which lists the project's
+    files again only when the list lacks one that exists or has one that went, or a file under
+    a directory that went (a save renamed onto its file changes nothing). Files read again do
+    not count against the cap of files read from disk, and are read before new ones.
+  - Each indexed file keeps the theorem names it was indexed with. When the project's names
+    change (a preamble file read after the chapters), the files whose environments use a
+    changed name are indexed again: open documents at once, the others on the next discovery
+    pass. This converges, as a file's own declarations do not depend on the names.
+  - The label checks and the Outline wait for `completion::index_busy` (re-index timers and
+    jobs, discovery passes), not for the words rebuilt 1.5 s later; `project_busy` still counts
+    everything, for tests that want the feed settled.
 - **Problems (§5, 2026-10-25):**
   - The Problems page builds a build's rows when it is shown, and lists at most
     `MAX_SECTION_ROWS` (500) of its problems, the most severe ones (errors, then warnings, then

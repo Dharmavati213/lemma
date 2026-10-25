@@ -102,6 +102,18 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   the empty prompt box then (the next keys of the conversion, such as `n`, answered it).
 - A table in an agent's answer no longer makes GTK warn ("Trying to measure GtkGrid …") each
   time it is laid out.
+- Changes that other programs make to the files in the project's folder now reach completion,
+  the undefined-reference check and the Outline without a build: a bibliography that a
+  reference manager exports again, a chapter that is not open, edited in another editor or
+  changed by `git checkout`, a file that an `\input` named before it existed, and images created
+  or deleted (for `\includegraphics{`). A deleted chapter takes its labels with it.
+- Undefined references and citations are underlined and listed on the Problems page, and the
+  inline equation numbers refreshed, about half a second after typing stops instead of about
+  two seconds: the check no longer waits for the project's word list to be rebuilt.
+- Theorem environments declared in a separate preamble file (`\newtheorem{mainthm}{Main
+  Theorem}` in `preamble.tex`) appear in the Outline of the chapters that use them, open or
+  not, and labels inside them get the theorem's title. Before, only the common names
+  (`theorem`, `lemma`, …) did when the chapter was read before the preamble.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive
   (`C:/texlive/…/geometry.sty:1005: …`), such as an unknown package option, reach the Problems
   page.

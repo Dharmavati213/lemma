@@ -482,17 +482,18 @@ fn manual_snippets_choose_the_if_undefined_body() {
 #[test]
 fn files_by_command() {
     let mut s = Setup::new();
-    s.completer.set_files(
-        [
-            "main.tex",
-            "chapters/yoneda.tex",
-            "fig/plot.pdf",
-            "refs.bib",
-            "notes.txt",
-        ]
-        .map(String::from)
-        .to_vec(),
-    );
+    assert!(s.completer.files().is_empty());
+    let files = [
+        "main.tex",
+        "chapters/yoneda.tex",
+        "fig/plot.pdf",
+        "refs.bib",
+        "notes.txt",
+    ]
+    .map(String::from)
+    .to_vec();
+    s.completer.set_files(files.clone());
+    assert_eq!(s.completer.files(), files);
     let line = r"\input{ch";
     let items = s.complete(&arg("input", ArgKind::File, line), line);
     assert_eq!(labels(&items), ["chapters/yoneda"]);

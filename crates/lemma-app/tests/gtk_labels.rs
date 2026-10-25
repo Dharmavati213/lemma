@@ -1,6 +1,7 @@
-//! WP3.2: the label tools (`labels.rs`) — undefined and unused names, find references, rename
-//! as reviewable hunks — and the inline equation numbers (`editor/annotations.rs`), on the
-//! project fixture of `tests/labels_common`.
+//! WP3.2: the label tools (`labels.rs`) — undefined and unused names (following edits, saves
+//! and files other programs change), find references, rename as reviewable hunks — and the
+//! inline equation numbers (`editor/annotations.rs`), on the project fixture of
+//! `tests/labels_common`.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_labels`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `j-references`, `j-rename`, `j-unused` and
@@ -11,7 +12,7 @@ mod labels_common;
 
 use adw::prelude::*;
 use labels_common::{
-    AUX, CHAPTER, MAIN, TIMEOUT, block_on, disk, find, fixture, offset_of, snapshots,
+    AUX, BIB, CHAPTER, Fixture, MAIN, TIMEOUT, block_on, disk, find, fixture, offset_of, snapshots,
 };
 use lemma_app::editor::{Editor, annotations, completion, goto};
 use lemma_app::labels::{self, Finding, NameKind};
@@ -20,7 +21,7 @@ use lemma_app::workspace::normalize;
 use lemma_core::DiagSource;
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     common::run(&[
@@ -28,6 +29,14 @@ fn main() -> ExitCode {
         (
             "undefined_follows_edits_saves_and_bibliographies",
             undefined_follows,
+        ),
+        (
+            "undefined_shows_without_waiting_for_the_words",
+            undefined_soon_after_typing,
+        ),
+        (
+            "undefined_follows_files_changed_on_disk",
+            undefined_follows_files_on_disk,
         ),
         ("problems_page_references_section_and_fix", problems_page),
         ("unused_labels_and_entries_on_demand", unused),
@@ -165,6 +174,133 @@ fn undefined_follows() {
             .iter()
             .all(|f| f.kind == NameKind::Label)
     );
+}
+
+/// The checks wait for the project index only, not for the project's words (rebuilt 1.5 s after
+/// the index changed): a reference to nothing is underlined about half a second after typing
+/// stops, while the words still wait.
+fn undefined_soon_after_typing() {
+    let f = fixture("labels-undefined-soon");
+    let editor = f.open("main.tex");
+    f.wait_index();
+    f.wait_checks();
+    let before = labels::checks_done(&f.state);
+    insert_before(&editor, "\\end{document}", "See \\ref{nope}.\n");
+    let typed = Instant::now();
+    common::pump_until(TIMEOUT, || {
+        labels::undefined(&f.state)
+            .iter()
+            .any(|finding| finding.name == "nope")
+    });
+    let elapsed = typed.elapsed();
+    let feed = completion::project_feed_state(&f.state);
+    println!("    undefined after {elapsed:?} ({feed})");
+    assert!(labels::checks_done(&f.state) > before);
+    assert!(
+        feed.contains("words timer true"),
+        "the check waited for the words: {feed}"
+    );
+    let text = editor.document().text();
+    let nope = find(&text, "nope}", 0);
+    assert!(labels::underlined(&editor).contains(&(nope..nope + "nope".len())));
+    if !cfg!(debug_assertions) {
+        assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+    }
+}
+
+/// The proposals after `before`, typed on a line of its own before `\end{document}` (then
+/// removed again).
+fn proposals_after(f: &Fixture, editor: &Editor, before: &str) -> Vec<String> {
+    let line = format!("{before}\n");
+    insert_before(editor, "\\end{document}", &line);
+    let buffer = editor.buffer();
+    let at = offset_of(editor, &line, before.len());
+    buffer.place_cursor(&editor.iter_near(at).unwrap());
+    // (The scanner's contexts follow the edit.)
+    common::pump_for(Duration::from_millis(5));
+    let labels = completion::items_at_cursor(&f.state, editor)
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+    let start = offset_of(editor, &line, 0);
+    let mut a = editor.iter_near(start).unwrap();
+    let mut b = editor.iter_near(start + line.len()).unwrap();
+    buffer.delete(&mut a, &mut b);
+    labels
+}
+
+/// Other programs change the files the project index read from disk, without a build or an
+/// edit in Lemma: the chapter (not open) gains the label that was undefined, the bibliography
+/// the missing key (as a reference manager exports it), a file an `\input` named before it
+/// existed is written, and a deleted chapter takes its labels along. The checks, the Problems
+/// page and completion follow.
+fn undefined_follows_files_on_disk() {
+    let f = fixture("labels-undefined-disk");
+    let editor = f.open("main.tex");
+    f.wait_index();
+    assert_eq!(
+        names(&labels::undefined(&f.state)),
+        vec![
+            ("missing".to_owned(), 10, NameKind::Cite),
+            ("sec:undefined".to_owned(), 23, NameKind::Label),
+        ]
+    );
+    std::fs::write(
+        f.path("chapters/ch1.tex"),
+        format!("{CHAPTER}\\section{{Late}}\\label{{sec:undefined}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        f.path("refs.bib"),
+        format!("{BIB}@misc{{missing, title = {{Found}}, year = {{2026}}}}\n"),
+    )
+    .unwrap();
+    common::pump_until(TIMEOUT, || labels::undefined(&f.state).is_empty());
+    assert!(labels::cites_checked(&f.state));
+    assert!(labels::published(&f.state).is_empty());
+    assert!(proposals_after(&f, &editor, "\\cite{").contains(&"missing".to_owned()));
+    assert!(proposals_after(&f, &editor, "\\ref{").contains(&"sec:undefined".to_owned()));
+    // An `\input` of a file that does not exist yet, then the file.
+    insert_before(
+        &editor,
+        "\\end{document}",
+        "\\input{chapters/ch2}\nSee \\ref{sec:two}.\n",
+    );
+    common::pump_until(TIMEOUT, || {
+        labels::undefined(&f.state)
+            .iter()
+            .any(|finding| finding.name == "sec:two")
+    });
+    std::fs::write(
+        f.path("chapters/ch2.tex"),
+        "\\section{Two}\\label{sec:two}\n",
+    )
+    .unwrap();
+    common::pump_until(TIMEOUT, || labels::undefined(&f.state).is_empty());
+    // The chapter deleted: what only it defined is undefined again (`sec:ch` stays defined by
+    // the `.aux`).
+    std::fs::remove_file(f.path("chapters/ch1.tex")).unwrap();
+    common::pump_until(TIMEOUT, || {
+        names(&labels::undefined(&f.state))
+            == vec![("sec:undefined".to_owned(), 23, NameKind::Label)]
+    });
+    let chapter = f.path("chapters/ch1.tex");
+    assert!(
+        !f.state
+            .workspace
+            .index
+            .borrow()
+            .files
+            .keys()
+            .any(|p| normalize(p) == chapter)
+    );
+    // The bibliography, open in a tab, deleted by another program and saved again from its
+    // tab: Lemma's own write, yet the index reads it again, as it could not before.
+    let bib = block_on(f.state.open_file(&f.path("refs.bib"))).expect("open");
+    std::fs::remove_file(f.path("refs.bib")).unwrap();
+    common::pump_until(TIMEOUT, || !labels::cites_checked(&f.state));
+    block_on(bib.document().save()).unwrap();
+    common::pump_until(TIMEOUT, || labels::cites_checked(&f.state));
 }
 
 fn problems_page() {
