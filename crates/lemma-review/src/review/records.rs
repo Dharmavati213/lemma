@@ -20,7 +20,8 @@
 //! taking at most [`MAX_RECORD_BYTES`]), so that the whole decision or turn is recognized when it
 //! is undone and redone; older ones are dropped beyond a cap of records and of bytes. An edit
 //! only meets the records next to it, so the ranges are kept in a [`Points`] index: an edit costs
-//! the records it meets (and those between it and the edit before), not every record.
+//! the records it meets and a step for each chunk of up to [`CHUNK_MAX`] others between it and
+//! the edit before, not every record.
 //!
 //! Only a buffer's undo and redo take up an agent edit's record, and they reach only the edits
 //! made in that buffer: a closed document's text goes into a new buffer as not undoable. So while
@@ -34,7 +35,7 @@
 use super::Reopen;
 use crate::text::{overlaps, shift_range, signed};
 use lemma_core::{Origin, TextEdit};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
 /// Top-level records kept at most (oldest dropped first). The rejects of the newest decision and
@@ -46,7 +47,8 @@ const MAX_RECORDS: usize = 512;
 const DROP_AT_ONCE: usize = MAX_RECORDS / 8;
 /// Agent records of the newest turn kept at most whatever the cap (its last ones): a few hundred
 /// bytes each, so that a replace_all of every space in a big file does not take hundreds of
-/// megabytes. That is 16 384 matches in an open buffer (a deletion and an insertion each).
+/// megabytes. That is 16 384 matches in an open buffer (a deletion and an insertion each), fewer
+/// when they are long: the turn's records also take at most about [`MAX_RECORD_BYTES`].
 const MAX_TURN_RECORDS: u64 = 1 << 15;
 /// What the top-level records take at most, about (see [`Record::cost`]): beyond, the oldest are
 /// dropped as beyond [`MAX_RECORDS`], and the newest turn's agent records are kept whatever the
@@ -61,6 +63,15 @@ const RECORD_OVERHEAD: usize = 400;
 /// Agent edits whose texts are larger than this (before plus after) are not recorded: a record
 /// holds copies of them, and undoing such an edit is still classified by the Inside rule.
 const MAX_AGENT_RECORD_BYTES: usize = 256 * 1024;
+
+/// Ranges a chunk of [`Points`] holds at most: a fuller one is split in two. Smaller chunks cost
+/// less to change and more to move as a whole: runs of edits were fastest with 64 to 128 (with
+/// 256 those among other records took 60% longer).
+const CHUNK_MAX: usize = 128;
+/// Of two neighbouring chunks of [`Points`], one holds at least this many ranges, so that `n`
+/// records take at most `2n / CHUNK_MIN + 1` chunks: a chunk that falls below it is merged with a
+/// neighbour.
+const CHUNK_MIN: usize = CHUNK_MAX / 4;
 
 /// What a record with these texts (the range's now, before and after the edit) takes, about:
 /// the texts and [`RECORD_OVERHEAD`]. The records it keeps are not counted.
@@ -658,7 +669,7 @@ impl Records {
             claim
         });
         // Every record the edit did not meet lies after it or before it.
-        self.points.moved(signed(text.len()) - signed(b - a));
+        self.points.moved(b, signed(text.len()) - signed(b - a));
         let end = claimer.as_ref().map(|r| r.range.end);
         for rec in claimer.into_iter().chain(kept) {
             self.attach(rec);
@@ -704,8 +715,8 @@ impl Records {
     #[cfg(test)]
     pub fn in_text_order(&self) -> Vec<(Range<usize>, &str)> {
         self.points
-            .starts()
-            .filter_map(|id| Some((self.points.get(id)?, self.list.get(&id)?.content.as_str())))
+            .in_order()
+            .filter_map(|(id, range)| Some((range, self.list.get(&id)?.content.as_str())))
             .collect()
     }
 
@@ -775,94 +786,223 @@ impl Records {
     }
 }
 
-/// Where an end of a record's range is kept (see [`Points`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Key {
-    /// At this position (before `Points::split`).
-    Front(usize),
-    /// At this position minus `Points::shift` (at or after `Points::split`).
-    Back(isize),
+/// Hashes record ids, which are mostly consecutive: a multiplication, folded so that every bit of
+/// the id counts in the low bits, which pick the bucket. Runs of edits take about 30% less time
+/// than with the standard hasher.
+#[derive(Clone, Copy, Debug, Default)]
+struct IdHash(u64);
+
+impl std::hash::Hasher for IdHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0.rotate_left(8) ^ u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let x = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = x ^ (x >> 32);
+    }
 }
 
-/// One end of the range of the record `id`: `id << 1`, plus one for the range's end (so that a
-/// start sorts before its end at the same position).
-fn end_of(id: u64, is_end: bool) -> u64 {
-    id << 1 | u64::from(is_end)
+/// A map from record ids.
+type IdMap<V> = std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<IdHash>>;
+
+/// A record's range in a [`Chunk`].
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    /// Its start minus the chunk's [`base`](Chunk::base).
+    start: isize,
+    id: u64,
+    len: usize,
 }
 
-/// The ranges of the records in the list, by id, and their ends in text order.
+/// Some of the ranges of [`Points`], next to each other in text order.
+#[derive(Clone, Debug, Default)]
+struct Chunk {
+    /// Added to every start in `spans` (see [`base`](Self::base)).
+    shift: isize,
+    /// The chunk is one of the last ones, which `Points::tail` moves too.
+    in_tail: bool,
+    /// By start, then id.
+    spans: VecDeque<Span>,
+    /// The furthest end of `spans`, minus the base.
+    reach: isize,
+}
+
+impl Chunk {
+    /// What is added to every start in `spans`, with `tail` the [`Points::tail`].
+    fn base(&self, tail: isize) -> isize {
+        if self.in_tail {
+            self.shift + tail
+        } else {
+            self.shift
+        }
+    }
+
+    /// Where `span` is.
+    fn range(&self, span: &Span, tail: isize) -> Range<usize> {
+        let start = usize::try_from(span.start + self.base(tail)).unwrap_or(0);
+        start..start + span.len
+    }
+
+    /// The start of the first range.
+    fn first(&self, tail: isize) -> isize {
+        self.spans
+            .front()
+            .map_or(isize::MAX, |s| s.start + self.base(tail))
+    }
+
+    /// The start and id of the last range, which the chunks are sorted by.
+    fn last(&self, tail: isize) -> (isize, u64) {
+        self.spans
+            .back()
+            .map_or((isize::MIN, 0), |s| (s.start + self.base(tail), s.id))
+    }
+
+    /// Notes again how far the ranges reach.
+    fn measure(&mut self) {
+        self.reach = self
+            .spans
+            .iter()
+            .map(|s| s.start + signed(s.len))
+            .max()
+            .unwrap_or(isize::MIN);
+    }
+}
+
+/// The ranges of the records in the list, in text order.
 ///
-/// An edit moves every range after it. So the ends before `split` are kept as positions, which an
-/// edit after them leaves alone, and the ends at or after it as positions minus `shift`, the net
-/// length change of the edits made before them, which an edit before them only adds to. Each edit
-/// first moves `split` to its start, converting the ends in between, so that the ranges it does
-/// not meet lie wholly before `split` or wholly after the edit: a run of edits going down or up
-/// the text (an action, its undo and its redo) converts each end once, not every end after each
-/// edit. The ranges holding `split` are found without a search (`across`).
+/// An edit moves every range after it, and a range it does not meet lies wholly before it or
+/// wholly after it: ranges only move as a whole, so each is kept as its start and its length. The
+/// ranges are sorted by start into chunks of at most [`CHUNK_MAX`], each with a shift added to
+/// every start in it. An edit moves the ranges after it in its own chunk one by one and the
+/// chunks after that as a whole: those form the tail, which has one more shift (`tail`), so the
+/// edit only moves the tail's start to the chunk after its own, across the chunks between it and
+/// the edit before. The ranges an edit meets start in the chunks between its start minus the
+/// longest range and its end, and each chunk knows how far its ranges reach; searches start from
+/// where the last one ended. So an edit costs O(`CHUNK_MAX`) plus a step for each chunk between
+/// it and the edit before, and for each chunk the longest range could reach it from, however
+/// many ranges they hold: a run of edits going down or up the text (an action, its undo and its
+/// redo) costs O(`CHUNK_MAX`) an edit while the ranges are short, and a jump O(chunks) more. The
+/// records of a replace_all in an open buffer (a deletion and an insertion a match) fill their
+/// chunks about half, so the newest turn's 32 768 take about 500. Finding a record by id costs
+/// O(`CHUNK_MAX`).
 #[derive(Clone, Debug, Default)]
 struct Points {
-    /// The ends before `split`: (position, [`end_of`]).
-    front: BTreeSet<(usize, u64)>,
-    /// The ends at or after `split`: (position minus `shift`, [`end_of`]).
-    back: BTreeSet<(isize, u64)>,
-    split: usize,
-    shift: isize,
-    /// Each record's start and end.
-    ends: BTreeMap<u64, (Key, Key)>,
-    /// The records whose start is in `front` and whose end is in `back`.
-    across: BTreeSet<u64>,
+    /// The chunks in text order (indices into `chunks`), none of them empty.
+    order: Vec<usize>,
+    /// Every chunk, those not in `order` (empty) listed in `free`.
+    chunks: Vec<Chunk>,
+    free: Vec<usize>,
+    /// The chunk of each record's range.
+    chunk_of: IdMap<usize>,
+    /// Added to the starts of the chunks from `order[tail_from]` on (those `in_tail`) besides
+    /// their own shift: the net length change of the edits before them since they joined it.
+    tail: isize,
+    tail_from: usize,
+    /// How many ranges have each length: none is longer than the last.
+    lengths: BTreeMap<usize, usize>,
+    /// Where in `order` the last search ended: the next one starts there.
+    finger: usize,
 }
 
 impl Points {
-    /// How the position `p` is kept now.
-    fn key(&self, p: usize) -> Key {
-        if p < self.split {
-            Key::Front(p)
-        } else {
-            Key::Back(signed(p) - self.shift)
-        }
-    }
-
-    /// The position `k` stands for.
-    fn at(&self, k: Key) -> usize {
-        match k {
-            Key::Front(p) => p,
-            Key::Back(q) => usize::try_from(q + self.shift).unwrap_or(0),
-        }
-    }
-
-    fn put(&mut self, k: Key, end: u64) {
-        match k {
-            Key::Front(p) => self.front.insert((p, end)),
-            Key::Back(q) => self.back.insert((q, end)),
-        };
-    }
-
-    fn take(&mut self, k: Key, end: u64) {
-        match k {
-            Key::Front(p) => self.front.remove(&(p, end)),
-            Key::Back(q) => self.back.remove(&(q, end)),
-        };
-    }
-
     /// Adds the record `id` at `r`.
     fn insert(&mut self, id: u64, r: &Range<usize>) {
-        let (s, e) = (self.key(r.start), self.key(r.end));
-        self.put(s, end_of(id, false));
-        self.put(e, end_of(id, true));
-        if matches!((s, e), (Key::Front(_), Key::Back(_))) {
-            self.across.insert(id);
+        let key = (signed(r.start), id);
+        *self.lengths.entry(r.len()).or_default() += 1;
+        let (i, k) = self.slot(key);
+        let c = self.order[i];
+        let chunk = &mut self.chunks[c];
+        let base = chunk.base(self.tail);
+        let span = Span {
+            start: key.0 - base,
+            id,
+            len: r.len(),
+        };
+        chunk.spans.insert(k, span);
+        let reach = span.start + signed(span.len);
+        if chunk.spans.len() == 1 || reach > chunk.reach {
+            chunk.reach = reach;
         }
-        self.ends.insert(id, (s, e));
+        self.chunk_of.insert(id, c);
+        if self.chunks[c].spans.len() > CHUNK_MAX {
+            self.split(i);
+        }
+    }
+
+    /// Where the range with this start and id goes: its chunk's index in `order` and its place
+    /// in the chunk. A full chunk does not take a range at either end, so that a run of edits
+    /// adds chunks instead of splitting them: the chunk before takes it, or a new one.
+    fn slot(&mut self, key: (isize, u64)) -> (usize, usize) {
+        let tail = self.tail;
+        if self.order.is_empty() {
+            let c = self.new_chunk(Chunk::default());
+            self.order_insert(0, c);
+            return (0, 0);
+        }
+        // The first chunk whose last range comes after it, or the last chunk.
+        let i = self
+            .find(|chunk| chunk.last(tail) >= key)
+            .min(self.order.len() - 1);
+        let chunk = &self.chunks[self.order[i]];
+        let base = chunk.base(tail);
+        let k = chunk
+            .spans
+            .partition_point(|s| (s.start + base, s.id) < key);
+        let n = chunk.spans.len();
+        if n < CHUNK_MAX || (0 < k && k < n) {
+            return (i, k);
+        }
+        let (shift, in_tail) = (chunk.shift, chunk.in_tail);
+        if k == 0
+            && let Some(&before) = i.checked_sub(1).and_then(|j| self.order.get(j))
+            && self.chunks[before].spans.len() < CHUNK_MAX
+        {
+            return (i - 1, self.chunks[before].spans.len());
+        }
+        let at = if k == 0 { i } else { i + 1 };
+        let c = self.new_chunk(Chunk {
+            shift,
+            in_tail,
+            ..Chunk::default()
+        });
+        self.order_insert(at, c);
+        (at, 0)
     }
 
     /// Removes the record `id`; returns where it was.
     fn remove(&mut self, id: u64) -> Option<Range<usize>> {
-        let (s, e) = self.ends.remove(&id)?;
-        self.take(s, end_of(id, false));
-        self.take(e, end_of(id, true));
-        self.across.remove(&id);
-        Some(self.at(s)..self.at(e))
+        let c = self.chunk_of.remove(&id)?;
+        let chunk = &mut self.chunks[c];
+        let k = chunk.spans.iter().position(|s| s.id == id)?;
+        let span = chunk.spans.remove(k)?;
+        if span.start + signed(span.len) >= chunk.reach {
+            chunk.measure();
+        }
+        let range = chunk.range(&span, self.tail);
+        let few = chunk.spans.len() < CHUNK_MIN;
+        if let Some(n) = self.lengths.get_mut(&span.len) {
+            *n -= 1;
+            if *n == 0 {
+                self.lengths.remove(&span.len);
+            }
+        }
+        if few {
+            self.rebalance(c);
+        }
+        // A table does not shrink by itself: closing a document drops most records, if not all.
+        if self.chunk_of.is_empty() {
+            *self = Self::default();
+        } else if self.chunk_of.len() < self.chunk_of.capacity() / 4 {
+            self.chunk_of.shrink_to_fit();
+        }
+        Some(range)
     }
 
     /// Moves the record `id`, if kept, to `r`.
@@ -874,87 +1014,278 @@ impl Points {
 
     /// Where the record `id` is.
     fn get(&self, id: u64) -> Option<Range<usize>> {
-        let (s, e) = self.ends.get(&id)?;
-        Some(self.at(*s)..self.at(*e))
-    }
-
-    /// Notes that the end `end` ([`end_of`]) is now kept as `k`.
-    fn rekey(&mut self, end: u64, k: Key) {
-        let (id, is_end) = (end >> 1, end & 1 == 1);
-        if let Some(ends) = self.ends.get_mut(&id) {
-            if is_end {
-                ends.1 = k;
-            } else {
-                ends.0 = k;
-            }
-        }
-        // The range holds `split` while only its start is in `front`.
-        let (start, finish) = self.ends.get(&id).copied().unwrap_or((k, k));
-        if matches!((start, finish), (Key::Front(_), Key::Back(_))) {
-            self.across.insert(id);
-        } else {
-            self.across.remove(&id);
-        }
-    }
-
-    /// Moves `split` to `x`, converting the ends in between.
-    fn split_at(&mut self, x: usize) {
-        while let Some(&(q, end)) = self.back.first() {
-            let p = self.at(Key::Back(q));
-            if p >= x {
-                break;
-            }
-            self.back.pop_first();
-            self.front.insert((p, end));
-            self.rekey(end, Key::Front(p));
-        }
-        while let Some(&(p, end)) = self.front.last() {
-            if p < x {
-                break;
-            }
-            self.front.pop_last();
-            let q = signed(p) - self.shift;
-            self.back.insert((q, end));
-            self.rekey(end, Key::Back(q));
-        }
-        self.split = x;
+        let chunk = &self.chunks[*self.chunk_of.get(&id)?];
+        let span = chunk.spans.iter().find(|s| s.id == id)?;
+        Some(chunk.range(span, self.tail))
     }
 
     /// The records whose ranges meet the closed interval `[a, b]` (holding it, or with an end in
-    /// it), ascending; `split` moves to `a`.
+    /// it), ascending.
     fn meeting(&mut self, a: usize, b: usize) -> BTreeSet<u64> {
-        self.split_at(a);
-        let mut ids = self.across.clone();
-        let hi = signed(b) - self.shift;
-        ids.extend(self.back.range(..=(hi, u64::MAX)).map(|&(_, end)| end >> 1));
+        let (a, b, tail) = (signed(a), signed(b), self.tail);
+        let longest = self.lengths.last_key_value().map_or(0, |(&n, _)| signed(n));
+        // No range in the chunks before this one reaches `a`.
+        let from = self.find(|chunk| chunk.last(tail).0 >= a - longest);
+        let mut ids = BTreeSet::new();
+        for &c in &self.order[from..] {
+            let chunk = &self.chunks[c];
+            if chunk.first(tail) > b {
+                break;
+            }
+            let base = chunk.base(tail);
+            if chunk.reach + base < a {
+                continue;
+            }
+            let (a, b) = (a - base, b - base);
+            for s in chunk.spans.iter().take_while(|s| s.start <= b) {
+                if s.start + signed(s.len) >= a {
+                    ids.insert(s.id);
+                }
+            }
+        }
         ids
     }
 
-    /// The text changed by `delta` bytes before every end at or after `split`, which the change
-    /// does not meet.
-    fn moved(&mut self, delta: isize) {
-        self.shift += delta;
+    /// The text changed by `delta` bytes before every range that starts after `after`, which the
+    /// change does not meet (the records it meets are taken out first).
+    fn moved(&mut self, after: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let (after, tail) = (signed(after), self.tail);
+        // The first chunk with a range starting after `after`.
+        let i = self.find(|chunk| chunk.last(tail).0 > after);
+        let Some(&c) = self.order.get(i) else {
+            return;
+        };
+        let chunk = &mut self.chunks[c];
+        let base = chunk.base(tail);
+        let k = chunk.spans.partition_point(|s| s.start + base <= after);
+        let whole = if k == 0 {
+            i
+        } else {
+            for s in chunk.spans.range_mut(k..) {
+                s.start += delta;
+            }
+            chunk.measure();
+            i + 1
+        };
+        self.retail(whole);
+        self.tail += delta;
     }
 
-    /// The records by the start of their ranges.
+    /// Makes the chunks from `order[j]` on the tail.
+    fn retail(&mut self, j: usize) {
+        let (tail, p) = (self.tail, self.tail_from);
+        for &c in self.order.get(j..p).unwrap_or_default() {
+            let chunk = &mut self.chunks[c];
+            chunk.shift -= tail;
+            chunk.in_tail = true;
+        }
+        for &c in self.order.get(p..j).unwrap_or_default() {
+            let chunk = &mut self.chunks[c];
+            chunk.shift += tail;
+            chunk.in_tail = false;
+        }
+        self.tail_from = j;
+        if j == self.order.len() {
+            self.tail = 0;
+        }
+    }
+
+    /// The first index in `order` from which `past` holds (it holds for every chunk after one it
+    /// holds for), looked for from where the last search ended: next to it in O(1), anywhere in
+    /// O(log chunks).
+    fn find(&mut self, past: impl Fn(&Chunk) -> bool) -> usize {
+        let n = self.order.len();
+        let holds = |i: usize| past(&self.chunks[self.order[i]]);
+        let at = self.finger.min(n);
+        // Bracket it, going away from the finger in growing steps.
+        let (mut lo, mut hi) = (0, n);
+        if at < n && !holds(at) {
+            lo = at + 1;
+            let mut step = 1;
+            while at + step < n {
+                if holds(at + step) {
+                    hi = at + step;
+                    break;
+                }
+                lo = at + step + 1;
+                step *= 2;
+            }
+        } else {
+            hi = at;
+            let mut step = 1;
+            while step <= at {
+                if !holds(at - step) {
+                    lo = at - step + 1;
+                    break;
+                }
+                hi = at - step;
+                step *= 2;
+            }
+        }
+        let found = lo + self.order[lo..hi].partition_point(|&c| !past(&self.chunks[c]));
+        self.finger = found;
+        found
+    }
+
+    /// Puts `chunk` among the chunks; returns its index.
+    fn new_chunk(&mut self, chunk: Chunk) -> usize {
+        if let Some(c) = self.free.pop() {
+            self.chunks[c] = chunk;
+            c
+        } else {
+            self.chunks.push(chunk);
+            self.chunks.len() - 1
+        }
+    }
+
+    /// Puts the chunk `c` at `order[i]`: at or before the tail's first chunk unless it is in
+    /// the tail.
+    fn order_insert(&mut self, i: usize, c: usize) {
+        self.order.insert(i, c);
+        if !self.chunks[c].in_tail {
+            self.tail_from += 1;
+        }
+    }
+
+    /// Takes the chunk `order[i]` out of the order, and frees it.
+    fn order_remove(&mut self, i: usize) {
+        let c = self.order.remove(i);
+        if i < self.tail_from {
+            self.tail_from -= 1;
+        }
+        self.chunks[c] = Chunk::default();
+        self.free.push(c);
+    }
+
+    /// Splits the chunk `order[i]` into two halves.
+    fn split(&mut self, i: usize) {
+        let chunk = &mut self.chunks[self.order[i]];
+        let mut half = Chunk {
+            shift: chunk.shift,
+            in_tail: chunk.in_tail,
+            spans: chunk.spans.split_off(chunk.spans.len() / 2),
+            reach: 0,
+        };
+        chunk.measure();
+        half.measure();
+        let h = self.new_chunk(half);
+        for s in &self.chunks[h].spans {
+            self.chunk_of.insert(s.id, h);
+        }
+        self.order_insert(i + 1, h);
+    }
+
+    /// The chunk `c` holds fewer than [`CHUNK_MIN`] ranges: it goes when empty, and is merged
+    /// with a neighbour otherwise.
+    fn rebalance(&mut self, c: usize) {
+        let Some(i) = self.order.iter().position(|&x| x == c) else {
+            return;
+        };
+        if self.chunks[c].spans.is_empty() {
+            self.order_remove(i);
+        } else if self.order.len() > 1 {
+            self.merge(i.min(self.order.len() - 2));
+        }
+    }
+
+    /// Merges the chunks `order[i]` and `order[i + 1]`: the ranges of the smaller go into the
+    /// other, which is split again when that makes it too full.
+    fn merge(&mut self, i: usize) {
+        let (left, right) = (self.order[i], self.order[i + 1]);
+        let into_left = self.chunks[right].spans.len() <= self.chunks[left].spans.len();
+        let (from, into) = if into_left {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let mut moving = std::mem::take(&mut self.chunks[from].spans);
+        let rebase = self.chunks[from].base(self.tail) - self.chunks[into].base(self.tail);
+        for s in &mut moving {
+            s.start += rebase;
+            self.chunk_of.insert(s.id, into);
+        }
+        let chunk = &mut self.chunks[into];
+        if into_left {
+            chunk.spans.append(&mut moving);
+        } else {
+            moving.append(&mut chunk.spans);
+            chunk.spans = moving;
+        }
+        chunk.measure();
+        let full = chunk.spans.len() > CHUNK_MAX;
+        self.order_remove(if into_left { i + 1 } else { i });
+        if full {
+            self.split(i);
+        }
+    }
+
+    /// The records and their ranges, by start.
     #[cfg(test)]
-    fn starts(&self) -> impl Iterator<Item = u64> + '_ {
-        let front = self.front.iter().map(|&(_, end)| end);
-        let back = self.back.iter().map(|&(_, end)| end);
-        front
-            .chain(back)
-            .filter(|end| end & 1 == 0)
-            .map(|end| end >> 1)
+    fn in_order(&self) -> impl Iterator<Item = (u64, Range<usize>)> + '_ {
+        self.order.iter().flat_map(|&c| {
+            let chunk = &self.chunks[c];
+            chunk
+                .spans
+                .iter()
+                .map(|s| (s.id, chunk.range(s, self.tail)))
+        })
+    }
+
+    /// Panics when the chunks are not what they should be: sorted, each holding one to
+    /// [`CHUNK_MAX`] ranges and of two neighbours one at least [`CHUNK_MIN`], knowing how far they
+    /// reach, found by id, in the tail from `tail_from` on; or when the lengths are not counted
+    /// right, or the table of ids is mostly empty.
+    #[cfg(test)]
+    fn check(&self) {
+        let mut previous = None;
+        let mut lengths = BTreeMap::new();
+        for (i, &c) in self.order.iter().enumerate() {
+            let chunk = &self.chunks[c];
+            let n = chunk.spans.len();
+            assert!((1..=CHUNK_MAX).contains(&n), "chunk {c} holds {n} ranges");
+            if let Some(&next) = self.order.get(i + 1) {
+                let both = n.max(self.chunks[next].spans.len());
+                assert!(
+                    both >= CHUNK_MIN,
+                    "chunks {c} and {next} hold {both} at most"
+                );
+            }
+            assert_eq!(chunk.in_tail, i >= self.tail_from, "chunk {c} at {i}");
+            let mut measured = chunk.clone();
+            measured.measure();
+            assert_eq!(chunk.reach, measured.reach, "chunk {c}");
+            for s in &chunk.spans {
+                let key = (s.start + chunk.base(self.tail), s.id);
+                assert!(previous < Some(key), "{key:?} after {previous:?}");
+                previous = Some(key);
+                assert_eq!(self.chunk_of.get(&s.id), Some(&c), "record {}", s.id);
+                *lengths.entry(s.len).or_default() += 1;
+            }
+        }
+        assert!(self.tail_from <= self.order.len());
+        assert_eq!(lengths, self.lengths);
+        assert_eq!(self.chunk_of.len(), lengths.values().sum::<usize>());
+        assert!(
+            self.chunk_of.capacity() / 4 <= self.chunk_of.len(),
+            "the table shrinks"
+        );
+        assert!(self.free.iter().all(|&c| self.chunks[c].spans.is_empty()));
+        assert_eq!(self.order.len() + self.free.len(), self.chunks.len());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Context, Kind, MAX_RECORD_BYTES, MAX_TURN_RECORDS, Points, Records, Reopen, Step, cost,
+        CHUNK_MAX, Context, Kind, MAX_RECORD_BYTES, MAX_TURN_RECORDS, Points, Records, Reopen,
+        Step, cost,
     };
     use lemma_core::Origin;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ops::Range;
 
     /// How many agent records are kept.
     fn agent_records(records: &Records) -> usize {
@@ -1094,59 +1425,106 @@ mod tests {
         assert!(records.list.values().all(|r| r.turn == Some(13)));
     }
 
+    /// A pseudo-random number below `n` (0 when `n` is 0).
+    fn random(seed: &mut u64, n: usize) -> usize {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        usize::try_from(*seed >> 33).unwrap() % n.max(1)
+    }
+
     /// The index finds what a scan of every range would, through edits going down, up and
-    /// anywhere.
+    /// anywhere, while records go and come (now and then most or all of them at once, and come
+    /// back as a run), in one chunk and in many, short and now and then long.
     #[test]
     fn points_meet_what_a_scan_finds() {
-        let mut points = Points::default();
-        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
         let mut seed = 7u64;
-        let mut next = |n: usize| {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            usize::try_from(seed >> 33).unwrap() % n.max(1)
-        };
-        let mut len = 1000;
-        for id in 0..200u64 {
-            let s = next(len);
-            let e = s + next(30).min(len - s);
-            points.insert(id, &(s..e));
-            ranges.push(s..e);
-        }
-        for round in 0..400 {
-            let a = match round % 3 {
-                0 => len.saturating_sub(round),
-                1 => round.min(len),
-                _ => next(len),
-            };
-            let b = (a + next(20)).min(len);
-            let expected: BTreeSet<u64> = (0..ranges.len())
-                .filter(|&i| ranges[i].start <= b && a <= ranges[i].end)
-                .map(|i| i as u64)
-                .collect();
-            assert_eq!(points.meeting(a, b), expected, "round {round}");
-            // The edit `[a, b) → n bytes` moves the ranges after it; those it meets are put
-            // back where they were (the caller decides that).
-            let n = next(25);
-            for &id in &expected {
+        for (count, rounds) in [(200, 400), (3000, 600)] {
+            let mut points = Points::default();
+            let mut ranges: BTreeMap<u64, Range<usize>> = BTreeMap::new();
+            let mut len = count * 5;
+            let mut next_id = 0u64;
+            for round in 0..rounds {
+                let keep = match round % 100 {
+                    25 | 75 => count / 10,
+                    50 => 0,
+                    _ => ranges.len() - random(&mut seed, 2).min(ranges.len()),
+                };
+                while ranges.len() > keep {
+                    let i = random(&mut seed, ranges.len());
+                    let id = *ranges.keys().nth(i).unwrap();
+                    assert_eq!(points.remove(id), ranges.remove(&id), "round {round}");
+                }
+                // After those, the records come back as a run of edits makes them, going down the
+                // text or up, among the others or alone; one by one anywhere otherwise.
+                let run = matches!(round % 100, 25 | 50 | 75);
+                let down = round % 100 == 25 || (round % 100 == 50 && round / 100 % 2 == 0);
+                let mut at = if down { len } else { 0 };
+                while ranges.len() < count {
+                    let s = if !run {
+                        random(&mut seed, len)
+                    } else if down {
+                        at.saturating_sub(1 + random(&mut seed, 3))
+                    } else {
+                        (at + 1 + random(&mut seed, 3)).min(len)
+                    };
+                    at = s;
+                    // Now and then a long one, which edits far past its start meet.
+                    let longest = if random(&mut seed, 100) == 0 {
+                        len / 8
+                    } else {
+                        30
+                    };
+                    let r = s..s + random(&mut seed, longest).min(len - s);
+                    points.insert(next_id, &r);
+                    ranges.insert(next_id, r);
+                    next_id += 1;
+                }
+                let a = match round % 3 {
+                    0 => len.saturating_sub(round * 7),
+                    1 => (round * 7).min(len),
+                    _ => random(&mut seed, len),
+                };
+                let b = (a + random(&mut seed, 20)).min(len);
+                let expected: BTreeSet<u64> = ranges
+                    .iter()
+                    .filter(|(_, r)| r.start <= b && a <= r.end)
+                    .map(|(&id, _)| id)
+                    .collect();
+                assert_eq!(points.meeting(a, b), expected, "round {round}");
+                // The edit `[a, b) → n bytes` moves the ranges after it; those it meets are put
+                // back where they were (the caller decides that).
+                let n = random(&mut seed, 25);
+                for &id in &expected {
+                    points.remove(id);
+                }
+                points.moved(b, n as isize - (b - a) as isize);
+                for r in ranges.values_mut() {
+                    if r.start > b {
+                        *r = r.start + n - (b - a)..r.end + n - (b - a);
+                    }
+                }
+                len = len + n - (b - a);
+                for id in &expected {
+                    let r = ranges.get_mut(id).unwrap();
+                    *r = r.start.min(len)..r.end.min(len);
+                    points.insert(*id, r);
+                }
+                points.check();
+                for (&id, r) in &ranges {
+                    assert_eq!(points.get(id), Some(r.clone()), "round {round}");
+                }
+                let mut by_start: Vec<(u64, Range<usize>)> =
+                    ranges.iter().map(|(&id, r)| (id, r.clone())).collect();
+                by_start.sort_by_key(|(id, r)| (r.start, *id));
+                assert!(points.in_order().eq(by_start), "round {round}");
+            }
+            assert!(points.order.len() > count / CHUNK_MAX, "{count} records");
+            // Without records, it gives its memory back.
+            for id in ranges.into_keys() {
                 points.remove(id);
             }
-            points.moved(n as isize - (b - a) as isize);
-            for r in &mut ranges {
-                if r.start > b {
-                    *r = r.start + n - (b - a)..r.end + n - (b - a);
-                }
-            }
-            len = len + n - (b - a);
-            for &id in &expected {
-                let r = &mut ranges[id as usize];
-                *r = r.start.min(len)..r.end.min(len);
-                points.insert(id, r);
-            }
-            for (id, r) in ranges.iter().enumerate() {
-                assert_eq!(points.get(id as u64), Some(r.clone()), "round {round}");
-            }
+            assert!(points.chunks.is_empty() && points.chunk_of.capacity() == 0);
         }
     }
 }

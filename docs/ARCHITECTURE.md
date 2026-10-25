@@ -1237,18 +1237,34 @@ they conflict with the sections above, this section wins.
     back), with the result of putting them back one by one (differential proptest
     `review::tests::unaccept_batch_is_unaccept_each`): 5000 hunks 0.27 s → 21 ms.
   - The records that recognize the buffer's undo and redo of Lemma's own edits
-    (`review/records.rs`) keep their ranges split at the last edit, as `LineIndex` keeps line
-    starts (`Points`): the ends before it as positions, those after it as positions minus the
-    net length change of the edits since, and the ranges holding it in a set. An edit takes out
-    only the records it meets (each O(log records)), after converting the ends between it and
-    the edit before, so a run of edits down or up the text converts each end once. 20 000 edits
-    right after rejecting 5000 hunks (the decision keeps all their records): 0.73 s → 0.07 s
-    (6.5 s before the batched feed). A completed undo or redo step re-checks only the records it
-    brought back (the others followed the text edit by edit; the unit tests check them all after
-    every change), against the model without building strings (`current_text_is`), and
-    `growth_before` sums from the nearer end of the hunk list. Reject all of 5000 line hunks,
-    with its recompute: 2.3 s → 0.05 s; its Ctrl+Z 100 s → 0.07 s; its Alt+U 1.1 s → 0.18 s
-    (`regress2_d` `perf_reject_all_of_5000_hunks_and_its_undo`).
+    (`review/records.rs`) keep their ranges in an index (`Points`), and an edit takes out only
+    the records it meets. A range an edit does not meet lies wholly before or after it, so each
+    range is kept as its start and length, sorted by start into chunks of at most 128
+    (`CHUNK_MAX`), each with a shift added to its starts. An edit moves the ranges after it in
+    its own chunk one by one and the chunks after that as a whole: those are the tail, which has
+    a shift of its own, so the edit only moves the tail's start to the chunk after its own,
+    across the chunks between it and the edit before. The records it meets start between its
+    start minus the longest range and its end, and each chunk knows how far its ranges reach.
+    Searches start where the last one ended, and a full chunk hands a range at either end to the
+    chunk before or to a new one instead of splitting, so a run of edits that each add a record
+    at its end fills chunks without moving ranges between them (a replace_all in an open buffer,
+    a deletion and an insertion a match, fills them about half: the newest turn's 32 768 records
+    take about 500 chunks). An edit costs O(128) plus a step for each chunk between it and the
+    edit before, and for each chunk the longest range could reach it from, however many records
+    they hold. The index first kept the ranges split at the last edit, as `LineIndex` keeps line
+    starts, and converted the ends between an edit and the one before one by one: with the
+    newest turn's 32 768 records held (a replace_all of 30 000 matches in an open 10 000-line
+    file), the first keystroke far from the last edit took 10–12 ms, 11–14 ms with the changes
+    in one hunk; now 45–60 µs and 0.33–0.5 ms, as much as without the records within the noise
+    (`perf_keystroke_after_a_jump_with_turn_records`), and runs of edits got faster too (a
+    replace_all of 5000 matches over 5000 hunks 28 ms → 17 ms). Against a scan of every record,
+    20 000 edits right after rejecting 5000 hunks (the decision keeps all their records) take
+    0.07 s instead of 0.73 s (6.5 s before the batched feed). A completed undo or redo step
+    re-checks only the records it brought back (the others followed the text edit by edit; the
+    unit tests check them all after every change), against the model without building strings
+    (`current_text_is`), and `growth_before` sums from the nearer end of the hunk list. Reject
+    all of 5000 line hunks, with its recompute: 2.3 s → 0.05 s; its Ctrl+Z 100 s → 0.07 s; its
+    Alt+U 1.1 s → 0.18 s (`regress2_d` `perf_reject_all_of_5000_hunks_and_its_undo`).
   - Beyond the cap of 512 records, the agent edits of the newest turn (a run of agent edits
     attributed to one turn, whatever comes between them) are kept as the newest decision's
     rejects are, at most their last 32 768 (`MAX_TURN_RECORDS`; a few hundred bytes each). The
@@ -1257,7 +1273,8 @@ they conflict with the sections above, this section wins.
     whose records were gone) and the redo brings every hunk back (it folded those changes into
     the baseline). A per-action log of the agent's changes, recognizing them where no record
     does, was the alternative; the records also bring back the turns, segments and records
-    that an undo or a redo restores, and now cost O(log records) an edit.
+    that an undo or a redo restores, and with the index above they cost O(128) an edit in a
+    run of edits, a few µs more after a jump.
   - Records without a buffer (2026-10-25): only the buffer's undo and redo take up an agent
     edit's record, or a reject's once it is undone, and they reach only the edits made in that
     buffer (a closed document's text goes into a new buffer as not undoable). So

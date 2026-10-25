@@ -232,7 +232,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   256 of them came back as hunks: the review took the others for your own typing, so Reject
   all, Reject Turn and the Undo of Replace in Project could not take them back, and the undo
   told the agent that you had edited its changes. Every agent edit of the last turn is
-  recognized now, up to 16 384 replacements in an open file.
+  recognized now, up to 16 384 replacements in an open file (fewer when they are long: the
+  records of the last turn take at most about 16 MB). Keeping them adds a few microseconds to a
+  keystroke wherever it is typed.
 - Reject all of thousands of changes, and its Ctrl+Z and Alt+U, no longer freeze the window:
   5000 changes take 0.05 s instead of 2.3 s, 0.07 s instead of 100 s and 0.18 s instead of
   1.1 s. Edits right after such a Reject all are no longer slowed down by it (a replace_all of

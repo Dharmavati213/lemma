@@ -293,6 +293,95 @@ fn perf_undo_and_redo_of_a_replace_all() {
     assert!(redo < Duration::from_secs(1), "{redo:?}");
 }
 
+/// 10 000 lines with three formulas on every `every`-th line, between plain ones: each such
+/// line is a hunk of its own after a replace_all of `$` (every other line), or they all make one.
+fn formulas(every: usize) -> String {
+    (0..10_000)
+        .map(|i| {
+            if i % every == 0 {
+                format!("line {i} has $a$ and $b$ and $c$ in it\n")
+            } else {
+                format!("plain line {i}\n")
+            }
+        })
+        .collect()
+}
+
+/// Where line `k` of `text` ends (before its newline).
+fn line_end(text: &str, k: usize) -> usize {
+    text.match_indices('\n')
+        .nth(k)
+        .map_or(text.len(), |(i, _)| i)
+}
+
+/// A keystroke far from the edit before, with the newest turn's last 32 768 records
+/// (`MAX_TURN_RECORDS`) held: those of a replace_all of `$` in a 10 000-line file, fed as an
+/// open buffer reports it (a deletion and an insertion per match). With a hunk per changed
+/// line (30 000 matches) and with all of them in one hunk (60 000): `on_edit` ≤ 2 ms median,
+/// and what the records add to it (against the same review without them) ≤ 0.2 ms. Measured
+/// 45–60 µs and 0.33–0.5 ms, the records' part within the noise; 10–12 ms and 11–14 ms while
+/// each such keystroke converted the ends of the records between it and the edit before, one
+/// by one.
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_keystroke_after_a_jump_with_turn_records() {
+    for (layout, every) in [("a hunk per line", 2), ("one hunk", 1)] {
+        let mut text = formulas(every);
+        let mut review = FileReview::new(text.clone());
+        review.set_turn(1);
+        let changes: Vec<TextEdit> = str_replace(&text, "$", "\\(", true)
+            .unwrap()
+            .iter()
+            .flat_map(|e| {
+                [
+                    TextEdit::delete(e.range.clone()),
+                    TextEdit::insert(e.range.start, &e.text),
+                ]
+            })
+            .collect();
+        feed(&mut review, &mut text, &changes);
+        review.recompute(&text);
+        assert_eq!(review.held_records().0, 1 << 15, "{layout}");
+        let hunks = review.hunks().len();
+        let mut bare = review.clone();
+        bare.set_in_buffer(false);
+        assert_eq!(bare.held_records().0, 0);
+        // The last line, below the records (the agent's last change is at the top), the
+        // second, above all of them, and the middle one, among them. Each key goes to both
+        // reviews in turn, so that the load on the machine weighs on both alike, and to each
+        // first every other time (the second finds the caches warmer).
+        let (mut with, mut without) = (Vec::new(), Vec::new());
+        for (i, line) in [9_999, 1, 5_001].repeat(8).into_iter().enumerate() {
+            let e = TextEdit::insert(line_end(&text, line), "x");
+            let mut both = [(&mut review, &mut with), (&mut bare, &mut without)];
+            if i % 2 == 1 {
+                both.reverse();
+            }
+            for (review, times) in both {
+                let t = Instant::now();
+                review.on_edit(&e, Origin::User);
+                times.push(t.elapsed());
+            }
+            e.apply(&mut text);
+        }
+        with.sort();
+        without.sort();
+        let (median, max) = (with[with.len() / 2], with[with.len() - 1]);
+        let bare_median = without[without.len() / 2];
+        let records = median.saturating_sub(bare_median);
+        eprintln!(
+            "perf_keystroke_after_a_jump_with_turn_records ({layout}, {} changes, {hunks} hunks): \
+             median {median:?}, max {max:?}; without the records median {bare_median:?}",
+            changes.len(),
+        );
+        assert!(median < Duration::from_millis(2), "{layout}: {median:?}");
+        assert!(
+            records < Duration::from_micros(200),
+            "{layout}: the records add {records:?}"
+        );
+    }
+}
+
 /// Alt+U of an Accept all of 5000 hunks puts them back at once: ≤ 100 ms (one by one, each
 /// went in front of those put back before it, 0.27 s; 20 000 hunks took seconds).
 #[test]
