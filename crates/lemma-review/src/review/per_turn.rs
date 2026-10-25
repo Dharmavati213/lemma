@@ -183,8 +183,9 @@ impl FileReview {
                     .collect(),
                 lo: rel(seg.range.start),
                 hi: signed(seg.range.end) - signed(edit.range.end),
+                shared: (false, false),
             };
-            self.parked_segments.push((record, parked));
+            self.parked_segments.insert(record, parked);
             edits.push(edit);
             records.push(record);
         }
@@ -512,7 +513,10 @@ impl FileReview {
     }
 
     /// Takes the segments and unknown places around hunk `k` (from the end of the previous hunk
-    /// to the start of the next) out, for a decision on it; positions relative to `anchor`.
+    /// to the start of the next) out, for a decision on it; positions relative to `anchor`. The
+    /// unknown places touching those neighbours stay: they may be about them (an unknown place
+    /// at the start of the next hunk keeps it from being decided per turn, whatever is decided
+    /// before it).
     pub(super) fn park_around(&mut self, k: usize, anchor: &Range<usize>) -> Parked {
         let lo = k.checked_sub(1).map_or(0, |p| self.hunks[p].cur_bytes.end);
         let hi = self
@@ -535,9 +539,10 @@ impl FileReview {
                 (s, start, end, hash)
             })
             .collect();
-        let unknown = self
-            .unknown
-            .extract(&(lo..hi))
+        let shared = (k > 0, k + 1 < self.hunks.len());
+        let unknown = unknown_extent(lo, hi, shared)
+            .map(|r| self.unknown.extract(&r))
+            .unwrap_or_default()
             .into_iter()
             .map(|(t, r)| (t, rel(r.start), rel(r.end)))
             .collect();
@@ -547,6 +552,7 @@ impl FileReview {
             attribution: Vec::new(),
             lo: rel(lo),
             hi: signed(hi) - signed(anchor.end),
+            shared,
         }
     }
 
@@ -609,7 +615,7 @@ impl FileReview {
     /// The reject recorded as `id` was undone (its proposal is back at `anchor`): what it took
     /// out comes back. The parked copy stays, for the next time.
     pub(super) fn restore_parked(&mut self, id: u64, anchor: &Range<usize>) {
-        if let Some((_, parked)) = self.parked_segments.iter().find(|(r, _)| *r == id) {
+        if let Some(parked) = self.parked_segments.get(&id) {
             let parked = parked.clone();
             self.put_back(&parked, anchor);
         }
@@ -618,7 +624,7 @@ impl FileReview {
     /// The reject recorded as `id` was redone (the baseline's text is back at `anchor`): the
     /// segments and unknown places around it describe no change any more.
     pub(super) fn drop_parked_extent(&mut self, id: u64, anchor: &Range<usize>) {
-        let Some((_, parked)) = self.parked_segments.iter().find(|(r, _)| *r == id) else {
+        let Some(parked) = self.parked_segments.get(&id) else {
             return;
         };
         let at = |base: usize, x: isize| usize::try_from(signed(base) + x).unwrap_or(0);
@@ -631,7 +637,9 @@ impl FileReview {
         for s in crossing.into_iter().filter(|s| s.replaced) {
             self.unknown.add(s.turn, s.range);
         }
-        self.unknown.extract(&(lo..hi));
+        if let Some(r) = unknown_extent(lo, hi, parked.shared) {
+            self.unknown.extract(&r);
+        }
         if !parked.attribution.is_empty() {
             let turns: Vec<u32> = parked.attribution.iter().map(|a| a.0).collect();
             let mut gone = lo..hi;
@@ -643,6 +651,14 @@ impl FileReview {
             self.refresh_turns_near(&gone);
         }
     }
+}
+
+/// The closed interval of unknown places a decision on the region `[lo, hi]` takes: without an
+/// end that another hunk touches (`shared`, see [`Parked::shared`]). `None` when nothing is left.
+fn unknown_extent(lo: usize, hi: usize, shared: (bool, bool)) -> Option<Range<usize>> {
+    let lo = if shared.0 { lo + 1 } else { lo };
+    let hi = if shared.1 { hi.checked_sub(1)? } else { hi };
+    (lo <= hi).then_some(lo..hi)
 }
 
 /// Whether `text` is `pieces[0]`, then anything, then `pieces[1]`, … then `pieces[n]` (literal

@@ -215,12 +215,22 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   change by a differential property in its white-box tests
   (`review::tests::on_edits_is_on_edit_for_each_edit`): random sessions of every kind of step
   on documents of a few KiB, then a random batch (spread out, adjacent, replace_all-like) for
-  each origin; every field of the two reviews must be equal. Alt+U of an Accept all
+  each origin; every field of the two reviews must be equal but the word spans (a recompute
+  has 8 ms for them, which a loaded machine can run out of). Alt+U of an Accept all
   (`unaccept_batch`) is checked the same way against putting the regions back one by one
   (`review::tests::unaccept_batch_is_unaccept_each`). `tests/common`'s `Session::edits`
   goes through `on_edits` too, so every review suite uses it; `gtk_document`
   `replace_all_under_review_reports_every_change` checks `Document::apply_edits` (what the
   review gets, the observers, the line deltas and the version) on a closed and an open document.
+  The histories of both run with `play`'s checks of each step, and in the white-box tests every
+  undo record is checked against the text after every change (`FileReview::check_records`), and
+  `growth_before`'s sum from the end of the hunk list against the sum from the start.
+- The buffer's undo and redo of agent edits beyond the records' cap: `tests/properties.rs`
+  property 9 (a replace_all of hundreds of lines between smaller agent edits, as a closed
+  document and as an open buffer report it; a fortieth of the cases, at least 10),
+  `tests/review.rs` `undo_and_redo_of_an_agent_action_beyond_the_record_cap` and `gtk_review`
+  `undo_and_redo_of_a_large_agent_edit_keep_it_under_review` (real `undo` and `redo` of the
+  buffer).
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -233,9 +243,10 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `regress2_*` (M2: `crates/lemma-agent/tests/regress2_a_{acp,mcp}.rs`,
   `crates/lemma-review/tests/regress2_d.rs`, `crates/lemma-complete/tests/regress2_e2.rs`,
   `crates/lemma-app/tests/regress2_c.rs`, `gtk_regress2_{b,c,d,e1,e2,f}.rs`). The only ignored
-  one is `regress2_d`'s `regress2_replace_all_20k_matches_is_fast` (D-5, fixed: a release
-  timing test, about 0.1 s there but 4 s in a debug build; run it with `cargo test --release -p
-  lemma-review --test regress2_d -- --ignored regress2_replace_all`). The M3 integration's
+  ones are `regress2_d`'s release timing tests: `regress2_replace_all_20k_matches_is_fast`
+  (D-5, fixed: about 0.1 s there but 4 s in a debug build; run it with `cargo test --release -p
+  lemma-review --test regress2_d -- --ignored regress2_replace_all`) and
+  `perf_reject_all_of_5000_hunks_and_its_undo` (see Performance tests). The M3 integration's
   regression test is `gtk_agent_panel` `regress3_inline_popover_of_a_closed_tab_leaves_no_critical`;
   its other fixes are checked by assertions added to existing tests. The M5 review's 16 are
   `regress5_*`, next to the code they test: unit tests in `bibimport.rs`, `format.rs` and `editor/align.rs`; `crates/lemma-agent/tests/regress5_acp_env.rs`
@@ -322,7 +333,9 @@ check the budgets only in release builds:
 | `gtk_search` `perf_search_10k_frame_budget` | the Search page's work per main-loop step while 10 000 matches stream in ≤ 4 ms |
 | `gtk_search` `perf_find_bar_replace_all_large_tex` | the find bar's Replace All of 20 000 matches on `large.tex`, and what the same line index updates take alone (printed) |
 | `lemma-review` `perf_unaccept_accept_all` | Alt+U of an Accept all of 5000 hunks ≤ 100 ms |
-| `lemma-review` `perf_on_edits_replace_all` | a replace_all fed to a review at once (`on_edits`): 20 000 matches ≤ 0.5 s and linear (≤ 6× the time of 10 000); 20 000 over 5000 hunks, or right after accepting them, ≤ 0.5 s; right after rejecting them, printed only (the records, O(edits × rejects)) |
+| `lemma-review` `perf_on_edits_replace_all` | a replace_all fed to a review at once (`on_edits`): 20 000 matches ≤ 0.5 s and linear (≤ 6× the time of 10 000); 20 000 over 5000 hunks, or right after accepting or rejecting them, ≤ 0.5 s |
+| `lemma-review` `perf_undo_and_redo_of_a_replace_all` | the buffer's undo and redo of a replace_all of 5000 matches in an open buffer (10 000 changes, each recognized by its record), with their recomputes: ≤ 1 s each, every hunk back (measured 0.14 s and 0.21 s) |
+| `regress2_d` `perf_reject_all_of_5000_hunks_and_its_undo` | Reject all of 5000 line hunks, its Ctrl+Z and its Alt+U, each with its recompute: ≤ 0.5 s each (measured 0.05 s, 0.07 s, 0.18 s; 2.3 s, 100 s and 1.1 s when each step re-checked every record) |
 | `lemma-core` `perf_line_index_replace_all_large_tex` | the line index through the 40 000 changes of a replace all of 20 000 matches in `large.tex`, from the end and from the start, ≤ 50 ms each |
 | `gtk_document` `perf_apply_edits_replace_all` | `apply_edits` of 20 000 matches in a file under review: ≤ 0.5 s closed, ≤ 1.5 s open |
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |

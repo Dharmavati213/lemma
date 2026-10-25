@@ -48,10 +48,27 @@ impl FileReview {
     }
 
     /// Net growth of `hunks[..i]`: current offset minus baseline offset in the gap after them.
+    ///
+    /// Summed from the nearer end of the list: the growth of all the hunks is the current length
+    /// minus the baseline's, so the hunks from `i` on can be taken off that instead. `on_edit`
+    /// and the decisions change `current_len` together with the hunks and the baseline, so that
+    /// it is the baseline's length plus the hunks' growth wherever this is called (the unit
+    /// tests check it).
     pub(super) fn growth_before(&self, i: usize) -> isize {
         match &self.batch {
             Some(batch) => batch.growth_before(&self.hunks, i),
-            None => self.hunks[..i].iter().map(growth).sum(),
+            None if 2 * i <= self.hunks.len() => self.hunks[..i].iter().map(growth).sum(),
+            None => {
+                let all = signed(self.current_len) - signed(self.baseline.len());
+                let before = all - self.hunks[i..].iter().map(growth).sum::<isize>();
+                #[cfg(test)]
+                assert_eq!(
+                    before,
+                    self.hunks[..i].iter().map(growth).sum::<isize>(),
+                    "current_len is not the baseline's length plus the growth of the hunks"
+                );
+                before
+            }
         }
     }
 
@@ -77,34 +94,117 @@ impl FileReview {
 
     /// `current[range]` according to the model, if `range` fits the text.
     pub(super) fn current_text(&self, range: &Range<usize>) -> Option<String> {
+        let mut out = String::with_capacity(range.len());
+        self.current_pieces(range, |piece| {
+            out.push_str(piece);
+            true
+        })
+        .then_some(out)
+    }
+
+    /// Whether `current[range]` according to the model is `text` (what
+    /// [`current_text`](Self::current_text) would return, without building it).
+    pub(super) fn current_text_is(&self, range: &Range<usize>, text: &str) -> bool {
+        if range.len() != text.len() {
+            return false;
+        }
+        let mut rest = text;
+        self.current_pieces(range, |piece| match rest.strip_prefix(piece) {
+            Some(after) => {
+                rest = after;
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Whether `current[range]` according to the model is `text`, where `hunks[..i]` end at or
+    /// before `range.start` and grow the text by `grown`: a walk from hunk `i` on, so that
+    /// `check_records` checks every record in one pass over the hunks. The bytes are
+    /// compared: equal to a string's, they start and end on char boundaries.
+    #[cfg(test)]
+    pub(super) fn text_is_at(
+        &self,
+        range: &Range<usize>,
+        text: &str,
+        mut i: usize,
+        mut grown: isize,
+    ) -> bool {
+        if range.start > range.end || range.end > self.expected_len() || text.len() != range.len() {
+            return false;
+        }
+        let mut pos = range.start;
+        if range.is_empty() {
+            return match self.hunks.get(i) {
+                Some(h) if h.cur_bytes.start <= pos => self.meta[i]
+                    .new_text
+                    .is_char_boundary(pos - h.cur_bytes.start),
+                _ => self.baseline.is_char_boundary(offset(pos, -grown)),
+            };
+        }
+        while pos < range.end {
+            let (piece, end) = match self.hunks.get(i) {
+                Some(h) if h.cur_bytes.start <= pos => {
+                    let (s, end) = (h.cur_bytes.start, range.end.min(h.cur_bytes.end));
+                    grown += growth(h);
+                    i += 1;
+                    (
+                        self.meta[i - 1].new_text.as_bytes().get(pos - s..end - s),
+                        end,
+                    )
+                }
+                next => {
+                    let end = next.map_or(range.end, |h| h.cur_bytes.start.min(range.end));
+                    let at = offset(pos, -grown);
+                    (self.baseline.as_bytes().get(at..at + (end - pos)), end)
+                }
+            };
+            if piece != text.as_bytes().get(pos - range.start..end - range.start) {
+                return false;
+            }
+            pos = end;
+        }
+        true
+    }
+
+    /// Hands the pieces of `current[range]` (hunk texts and baseline gaps, in order) to `piece`
+    /// while it returns true. False when `range` does not fit the text or `piece` stopped.
+    fn current_pieces(&self, range: &Range<usize>, mut piece: impl FnMut(&str) -> bool) -> bool {
         if range.start > range.end
             || range.end > self.expected_len()
             || !self.is_char_boundary(range.start)
             || !self.is_char_boundary(range.end)
         {
-            return None;
+            return false;
         }
-        let mut out = String::with_capacity(range.len());
         let mut pos = range.start;
         let mut i = self.first_ending_after(pos);
+        // The growth of the hunks before `i`, once it is needed.
+        let mut grown: Option<isize> = None;
         while pos < range.end {
             match self.hunks.get(i) {
                 Some(h) if h.cur_bytes.start <= pos => {
                     let end = range.end.min(h.cur_bytes.end);
                     let s = h.cur_bytes.start;
-                    out.push_str(&self.meta[i].new_text[pos - s..end - s]);
+                    if !piece(&self.meta[i].new_text[pos - s..end - s]) {
+                        return false;
+                    }
                     pos = end;
+                    grown = grown.map(|g| g + growth(h));
                     i += 1;
                 }
                 next => {
                     let end = next.map_or(range.end, |h| h.cur_bytes.start.min(range.end));
-                    let at = offset(pos, -self.growth_before(i));
-                    out.push_str(self.baseline.get(at..at + (end - pos))?);
-                    pos = end;
+                    let g = *grown.get_or_insert_with(|| self.growth_before(i));
+                    let at = offset(pos, -g);
+                    match self.baseline.get(at..at + (end - pos)) {
+                        Some(gap) if piece(gap) => pos = end,
+                        _ => return false,
+                    }
                 }
             }
         }
-        Some(out)
+        true
     }
 
     /// Current and baseline line of the baseline offset `at`, which lies in the gap before

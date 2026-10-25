@@ -140,6 +140,20 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   index no longer moves every line after each change, so the find bar's Replace All of 20 000
   matches in a 60 000-line file takes 0.6 s instead of 0.9 s. Alt+U of an Accept all of
   thousands of changes puts them back at once too (5000 changes: 21 ms instead of 0.27 s).
+- Undoing and redoing a large agent edit keeps all of it under review. After Ctrl+Z and
+  Ctrl+Shift+Z (Vim `u` and Ctrl+R) of a replace_all with more than 256 matches, only about
+  256 of them came back as hunks: the review took the others for your own typing, so Reject
+  all, Reject Turn and the Undo of Replace in Project could not take them back, and the undo
+  told the agent that you had edited its changes. Every agent edit of the last turn is
+  recognized now, up to 16 384 replacements in an open file.
+- Reject all of thousands of changes, and its Ctrl+Z and Alt+U, no longer freeze the window:
+  5000 changes take 0.05 s instead of 2.3 s, 0.07 s instead of 100 s and 0.18 s instead of
+  1.1 s. Edits right after such a Reject all are no longer slowed down by it (a replace_all of
+  20 000 matches: 0.07 s instead of 0.73 s), and the same goes for Reject Turn and the Undo of
+  Replace in Project.
+- Keeping or rejecting one change no longer lets Keep Turn and Reject Turn decide the change
+  after it as the turn's alone when what the turn changed there is not known exactly (another
+  edit cut into it): they leave it to be decided by hand, as before the first decision.
 - An agent edit that only inserts or only deletes text could crash Lemma when a non-ASCII
   character (é, ∑, …) sat 256 bytes before it.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive

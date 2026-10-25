@@ -484,6 +484,10 @@ pub(super) struct Parked {
     /// The region the decision covered: `[anchor.start + lo, anchor.end + hi]`.
     pub lo: isize,
     pub hi: isize,
+    /// Another hunk ended at the region's start, began at its end: the unknown places touching
+    /// it there may be about that hunk, so the decision leaves them (see
+    /// `FileReview::park_around`).
+    pub shared: (bool, bool),
 }
 
 impl Parked {

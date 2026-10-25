@@ -1,8 +1,8 @@
 //! Regression tests for verified review defects of the M2 review pass (area D: review turns,
 //! persistence). Each test reproduces one defect and fails until it is fixed.
 //!
-//! `cargo test -p lemma-review --test regress2_d`; the timing test is ignored by default and runs
-//! with `cargo test --release -p lemma-review --test regress2_d -- --ignored`.
+//! `cargo test -p lemma-review --test regress2_d`; the timing tests are ignored by default and
+//! run with `cargo test --release -p lemma-review --test regress2_d -- --ignored`.
 
 mod common;
 
@@ -82,8 +82,8 @@ fn regress2_reject_turn_restores_other_turns_deletion() {
 
 // ---- D-10: a decision larger than the record cap cannot be undone ---------------------------
 
-/// `n` separate lines, each changed by one replace_all of the agent, then Reject all.
-fn many_rejected(n: usize) -> (Session, String, Vec<TextEdit>, Vec<String>) {
+/// `n` separate lines, each changed by one replace_all of the agent: `n` hunks.
+fn many_changed(n: usize) -> Session {
     let base: String = (0..n)
         .map(|i| format!("Line {i} uses \\R here.\nPlain line {i}.\n"))
         .collect();
@@ -94,7 +94,12 @@ fn many_rejected(n: usize) -> (Session, String, Vec<TextEdit>, Vec<String>) {
     s.edits(&edits, Origin::Agent { call: 1 });
     s.recompute();
     assert_eq!(s.hunks().len(), n);
-    let agent_text = s.text.clone();
+    s
+}
+
+/// Reject all, applied as one `Origin::Review` action and recomputed: the reject edits and the
+/// texts they replaced.
+fn reject_everything(s: &mut Session) -> (Vec<TextEdit>, Vec<String>) {
     let rejects = s.review.reject_all(&s.text);
     let replaced: Vec<String> = rejects
         .iter()
@@ -102,7 +107,15 @@ fn many_rejected(n: usize) -> (Session, String, Vec<TextEdit>, Vec<String>) {
         .collect();
     s.edits(&rejects, Origin::Review);
     s.recompute();
-    assert_eq!(s.text, base);
+    (rejects, replaced)
+}
+
+/// `n` separate lines, each changed by one replace_all of the agent, then Reject all.
+fn many_rejected(n: usize) -> (Session, String, Vec<TextEdit>, Vec<String>) {
+    let mut s = many_changed(n);
+    let (base, agent_text) = (s.review.baseline().to_owned(), s.text.clone());
+    let (rejects, replaced) = reject_everything(&mut s);
+    assert_eq!((s.text.as_str(), s.review.baseline()), (&*base, &*base));
     assert!(s.hunks().is_empty());
     (s, agent_text, rejects, replaced)
 }
@@ -200,4 +213,54 @@ fn regress2_replace_all_20k_matches_is_fast() {
         took < Duration::from_secs(1),
         "on_edits for {n} replace_all matches took {took:?}"
     );
+}
+
+/// A copy of the session, to take several ways from one state.
+fn fork(s: &Session) -> Session {
+    Session {
+        review: s.review.clone(),
+        text: s.text.clone(),
+    }
+}
+
+/// Reject all of 5000 hunks (the D-10 case at scale), and its Ctrl+Z and Alt+U, each with its
+/// recompute, must not freeze the window: every reject (and every step of their undo) re-checked
+/// every record of the decision against the text, and Ctrl+Z, which puts the hunks back from the
+/// top down, found each record past the hunks already back (O(rejects³)): 2.3 s, 100 s and 1.1 s
+/// in release, now about 0.05 s, 0.07 s and 0.18 s. Release build: `-- --ignored perf_reject`.
+#[test]
+#[ignore = "release timing test; run in release with --ignored perf_reject"]
+fn perf_reject_all_of_5000_hunks_and_its_undo() {
+    let n = 5000;
+    let mut s = many_changed(n);
+    let agent_text = s.text.clone();
+    let t = Instant::now();
+    let (rejects, replaced) = reject_everything(&mut s);
+    let reject = t.elapsed();
+    assert!(s.hunks().is_empty());
+
+    let mut undone = fork(&s);
+    let t = Instant::now();
+    undone.undo_action(&rejects, &replaced);
+    undone.recompute();
+    let ctrl_z = t.elapsed();
+    assert_eq!(undone.text, agent_text);
+    assert_eq!(undone.hunks().len(), n);
+    assert_eq!(undone.review.baseline(), s.review.baseline());
+
+    let mut reverted = fork(&s);
+    let t = Instant::now();
+    let action = reverted.undo_review();
+    let alt_u = t.elapsed();
+    assert!(matches!(action, Some(UndoAction::Edits(e)) if e.len() == n));
+    assert_eq!(reverted.text, agent_text);
+    assert_eq!(reverted.hunks().len(), n);
+
+    eprintln!("{n} hunks: Reject all {reject:?}, its Ctrl+Z {ctrl_z:?}, its Alt+U {alt_u:?}");
+    for (what, took) in [("Reject all", reject), ("Ctrl+Z", ctrl_z), ("Alt+U", alt_u)] {
+        assert!(
+            took < Duration::from_millis(500),
+            "{what} of {n} hunks took {took:?}"
+        );
+    }
 }

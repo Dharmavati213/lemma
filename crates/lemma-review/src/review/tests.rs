@@ -383,6 +383,67 @@ fn widening_starts_on_a_char_boundary() {
     }
 }
 
+/// Deciding a hunk takes the unknown places around it along (they describe its change), but not
+/// one at the start of the next hunk, which may be about that hunk: Keep Turn kept the first of
+/// two hunks of a turn and so made the second, whose change is not known exactly, look like the
+/// turn's alone (random sessions found it: `play`'s check after `AcceptTurn`). The same for a
+/// reject, and for its redo after an undo.
+#[test]
+fn a_decision_leaves_the_next_hunks_unknown_places() {
+    let base = "a\nb\nc\nd\n";
+    let agent = Origin::Agent { call: 1 };
+    let review = || {
+        let mut r = FileReview::new(base.to_owned());
+        let mut cur = base.to_owned();
+        // Two edits in the first hunk, so that redoing its reject is not undoing one of them.
+        apply(&mut r, &mut cur, &TextEdit::insert(0, "A"), agent);
+        apply(&mut r, &mut cur, &TextEdit::insert(2, "Z"), agent);
+        apply(&mut r, &mut cur, &TextEdit::insert(6, "C"), agent);
+        r.recompute(&cur);
+        assert_eq!(r.hunks.len(), 2);
+        // What the turn changed at the start of the second hunk is not known exactly.
+        let at = r.hunks[1].cur_bytes.start;
+        r.unknown.add(0, at..at);
+        let clusters = r.clusters(0, &cur);
+        assert_eq!(clusters.iter().filter(|c| c.keepable).count(), 1);
+        (r, cur)
+    };
+    let undecidable = |r: &FileReview, cur: &str| {
+        let [h] = &r.hunks[..] else {
+            panic!("{:?}", r.hunks);
+        };
+        assert_eq!(cur.get(h.cur_bytes.clone()), Some("Cc\n"));
+        assert!(r.clusters(0, cur).iter().all(|c| !c.keepable));
+    };
+
+    let (mut r, cur) = review();
+    r.accept_turn(0, &cur);
+    undecidable(&r, &cur);
+
+    let (mut r, mut cur) = review();
+    let id = r.hunks[0].id;
+    let e = r.reject(id, &cur).unwrap();
+    let proposal = cur[e.range.clone()].to_owned();
+    apply(&mut r, &mut cur, &e, Origin::Review);
+    r.recompute(&cur);
+    undecidable(&r, &cur);
+    // Ctrl+Z, then Ctrl+Shift+Z.
+    let start = e.range.start;
+    let undo = TextEdit::delete(start..start + e.text.len());
+    apply(&mut r, &mut cur, &undo, Origin::History);
+    apply(
+        &mut r,
+        &mut cur,
+        &TextEdit::insert(start, &proposal),
+        Origin::History,
+    );
+    r.recompute(&cur);
+    assert_eq!(r.hunks.len(), 2);
+    apply(&mut r, &mut cur, &e, Origin::History);
+    r.recompute(&cur);
+    undecidable(&r, &cur);
+}
+
 // ----- on_edits ---------------------------------------------------------------------------------
 
 const WORDS: &[&str] = &["alpha", "$x$", "\\beta", "é∑", "", "a\rb", "x x", "$"];
@@ -483,9 +544,13 @@ fn action_edits(current: &str, action: &Action) -> Vec<TextEdit> {
 }
 
 /// Everything a review holds: its `Debug` form (every field), and the occurrence hints sorted
-/// (a `HashMap` prints in no fixed order).
+/// (a `HashMap` prints in no fixed order). Word spans are left out: a recompute has 8 ms for them,
+/// and on a loaded machine one of two recomputes of the same texts may run out.
 fn state(r: &FileReview) -> (String, Vec<(u64, u64)>) {
     let mut r = r.clone();
+    for h in &mut r.hunks {
+        h.words.clear();
+    }
     let mut hints: Vec<(u64, u64)> = r.free_hints.drain().collect();
     hints.sort_unstable();
     (format!("{r:?}"), hints)
@@ -508,8 +573,7 @@ proptest! {
         let mut r = FileReview::new(base.clone());
         let mut current = base;
         for op in &history {
-            // Only the state matters here, not what `play` checks about its step.
-            let _ = play(&mut r, &mut current, op);
+            play(&mut r, &mut current, op).map_err(TestCaseError::fail)?;
         }
         let edits = action_edits(&current, &action);
         let origin = origin_of(origin);

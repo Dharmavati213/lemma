@@ -214,8 +214,8 @@ fn perf_on_edits_replace_all() {
     );
     assert!(t < Duration::from_millis(500), "{t:?}");
 
-    // After Reject all of 5000 hunks the records keep every reject of that decision, and each
-    // edit still goes through all of them: O(edits × rejects), reported only.
+    // After Reject all of 5000 hunks the records keep every reject of that decision; each edit
+    // meets only those next to it (it went through all of them: 1.06 s).
     let (mut review, mut text) = replaced_once(5000);
     let rejects = review.reject_all(&text);
     review.on_edits(&rejects, Origin::Review);
@@ -227,6 +227,70 @@ fn perf_on_edits_replace_all() {
         "  {} matches after rejecting 5000 hunks: {t:?}",
         edits.len()
     );
+    assert!(t < Duration::from_millis(500), "{t:?}");
+}
+
+/// The buffer's undo of a replace_all of 5000 matches, as an open buffer reports it (a deletion
+/// and an insertion each: 10 000 changes, each recognized by its record), and its redo, each with
+/// its recompute: ≤ 1 s each, and every hunk back after the redo (with the records of the last
+/// 512 changes only, the redo put most of them into the baseline). The changes reach the review
+/// one by one, as the buffer's do, each moving the hunks, segments and attribution after it:
+/// twice the matches take about four times as long.
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_undo_and_redo_of_a_replace_all() {
+    let mut text = dollars(1250);
+    let base = text.clone();
+    let mut review = FileReview::new(text.clone());
+    review.set_turn(1);
+    let changes: Vec<TextEdit> = str_replace(&text, "$", "\\(", true)
+        .unwrap()
+        .iter()
+        .flat_map(|e| {
+            [
+                TextEdit::delete(e.range.clone()),
+                TextEdit::insert(e.range.start, &e.text),
+            ]
+        })
+        .collect();
+    let removed: Vec<String> = changes
+        .iter()
+        .map(|e| text[e.range.clone()].to_owned())
+        .collect();
+    feed(&mut review, &mut text, &changes);
+    review.recompute(&text);
+    let hunks = review.hunks().len();
+
+    // Undo: the inverse of each change, the last one first.
+    let t = Instant::now();
+    for (e, removed) in changes.iter().zip(&removed).rev() {
+        let inverse = TextEdit {
+            range: e.range.start..e.range.start + e.text.len(),
+            text: removed.clone(),
+        };
+        review.on_edit(&inverse, Origin::History);
+        inverse.apply(&mut text);
+    }
+    review.recompute(&text);
+    let undo = t.elapsed();
+    assert_eq!(text, base);
+    assert!(review.hunks().is_empty());
+
+    let t = Instant::now();
+    for e in &changes {
+        review.on_edit(e, Origin::History);
+        e.apply(&mut text);
+    }
+    review.recompute(&text);
+    let redo = t.elapsed();
+    assert_eq!(review.baseline(), base);
+    assert_eq!(review.hunks().len(), hunks);
+    eprintln!(
+        "perf_undo_and_redo_of_a_replace_all: {} changes over {hunks} hunks: undo {undo:?}, redo {redo:?}",
+        changes.len()
+    );
+    assert!(undo < Duration::from_secs(1), "{undo:?}");
+    assert!(redo < Duration::from_secs(1), "{redo:?}");
 }
 
 /// Alt+U of an Accept all of 5000 hunks puts them back at once: ≤ 100 ms (one by one, each

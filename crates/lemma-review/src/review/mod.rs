@@ -34,7 +34,7 @@ use journal::{Accepted, Entry, Journal};
 use lemma_core::{Origin, TextEdit, fnv1a64};
 use records::{Kind, Records, Step};
 use segments::{Parked, Segment, Segments};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,7 +115,7 @@ pub struct FileReview {
     attribution: Attribution,
     /// Turns taken out of the attribution by a recorded step (a reject, the undo of an agent
     /// edit), by record id: reversing the step puts them back.
-    parked: Vec<(u64, Vec<u32>)>,
+    parked: BTreeMap<u64, Vec<u32>>,
     /// What each turn's edits replaced, where that is known exactly.
     segments: Segments,
     /// Where a turn changed text whose segment was lost (another change cut into it): hunks there
@@ -123,7 +123,7 @@ pub struct FileReview {
     unknown: Attribution,
     /// Segments and unknown places a reject took out, by record id: undoing the reject puts them
     /// back.
-    parked_segments: Vec<(u64, Parked)>,
+    parked_segments: BTreeMap<u64, Parked>,
     /// Bumped by every change of the state (see [`FileReview::generation`]).
     generation: u64,
     created_unix: u64,
@@ -153,10 +153,10 @@ impl FileReview {
             turn: 0,
             attr_turn: 0,
             attribution: Attribution::default(),
-            parked: Vec::new(),
+            parked: BTreeMap::new(),
             segments: Segments::default(),
             unknown: Attribution::default(),
-            parked_segments: Vec::new(),
+            parked_segments: BTreeMap::new(),
             generation: 0,
             created_unix,
             batch: None,
@@ -325,15 +325,16 @@ impl FileReview {
         self.attribution.remap(&mut f);
         self.unknown.remap(&mut f);
         self.segments.remap(&mut f);
-        for (_, turns) in &mut self.parked {
+        for turns in self.parked.values_mut() {
             for t in turns.iter_mut() {
                 *t = f(*t);
             }
         }
-        for (_, parked) in &mut self.parked_segments {
+        for parked in self.parked_segments.values_mut() {
             parked.remap(&mut f);
         }
         self.journal.remap(&mut f);
+        self.records.remap_turns(&mut f);
         for h in &mut self.hunks {
             h.turns = self.attribution.turns_touching(&h.cur_bytes);
         }
@@ -478,19 +479,16 @@ impl FileReview {
     fn park(&mut self, id: u64, range: &Range<usize>, only: Option<u32>) {
         let turns = self.attribution.subtract(range, only);
         self.prune_near(range, None);
-        let records = &self.records;
-        self.parked
-            .retain(|(r, _)| *r != id && records.contains(*r));
+        self.parked.remove(&id);
         if !turns.is_empty() {
-            self.parked.push((id, turns));
+            self.parked.insert(id, turns);
         }
         self.refresh_turns_near(range);
     }
 
     /// Gives the turns kept under the record `id` back to the closed interval `range`.
     fn unpark(&mut self, id: u64, range: &Range<usize>) {
-        if let Some(i) = self.parked.iter().position(|(r, _)| *r == id) {
-            let (_, turns) = self.parked.remove(i);
+        if let Some(turns) = self.parked.remove(&id) {
             for t in turns {
                 self.attribution.add(t, range.clone());
             }
@@ -571,6 +569,8 @@ impl FileReview {
             self.refresh_turns_near(&changed);
             return class;
         }
+        // `current_len` follows once the hunks have changed: `growth_before` counts on it being
+        // the baseline's length plus their growth.
         match (claim, origin, class) {
             (None, Origin::User | Origin::History, EditClass::Outside) => {
                 if let Some(at) = self.fold_into_baseline(first, a, b, &e.text) {
@@ -581,12 +581,12 @@ impl FileReview {
                 }
             }
             (None, Origin::User | Origin::History, EditClass::Inside(_)) => {
-                self.current_len = grown;
                 self.edit_inside(first, a, b, &e.text);
+                self.current_len = grown;
             }
             _ => {
-                self.current_len = grown;
                 let merged = self.edit_proposal(a, b, &e.text);
+                self.current_len = grown;
                 if let Some(claim) = claim {
                     self.apply_claim(claim, &merged);
                 }
@@ -620,14 +620,41 @@ impl FileReview {
         self.refresh_turns_near(&changed);
         if claim.is_some_and(|c| c.done) {
             // Records cut by this step's edit may have come back. They match the text when the
-            // buffer's undo replays strictly in order; drop any that do not.
+            // buffer's undo replays strictly in order; drop any that do not. Every other record
+            // followed the text edit by edit.
             let mut records = std::mem::take(&mut self.records);
-            records.retain(|range, content| {
-                self.current_text(range).is_some_and(|text| text == content)
-            });
+            records.retain_restored(|range, content| self.current_text_is(range, content));
             self.records = records;
         }
+        // The unit tests check every record after every change (`on_edits` once its batch is
+        // back together).
+        #[cfg(test)]
+        if self.batch.is_none() {
+            self.check_records(|| format!("{e:?} ({origin:?})"));
+        }
         class
+    }
+
+    /// Panics when a record does not hold the text at its range; `after` names the change. In
+    /// text order, so that the hunk list is walked once.
+    #[cfg(test)]
+    pub(super) fn check_records(&self, after: impl Fn() -> String) {
+        let (mut i, mut grown) = (0, 0);
+        for (range, content) in self.records.in_text_order() {
+            while self
+                .hunks
+                .get(i)
+                .is_some_and(|h| h.cur_bytes.end <= range.start)
+            {
+                grown += model::growth(&self.hunks[i]);
+                i += 1;
+            }
+            assert!(
+                self.text_is_at(&range, content, i, grown),
+                "the record at {range:?} ({content:?}) does not match the text after {}",
+                after()
+            );
+        }
     }
 
     /// Recompute hunks: similar Myers line diff with an 8 ms timeout + iter_inline_changes for word spans.
@@ -691,8 +718,10 @@ impl FileReview {
         } else {
             self.segments.drop_unchanged(current);
         }
+        // What the steps of records that are gone took out cannot come back.
         let records = &self.records;
-        self.parked_segments.retain(|(id, _)| records.contains(*id));
+        self.parked.retain(|id, _| records.contains(*id));
+        self.parked_segments.retain(|id, _| records.contains(*id));
         let delta = hunk_delta(&self.published, &self.hunks, &hunks);
         self.published = hunks.iter().map(|h| h.id).collect();
         self.hunks = hunks;
@@ -1084,13 +1113,13 @@ impl FileReview {
             self.records
                 .push_reject(edit.range.clone(), proposal, edit.text.clone(), reopen);
         if !turns.is_empty() {
-            self.parked.push((record, turns));
+            self.parked.insert(record, turns);
         }
         // The region goes back to the baseline: what the turns changed around it waits for the
         // reject to be undone.
         let parked = self.park_around(k, &edit.range);
         if !parked.is_empty() {
-            self.parked_segments.push((record, parked));
+            self.parked_segments.insert(record, parked);
         }
         (edit, Some(record), Some(event))
     }

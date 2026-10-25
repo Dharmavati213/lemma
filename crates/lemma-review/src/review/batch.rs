@@ -25,9 +25,9 @@
 //!
 //! What `on_edit` reads across the whole text is kept for the whole review meanwhile ([`Batch`]):
 //! which hunk ids exist (`free_occurrence`), and the net growth of the hunks before a point
-//! (`growth_before`, from prefix sums over the hunks no edit has reached yet). The records (at
-//! most 512, plus the rejects of the newest decision) stay up to date edit by edit as before. The
-//! journal is moved through all the edits at the end (`Journal::track_all`).
+//! (`growth_before`, from prefix sums over the hunks no edit has reached yet). The records stay
+//! up to date edit by edit as before, each edit meeting only those next to it (see `records`).
+//! The journal is moved through all the edits at the end (`Journal::track_all`).
 //!
 //! Alt+U of an Accept all puts thousands of regions back the same way, from the last one down
 //! ([`FileReview::unaccept_batch`]): each one inserts its hunk below the ones put back before it
@@ -192,6 +192,8 @@ impl FileReview {
         self.batch = None;
         journal.track_all(&applied);
         self.journal = journal;
+        #[cfg(test)]
+        self.check_records(|| format!("{} edits ({origin:?})", edits.len()));
     }
 
     /// `unaccept_each` of `regions` (descending), with the same result: O(log hunks) per region

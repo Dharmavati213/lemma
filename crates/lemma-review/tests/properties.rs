@@ -450,3 +450,101 @@ proptest! {
         prop_assert_eq!(s.ids(), ids);
     }
 }
+
+/// Fewer cases for property 9, whose documents have hundreds of lines (a fortieth, at least 10).
+fn big_config() -> ProptestConfig {
+    let cases = config().cases;
+    ProptestConfig::with_cases((cases / 40).max(10))
+}
+
+/// A document of `pairs` lines `l<i> …` (with two spaces each), each followed by a line `m<i>`
+/// without one, so that changing every space leaves a hunk per pair.
+fn spaced_document(pairs: std::ops::Range<usize>) -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        (prop::sample::select(WORDS), prop::sample::select(WORDS)),
+        pairs,
+    )
+    .prop_map(|lines| {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| format!("l{i} {a} {b}\nm{i}\n"))
+            .collect()
+    })
+}
+
+/// The changes of `edits` as an open buffer reports them: a deletion, then an insertion, for each
+/// (descending, as `apply_edits` makes them).
+fn as_open_buffer(edits: &[TextEdit]) -> Vec<TextEdit> {
+    edits
+        .iter()
+        .flat_map(|e| {
+            let delete = (!e.range.is_empty()).then(|| TextEdit::delete(e.range.clone()));
+            let insert = (!e.text.is_empty()).then(|| TextEdit::insert(e.range.start, &e.text));
+            delete.into_iter().chain(insert)
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(big_config())]
+
+    /// 9. Properties 7 and 8 for an action with more changes than the review records of older
+    /// turns (512): a replace_all of the spaces of hundreds of lines (two a line), between
+    /// smaller actions, reported as a closed document or an open buffer reports it.
+    #[test]
+    fn buffer_undo_and_redo_of_an_action_beyond_the_record_cap(
+        base in spaced_document(260..300),
+        before in prop::collection::vec(agent_op(), 0..3),
+        after in prop::collection::vec(agent_op(), 0..3),
+        to in prop::sample::select(vec!["  ", "_", ""]),
+        open in any::<bool>(),
+    ) {
+        let (mut s, mut actions) = recorded_agent_session(&base, &before, 0);
+        let all = lemma_review::str_replace(&s.text, " ", to, true).unwrap();
+        let edits = if open { as_open_buffer(&all) } else { all };
+        prop_assert!(edits.len() > 512);
+        let replaced: Vec<String> = edits
+            .iter()
+            .map(|e| s.text[e.range.clone()].to_owned())
+            .collect();
+        s.edits(&edits, Origin::Agent { call: 99 });
+        s.recompute();
+        actions.push((edits, replaced));
+        let mut serial = 1000;
+        for (i, op) in after.iter().enumerate() {
+            let target = changed(&s.text, op, &mut serial);
+            let edits = minimal_edits(&s.text, &target);
+            let replaced = edits
+                .iter()
+                .map(|e| s.text[e.range.clone()].to_owned())
+                .collect();
+            s.edits(&edits, Origin::Agent { call: 100 + i as u64 });
+            actions.push((edits, replaced));
+        }
+        s.recompute();
+        let ids = s.ids();
+        s.review.drain_events();
+
+        for (edits, replaced) in actions.iter().rev() {
+            s.undo_action(edits, replaced);
+        }
+        s.recompute();
+        prop_assert_eq!(s.text.as_str(), base.as_str());
+        prop_assert_eq!(s.review.baseline(), base.as_str());
+        prop_assert!(s.review.is_clean(), "{} hunks left", s.hunks().len());
+        let edited = s
+            .review
+            .drain_events()
+            .into_iter()
+            .find(|e| matches!(e, lemma_review::ReviewEvent::UserEditedInHunk { .. }));
+        prop_assert!(edited.is_none(), "the undo looked like the user's: {:?}", edited);
+
+        for (edits, _) in &actions {
+            s.edits(edits, Origin::History);
+        }
+        s.recompute();
+        prop_assert_eq!(s.review.baseline(), base.as_str());
+        prop_assert_eq!(s.ids(), ids);
+    }
+}

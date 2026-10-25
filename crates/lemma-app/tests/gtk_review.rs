@@ -40,6 +40,10 @@ fn main() -> ExitCode {
             "ctrl_z_after_reject_reopens_the_same_hunk",
             undo_after_reject,
         ),
+        (
+            "undo_and_redo_of_a_large_agent_edit_keep_it_under_review",
+            undo_redo_large_agent_edit,
+        ),
         ("alt_u_reverts_accept_and_reject", review_undo),
         ("navigation_wraps_across_files", navigation),
         ("decisions_advance_to_the_next_hunk", auto_advance),
@@ -398,6 +402,56 @@ fn undo_after_reject() {
     editor.buffer().undo();
     common::pump_for(Duration::from_millis(80));
     assert_eq!(f.ids("main.tex"), vec![id]);
+}
+
+/// Ctrl+Z and Ctrl+Shift+Z of one agent edit with 300 replacements: an open buffer reports each
+/// as a deletion and an insertion, 600 changes, more than the review records of older turns
+/// (512). The undo leaves nothing to review, the redo brings every hunk back, and none of the
+/// agent's changes goes into the baseline on the way (64 did: their records had been dropped, so
+/// the redo looked like the user's own typing).
+fn undo_redo_large_agent_edit() {
+    let original: String = (0..300)
+        .map(|i| format!("Line {i} uses \\R here.\nPlain line {i}.\n"))
+        .collect();
+    let f = fixture("undo-redo-large", &[("main.tex", &original)]);
+    let editor = f.open("main.tex");
+    let reply = f.agent(
+        1,
+        EditorRequest::Edit {
+            path: "main.tex".into(),
+            old_string: "\\R".into(),
+            new_string: "\\mathbb{R}".into(),
+            replace_all: true,
+        },
+    );
+    assert!(!reply.is_error, "edit failed: {}", reply_text(&reply));
+    let proposal = f.doc("main.tex").text();
+    let ids = f.ids("main.tex");
+    assert_eq!(ids.len(), 300);
+    let baseline = || {
+        f.doc("main.tex")
+            .review
+            .borrow()
+            .as_ref()
+            .map(|r| r.baseline().to_owned())
+    };
+
+    editor.buffer().undo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.doc("main.tex").text(), original);
+    assert!(f.hunks("main.tex").is_empty());
+    assert_eq!(baseline().as_deref(), Some(original.as_str()));
+
+    editor.buffer().redo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.doc("main.tex").text(), proposal);
+    let folded = baseline().map_or(0, |b| b.matches("mathbb").count());
+    assert_eq!(
+        (f.hunks("main.tex").len(), folded),
+        (300, 0),
+        "hunks after the redo, and agent changes in the baseline"
+    );
+    assert_eq!(f.ids("main.tex"), ids, "every hunk comes back with its id");
 }
 
 fn review_undo() {

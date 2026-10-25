@@ -50,7 +50,7 @@ use adw::prelude::*;
 use lemma_core::{Origin, TextEdit};
 use lemma_review::{FileReview, HunkDelta, HunkId, ReviewEvent, UndoAction};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -1490,13 +1490,15 @@ fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: De
                 let Some(review) = review.as_mut() else {
                     return 0;
                 };
-                let ids: Vec<HunkId> = match pick {
+                // A set: Reject Turn (Replace in Project's Undo) can pick thousands of hunks.
+                let ids: HashSet<HunkId> = match pick {
                     Pick::Turn(turn) => review.hunks_of_turn(turn).iter().map(|h| h.id).collect(),
-                    Pick::Hunks(ids) => ids.to_vec(),
+                    Pick::Hunks(ids) => ids.iter().copied().collect(),
                 };
-                let touched = ids
+                let touched = review
+                    .hunks()
                     .iter()
-                    .any(|id| review.hunk(*id).is_some_and(|h| h.user_touched));
+                    .any(|h| h.user_touched && ids.contains(&h.id));
                 let edits = match pick {
                     Pick::Turn(turn) => review.reject_turn(turn, &text),
                     Pick::Hunks(ids) => review.reject_hunks(ids, &text),

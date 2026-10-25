@@ -1018,6 +1018,10 @@ they conflict with the sections above, this section wins.
 - **Review (§4.4, §4.5, §10.3):**
   - Reject Turn reverts only that turn's own edits inside mixed hunks; Keep Turn keeps only hunks that are that turn's
     alone.
+  - Deciding a hunk takes the turns' unknown places around it out, but not those touching the
+    hunks next to it, which may be about them (`park_around`, 2026-10-25): accepting one hunk
+    made the next one, whose change was not known exactly, look like its turn's alone, so a
+    Keep Turn after it kept it whole.
   - `PersistedReview` gains optional `turn_edits` / `unknown_turn_edits`.
   - A dirty document keeps the entry captured at its last save.
   - `replace_all` with tens of thousands of matches is linear (D-5, fixed 2026-10-25: see
@@ -1164,7 +1168,8 @@ they conflict with the sections above, this section wins.
     order they are applied, each ending at or before the start of the one before, with the
     pre-edit offsets of its moment). The result is exactly that of `on_edit` for each in turn,
     which is what it does for User, History and Review edits; a differential proptest
-    (`review::tests::on_edits_is_on_edit_for_each_edit`) compares every field of the review.
+    (`review::tests::on_edits_is_on_edit_for_each_edit`) compares every field of the review but
+    the word spans (their 8 ms deadline).
   - For Agent and Reload edits it costs O(log hunks) per edit instead of O(hunks): before each
     edit it sets aside the hunks, segments and attribution intervals beyond the edit's reach
     (what `on_edit` reads for it: the hunks and segments it meets, `MAX_SLIDE` bytes past them,
@@ -1176,12 +1181,37 @@ they conflict with the sections above, this section wins.
     one down, with what lies beyond each set aside and its baseline offsets moved when it comes
     back), with the result of putting them back one by one (differential proptest
     `review::tests::unaccept_batch_is_unaccept_each`): 5000 hunks 0.27 s → 21 ms.
-  - Still O(edits × records): right after a Reject all of thousands of hunks the records keep
-    every reject of that decision and each edit goes through them (20 000 edits after rejecting
-    5000 hunks: 6.5 s → 1.0–1.4 s). An edit inside one hunk costs O(that hunk's text), as
-    before, so a replace_all inside one hunk that spans most of the file stays quadratic. Accept
-    all and its Alt+U still move the baseline after each region (`String::replace_range`):
-    about 0.25 s each for 20 000 hunks in a 1 MB file.
+  - The records that recognize the buffer's undo and redo of Lemma's own edits
+    (`review/records.rs`) keep their ranges split at the last edit, as `LineIndex` keeps line
+    starts (`Points`): the ends before it as positions, those after it as positions minus the
+    net length change of the edits since, and the ranges holding it in a set. An edit takes out
+    only the records it meets (each O(log records)), after converting the ends between it and
+    the edit before, so a run of edits down or up the text converts each end once. 20 000 edits
+    right after rejecting 5000 hunks (the decision keeps all their records): 0.73 s → 0.07 s
+    (6.5 s before the batched feed). A completed undo or redo step re-checks only the records it
+    brought back (the others followed the text edit by edit; the unit tests check them all after
+    every change), against the model without building strings (`current_text_is`), and
+    `growth_before` sums from the nearer end of the hunk list. Reject all of 5000 line hunks,
+    with its recompute: 2.3 s → 0.05 s; its Ctrl+Z 100 s → 0.07 s; its Alt+U 1.1 s → 0.18 s
+    (`regress2_d` `perf_reject_all_of_5000_hunks_and_its_undo`).
+  - Beyond the cap of 512 records, the agent edits of the newest turn (a run of agent edits
+    attributed to one turn, whatever comes between them) are kept as the newest decision's
+    rejects are, at most their last 32 768 (`MAX_TURN_RECORDS`; a few hundred bytes each). The
+    buffer's undo and redo of a replace_all with more matches than the cap are recognized change
+    by change: the undo sends `UndoneByUser` (it sent `UserEditedInHunk` for the changes
+    whose records were gone) and the redo brings every hunk back (it folded those changes into
+    the baseline). A per-action log of the agent's changes, recognizing them where no record
+    does, was the alternative; the records also bring back the turns, segments and records
+    that an undo or a redo restores, and now cost O(log records) an edit.
+  - Still O(edits × hunks): Review and History edits (a Reject all and its Alt+U, the buffer's
+    undo and redo) reach `on_edit` one by one, each moving the hunks, segments and attribution
+    after it, as typing does. Where they go down the text, each new hunk goes in front of the
+    others: Alt+U of a Reject all of 5000 hunks 0.18 s; undo and redo of a replace_all of 5000
+    matches in an open buffer (10 000 changes) 0.14 s and 0.21 s, four times that for twice the
+    matches (`perf_undo_and_redo_of_a_replace_all`). An edit inside one hunk costs O(that
+    hunk's text), as before, so a replace_all inside one hunk that spans most of the file stays
+    quadratic. Accept all and its Alt+U still move the baseline after each region
+    (`String::replace_range`): about 0.25 s each for 20 000 hunks in a 1 MB file.
   - `Document::apply_edits` gives the review the changes the document reported while it
     applied them, at once when they are applied (`review_ui::before_edits`): a delete and an
     insert per edit on an open buffer, the edits themselves on a closed document, in runs of one

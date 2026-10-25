@@ -6,6 +6,7 @@ use common::Session;
 use lemma_core::{Origin, TextEdit, fnv1a64};
 use lemma_review::{
     EditClass, FileReview, HunkId, ReviewError, ReviewEvent, Side, UndoAction, WordSpan,
+    str_replace,
 };
 
 const DOC: &str = "\\section{Intro}\nLet $x$ be a point.\nThen $f(x)=0$.\n\\end{document}\n";
@@ -470,6 +471,56 @@ fn redo_of_an_agent_edit_brings_the_hunk_back() {
     s.recompute();
     assert_eq!(s.ids(), [id]);
     assert_eq!(s.review.baseline(), "a\nb\nc\n");
+}
+
+/// Ctrl+Z then Ctrl+Shift+Z of one agent action with more changes than the records' cap of 512
+/// (a replace_all of 600 matches): the undo is recognized change by change (the agent hears
+/// `UndoneByUser`, not that the user edited its change), and the redo brings every hunk back,
+/// with its id and turn. Only the records of the last 472 changes were kept: undoing the first
+/// 128 looked like the user editing them, and redoing them put them into the baseline.
+#[test]
+fn undo_and_redo_of_an_agent_action_beyond_the_record_cap() {
+    let base: String = (0..600)
+        .map(|i| format!("Line {i} uses \\R here.\nPlain line {i}.\n"))
+        .collect();
+    let mut s = Session::new(&base);
+    s.review.set_turn(1);
+    let edits = str_replace(&s.text, "\\R", "\\mathbb{R}", true).unwrap();
+    let replaced: Vec<String> = edits
+        .iter()
+        .map(|e| s.text[e.range.clone()].to_owned())
+        .collect();
+    s.edits(&edits, Origin::Agent { call: 1 });
+    s.recompute();
+    let (ids, proposal) = (s.ids(), s.text.clone());
+    assert_eq!(ids.len(), 600);
+    s.review.drain_events();
+
+    s.undo_action(&edits, &replaced);
+    s.recompute();
+    assert_eq!(s.text, base);
+    assert!(s.review.is_clean(), "{} hunks left", s.hunks().len());
+    let events = s.review.drain_events();
+    let undone = events
+        .iter()
+        .filter(|e| matches!(e, ReviewEvent::UndoneByUser { .. }))
+        .count();
+    assert_eq!(
+        (undone, events.len()),
+        (600, 600),
+        "{:?}",
+        events
+            .iter()
+            .find(|e| !matches!(e, ReviewEvent::UndoneByUser { .. }))
+    );
+
+    // Redo: GTK replays the action's changes in order.
+    s.edits(&edits, Origin::History);
+    s.recompute();
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.review.baseline(), base, "changes went into the baseline");
+    assert_eq!(s.ids(), ids);
+    assert!(s.hunks().iter().all(|h| h.turns == [1]));
 }
 
 // ---- accept, reject, undo ----------------------------------------------------------------------
