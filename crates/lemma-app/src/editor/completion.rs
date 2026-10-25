@@ -53,16 +53,21 @@
 //!
 //! The window's `workspace.index` (`ProjectIndex`) is kept fresh here: open documents are
 //! re-indexed on the jobs thread 300 ms after their last change (one job per document at a time:
-//! edits made while it runs are indexed once more after it); the files they include, the
-//! `.tex` files next to them (to find the root), the bibliographies and the root's `.aux` (in the
-//! build directory or next to it) are read from disk; after each build the `.aux`, the `.bib`
-//! files and the project's file list are read again (and when the root found lives in another
-//! directory than the one listed). Files read from disk that another program changes, creates or
-//! deletes (a re-exported `.bib`, a `git checkout`, a chapter edited elsewhere, a file an
-//! `\input` named before it existed) are read again as the file monitor reports them
-//! ([`disk_changed`]; a file that is gone leaves the index), and the file list is made again
-//! when files come or go ([`files_moved`]). The monitor watches the workspace folder only: a
-//! `.bib` outside it is read again after a build. When the project's theorem environments
+//! edits made while it runs are indexed once more after it); the files they include, the local
+//! packages and classes they load (`\usepackage{mymacros}` with a `mymacros.sty` next to the
+//! file or in the root's directory, a `\documentclass` whose `.cls` is next to the root: their
+//! macros and theorems; a package of the distribution is looked for there once until the next
+//! build), the `.tex` files next to them (to find the root), the bibliographies and the root's
+//! `.aux` (in the build directory or next to it) are read from disk; after each build the
+//! `.aux`, the `.bib` files and the project's file list are read again (and when the root found
+//! lives in another directory than the one listed). The words of the `.tex` files read from
+//! disk are collected again only when one of their texts changed (or one came or went), not
+//! after a build that changed only the `.aux`. Files read from disk that another program
+//! changes, creates or deletes (a re-exported `.bib`, a `git checkout`, a chapter edited
+//! elsewhere, a file an `\input` named before it existed) are read again as the file monitor
+//! reports them ([`disk_changed`]; a file that is gone leaves the index), and the file list is
+//! made again when files come or go ([`files_moved`]). The monitor watches the workspace folder
+//! only: a `.bib` outside it is read again after a build. When the project's theorem environments
 //! change (a preamble file read after the chapters that use its `\newtheorem`s, a declaration
 //! typed or removed), the files whose environments use a changed name are indexed again, so
 //! their theorem rows and label titles follow. A `.tex` file next to an open document joins the
@@ -528,6 +533,22 @@ fn shared_for(state: &Rc<WindowState>) -> Rc<Shared> {
         }
     });
     shared.hooks.replace(vec![config, root]);
+    // Lemma's save of a closed document (an agent's edit, a rejected hunk) reaches the index
+    // from the saved text, not through a discovery job; an open one's words come from its tab
+    // until it closes (`detach`).
+    let weak = Rc::downgrade(&shared);
+    let saved = crate::saver::connect_saved(move |path, _| {
+        if let Some(shared) = weak.upgrade()
+            && shared
+                .state()
+                .is_none_or(|s| s.workspace.get(path).is_none_or(|d| !d.is_open()))
+        {
+            shared.disk_text_unread(path);
+        }
+    });
+    state
+        .window
+        .connect_destroy(move |_| crate::saver::disconnect_saved(saved));
     if let Some(build) = state.build.get() {
         let weak = Rc::downgrade(&shared);
         build.connect_finished(move |outcome| {
@@ -773,6 +794,8 @@ pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     };
     if let Some(attached) = removed {
         attached.shutdown();
+        // What its file holds now (saved or reloaded while it was open) no discovery job read.
+        shared.disk_text_unread(editor.document().path());
         // Once the document has left the workspace (right after this), what only it reached
         // leaves the index.
         let weak = Rc::downgrade(&shared);
@@ -1722,6 +1745,12 @@ pub fn file_walks(state: &WindowState) -> u64 {
     shared_of(state).map_or(0, |s| s.feed.walks.get())
 }
 
+/// How many times the words of the files read from disk were collected (tests): when the
+/// dictionary or the text of such a `.tex` file changed, or one came or went.
+pub fn base_word_builds(state: &WindowState) -> u64 {
+    shared_of(state).map_or(0, |s| s.feed.base_generation.get())
+}
+
 /// Reads the `.aux` (first the one beside `pdf`), the bibliographies and the project's file list
 /// again, as every finished build does (`BuildController::connect_finished`).
 pub fn refresh_after_build(state: &WindowState, pdf: Option<&Path>) {
@@ -1798,6 +1827,20 @@ struct Feed {
     dictionary: RefCell<Arc<WordList>>,
     /// The dictionary plus the words of the project files read from disk.
     base_words: RefCell<Arc<WordList>>,
+    /// A hash of the text of each file a discovery job read (indexed or a candidate), and what
+    /// the base words were last built from: a discovery pass that changes no such text (the
+    /// `.aux` and the bibliographies read after a build, a root read again unchanged) does not
+    /// read the project's files for their words again.
+    text_hashes: RefCell<HashMap<PathBuf, u64>>,
+    base_inputs: RefCell<Option<BaseInputs>>,
+    /// A `.tex` file the base words read may hold another text than the one hashed, as no
+    /// discovery job read it: its document closed (saved or reloaded while open, when the jobs
+    /// skip it), or Lemma saved it closed (the index takes the saved text, `labels::saved`). The
+    /// base words are collected again on the next pass that reads from disk.
+    base_stale: Cell<bool>,
+    /// Bumped by every base words job, so an older one that ends last is dropped (and counts
+    /// them, for tests).
+    base_generation: Cell<u64>,
     words_timer: RefCell<Option<glib::SourceId>>,
     /// Bumped by every job start, so stale word rebuilds are dropped.
     words_generation: Cell<u64>,
@@ -1840,12 +1883,17 @@ type Theorems = Arc<Vec<String>>;
 /// A possible root found next to an open document: its index and document class.
 type Candidate = (Arc<FileIndex>, Option<String>);
 
+/// What the base words are built from: the dictionary, and the `.tex` files read from disk with
+/// the hashes of their texts, by path.
+type BaseInputs = (Arc<WordList>, Vec<(PathBuf, u64)>);
+
 /// A file a discovery job read: `listed` when it was found by listing a directory (a possible
-/// root), not through an include.
+/// root), not through an include; `hash`, of its text ([`text_hash`]).
 struct ReadFile {
     path: PathBuf,
     read: IndexedFile,
     listed: bool,
+    hash: u64,
 }
 
 /// What a discovery job read.
@@ -2025,10 +2073,13 @@ impl Shared {
             self.walk_files();
         }
         self.discover();
-        if disk {
-            self.rebuild_base_words();
-        } else {
+        if !disk {
             self.schedule_words();
+        } else if self.base_words_current() {
+            // No text read from disk changed: only the open documents' words are added again.
+            self.rebuild_words();
+        } else {
+            self.rebuild_base_words();
         }
     }
 
@@ -2191,6 +2242,18 @@ impl Shared {
                 want_file(path.clone(), &mut wanted);
             }
         }
+        // Local packages and classes, for their macros and theorems. Most packages are the
+        // distribution's: their reads fail once and stay in `unreadable`. After the includes,
+        // so that they never take the budget from them.
+        let root_dirs = root_dirs(&index);
+        let classes = self.feed.classes.borrow();
+        for (path, file) in &index.files {
+            let class = classes.get(path).map(String::as_str);
+            for style in local_styles(path, file, class, &root_dirs) {
+                want_file(style, &mut wanted);
+            }
+        }
+        drop(classes);
         // Files read again count against the cap already: they are read first, on a budget of
         // their own, so that new files never take it and go past the cap.
         let disk_files = self.feed.disk_files.borrow();
@@ -2275,13 +2338,23 @@ impl Shared {
         };
         let mut changed = false;
         self.feed.searched.borrow_mut().extend(found.searched);
-        for ReadFile { path, read, listed } in found.files {
+        for ReadFile {
+            path,
+            read,
+            listed,
+            hash,
+        } in found.files
+        {
             self.feed.stale.borrow_mut().remove(&path);
             if state.workspace.get(&path).is_some_and(|d| d.is_open()) {
                 continue; // The live text is indexed instead.
             }
             match read {
                 Some((index, class)) => {
+                    self.feed
+                        .text_hashes
+                        .borrow_mut()
+                        .insert(path.clone(), hash);
                     self.feed
                         .indexed_with
                         .borrow_mut()
@@ -2299,6 +2372,7 @@ impl Shared {
                 }
                 None => {
                     // Gone (deleted, or no longer readable): what it had leaves the index.
+                    self.feed.text_hashes.borrow_mut().remove(&path);
                     if state
                         .workspace
                         .index
@@ -2390,8 +2464,8 @@ impl Shared {
     /// Drops from the index, the bibliographies, the candidates and the bookkeeping what no
     /// open document reaches any more: the files of a closed tab's project, an `\input` that was
     /// removed, a renamed file. Kept are the open documents, the indexed files whose project
-    /// contains one (their roots), the `% !TEX root` files of those, and everything these
-    /// include. True when files were dropped.
+    /// contains one (their roots), the `% !TEX root` files of those, everything these include,
+    /// and the local packages and classes all of them load. True when files were dropped.
     fn prune(&self, state: &WindowState) -> bool {
         let open = open_latex_documents(state);
         let mut index = state.workspace.index.borrow_mut();
@@ -2412,6 +2486,27 @@ impl Shared {
         for root in &roots {
             keep.extend(index.project_files(root));
         }
+        // The local packages and classes the kept files load (see `wanted`), what those include
+        // and load in turn.
+        let root_dirs = root_dirs(&index);
+        let classes = self.feed.classes.borrow();
+        let mut queue: Vec<PathBuf> = keep.iter().cloned().collect();
+        while let Some(path) = queue.pop() {
+            let Some(file) = index.files.get(&path) else {
+                continue;
+            };
+            let class = classes.get(&path).map(String::as_str);
+            for style in local_styles(&path, file, class, &root_dirs) {
+                if index.files.contains_key(&style) && !keep.contains(&style) {
+                    for included in index.project_files(&style) {
+                        if keep.insert(included.clone()) {
+                            queue.push(included);
+                        }
+                    }
+                }
+            }
+        }
+        drop(classes);
         let before = index.files.len();
         index.files.retain(|path, _| keep.contains(path));
         let dropped = index.files.len() < before;
@@ -2469,6 +2564,10 @@ impl Shared {
         let candidates = self.feed.candidates.borrow();
         self.feed
             .indexed_with
+            .borrow_mut()
+            .retain(|p, _| keep.contains(p) || candidates.contains_key(p));
+        self.feed
+            .text_hashes
             .borrow_mut()
             .retain(|p, _| keep.contains(p) || candidates.contains_key(p));
         dropped
@@ -2638,23 +2737,69 @@ impl Shared {
         });
     }
 
-    /// The dictionary plus the words of the files read from disk (jobs thread).
+    /// What [`Self::rebuild_base_words`] builds the base words from now.
+    fn base_inputs(&self) -> BaseInputs {
+        let hashes = self.feed.text_hashes.borrow();
+        let mut files: Vec<(PathBuf, u64)> = self
+            .feed
+            .disk_files
+            .borrow()
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "tex"))
+            .map(|f| (f.clone(), hashes.get(f).copied().unwrap_or_default()))
+            .collect();
+        files.sort_unstable();
+        (self.feed.dictionary.borrow().clone(), files)
+    }
+
+    /// Whether the base words were built (or are being built) from what they would be built
+    /// from now: the same dictionary, and the same `.tex` files read from disk with the same
+    /// texts.
+    fn base_words_current(&self) -> bool {
+        if self.feed.base_stale.get() {
+            return false;
+        }
+        let now = self.base_inputs();
+        self.feed
+            .base_inputs
+            .borrow()
+            .as_ref()
+            .is_some_and(|built| Arc::ptr_eq(&built.0, &now.0) && built.1 == now.1)
+    }
+
+    /// The file at `path` (normalized) may have changed without a discovery job reading it:
+    /// when the base words read it, they are collected again on the next pass that reads from
+    /// disk ([`Feed::base_stale`]).
+    fn disk_text_unread(&self, path: &Path) {
+        let disk_files = self.feed.disk_files.borrow();
+        let tex = disk_files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "tex"));
+        if !keys_naming(tex, path).is_empty() {
+            self.feed.base_stale.set(true);
+        }
+    }
+
+    /// The dictionary plus the words of the files read from disk (jobs thread): the files are
+    /// read one at a time and their words merged into the list once.
     fn rebuild_base_words(self: &Rc<Self>) {
-        let dictionary = self.feed.dictionary.borrow().clone();
-        let files: Vec<PathBuf> = self.feed.disk_files.borrow().iter().cloned().collect();
+        let inputs = self.base_inputs();
+        let dictionary = inputs.0.clone();
+        let files: Vec<PathBuf> = inputs.1.iter().map(|(path, _)| path.clone()).collect();
+        self.feed.base_inputs.replace(Some(inputs));
+        self.feed.base_stale.set(false);
+        let generation = self.feed.base_generation.get() + 1;
+        self.feed.base_generation.set(generation);
         let weak = Rc::downgrade(self);
         self.feed.jobs.set(self.feed.jobs.get() + 1);
         glib::spawn_future_local(async move {
             let base = gio::spawn_blocking(move || {
                 let mut words = (*dictionary).clone();
-                for file in files
-                    .iter()
-                    .filter(|f| f.extension().is_some_and(|e| e == "tex"))
-                {
-                    if let Some(text) = read_text(file, MAX_FILE_BYTES) {
-                        words.add_project_text(&text);
-                    }
-                }
+                words.add_project_texts(
+                    files
+                        .iter()
+                        .filter_map(|file| read_text(file, MAX_FILE_BYTES)),
+                );
                 words
             })
             .await;
@@ -2662,7 +2807,9 @@ impl Shared {
                 return;
             };
             shared.feed.jobs.set(shared.feed.jobs.get() - 1);
-            if let Ok(base) = base {
+            if let Ok(base) = base
+                && shared.feed.base_generation.get() == generation
+            {
                 shared.feed.base_words.replace(Arc::new(base));
                 shared.rebuild_words();
             }
@@ -2707,9 +2854,7 @@ impl Shared {
         glib::spawn_future_local(async move {
             let words = gio::spawn_blocking(move || {
                 let mut words = (*base).clone();
-                for text in &texts {
-                    words.add_project_text(text);
-                }
+                words.add_project_texts(&texts);
                 words
             })
             .await;
@@ -2767,6 +2912,47 @@ fn open_latex_documents(state: &WindowState) -> HashSet<PathBuf> {
         .collect()
 }
 
+/// The directories of the indexed files that have a `\documentclass` (the roots): TeX runs
+/// there, so it finds a package there first.
+fn root_dirs(index: &ProjectIndex) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = index
+        .files
+        .iter()
+        .filter(|(_, file)| file.has_documentclass)
+        .filter_map(|(path, _)| path.parent().map(Path::to_path_buf))
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+/// Where the packages and the class that `file` (at `path`) loads would be if they were local:
+/// `name.sty` next to it and in each of `root_dirs` for every `\usepackage{name}` and
+/// `\RequirePackage{name}`, and `class.cls` next to it for its `\documentclass{class}`. The
+/// paths may repeat.
+fn local_styles(
+    path: &Path,
+    file: &FileIndex,
+    class: Option<&str>,
+    root_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let Some(dir) = path.parent() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for package in &file.packages {
+        let name = format!("{package}.sty");
+        out.push(lexical_join(dir, &name));
+        for root in root_dirs.iter().filter(|root| root.as_path() != dir) {
+            out.push(lexical_join(root, &name));
+        }
+    }
+    if let Some(class) = class {
+        out.push(lexical_join(dir, format!("{class}.cls")));
+    }
+    out
+}
+
 /// The `% !TEX root` file named by `file` (at `path`), as a path.
 fn magic_root(path: &Path, file: &FileIndex) -> Option<PathBuf> {
     let root = file.magic.root.as_ref()?;
@@ -2816,6 +3002,14 @@ fn read_text(path: &Path, cap: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// A hash of a file's text, to tell whether a file read again changed.
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The discovery job (jobs thread): reads and indexes `wanted`.
 fn read_wanted(wanted: Wanted) -> Discovered {
     let mut found = Discovered {
@@ -2861,11 +3055,17 @@ fn read_wanted(wanted: Wanted) -> Discovered {
         {
             continue;
         }
+        let hash = text.as_deref().map(text_hash).unwrap_or_default();
         let read = text.map(|text| {
             let class = document_class(&text).map(str::to_owned);
             (index_file_with_theorems(&text, &wanted.theorems), class)
         });
-        found.files.push(ReadFile { path, read, listed });
+        found.files.push(ReadFile {
+            path,
+            read,
+            listed,
+            hash,
+        });
     }
     for path in wanted.bibs {
         let entries = read_text(&path, MAX_FILE_BYTES).map(|text| scan_bib(&text));

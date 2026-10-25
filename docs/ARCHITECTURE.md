@@ -1172,6 +1172,21 @@ they conflict with the sections above, this section wins.
   - The label checks and the Outline wait for `completion::index_busy` (re-index timers and
     jobs, discovery passes), not for the words rebuilt 1.5 s later; `project_busy` still counts
     everything, for tests that want the feed settled.
+  - Local packages and classes join the index: for each `\usepackage`/`\RequirePackage{name}`
+    of an indexed file, `name.sty` next to it and in every root's directory, and for a file
+    with `\documentclass{class}`, `class.cls` next to it (`local_styles`), after the includes,
+    so they take no budget from them. A package of the distribution is not there: its read
+    fails and the path stays in `unreadable` until the next build. `prune` keeps the local
+    packages (and what they include and load) of the files it keeps. Command completion leaves
+    out macros whose names contain `@`.
+  - The words of the `.tex` files read from disk are collected in one pass
+    (`WordList::add_project_texts`: one merge into the sorted list) and only when their inputs
+    changed: the dictionary, or the set of those files with a hash of each text as the
+    discovery job read it. A pass that read only the `.aux` and the bibliographies, or a file
+    whose text is unchanged, rebuilds just the open documents' words. The jobs do not read
+    every new text of those files: when such a document closes (it may have been saved or
+    reloaded while open) or Lemma saves it closed (an agent's edit, indexed from the saved
+    text), the next pass that reads from disk collects the words again.
 - **Batched review feed (§4.1, §10.3, 2026-10-25):**
   - `FileReview::on_edits(edits, origin)` takes the changes of one action at once (in the
     order they are applied, each ending at or before the start of the one before, with the

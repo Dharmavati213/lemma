@@ -564,6 +564,13 @@ impl DiagnosticsPanel {
         self.inner.problem_for_agent(index)
     }
 
+    /// Every problem as [`Self::problem_for_agent`] gives it, in the list's order: what the
+    /// agent's `compile` and `get_diagnostics` report and `:Agent fix-this-error` picks from.
+    /// Each open editor's path is normalized once for all of them, not once per problem.
+    pub fn problems_for_agent(&self) -> Vec<Problem> {
+        self.inner.problems_for_agent()
+    }
+
     /// "Ask agent to fix" on problem `index` (the rows' context-menu item, action
     /// `problems.ask-agent-fix(u)` on the page): passes it to `agent::quick::fix_diagnostic`.
     pub fn ask_agent(&self, index: usize) {
@@ -855,15 +862,44 @@ impl Inner {
     }
 
     fn problem_for_agent(&self, index: usize) -> Option<Problem> {
-        let mut problem = self.problems.borrow().get(index).cloned()?;
-        let editor = self.state.upgrade().and_then(|state| {
-            state
-                .editors()
-                .into_iter()
-                .find(|e| normalize(e.document().path()) == problem.path)
-        });
-        problem.line = match editor {
-            Some(editor) => self.current_line(index, &problem, &editor),
+        let problem = self.problems.borrow().get(index).cloned()?;
+        Some(self.with_current_line(index, problem, &self.editors_by_path()))
+    }
+
+    fn problems_for_agent(&self) -> Vec<Problem> {
+        let editors = self.editors_by_path();
+        let problems = self.problems.borrow().clone();
+        problems
+            .into_iter()
+            .enumerate()
+            .map(|(index, problem)| self.with_current_line(index, problem, &editors))
+            .collect()
+    }
+
+    /// The window's editors by normalized path (the first editor of a path, as a search
+    /// through the tabs would find).
+    fn editors_by_path(&self) -> HashMap<PathBuf, Rc<Editor>> {
+        let mut editors = HashMap::new();
+        if let Some(state) = self.state.upgrade() {
+            for editor in state.editors() {
+                editors
+                    .entry(normalize(editor.document().path()))
+                    .or_insert(editor);
+            }
+        }
+        editors
+    }
+
+    /// `problem` (problem `index`) with its line in the current text: the line its mark moved
+    /// to in its file's editor, else its build line moved by the edits since.
+    fn with_current_line(
+        &self,
+        index: usize,
+        mut problem: Problem,
+        editors: &HashMap<PathBuf, Rc<Editor>>,
+    ) -> Problem {
+        problem.line = match editors.get(&problem.path) {
+            Some(editor) => self.current_line(index, &problem, editor),
             None => self
                 .lines
                 .borrow()
@@ -872,7 +908,7 @@ impl Inner {
                 .flatten()
                 .or(problem.line),
         };
-        Some(problem)
+        problem
     }
 
     fn ask_agent(&self, index: usize) {

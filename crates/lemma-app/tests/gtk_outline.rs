@@ -861,8 +861,10 @@ const THEOREMS_TREE: &str = "Results\n  [parts/later.tex]\n    Later\n      Main
 /// gives the rows of the files that use it, whichever of them the project feed reads first:
 /// the preamble and the chapter read together, the chapter open alone (as a session restores
 /// it; its root and the preamble are found after it was indexed), and the preamble `\input`
-/// typed after the chapter was indexed. Nothing but the feed itself indexes the files again
-/// (the page is shown without `completion::refresh_project`).
+/// typed after the chapter was indexed; and declared in a local package or class
+/// (`\usepackage{mythms}` with `mythms.sty`, `\documentclass{mythesis}` with `mythesis.cls`).
+/// Nothing but the feed itself indexes the files again (the page is shown without
+/// `completion::refresh_project`).
 fn theorems_from_a_preamble_file() {
     let files = [
         ("main.tex", THEOREMS_MAIN),
@@ -879,6 +881,31 @@ fn theorems_from_a_preamble_file() {
         f.wait_tree(&format!("the preamble's theorem with {open} open"), |t| {
             t == THEOREMS_TREE
         });
+    }
+    // Declared in a local package, or in the class.
+    for (name, main, file) in [
+        (
+            "theorems-package",
+            THEOREMS_MAIN.replace("\\input{preamble}", "\\usepackage{amsthm,mythms}"),
+            "mythms.sty",
+        ),
+        (
+            "theorems-class",
+            THEOREMS_MAIN
+                .replace("{article}", "{mythesis}")
+                .replace("\\input{preamble}\n", ""),
+            "mythesis.cls",
+        ),
+    ] {
+        let files = [
+            ("main.tex", main.as_str()),
+            (file, THEOREMS_PREAMBLE),
+            ("parts/later.tex", THEOREMS_LATER),
+        ];
+        let f = fixture(name, None, &files);
+        f.open("main.tex");
+        f.state.sidebar.show_page(PAGE_OUTLINE);
+        f.wait_tree(&format!("the theorem of {file}"), |t| t == THEOREMS_TREE);
     }
     let f = fixture(
         "theorems-typed",

@@ -305,9 +305,15 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `outline::is_settled` (which looks at the page again by itself), so only the file monitor
   and the project feed can bring it. `gtk_completion` also checks that a save lists no files
   again and, in `the_project_feed_follows_files_on_disk_at_its_cap`, that a changed file is
-  read again at the cap of 300 files read from disk without letting more files in,
-  `gtk_outline` `theorems_declared_in_a_preamble_file` that a preamble's `\newtheorem` names the
-  rows of chapters read before it, and `gtk_labels`
+  read again at the cap of 300 files read from disk without letting more files in (40
+  distribution packages in the preamble take no place), that a build changing only the `.aux`
+  and a chapter written again unchanged collect no words (`completion::base_word_builds`)
+  while a chapter saved in its tab and closed, or saved closed, has the words of its file
+  collected on the next build's pass, and, in `the_project_feed_reads_local_packages`, that a local `.sty` (and what it loads) and the
+  root's `.cls` reach the index and completion and leave it with their `\usepackage`;
+  `gtk_outline` `theorems_declared_in_a_preamble_file` that a preamble's (or a local package's
+  or class's) `\newtheorem` names the rows of chapters read before it, `gtk_goto` that F12 on a
+  local package's macro goes to its `.sty`, and `gtk_labels`
   `undefined_shows_without_waiting_for_the_words` that the check runs while the words timer
   still waits (in a release build, under 1.2 s after the edit).
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
@@ -343,6 +349,7 @@ check the budgets only in release builds:
 | `gtk_typing` `perf_typing_large_tex` | Enter and `\end` keys (which scan environments) on `large.tex` ≤ 2 ms p90 |
 | `gtk_completion` `perf_completion_keystroke` | keystroke to frame with completion, autosnippets and highlighting on a 5k-line document ≤ 8 ms p99 |
 | `lemma-complete` `perf_complete` | completion ≤ 3 ms p99 with all tables and a 7k-line project index |
+| `lemma-complete` `perf_word_list_project` | the words of a generated 300-file project (120k lines, 26k words) added at once: linear, twice the files ≤ 2.5× the time (measured 0.16–0.19 s; 0.7–0.9 s when each file re-sorted and copied the list) |
 | `agent::markdown` `perf_render_long_message` | re-rendering a streaming 100 kB answer ≤ 2 ms per frame |
 | `lemma-agent` `perf_text_deltas_append_in_place` | the API backend's streamed deltas appended to their block: 32k deltas of 16 bytes ≤ 20 ms, and twice the deltas ≤ 3× the time (measured 0.8 ms; 230 ms when every delta copied the block) |
 | `gtk_agent_panel` `perf_streamed_table` | a 60-row, 5-column table streaming in 10-byte chunks: each chunk's re-render and layout of the table ≤ 2 ms p99, and the table is never built again |
@@ -474,7 +481,9 @@ Committed fixtures (`tests/fixtures/`, never written to; TeX builds run in temp 
 | `large.tex` | 60k lines, for performance and memory tests. |
 
 Crate-local test data (M3): `crates/lemma-build/tests/data/explain/` (error messages for the
-explanation table) with the chktex golden `crates/lemma-build/tests/snapshots/
+explanation table: one `main.tex` per error and the `main.log` of a real run of
+`pdflatex -interaction=nonstopmode -file-line-error` with `max_print_line=10000 error_line=254
+half_error_line=238`, as Lemma's builds set them) with the chktex golden `crates/lemma-build/tests/snapshots/
 chktex__fixtures.snap`, and `crates/lemma-pdf/tests/golden/proj-outline.txt` (the bookmark tree
 of `proj/main.pdf`).
 

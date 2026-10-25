@@ -246,6 +246,24 @@ fn user_macro_z_has_the_glyph_of_its_definition() {
 }
 
 #[test]
+fn macros_of_a_local_package_but_not_its_internal_ones() {
+    let mut idx = ProjectIndex::default();
+    idx.update_file(
+        PathBuf::from("/p/mymacros.sty"),
+        Arc::new(index_file(
+            "\\ProvidesPackage{mymacros}\n\\newcommand{\\my@helper}{x}\n\
+             \\newcommand{\\mydef}{\\my@helper}\n\\def\\mysecond{y}\n",
+        )),
+    );
+    let mut s = Setup::with_index(idx);
+    let items = s.complete(&Context::Text, r"See \my");
+    let found = labels(&items);
+    assert!(found.contains(&r"\mydef"), "{found:?}");
+    assert!(found.contains(&r"\mysecond"), "{found:?}");
+    assert!(!found.iter().any(|l| l.contains('@')), "{found:?}");
+}
+
+#[test]
 fn text_only_commands_are_hidden_in_math_and_math_only_in_text() {
     let mut s = Setup::new();
     let math_items = s.complete(&math(), r"$\sec");

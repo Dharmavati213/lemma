@@ -1,7 +1,7 @@
 //! Plain-English explanations of the most common TeX and LaTeX errors.
 //!
 //! [`explain`] matches a parsed log message (as [`crate::parse_log`] words it: `LaTeX Error: `
-//! dropped, `Package x Error: m` as `Package x: m`) against a table of 28 errors and 5 common
+//! dropped, `Package x Error: m` as `Package x: m`) against a table of 35 errors and 5 common
 //! warnings. Each match gives a one-sentence [`Explanation`] for the Problems row's tooltip and
 //! expander, and, where a fix is safe, a [`FixHint`] saying what the app's quick fix
 //! (`lemma-app/src/quickfix.rs`) should do. The table was checked against the logs of real
@@ -46,6 +46,14 @@ pub enum ErrorKind {
     LeftRight,
     ArgumentExtraBrace,
     IllegalParameter,
+    CapacityExceeded,
+    DimensionTooLarge,
+    /// keyval's and pgfkeys' unknown keys (`\includegraphics[widht=…]`, `\draw[colr=…]`).
+    UnknownKey,
+    UndefinedColor,
+    FloatsLost,
+    TooManyFloats,
+    OutputLoop,
     // Warnings.
     ReferenceUndefined,
     CitationUndefined,
@@ -56,7 +64,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, errors first.
-    pub const ALL: [ErrorKind; 33] = [
+    pub const ALL: [ErrorKind; 40] = [
         Self::UndefinedControlSequence,
         Self::MissingDollar,
         Self::EnvironmentUndefined,
@@ -85,6 +93,13 @@ impl ErrorKind {
         Self::LeftRight,
         Self::ArgumentExtraBrace,
         Self::IllegalParameter,
+        Self::CapacityExceeded,
+        Self::DimensionTooLarge,
+        Self::UnknownKey,
+        Self::UndefinedColor,
+        Self::FloatsLost,
+        Self::TooManyFloats,
+        Self::OutputLoop,
         Self::ReferenceUndefined,
         Self::CitationUndefined,
         Self::LabelMultiplyDefined,
@@ -487,6 +502,105 @@ pub fn explain(message: &str, context: Option<&str>) -> Option<Explanation> {
             None,
         );
     }
+    if let Some(rest) = m.strip_prefix("TeX capacity exceeded") {
+        // `TeX capacity exceeded, sorry [grouping levels=255].`
+        let what = rest
+            .split_once('[')
+            .and_then(|(_, r)| r.split_once('='))
+            .map_or("memory", |(w, _)| w.trim());
+        let text = match what {
+            "input stack size"
+            | "grouping levels"
+            | "parameter stack size"
+            | "save size"
+            | "semantic nest size"
+            | "expansion depth" => format!(
+                "TeX reached its limit of {what}, almost always because a command calls itself \
+                 without end, such as a \\renewcommand whose new definition uses the command \
+                 itself."
+            ),
+            "text input levels" => "Files are \\input inside each other too deeply, usually \
+                                    because a file inputs itself."
+                .to_owned(),
+            _ => format!(
+                "TeX reached its limit of {what}: a command may call itself without end, or the \
+                 document builds something (a table, a picture, a plot) too large for TeX."
+            ),
+        };
+        return explained(ErrorKind::CapacityExceeded, text, None);
+    }
+    if m.starts_with("Dimension too large") {
+        return explained(
+            ErrorKind::DimensionTooLarge,
+            "A length came out larger than TeX allows (about 5.75 m); in TikZ and pgfplots, \
+             coordinates or data values that are too large cause this, so scale them down."
+                .to_owned(),
+            None,
+        );
+    }
+    if let Some(key) = between(m, "Package keyval: ", " undefined") {
+        return explained(
+            ErrorKind::UnknownKey,
+            format!(
+                "“{key}” is not an option of the command or package it is given to: it is \
+                 misspelled, or it belongs to another command."
+            ),
+            None,
+        );
+    }
+    if let Some(rest) = m.strip_prefix("Package pgfkeys: I do not know the key") {
+        // `I do not know the key '/tikz/colr', to which you passed 'red', and I am going to
+        // ignore it. Perhaps you misspelled it.`
+        let key = quoted(rest).unwrap_or("this key");
+        return explained(
+            ErrorKind::UnknownKey,
+            format!(
+                "The key “{key}” is unknown: it is misspelled, or the TikZ library \
+                 (\\usetikzlibrary) or package that defines it is not loaded."
+            ),
+            None,
+        );
+    }
+    if let Some(rest) = m.strip_prefix("Package xcolor: Undefined color") {
+        let name = quoted(rest).unwrap_or("this color");
+        return explained(
+            ErrorKind::UndefinedColor,
+            format!(
+                "The color “{name}” is not defined: it is misspelled, or it needs a \
+                 \\definecolor (or an xcolor option such as dvipsnames) first."
+            ),
+            None,
+        );
+    }
+    if m.starts_with("Float(s) lost") {
+        return explained(
+            ErrorKind::FloatsLost,
+            "A figure, table or margin note (\\marginpar, \\todo) inside a box, a footnote or \
+             another figure could not be placed and is missing from the output; move it out."
+                .to_owned(),
+            None,
+        );
+    }
+    if m.starts_with("Too many unprocessed floats") {
+        return explained(
+            ErrorKind::TooManyFloats,
+            "Too many figures and tables wait to be placed, usually because an earlier one has \
+             nowhere to go (only [h] or [b], or too large); allow [htbp], make it smaller, or \
+             add a \\clearpage."
+                .to_owned(),
+            None,
+        );
+    }
+    if let Some(cycles) = between(m, "Output loop---", " consecutive dead cycles") {
+        return explained(
+            ErrorKind::OutputLoop,
+            format!(
+                "LaTeX failed to finish a page {cycles} times in a row, which follows from an \
+                 earlier error (usually about figures and tables); fix that one first."
+            ),
+            None,
+        );
+    }
     // Warnings.
     if m.starts_with("Reference ") && m.contains(" undefined") {
         let label = quoted(m).unwrap_or("this label");
@@ -535,6 +649,24 @@ pub fn explain(message: &str, context: Option<&str>) -> Option<Explanation> {
             ErrorKind::UnderfullBox,
             "A line is spaced too loosely, often because of \\\\ or \\newline at the end of a \
              paragraph or a very short line; usually harmless."
+                .to_owned(),
+            None,
+        );
+    }
+    if m.starts_with("Overfull \\vbox") {
+        return explained(
+            ErrorKind::OverfullBox,
+            "Something is too tall for its page or box and sticks out at the bottom: usually a \
+             figure, table or formula taller than the page, or a box of fixed height."
+                .to_owned(),
+            None,
+        );
+    }
+    if m.starts_with("Underfull \\vbox") {
+        return explained(
+            ErrorKind::UnderfullBox,
+            "A page is spaced too loosely from top to bottom, often because a large figure or a \
+             page break left too little text to fill it; usually harmless."
                 .to_owned(),
             None,
         );
@@ -1520,5 +1652,73 @@ mod tests {
             "The argument of a command contains a blank line, or its closing brace } is missing."
         );
         assert_eq!(explain("Something entirely new.", None), None);
+    }
+
+    #[test]
+    fn keys_colors_capacity_and_vertical_boxes() {
+        let text = |message: &str| {
+            let e = explain(message, None).unwrap_or_else(|| panic!("{message:?}"));
+            (e.kind, e.text)
+        };
+        // Package errors as `crate::parse_log` words them.
+        let (kind, t) = text("Package keyval: widht undefined.");
+        assert_eq!(kind, ErrorKind::UnknownKey);
+        assert!(t.starts_with("“widht” is not an option"), "{t}");
+        for message in [
+            "Package pgfkeys: I do not know the key '/tikz/colr', to which you passed 'red', and \
+             I am going to ignore it. Perhaps you misspelled it.",
+            "Package pgfkeys: I do not know the key '/tikz/colr' and I am going to ignore it. \
+             Perhaps you misspelled it.",
+        ] {
+            let (kind, t) = text(message);
+            assert_eq!(kind, ErrorKind::UnknownKey);
+            assert!(
+                t.contains("“/tikz/colr”") && t.contains("\\usetikzlibrary"),
+                "{t}"
+            );
+        }
+        let (kind, t) = text("Package xcolor: Undefined color `redd'.");
+        assert_eq!(kind, ErrorKind::UndefinedColor);
+        assert!(t.contains("“redd”"), "{t}");
+        // What ran out decides the likely cause.
+        let (kind, t) = text("TeX capacity exceeded, sorry [input stack size=10000].");
+        assert_eq!(kind, ErrorKind::CapacityExceeded);
+        assert!(
+            t.contains("input stack size") && t.contains("calls itself"),
+            "{t}"
+        );
+        assert!(
+            text("TeX capacity exceeded, sorry [text input levels=15].")
+                .1
+                .contains("inputs itself")
+        );
+        let t = text("TeX capacity exceeded, sorry [main memory size=5000000].").1;
+        assert!(
+            t.contains("main memory size") && t.contains("too large"),
+            "{t}"
+        );
+        assert!(
+            text("TeX capacity exceeded, sorry.")
+                .1
+                .contains("limit of memory")
+        );
+        // Vertical boxes have their own explanations; horizontal ones keep theirs.
+        let (kind, t) = text("Overfull \\vbox (28.45276pt too high) detected at line 7");
+        assert_eq!(kind, ErrorKind::OverfullBox);
+        assert!(t.contains("too tall"), "{t}");
+        let (kind, t) =
+            text("Underfull \\vbox (badness 10000) has occurred while \\output is active");
+        assert_eq!(kind, ErrorKind::UnderfullBox);
+        assert!(t.starts_with("A page is spaced too loosely"), "{t}");
+        assert!(
+            text("Overfull \\hbox (2.0pt too wide) in paragraph at lines 3--4")
+                .1
+                .contains("margin")
+        );
+        assert!(
+            text("Underfull \\hbox (badness 10000) in paragraph at lines 5--5")
+                .1
+                .starts_with("A line")
+        );
     }
 }

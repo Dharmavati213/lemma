@@ -158,6 +158,21 @@ fn fixture_warnings_are_explained() {
         warns.contains(&ErrorKind::LabelMultiplyDefined),
         "{warns:?}"
     );
+    // Vertical bad boxes (a real pdflatex log): a page spaced too loosely and a box taller than
+    // its height, each with its own explanation.
+    let vbox: Vec<(ErrorKind, String)> = diagnostics(&data().join("vbox"), "main.log")
+        .iter()
+        .filter(|d| d.severity == Severity::BadBox)
+        .map(|d| {
+            let e = explain::explain(&d.message, d.context.as_deref())
+                .unwrap_or_else(|| panic!("unexplained {:?}", d.message));
+            (e.kind, e.text)
+        })
+        .collect();
+    let kinds: Vec<ErrorKind> = vbox.iter().map(|(k, _)| *k).collect();
+    assert_eq!(kinds, [ErrorKind::UnderfullBox, ErrorKind::OverfullBox]);
+    assert!(vbox[0].1.starts_with("A page is spaced too loosely"));
+    assert!(vbox[1].1.contains("too tall"));
 }
 
 /// (case directory, the kind of its first error).
@@ -195,7 +210,18 @@ const CASES: &[(&str, ErrorKind)] = &[
     ("missingright", ErrorKind::LeftRight),
     ("extraright", ErrorKind::LeftRight),
     ("paramnumber", ErrorKind::IllegalParameter),
+    ("capacity", ErrorKind::CapacityExceeded),
+    ("dimtoolarge", ErrorKind::DimensionTooLarge),
+    ("keyval", ErrorKind::UnknownKey),
+    ("pgfkeys", ErrorKind::UnknownKey),
+    ("undefcolor", ErrorKind::UndefinedColor),
+    ("floatslost", ErrorKind::FloatsLost),
+    ("manyfloats", ErrorKind::TooManyFloats),
 ];
+
+/// Error kinds that TeX reports only as a consequence of another error: (case directory, the
+/// kind among its later errors).
+const CONSEQUENCES: &[(&str, ErrorKind)] = &[("manyfloats", ErrorKind::OutputLoop)];
 
 #[test]
 fn every_error_class_matches_a_real_log() {
@@ -220,8 +246,16 @@ fn every_error_class_matches_a_real_log() {
         }
         seen.insert(*want);
     }
-    // Every error kind of the table has a real log (the warnings come from the fixtures);
-    // InvalidInMathMode comes from the missingdollar fixture.
+    for (case, want) in CONSEQUENCES {
+        let found: Vec<_> = errors(&data().join(case), "main.log")
+            .iter()
+            .filter_map(kind)
+            .collect();
+        assert!(found.contains(want), "{case}: no {want:?} in {found:?}");
+        seen.insert(*want);
+    }
+    // Every error kind of the table has a real log (the warnings come from the fixtures and the
+    // vbox case); InvalidInMathMode comes from the missingdollar fixture.
     for kind in ErrorKind::ALL {
         if !kind.is_warning() && kind != ErrorKind::InvalidInMathMode {
             assert!(seen.contains(&kind), "no real log for {kind:?}");

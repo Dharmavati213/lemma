@@ -590,7 +590,10 @@ fn saves_are_announced() {
 }
 
 fn ask_agent_to_fix() {
-    let f = fixture("ask-agent", &[("main.tex", "a\nb\nc\nd\n")]);
+    let f = fixture(
+        "ask-agent",
+        &[("main.tex", "a\nb\nc\nd\n"), ("ch.tex", "x\ny\n")],
+    );
     let build = f.state.build.get().unwrap();
     let path = f.path("main.tex").canonicalize().unwrap();
     let problem = Problem {
@@ -601,12 +604,19 @@ fn ask_agent_to_fix() {
         context: Some("l.3 \\foo".into()),
         source: DiagSource::Tex,
     };
-    build.diagnostics().set(vec![problem.clone()], &path);
+    let closed = Problem {
+        path: f.path("ch.tex").canonicalize().unwrap(),
+        line: Some(2),
+        ..problem.clone()
+    };
+    build
+        .diagnostics()
+        .set(vec![problem.clone(), closed.clone()], &path);
     assert_eq!(
         build.diagnostics().problem_for_agent(0),
         Some(problem.clone())
     );
-    assert_eq!(build.diagnostics().problem_for_agent(1), None);
+    assert_eq!(build.diagnostics().problem_for_agent(2), None);
 
     // The line follows edits made since the build.
     let editor = f.open("main.tex");
@@ -615,6 +625,13 @@ fn ask_agent_to_fix() {
     let moved = build.diagnostics().problem_for_agent(0).unwrap();
     assert_eq!(moved.line, Some(5));
     assert_eq!(moved.message, problem.message);
+    // All of them at once, as the agent's tools ask: the open file's line moved, the closed
+    // file's as the build reported it.
+    assert_eq!(
+        build.diagnostics().problems_for_agent(),
+        [moved.clone(), closed.clone()]
+    );
+    assert_eq!(build.diagnostics().problem_for_agent(1), Some(closed));
 
     // The rows' context action is installed for the list and reaches the agent hook.
     let list = descendants(&build.diagnostics().widget())

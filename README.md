@@ -35,7 +35,8 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   explanations and quick fixes for common errors, plus optional `chktex` lint. F4 and Shift+F4
   (`]e` and `[e` in Vim) go to the next and previous build problem, across files.
 - **Writing help.** Completion for commands, environments, labels, citations and Unicode math
-  glyphs from per-package word lists. Snippets and autosnippets, bracket pairing, spell
+  glyphs from per-package word lists, and for your own macros, also those of a `.sty` or `.cls`
+  next to the document. Snippets and autosnippets, bracket pairing, spell
   checking, hover previews of `\ref`, `\cite` and rendered math, and label rename/references.
   Ctrl+/ comments lines out and back in; Ctrl+B and Ctrl+I put the selection in `\textbf{…}`
   and `\textit{…}` (`\mathbf`, `\mathit` in math) and take it out again, and Emphasize

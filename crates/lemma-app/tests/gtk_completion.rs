@@ -28,7 +28,7 @@ use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_complete::{Insert, Item, ItemKind};
 use lemma_config::Config;
-use lemma_core::ProjectRoot;
+use lemma_core::{Origin, ProjectRoot, TextEdit};
 use std::cell::Cell;
 use std::future::Future;
 use std::path::PathBuf;
@@ -58,6 +58,10 @@ fn main() -> ExitCode {
         (
             "the_project_feed_finds_the_root_of_a_chapter",
             project_feed_from_a_chapter,
+        ),
+        (
+            "the_project_feed_reads_local_packages",
+            project_feed_reads_local_packages,
         ),
         ("triggers_on_the_scanners_contexts", triggers),
         ("accepting_each_kind_of_proposal", accepting),
@@ -439,7 +443,8 @@ fn labels_of(items: &[Item]) -> Vec<&str> {
 }
 
 /// The feed indexes the included chapter and the bibliography, reads the `.aux`, and loads
-/// the packages' command tables; an edit is indexed after a short delay.
+/// the packages' command tables; an edit is indexed after a short delay. The chapter's words
+/// follow what Lemma saves in it, in its tab or closed, from the next build on.
 fn project_feed() {
     let f = fixture("feed", false);
     let index = f.state.workspace.index.borrow();
@@ -491,10 +496,13 @@ fn project_feed() {
         + "\n@book{Lurie, author = {Lurie, Jacob}, title = {Higher Topos Theory}, year = {2009}}\n";
     std::fs::write(dir.join("refs.bib"), bib).unwrap();
     std::fs::write(dir.join("figures/new.png"), b"").unwrap();
+    let builds = completion::base_word_builds(&f.state);
     completion::refresh_after_build(&f.state, Some(&dir.join(".build/main.pdf")));
     f.wait("the build's files to be read", || {
         !completion::project_busy(&f.state)
     });
+    // No `.tex` file read from disk changed: their words are not collected again.
+    assert_eq!(completion::base_word_builds(&f.state), builds);
     let refs = f.items("\\ref{sec:n", "}");
     let new = refs.iter().find(|i| i.label == "sec:new").expect("sec:new");
     assert!(
@@ -507,6 +515,46 @@ fn project_feed() {
         f.labels("\\includegraphics{")
             .contains(&"figures/new.png".to_owned())
     );
+    // The chapter read from disk, saved with a new word while open and closed, then saved
+    // again while closed (as an agent's edit is): no discovery job reads these texts, yet the
+    // next build's pass collects the words of the file as saved.
+    let idle =
+        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    let chapter_path = dir.join("chapters/yoneda.tex");
+    let chapter = block_on(f.state.open_file(&chapter_path)).expect("open the chapter");
+    let buffer = chapter.buffer();
+    buffer.insert(&mut buffer.end_iter(), "\nA quasitriangular case.\n");
+    block_on(chapter.document().save()).unwrap();
+    // The file monitor sees the save while the tab is open (Lemma's own write).
+    common::pump_for(Duration::from_millis(500));
+    common::pump_until(TIMEOUT, idle);
+    f.state.close_editor(&chapter, false);
+    drop(chapter);
+    common::pump_until(TIMEOUT, idle);
+    completion::refresh_after_build(&f.state, None);
+    f.wait("the word saved in the chapter's tab", || {
+        !completion::project_busy(&f.state)
+            && f.labels("A quasitri")
+                .contains(&"quasitriangular".to_owned())
+    });
+    let closed = block_on(f.state.workspace.get_or_load(&chapter_path)).unwrap();
+    assert!(!closed.is_open());
+    let end = closed.text().len();
+    closed
+        .apply_edits(
+            &[TextEdit::insert(end, "A pseudomonotone case.\n")],
+            Origin::User,
+        )
+        .unwrap();
+    block_on(closed.save()).unwrap();
+    common::pump_for(Duration::from_millis(500));
+    common::pump_until(TIMEOUT, idle);
+    completion::refresh_after_build(&f.state, None);
+    f.wait("the word saved in the closed chapter", || {
+        !completion::project_busy(&f.state)
+            && f.labels("A pseudomon")
+                .contains(&"pseudomonotone".to_owned())
+    });
 }
 
 /// Files another program writes reach the feed without a build: a citation key added to the
@@ -533,9 +581,10 @@ fn project_feed_follows_the_disk() {
     let bib = std::fs::read_to_string(dir.join("refs.bib")).unwrap()
         + "\n@book{Lurie, author = {Lurie, Jacob}, title = {Higher Topos Theory}, year = {2009}}\n";
     std::fs::write(dir.join("refs.bib"), bib).unwrap();
+    let builds = completion::base_word_builds(&f.state);
     let chapter = std::fs::read_to_string(dir.join("chapters/yoneda.tex")).unwrap()
-        + "\\section{Elsewhere}\\label{sec:elsewhere}\n";
-    std::fs::write(dir.join("chapters/yoneda.tex"), chapter).unwrap();
+        + "\\section{Elsewhere}\\label{sec:elsewhere}\nThe zygomorphic case.\n";
+    std::fs::write(dir.join("chapters/yoneda.tex"), &chapter).unwrap();
     std::fs::write(dir.join("figures/drawn.png"), b"").unwrap();
     std::fs::remove_file(dir.join("figures/plot.pdf")).unwrap();
     f.wait("the files written elsewhere", || {
@@ -548,6 +597,19 @@ fn project_feed_follows_the_disk() {
         f.labels("\\ref{sec:else")
             .contains(&"sec:elsewhere".to_owned())
     );
+    // The chapter's words follow its text; the same text read again collects nothing.
+    f.wait("the chapter's new word", || {
+        !completion::project_busy(&f.state)
+            && f.labels("The zygom").contains(&"zygomorphic".to_owned())
+    });
+    let builds = completion::base_word_builds(&f.state) - builds;
+    assert!(builds >= 1, "{builds} word builds");
+    let builds = completion::base_word_builds(&f.state);
+    std::fs::write(dir.join("chapters/yoneda.tex"), &chapter).unwrap();
+    let chapter_path = lemma_app::workspace::normalize(&dir.join("chapters/yoneda.tex"));
+    assert!(completion::disk_changed(&f.state, &chapter_path, false));
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(completion::base_word_builds(&f.state), builds);
     f.wait("the new image", || {
         let files = f.labels("\\includegraphics{");
         files.contains(&"figures/drawn.png".to_owned())
@@ -575,12 +637,17 @@ fn project_feed_follows_the_disk() {
 
 /// At the cap of files read from disk (300, `MAX_DISK_FILES`), a file of the index that another
 /// program changes is still read again, and the files past the cap stay out: the file read
-/// again does not give its place to them.
+/// again does not give its place to them. The 40 packages of the preamble, looked for next to
+/// the root, take no place from the chapters either.
 fn project_feed_at_its_cap() {
     let dir = common::temp_dir("feed-cap");
     // 300 includes: `aaa.tex`, whose own includes are past the cap (and listed first, as the
     // index orders its files by path), then 299 chapters.
-    let mut main = String::from("\\documentclass{article}\n\\begin{document}\n\\input{aaa}\n");
+    let mut main = String::from("\\documentclass{article}\n");
+    for package in DISTRIBUTION_PACKAGES {
+        main += &format!("\\usepackage{{{package}}}\n");
+    }
+    main += "\\begin{document}\n\\input{aaa}\n";
     let mut aaa = String::new();
     std::fs::create_dir_all(dir.join("c")).unwrap();
     std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -603,6 +670,8 @@ fn project_feed_at_its_cap() {
     let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
     common::pump_until(TIMEOUT, idle);
     assert!(has("c:298") && !has("s:0"), "the cap");
+    let packages = completion::loaded_packages(&f.state);
+    assert!(packages.contains(&"tikz"), "{packages:?}");
     std::fs::write(
         dir.join("c/c150.tex"),
         "\\section{Changed}\\label{c:changed}\n",
@@ -612,6 +681,123 @@ fn project_feed_at_its_cap() {
     common::pump_until(TIMEOUT, idle);
     assert!(!has("c:150"));
     assert!((0..5).all(|i| !has(&format!("s:{i}"))), "past the cap");
+}
+
+/// Distribution packages loaded by the local-package tests' root: none of them is in its
+/// directory.
+const DISTRIBUTION_PACKAGES: &[&str] = &[
+    "amsmath",
+    "amssymb",
+    "amsthm",
+    "mathtools",
+    "hyperref",
+    "geometry",
+    "graphicx",
+    "xcolor",
+    "tikz",
+    "booktabs",
+    "enumitem",
+    "caption",
+    "subcaption",
+    "float",
+    "fancyhdr",
+    "microtype",
+    "babel",
+    "fontenc",
+    "inputenc",
+    "lmodern",
+    "csquotes",
+    "cleveref",
+    "siunitx",
+    "listings",
+    "xspace",
+    "url",
+    "setspace",
+    "titlesec",
+    "array",
+    "multirow",
+    "longtable",
+    "tabularx",
+    "makecell",
+    "placeins",
+    "appendix",
+    "bm",
+    "cancel",
+    "todonotes",
+    "mdframed",
+    "thmtools",
+];
+
+/// Local packages and classes reach the index (`\usepackage{mymacros}` with `mymacros.sty`
+/// next to the root, what it loads in turn, the root's `\documentclass` with its `.cls`), so
+/// their macros are offered, without their internal `@` names; the 40 packages of the
+/// distribution beside them are looked for once, still load their command tables and take
+/// nothing from the index. Unloading the package takes its files out of the index again.
+fn project_feed_reads_local_packages() {
+    let dir = common::temp_dir("feed-packages");
+    let mut main = String::from("\\documentclass{mythesis}\n");
+    for package in DISTRIBUTION_PACKAGES {
+        main += &format!("\\usepackage{{{package}}}\n");
+    }
+    main += "\\usepackage{mymacros}\n\\begin{document}\nText.\nPROBE\n\\printbibliography\n\
+             \\end{document}\n";
+    std::fs::write(dir.join("main.tex"), main).unwrap();
+    std::fs::write(
+        dir.join("mymacros.sty"),
+        "\\ProvidesPackage{mymacros}\n\\RequirePackage{myextra}\n\
+         \\newcommand{\\my@helper}{x}\n\\newcommand{\\mydef}{\\my@helper}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("myextra.sty"), "\\newcommand{\\myextra}{y}\n").unwrap();
+    std::fs::write(
+        dir.join("mythesis.cls"),
+        "\\ProvidesClass{mythesis}\n\\LoadClass{article}\n\\newcommand{\\thesistitle}{t}\n",
+    )
+    .unwrap();
+    let f = fixture_at(&dir, "main.tex", false);
+    let indexed = || -> Vec<String> {
+        let index = f.state.workspace.index.borrow();
+        let mut names: Vec<String> = index
+            .files
+            .keys()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        indexed(),
+        ["main.tex", "myextra.sty", "mymacros.sty", "mythesis.cls"]
+    );
+    for (typed, macro_name) in [
+        ("\\myd", "\\mydef"),
+        ("\\myex", "\\myextra"),
+        ("\\thesist", "\\thesistitle"),
+    ] {
+        let labels = f.labels(typed);
+        assert!(
+            labels.contains(&macro_name.to_owned()),
+            "{typed}: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains('@')),
+            "{typed}: {labels:?}"
+        );
+    }
+    let packages = completion::loaded_packages(&f.state);
+    for package in ["mathtools", "hyperref", "tikz", "siunitx", "cleveref"] {
+        assert!(packages.contains(&package), "{package} in {packages:?}");
+    }
+    // Without the package, its files leave the index and its macros the proposals.
+    let buffer = f.buffer();
+    let text = f.text();
+    let at = i32::try_from(text.find("\\usepackage{mymacros}\n").unwrap()).unwrap();
+    let (mut start, mut end) = (buffer.iter_at_offset(at), buffer.iter_at_offset(at + 22));
+    buffer.delete(&mut start, &mut end);
+    f.wait("the package to leave the index", || {
+        !completion::project_busy(&f.state) && indexed() == ["main.tex", "mythesis.cls"]
+    });
+    assert!(!f.labels("\\myd").contains(&"\\mydef".to_owned()));
 }
 
 /// Opening only a chapter: the root next to it is found (it includes the chapter), with its

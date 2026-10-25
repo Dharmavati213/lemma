@@ -635,12 +635,14 @@ fn select_best(cands: &mut Vec<Cand>, n: usize) {
 }
 
 /// The project's macros (not environments or theorems), first definition of each name.
+/// Internal names (`\my@helper`, from a local package or a `\makeatletter` block) are left out:
+/// a document can only use them between `\makeatletter` and `\makeatother`.
 fn user_macros(idx: &ProjectIndex) -> Vec<&MacroDef> {
     let mut seen = HashSet::new();
     idx.files
         .values()
         .flat_map(|f| f.macros.iter())
-        .filter(|m| !m.is_env && !m.is_theorem && !m.name.is_empty())
+        .filter(|m| !m.is_env && !m.is_theorem && !m.name.is_empty() && !m.name.contains('@'))
         .filter(|m| seen.insert(m.name.as_str()))
         .collect()
 }

@@ -160,10 +160,14 @@ fn targets() {
     assert_eq!(target(&editor, "% \\ref{sec:commented}", 9), None);
     assert_eq!(target(&editor, "\\label{thm:main}", 8), None);
     assert_eq!(target(&editor, "Statement", 2), None);
+    // A macro of the local package `mydefs.sty` (not open): its definition there.
     assert_eq!(
-        target(&editor, "\\mydef", 2),
-        None,
-        "a macro the index has not read"
+        target(&editor, "\\mydef.", 2),
+        Some(GotoTarget::Line {
+            path: f.path("mydefs.sty"),
+            line: 0,
+            find: Some("\\mydef".into()),
+        })
     );
 }
 

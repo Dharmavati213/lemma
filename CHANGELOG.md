@@ -65,6 +65,16 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   resized, and the session remembers it.
 - In the PDF, Left and Right (and h and l) scroll sideways when zoomed in. The shortcuts window
   lists the PDF's own keys.
+- Macros and theorem environments from your own packages and class: with
+  `\usepackage{mymacros}` and a `mymacros.sty` next to the document or the main file (and the
+  packages it loads in turn), or a `\documentclass` whose `.cls` is next to the main file, their
+  commands are completed, shown on hover and found by go to definition (F12), and their
+  `\newtheorem`s give the Outline its theorem rows. Internal names with `@` are not offered.
+- Plain-English explanations on the Problems page for more errors: TeX capacity exceeded (most
+  often a command that calls itself), Dimension too large (TikZ and pgfplots), an unknown
+  option key (`\includegraphics[widht=…]`, a TikZ key such as `colr=red`), an undefined color,
+  Float(s) lost, Too many unprocessed floats and the output loop that follows it; and for bad
+  vertical boxes (Overfull and Underfull `\vbox`), which had none.
 
 ### Changed
 
@@ -116,6 +126,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   goes on that many matches.
 - Of the last 64 tool calls, the editor keeps the first 2 KB of each reply instead of the whole
   reply (often a whole file), and forgets them when the agent stops.
+- Completion's word list is built in one pass over the project's files instead of being sorted
+  and copied again for each file (300 files of 400 lines: under 0.2 s instead of about 0.8 s),
+  and a build that changes only the `.aux` or the bibliography no longer reads all the
+  project's files again for their words.
+- The agent's `compile` and `get_diagnostics` and `:Agent fix-this-error` look up each open
+  tab's file once, not once for every build problem.
 - A table in an agent's answer is no longer built again on every frame while it streams: only
   the cells that changed are updated and new rows are added. With a 60-row table, each update
   kept the main thread busy for about 25 ms (over 50 ms at times), which made typing and

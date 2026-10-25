@@ -309,11 +309,7 @@ pub fn agent_command(state: &Rc<WindowState>, arg: &str) -> Result<(), String> {
 /// The build problem `:Agent fix-this-error` works on: the active file's problem nearest the
 /// cursor, else the first error, else the first problem.
 fn nearest_problem(state: &Rc<WindowState>) -> Option<Problem> {
-    let diagnostics = state.build.get()?.diagnostics();
-    let count = diagnostics.problems().len();
-    let problems: Vec<Problem> = (0..count)
-        .filter_map(|i| diagnostics.problem_for_agent(i))
-        .collect();
+    let problems = state.build.get()?.diagnostics().problems_for_agent();
     if let Some(editor) = state.active_editor() {
         let (line, _) = editor.cursor_position();
         let here = problems

@@ -2,7 +2,7 @@
 
 use lemma_syntax::{LineStates, Lines, ScanConfig, Token, TokenKind};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Words collected from the project's text must have at least this many letters.
@@ -63,70 +63,70 @@ impl WordList {
                 }
             }
         }
+        let mut words = dictionary.clone();
+        words.sort_unstable();
         let mut list = Self {
             dictionary,
-            words: Vec::new(),
+            words,
             commands: HashSet::new(),
         };
-        list.rebuild_words(BTreeSet::new());
-        for source in sources {
-            list.add_project_text(source);
-        }
+        list.add_project_texts(sources);
         list
     }
 
     /// A list built from LaTeX sources only (see [`Self::add_project_text`]).
     pub fn from_project(texts: &[&str]) -> Self {
         let mut list = Self::default();
-        for text in texts {
-            list.add_project_text(text);
-        }
+        list.add_project_texts(texts);
         list
     }
 
     /// Adds what one LaTeX source uses: the words of at least four letters in its text (not in
     /// math, commands, arguments such as labels, comments or verbatim) and its control words.
     ///
-    /// To refresh the project part, start again from a clone of the dictionary list.
+    /// To refresh the project part, start again from a clone of the dictionary list. For
+    /// several sources, [`Self::add_project_texts`] merges their words into the list once.
     pub fn add_project_text(&mut self, text: &str) {
-        let lines: Vec<&str> = text
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l))
-            .collect();
-        let src = SliceLines(&lines);
-        let mut states = LineStates::new(Arc::new(ScanConfig::default()));
-        states.rebuild(&src);
-        let mut found = BTreeSet::new();
-        let mut tokens: Vec<Token> = Vec::new();
-        for (n, line) in lines.iter().enumerate() {
-            tokens.clear();
-            states.tokens(n as u32, line, &mut tokens);
-            for t in &tokens {
-                let Some(span) = line.get(t.start as usize..t.end as usize) else {
-                    continue;
-                };
-                match t.kind {
-                    TokenKind::Text => collect_words(span, &mut found),
-                    TokenKind::Command | TokenKind::MathCommand | TokenKind::Sectioning => {
-                        let name = span.strip_prefix('\\').unwrap_or("");
-                        let letters = name.bytes().take_while(u8::is_ascii_alphabetic).count();
-                        if letters > 0 && !self.commands.contains(&name[..letters]) {
-                            self.commands.insert(Box::from(&name[..letters]));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        self.rebuild_words(found);
+        self.add_project_texts([text]);
     }
 
-    /// Merges `extra` into the sorted candidate list.
-    fn rebuild_words(&mut self, extra: BTreeSet<&str>) {
-        let mut all: BTreeSet<&str> = self.words.iter().map(AsRef::as_ref).collect();
-        all.extend(self.dictionary.iter().map(AsRef::as_ref));
-        all.extend(extra);
-        self.words = all.into_iter().map(Box::from).collect();
+    /// Adds what each of `texts` uses, as [`Self::add_project_text`] on each in turn would.
+    /// Their new words are collected first and merged into the sorted list in one pass, so the
+    /// cost is linear in the list and the texts, not in the list times the texts; only words
+    /// the list lacks are allocated. The texts are taken one at a time, so an iterator that
+    /// reads files keeps only one in memory.
+    pub fn add_project_texts<T: AsRef<str>>(&mut self, texts: impl IntoIterator<Item = T>) {
+        let known: HashSet<&str> = self.words.iter().map(AsRef::as_ref).collect();
+        let mut found: HashSet<Box<str>> = HashSet::new();
+        for text in texts {
+            scan_project_text(text.as_ref(), &mut self.commands, &mut |word| {
+                if !known.contains(word) && !found.contains(word) {
+                    found.insert(Box::from(word));
+                }
+            });
+        }
+        drop(known);
+        let mut found: Vec<Box<str>> = found.into_iter().collect();
+        found.sort_unstable();
+        self.merge_words(found);
+    }
+
+    /// Merges `extra`, sorted words the list does not have, into the sorted candidate list: one
+    /// pass that moves the entries it has.
+    fn merge_words(&mut self, extra: Vec<Box<str>>) {
+        if extra.is_empty() {
+            return;
+        }
+        let mut old = std::mem::take(&mut self.words).into_iter().peekable();
+        let mut merged = Vec::with_capacity(old.len() + extra.len());
+        for word in extra {
+            while let Some(w) = old.next_if(|w| *w < word) {
+                merged.push(w);
+            }
+            merged.push(word);
+        }
+        merged.extend(old);
+        self.words = merged;
     }
 
     /// The completion candidates (dictionary entries and project words), sorted.
@@ -190,15 +190,53 @@ impl Lines for SliceLines<'_> {
     }
 }
 
-/// Adds the words of `text`: runs of letters, which may contain single inner hyphens or
-/// apostrophes (`quasi-coherent`, `Grothendieck's`), with at least [`MIN_PROJECT_WORD`] letters.
-fn collect_words<'a>(text: &'a str, out: &mut BTreeSet<&'a str>) {
+/// Gives each word occurrence in the text of the LaTeX source `text` to `word` (see
+/// [`WordList::add_project_text`]) and adds its control words to `commands`.
+fn scan_project_text<'a>(
+    text: &'a str,
+    commands: &mut HashSet<Box<str>>,
+    word: &mut dyn FnMut(&'a str),
+) {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let src = SliceLines(&lines);
+    let mut states = LineStates::new(Arc::new(ScanConfig::default()));
+    states.rebuild(&src);
+    let mut tokens: Vec<Token> = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        tokens.clear();
+        states.tokens(n as u32, line, &mut tokens);
+        for t in &tokens {
+            let Some(span) = line.get(t.start as usize..t.end as usize) else {
+                continue;
+            };
+            match t.kind {
+                TokenKind::Text => collect_words(span, word),
+                TokenKind::Command | TokenKind::MathCommand | TokenKind::Sectioning => {
+                    let name = span.strip_prefix('\\').unwrap_or("");
+                    let letters = name.bytes().take_while(u8::is_ascii_alphabetic).count();
+                    if letters > 0 && !commands.contains(&name[..letters]) {
+                        commands.insert(Box::from(&name[..letters]));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Gives the words of `text` to `out`: runs of letters, which may contain single inner hyphens
+/// or apostrophes (`quasi-coherent`, `Grothendieck's`), with at least [`MIN_PROJECT_WORD`]
+/// letters.
+fn collect_words<'a>(text: &'a str, out: &mut dyn FnMut(&'a str)) {
     let mut start = None;
     let mut letters = 0usize;
     let mut last_letter_end = 0usize;
-    let finish = |start: usize, end: usize, letters: usize, out: &mut BTreeSet<&'a str>| {
+    let finish = |start: usize, end: usize, letters: usize, out: &mut dyn FnMut(&'a str)| {
         if (MIN_PROJECT_WORD..=MAX_WORD).contains(&letters) {
-            out.insert(&text[start..end]);
+            out(&text[start..end]);
         }
     };
     let mut chars = text.char_indices().peekable();
@@ -229,6 +267,7 @@ fn collect_words<'a>(text: &'a str, out: &mut BTreeSet<&'a str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn dictionary_entries() {
@@ -318,7 +357,9 @@ mod tests {
     #[test]
     fn words_split_on_punctuation() {
         let mut out = BTreeSet::new();
-        collect_words("well-known -dash- it's word. co--op longword'", &mut out);
+        collect_words("well-known -dash- it's word. co--op longword'", &mut |w| {
+            out.insert(w);
+        });
         let got: Vec<&str> = out.into_iter().collect();
         assert_eq!(got, ["dash", "longword", "well-known", "word"]);
     }
@@ -332,5 +373,41 @@ mod tests {
         assert_eq!(both.spell_words(), ["abelian"]);
         assert_eq!(dict.len(), 1);
         assert!(WordList::default().is_empty());
+    }
+
+    #[test]
+    fn several_texts_at_once_add_what_each_would() {
+        let dict = WordList::from_text(&["abelian\nsheaves\nZorn\n"]);
+        let texts = [
+            "\\section{Sheaves}\nAbelian sheaves and stacks, \\emph{stacks} again.\n",
+            "Zorn's lemma: \\cite{zorn} every chain has bounds. $\\alpha_n$ abelian\n",
+            "\\begin{proof}Stacks of sheaves.\\end{proof}\n",
+        ];
+        let mut one_by_one = dict.clone();
+        for text in texts {
+            one_by_one.add_project_text(text);
+        }
+        let mut together = dict.clone();
+        together.add_project_texts(texts);
+        let words =
+            |w: &WordList| -> Vec<String> { w.words().iter().map(|s| s.to_string()).collect() };
+        assert_eq!(words(&together), words(&one_by_one));
+        assert!(words(&together).is_sorted());
+        // Words the dictionary has are not added again.
+        assert_eq!(
+            words(&together).iter().filter(|w| *w == "sheaves").count(),
+            1
+        );
+        for command in ["section", "emph", "cite", "alpha"] {
+            assert!(together.uses_command(command), "{command}");
+        }
+        assert!(!together.uses_command("proof"));
+        assert_eq!(together.spell_words(), one_by_one.spell_words());
+        // Owned texts, as read from files.
+        let mut owned = dict.clone();
+        owned.add_project_texts(texts.iter().map(|t| t.to_string()));
+        assert_eq!(words(&owned), words(&together));
+        // Of the dictionary, only "Zorn" is not a project word too.
+        assert_eq!(WordList::from_project(&texts).len() + 1, together.len());
     }
 }

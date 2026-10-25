@@ -882,13 +882,7 @@ async fn compile(state: &Rc<WindowState>) -> Result<String, String> {
 
 /// The problems shown, each with its line moved to the current text.
 fn current_problems(build: &BuildController) -> Vec<Problem> {
-    let panel = build.diagnostics();
-    panel
-        .problems()
-        .into_iter()
-        .enumerate()
-        .map(|(i, p)| panel.problem_for_agent(i).unwrap_or(p))
-        .collect()
+    build.diagnostics().problems_for_agent()
 }
 
 fn severity_name(severity: Severity) -> &'static str {

@@ -21,7 +21,8 @@
 //!   `ProjectIndex::packages()` and `class-<name>` for the root's [`document_class`] whenever
 //!   the index changes (loading again is cheap).
 //! - **Words:** [`WordList::from_text`] with the user's word lists (`spell.word_lists`); clone
-//!   it and add the project's sources with [`WordList::add_project_text`] on idle.
+//!   it and add the project's sources with [`WordList::add_project_texts`] on idle (all at once:
+//!   one merge into the list).
 //! - **Files:** [`Completer::set_files`] with the project's files, relative to the root.
 //! - **Triggers:** `\`, `{` after a command whose argument the scanner classifies (or
 //!   [`CompletionDb::arg_kind`] knows), `,` in reference and citation lists, and words.

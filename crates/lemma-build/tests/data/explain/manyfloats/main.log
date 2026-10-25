@@ -1,0 +1,189 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026/Arch Linux) (preloaded format=pdflatex 2026.10.23)  25 OCT 2026 03:43
+entering extended mode
+ restricted \write18 enabled.
+ file:line:error style messages enabled.
+ %&-line parsing enabled.
+**main.tex
+(./main.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(/usr/share/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2025/01/22 v1.4n Standard LaTeX document class
+(/usr/share/texmf-dist/tex/latex/base/size10.clo
+File: size10.clo 2025/01/22 v1.4n Standard LaTeX file (size option)
+)
+\c@part=\count275
+\c@section=\count276
+\c@subsection=\count277
+\c@subsubsection=\count278
+\c@paragraph=\count279
+\c@subparagraph=\count280
+\c@figure=\count281
+\c@table=\count282
+\abovecaptionskip=\skip49
+\belowcaptionskip=\skip50
+\bibindent=\dimen148
+) (/usr/share/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def
+File: l3backend-pdftex.def 2025-10-09 L3 backend support: PDF output (pdfTeX)
+\l__color_backend_stack_int=\count283
+)
+No file main.aux.
+\openout1 = `main.aux'.
+
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 2.
+LaTeX Font Info:    ... okay on input line 2.
+
+./main.tex:107: LaTeX Error: Too many unprocessed floats.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help.
+ ->\errmessage  LaTeX Error: Too many unprocessed floats.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help\@err@                                                                   
+                                                                                                                                                                                                                                 
+l.107 \begin{figure}[b]
+                       \centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+You've lost some text.  Try typing  <return>  to proceed.
+If that doesn't work, type  X <return>  to quit.
+
+./main.tex:107: Undefined control sequence.
+\@xfloat ...`p' used.}\@setfpsbit 8\fi \fi \fi \fi \fi }\@tempcntb \csname ftype@\@captype \endcsname \multiply \@tempcntb \@xxxii \advance \@tempcnta \@tempcntb \global \count \@currbox \@tempcnta }\@fltovf \fi \global \setbox \@currbox 
+                                                                                                                                                                                                                                              \color@vbox \...
+l.107 \begin{figure}[b]
+                       \centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+The control sequence at the end of the top line
+of your error message was never \def'ed. If you have
+misspelled it (e.g., `\hobx'), type `I' and the correct
+spelling (e.g., `I\hbox'). Otherwise just continue,
+and I'll forget about whatever was undefined.
+
+./main.tex:107: Missing number, treated as zero.
+<to be read again> 
+                   \vbox 
+l.107 \begin{figure}[b]
+                       \centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+A number should have been here; I inserted `0'.
+(If you can't figure out why I needed to see a number,
+look up `weird error' in the index to The TeXbook.)
+
+./main.tex:107: Undefined control sequence.
+\@largefloatcheck ->\ifdim \ht \@currbox 
+                                         >\textheight \@tempdima -\textheight \advance \@tempdima \ht \@currbox \@latex@warning {Float too large for page by \the \@tempdima }\ht \@currbox \textheight \fi 
+l.107 \begin{figure}[b]\centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+                                                                                    
+The control sequence at the end of the top line
+of your error message was never \def'ed. If you have
+misspelled it (e.g., `\hobx'), type `I' and the correct
+spelling (e.g., `I\hbox'). Otherwise just continue,
+and I'll forget about whatever was undefined.
+
+./main.tex:107: Missing number, treated as zero.
+<to be read again> 
+                   >
+l.107 \begin{figure}[b]\centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+                                                                                    
+A number should have been here; I inserted `0'.
+(If you can't figure out why I needed to see a number,
+look up `weird error' in the index to The TeXbook.)
+
+./main.tex:107: Undefined control sequence.
+<argument> \@currbox 
+                     
+l.107 \begin{figure}[b]\centering\rule{1cm}{0.8\textheight}\caption{F53}\end{figure}
+                                                                                    
+The control sequence at the end of the top line
+of your error message was never \def'ed. If you have
+misspelled it (e.g., `\hobx'), type `I' and the correct
+spelling (e.g., `I\hbox'). Otherwise just continue,
+and I'll forget about whatever was undefined.
+
+./main.tex:109: Output loop---100 consecutive dead cycles.
+<argument> \if_int_compare:w 11=\tex_lastnodetype:D \tex_hskip:D \c_zero_dim \fi: \tex_par:D 
+                                                                                             \hook_use:n {para/after}\@kernel@after@para@after 
+l.109 \end{document}
+                    
+I've concluded that your \output is awry; it never does a
+\shipout, so I'm shipping \box255 out myself. Next time
+increase \maxdeadcycles if you want me to be more patient!
+
+[1
+
+{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}]
+./main.tex:109: Argument of \@xnext has an extra }.
+<inserted text> 
+                \par 
+l.109 \end{document}
+                    
+I've run across a `}' that doesn't seem to match anything.
+For example, `\def\a#1{...}' and `\a}' would produce
+this error. If you simply proceed now, the `\par' that
+I've just inserted will cause me to report a runaway
+argument that might be the root of the problem. But if
+your `}' was spurious, just type `2' and it will go away.
+
+Runaway argument?
+\@currbox \@currlist \ifnum \count \@currbox >\z@ \advance \@pageht \@pagedp \ifvoid \footins \else \advance \@pageht \ht \footins \advance \@pageht \skip \footins \advance \@pageht \dp \footins \fi \ifvbox \@kludgeins \ifdim \wd \@kludgeins =\z@ \ETC.
+./main.tex:109: Paragraph ended before \@xnext was complete.
+<to be read again> 
+                   \par 
+l.109 \end{document}
+                    
+I suspect you've forgotten a `}', causing me to apply this
+control sequence to too much text. How can we recover?
+My plan is to forget the whole thing and hope for the best.
+
+[1]
+
+./main.tex:109: LaTeX Error: Float(s) lost.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help.
+ ->\errmessage  LaTeX Error: Float(s) lost.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help\@err@                                                                   
+                                                                                                                                                                                                                   
+l.109 \end{document}
+                    
+You've lost some text.  Try typing  <return>  to proceed.
+If that doesn't work, type  X <return>  to quit.
+
+[2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [16] [17] [18] [19] [20] [21] [22] [23] [24] [25] [26] [27] [28] [29] [30] [31] [32] [33] [34] [35] [36] [37] [38] [39] [40] [41] [42] [43] [44] [45] [46] [47] [48] [49] [50] [51] [52] [53] (./main.aux)
+ ***********
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+ ***********
+ )
+(\end occurred when \ifx on line 109 was incomplete)
+(\end occurred when \ifnum on line 109 was incomplete)
+(\end occurred when \ifnum on line 109 was incomplete)
+(\end occurred when \ifnum on line 109 was incomplete) 
+Here is how much of TeX's memory you used:
+ 424 strings out of 469421
+ 7843 string characters out of 5467662
+ 443756 words of memory out of 5000000
+ 29184 multiletter control sequences out of 15000+600000
+ 627721 words of font info for 40 fonts, out of 8000000 for 9000
+ 36 hyphenation exceptions out of 8191
+ 35i,5n,38p,145b,168s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb>
+Output written on main.pdf (54 pages, 28033 bytes).
+PDF statistics:
+ 184 PDF objects out of 1000 (max. 8388607)
+ 124 compressed objects within 2 object streams
+ 0 named destinations out of 1000 (max. 500000)
+ 1 words of extra memory for PDF output out of 10000 (max. 10000000)
+
