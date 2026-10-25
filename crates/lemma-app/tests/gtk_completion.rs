@@ -1690,9 +1690,10 @@ fn perf_end_large() {
     } else {
         let (near, top) = (p(&near, 0.9), p(&top, 0.9));
         assert!(near <= Duration::from_millis(3), "p90 {near:?} over 3 ms");
+        // ARCHITECTURE §3's 2 ms per key (measured 0.75 ms on an idle machine).
         assert!(
-            top <= Duration::from_millis(1),
-            "p90 {top:?} over 1 ms at the top level"
+            top <= Duration::from_millis(2),
+            "p90 {top:?} over 2 ms at the top level"
         );
     }
 }
