@@ -1,4 +1,4 @@
-//! WP3.5: the command palette, quick open and the keyboard shortcuts window.
+//! WP3.5: the command palette, quick open (with Go to Line) and the keyboard shortcuts window.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_palette`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `palette-light.png`, `palette-dark.png`,
@@ -10,7 +10,7 @@ mod common;
 use adw::prelude::*;
 use gtk::gdk;
 use lemma_app::app::{self, ShortcutGroup};
-use lemma_app::editor::Editor;
+use lemma_app::editor::{Editor, goto};
 use lemma_app::palette::{self, Command};
 use lemma_app::quick_open::{self, FileCandidate, Source};
 use lemma_app::shortcuts;
@@ -47,6 +47,7 @@ fn main() -> ExitCode {
         ("palette_rows_show_keycaps_and_matches", rows_widgets),
         ("quick_open_orders_tabs_index_then_walk", quick_open_order),
         ("quick_open_ranks_and_opens", quick_open_ranks),
+        ("quick_open_goes_to_lines", quick_open_lines),
         ("pickers_replace_each_other", pickers_replace),
         ("shortcuts_window_lists_every_group", shortcuts_groups),
         (
@@ -873,6 +874,89 @@ fn quick_open_ranks() {
     assert_eq!(f.state.editors().len(), 2);
 }
 
+/// Go to Line: `:N` and `:N:C` in the active document, `file:N` in the files that match.
+fn quick_open_lines() {
+    let f = fixture("quick-lines", PROJECT);
+    let main = f.open("main.tex");
+    let (main_path, yoneda) = (f.path("main.tex"), f.path("chapters/yoneda.tex"));
+    let title = |i: usize| palette::visible_rows(&f.state)[i].title.clone();
+    // `:` (Ctrl+G) asks for a number, with the document's lines.
+    quick_open::show_goto_line(&f.state);
+    assert!(quick_open::is_open(&f.state));
+    let rows = palette::visible_rows(&f.state);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].title.as_str(), rows[0].subtitle.as_str()),
+        ("Type a line number", "main.tex, 6 lines")
+    );
+    assert!(!rows[0].enabled);
+    assert!(!palette::activate_selected(&f.state), "nothing to choose");
+    // One row; a line past the end is the last one (the final line break makes none).
+    palette::set_query(&f.state, ":4");
+    assert_eq!(
+        palette::visible(&f.state),
+        [quick_open::line_key(&main_path, 4, None)]
+    );
+    assert_eq!(title(0), "Go to line 4");
+    palette::set_query(&f.state, ":999999");
+    assert_eq!(title(0), "Go to line 6");
+    palette::set_query(&f.state, ":0");
+    assert_eq!(title(0), "Go to line 1");
+    // A column; Back returns from the jump.
+    palette::set_query(&f.state, ":4:3");
+    assert_eq!(title(0), "Go to line 4, column 3");
+    let start = main.cursor_offset();
+    assert!(palette::activate_selected(&f.state));
+    let hello = MAIN.find("Hello.").unwrap();
+    common::pump_until(TIMEOUT, || main.cursor_offset() == hello + 2);
+    assert!(goto::back(&f.state));
+    common::pump_until(TIMEOUT, || main.cursor_offset() == start);
+
+    // `file:N`: the files that match, each to that line.
+    quick_open::show(&f.state);
+    common::pump_until(TIMEOUT, || palette::visible(&f.state).len() >= 6);
+    palette::set_query(&f.state, "yon:1");
+    let rows = palette::visible_rows(&f.state);
+    assert_eq!(rows[0].key, quick_open::line_key(&yoneda, 1, None));
+    assert_eq!(rows[0].title, "yoneda.tex");
+    assert_eq!(rows[0].badge.as_deref(), Some("Line 1"));
+    // An open document's lines clamp the line.
+    palette::set_query(&f.state, "main.tex:99:2");
+    let rows = palette::visible_rows(&f.state);
+    assert_eq!(rows[0].key, quick_open::line_key(&main_path, 6, Some(2)));
+    assert_eq!(rows[0].badge.as_deref(), Some("Line 6, column 2"));
+    // As TeX writes it, and absolute.
+    palette::set_query(&f.state, "./chapters/yoneda.tex:1:");
+    assert_eq!(
+        palette::selected(&f.state),
+        Some(quick_open::line_key(&yoneda, 1, None))
+    );
+    palette::set_query(&f.state, &format!("{}:1", yoneda.display()));
+    assert_eq!(
+        palette::selected(&f.state),
+        Some(quick_open::line_key(&yoneda, 1, None))
+    );
+    assert!(palette::activate_selected(&f.state));
+    common::pump_until(TIMEOUT, || f.active_path() == Some(yoneda.clone()));
+    assert_eq!(f.state.active_editor().unwrap().cursor_offset(), 0);
+    assert!(goto::back(&f.state));
+    common::pump_until(TIMEOUT, || {
+        f.active_path() == Some(main_path.clone()) && main.cursor_offset() == start
+    });
+
+    // Without a document, `:4` asks for a file name.
+    for editor in f.state.editors() {
+        f.state.close_editor(&editor, true);
+    }
+    common::pump_until(TIMEOUT, || f.state.tab_view.n_pages() == 0);
+    quick_open::show_goto_line(&f.state);
+    palette::set_query(&f.state, ":4");
+    let rows = palette::visible_rows(&f.state);
+    assert_eq!(rows[0].title, "No document is open");
+    assert!(!rows[0].enabled);
+    f.close_dialogs();
+}
+
 fn pickers_replace() {
     let f = fixture("replace", PROJECT);
     let _main = f.open("main.tex");
@@ -1134,7 +1218,9 @@ fn demo() {
 mod real_keys {
     //! The palette, quick open, the shortcuts window and Preferences on real key events (a
     //! private Broadway daemon, see `tests/broadway_input`): the search entry has the keyboard,
-    //! Enter runs, Escape closes, and the focus goes back to the editor.
+    //! Enter runs, Escape closes, and the focus goes back to the editor. Ctrl+N in a picker is
+    //! its Down (the window's accelerators, New File's among them, do not reach a dialog), and
+    //! Go to Line's `:` (Ctrl+G) stays when the line number is typed.
     //!
     //! GTK drops key events whose target is not mapped yet: a dialog's entry is mapped in the
     //! dialog's first frame, which Broadway draws about a second later (on Wayland, within a
@@ -1142,6 +1228,7 @@ mod real_keys {
 
     use super::*;
     use broadway_input::{Browser, CONTROL, SHIFT};
+    use std::cell::Cell;
 
     macro_rules! step {
         ($($arg:tt)*) => { println!("child: {}", format!($($arg)*)) };
@@ -1319,5 +1406,61 @@ mod real_keys {
             "no key reached the editor"
         );
         assert_eq!(mode(), normal);
+
+        step!("Ctrl+N in quick open is its Down, not New File");
+        let asked = Rc::new(Cell::new(0));
+        let count = asked.clone();
+        lemma_app::file_commands::set_dialog_hook(Some(Box::new(move |_| {
+            count.set(count.get() + 1);
+            None
+        })));
+        browser.key(gdk::Key::p, CONTROL);
+        wait(&f.state, "quick open", || quick_open::is_open(&f.state));
+        wait_ready(&f.state);
+        let second = palette::visible(&f.state).get(1).cloned();
+        assert!(second.is_some());
+        browser.key(gdk::Key::n, CONTROL);
+        wait(&f.state, "Ctrl+N to move the selection", || {
+            palette::selected(&f.state) == second
+        });
+        common::pump_for(Duration::from_millis(50));
+        assert_eq!(asked.get(), 0, "Ctrl+N ran New File in the picker");
+        browser.key(gdk::Key::Escape, 0);
+        wait(&f.state, "no dialog", || {
+            f.state.window.visible_dialog().is_none()
+        });
+
+        step!("Ctrl+G, a line number and Enter, then Alt+Left (Vim off)");
+        f.state.set_vim_enabled(false);
+        f.state.select_editor(&editor);
+        wait(&f.state, "the editor's focus", || view.has_focus());
+        let start = editor.cursor_offset();
+        browser.key(gdk::Key::g, CONTROL);
+        wait(&f.state, "quick open", || quick_open::is_open(&f.state));
+        wait_ready(&f.state);
+        let query = || entry(&f.state).map(|e| e.text().to_string());
+        assert_eq!(query().as_deref(), Some(":"));
+        assert_eq!(
+            palette::visible_rows(&f.state)[0].title,
+            "Type a line number"
+        );
+        // The `:` stays: the digits are typed after it.
+        browser.text("4");
+        let main = f.path("main.tex");
+        wait(&f.state, "the line row", || {
+            palette::selected(&f.state) == Some(quick_open::line_key(&main, 4, None))
+        });
+        assert_eq!(query().as_deref(), Some(":4"));
+        browser.key(gdk::Key::Return, 0);
+        let line_4 = MAIN.find("Hello.").unwrap();
+        wait(&f.state, "line 4", || editor.cursor_offset() == line_4);
+        wait(&f.state, "the editor's focus", || view.has_focus());
+        browser.key(gdk::Key::Left, broadway_input::ALT);
+        wait(&f.state, "Alt+Left back", || {
+            editor.cursor_offset() == start
+        });
+        assert_eq!(editor.document().text(), MAIN, "no key was typed");
+        assert_eq!(asked.get(), 0);
+        lemma_app::file_commands::set_dialog_hook(None);
     }
 }

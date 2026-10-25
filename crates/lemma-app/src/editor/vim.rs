@@ -629,13 +629,16 @@ impl VimStatus {
 /// and `:e` (it emits `edit`), not their `!` forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileCommand {
-    /// `:w [path]`, `:wq`, `:x`; `force` (`:w!`, `:wq!`) also writes a file another program
-    /// changed.
+    /// `:w [path]`, `:wq [path]`, `:x`; `force` (`:w!`, `:wq!`) also writes a file another
+    /// program changed, and a `path` that exists. A `path` other than the file's own gets a copy
+    /// of the text; the document stays the file it was.
     Write {
         path: Option<String>,
         quit: bool,
         force: bool,
     },
+    /// `:sav[eas] path`: Save As; `force` (`:sav!`) writes over a file that exists.
+    SaveAs { path: Option<String>, force: bool },
     /// `:e [path]`; `force` (`:e!`) reloads the file even with unsaved changes, discarding them.
     Edit { path: Option<String>, force: bool },
     /// `:wa`, `:wqa`, `:xa`.
@@ -671,6 +674,8 @@ pub fn parse_file_command(command: &str) -> Option<FileCommand> {
             force,
         },
         "e" | "edit" => FileCommand::Edit { path, force },
+        // `:sa` is Vim's `:sargument`.
+        "sav" | "save" | "savea" | "saveas" => FileCommand::SaveAs { path, force },
         _ if path.is_some() => return None,
         "wa" | "wall" => FileCommand::WriteAll { quit: false },
         "wqa" | "wqall" | "xa" | "xall" => FileCommand::WriteAll { quit: true },
@@ -678,6 +683,22 @@ pub fn parse_file_command(command: &str) -> Option<FileCommand> {
         "qa" | "qall" | "quita" | "quitall" => FileCommand::QuitAll { force },
         _ => return None,
     })
+}
+
+/// Why the file name of `:w name` or `:sav name` is not one to write, if so: Vim would pipe the
+/// text to a command (`:w !sudo tee %`), append it to a file (`:w >> notes.tex`) or expand `%`
+/// and `#` (the current and the alternate file), none of which is supported. GtkSourceView
+/// hands such names over as they were typed, and writing them would make a file of that name.
+pub fn unsupported_file_name(name: &str) -> Option<&'static str> {
+    if name.starts_with('!') {
+        Some("Writing to a command (:w !cmd) is not supported")
+    } else if name.starts_with(">>") {
+        Some("Appending to a file (:w >> file) is not supported")
+    } else if name.contains(['%', '#']) {
+        Some("File names with % or # (the current or the alternate file) are not supported")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +814,33 @@ mod tests {
         assert_eq!(parse(":e"), Some(e(None, false)));
         assert_eq!(parse(":e!"), Some(e(None, true)));
         assert_eq!(parse(":edit! main.tex"), Some(e(Some("main.tex"), true)));
+        assert_eq!(parse(":wq b.tex"), Some(w(Some("b.tex"), true)));
+        let sav = |path: Option<&str>, force| FileCommand::SaveAs {
+            path: path.map(Into::into),
+            force,
+        };
+        assert_eq!(parse(":sav b.tex"), Some(sav(Some("b.tex"), false)));
+        assert_eq!(
+            parse(":saveas! ch/b.tex"),
+            Some(sav(Some("ch/b.tex"), true))
+        );
+        assert_eq!(parse(":savea b.tex"), Some(sav(Some("b.tex"), false)));
+        assert_eq!(parse(":sav"), Some(sav(None, false)));
+        assert_eq!(parse(":sa b.tex"), None, ":sargument");
         assert_eq!(parse(":"), None);
+        // Names Vim would not write as they are.
+        for name in [
+            "!sudo tee %",
+            ">> notes.tex",
+            ">>notes.tex",
+            "%.bak",
+            "#",
+            "a#b.tex",
+        ] {
+            assert!(unsupported_file_name(name).is_some(), "{name}");
+        }
+        for name in ["b.tex", "ch/b.tex", "a!b.tex", "a>b.tex"] {
+            assert_eq!(unsupported_file_name(name), None, "{name}");
+        }
     }
 }

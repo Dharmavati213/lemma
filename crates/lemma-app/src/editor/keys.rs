@@ -23,12 +23,13 @@
 //! Vim is switched on, see [`super::vim::Vim::blocks_key`]) runs just before the layer; it only
 //! stops a `J` that would hang GtkSourceView.
 //!
-//! **Ctrl+W and Ctrl+O** are application accelerators (close the tab, open a file), and Vim's
-//! own keys too (insert mode: delete the word before the cursor, run one normal-mode command).
-//! While Vim is on and an editor has the focus they are Vim's in every mode: a capture-phase
-//! controller on the window ([`install_window`]), which runs before the application's
-//! accelerators, gives them to that editor's layer and Vim. The menu and header buttons, and the
-//! keys while the focus is elsewhere or Vim is off, still close the tab and open a file.
+//! **Ctrl+W, Ctrl+O and Ctrl+N** are application accelerators (close the tab, open a file, new
+//! file), and Vim's own keys too (normal mode: next line for Ctrl+N; insert mode: delete the
+//! word before the cursor, run one normal-mode command, complete a word). While Vim is on and an
+//! editor has the focus they are Vim's in every mode: a capture-phase controller on the window
+//! ([`install_window`]), which runs before the application's accelerators, gives them to that
+//! editor's layer and Vim. The menu and header buttons, and the keys while the focus is
+//! elsewhere or Vim is off, still close the tab, open a file and make a new one.
 //!
 //! Handlers are registered per view with [`register`]`(view, priority, f)`; `f(event, mode)` runs
 //! for every key press, highest priority first (equal priorities in registration order), until
@@ -1248,9 +1249,9 @@ pub fn install_window(state: &Rc<WindowState>) {
     set_inline_edit_accel(state);
 }
 
-/// Keys that are application accelerators and Vim keys alike: with Vim on, in an editor that has
-/// the focus, they are Vim's (see the module docs).
-fn is_vim_accelerator_key(keyval: gdk::Key, state: gdk::ModifierType) -> bool {
+/// Keys that are application accelerators and Vim keys alike (Ctrl+W, Ctrl+O, Ctrl+N): with Vim
+/// on, in an editor that has the focus, they are Vim's (see the module docs).
+pub(crate) fn is_vim_accelerator_key(keyval: gdk::Key, state: gdk::ModifierType) -> bool {
     let modifiers = state
         & (gdk::ModifierType::CONTROL_MASK
             | gdk::ModifierType::ALT_MASK
@@ -1260,14 +1261,14 @@ fn is_vim_accelerator_key(keyval: gdk::Key, state: gdk::ModifierType) -> bool {
     modifiers == gdk::ModifierType::CONTROL_MASK
         && matches!(
             keyval,
-            gdk::Key::w | gdk::Key::W | gdk::Key::o | gdk::Key::O
+            gdk::Key::w | gdk::Key::W | gdk::Key::o | gdk::Key::O | gdk::Key::n | gdk::Key::N
         )
 }
 
-/// The capture-phase controller on the window that gives Ctrl+W and Ctrl+O to the focused
-/// editor's layer and Vim while Vim is on. Added after the window was given to the application,
-/// so it runs before the accelerators' controller (GTK runs a widget's controllers newest
-/// first).
+/// The capture-phase controller on the window that gives Ctrl+W, Ctrl+O and Ctrl+N to the
+/// focused editor's layer and Vim while Vim is on. Added after the window was given to the
+/// application, so it runs before the accelerators' controller (GTK runs a widget's controllers
+/// newest first).
 fn install_vim_accelerator_keys(state: &Rc<WindowState>) {
     let controller = gtk::EventControllerKey::new();
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);

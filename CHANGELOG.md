@@ -8,6 +8,23 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Added
 
+- Go to Line (Ctrl+G) opens quick open with `:` typed: `:42` goes to line 42 of the current
+  document and `:42:7` to its column 7 (as the status bar counts them), and `main.tex:42` (or
+  `./main.tex:42:`, as TeX writes it) to line 42 of a file; a line past the end is the last one.
+  Alt+Left goes back. With Vim on, Ctrl+G stays Vim's; in the PDF's search, it is still the next
+  match.
+- New File (Ctrl+N) and Save As (Ctrl+Shift+S), in the main menu and the command palette. New
+  File asks for a name in the current document's folder and opens the file in a tab; its first
+  save creates it. Save As writes the document, in its encoding and with its line breaks, under
+  the new name and shows that file in the same tab, the cursor where it was; the old file stays
+  as it is on disk, and the undo history starts afresh. Save As is refused while the agent is
+  working, or while the document has agent changes that are not decided. With Vim on, Ctrl+N in
+  the editor stays Vim's.
+- Vim: `:w file` writes a copy and goes on editing the current file (`:w! file` replaces a file
+  that exists), `:wq file` writes the copy and closes the tab, and `:sav file` (`:saveas`) is
+  Save As, refusing a file that exists unless `:sav!`. `:w other.tex` used to say that writing
+  to another file is not supported. `:w !cmd`, `:w >> file` and the `%` and `#` file names are
+  not supported (a toast says so).
 - Find and replace in the current file: Ctrl+F opens a find bar above the editor (Ctrl+H with
   its replace row) that highlights every match and counts them ("3 of 17"), with Match Case,
   Whole Word and Regular Expression, F3 / Shift+F3 (or Enter / Shift+Enter) for the next and

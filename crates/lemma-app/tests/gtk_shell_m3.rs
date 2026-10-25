@@ -259,6 +259,10 @@ fn actions() {
         ("win.find-replace", "<Control>h"),
         ("win.find-next", "F3"),
         ("win.find-prev", "<Shift>F3"),
+        // Go to Line, New File and Save As.
+        ("win.goto-line", "<Control>g"),
+        ("win.new-file", "<Control>n"),
+        ("win.save-as", "<Control><Shift>s"),
     ];
     assert_eq!(m3_accels().len(), expected.len());
     for (action, accel) in expected {
@@ -288,9 +292,30 @@ fn actions() {
         "find-replace",
         "find-next",
         "find-prev",
+        "goto-line",
+        "new-file",
+        "save-as",
     ] {
         assert!(f.state.window.lookup_action(name).is_some(), "win.{name}");
         assert!(app::action_info(&format!("win.{name}")).is_some(), "{name}");
+    }
+    assert_eq!(
+        app::action_info("win.goto-line").unwrap().group,
+        ShortcutGroup::Navigation
+    );
+    assert!(
+        app::action_info("win.goto-line")
+            .unwrap()
+            .unavailable
+            .is_some_and(|why| why.contains(":12")),
+        "Vim's way is named"
+    );
+    for name in ["win.new-file", "win.save-as"] {
+        assert_eq!(
+            app::action_info(name).unwrap().group,
+            app::action_info("win.save").unwrap().group,
+            "{name} is in Save's group"
+        );
     }
     // Groups for the shortcuts window.
     assert_eq!(
@@ -313,12 +338,14 @@ fn actions() {
 
 /// WP3.10: no key runs two actions (except the keys of `app::SHARED_ACCELS`, whose actions are
 /// never enabled together); every accelerator has Ctrl or Alt or is a function key (a plain or
-/// Shift+ key would be taken from typing and from Vim); Ctrl+W and Ctrl+O stay Close Tab and Open
-/// (§11: in the editor they go to Vim); the keys the panes handle themselves (the Search page, the
-/// PDF view and its search bar, the pickers, context menus) are no accelerator, which would run
-/// first, except the find bar's Ctrl+H, which is enabled only while an editor or the find bar has
-/// the focus; and the `[vim.normal]` defaults neither shadow each other nor take the key-layer
-/// handlers' `%` and Ctrl+O.
+/// Shift+ key would be taken from typing and from Vim); Ctrl+W, Ctrl+O and Ctrl+N stay Close Tab,
+/// Open and New File (§11: in the editor with Vim on they go to Vim); the keys the panes handle
+/// themselves (the Search page, the PDF view and its search bar, the pickers, context menus) are
+/// no accelerator, which would run first, except the find bar's Ctrl+H and Go to Line's Ctrl+G,
+/// which are enabled only while an editor or the find bar has the focus, and New File's Ctrl+N,
+/// which does not reach the pickers (dialogs: on real keys in `gtk_palette`); and the
+/// `[vim.normal]` defaults neither shadow each other nor take the key-layer handlers' `%` and
+/// Ctrl+O.
 fn accel_collisions() {
     let f = fixture("accel-collisions", &[("main.tex", DOC)]);
     let _editor = f.open("main.tex");
@@ -365,6 +392,11 @@ fn accel_collisions() {
     // Disabled while the Search page has the focus, which keeps its own Ctrl+H (on real keys in
     // `real_keys`).
     assert_eq!(owner("<Control>h").as_deref(), Some("win.find-replace"));
+    // Disabled while the PDF has the focus, so its search entry keeps Ctrl+G (the next match; on
+    // real keys in `real_keys`).
+    assert_eq!(owner("<Control>g").as_deref(), Some("win.goto-line"));
+    // The pickers' Ctrl+N (Down) is theirs: the window's accelerators do not reach a dialog.
+    assert_eq!(owner("<Control>n").as_deref(), Some("win.new-file"));
     for local in [
         // The Search page and the find bar.
         "<Alt>c",
@@ -373,7 +405,6 @@ fn accel_collisions() {
         "<Control><Alt>Return",
         "<Control>Return",
         // The PDF view, its search bar and the detached PDF window's Ctrl+F (a window of its own).
-        "<Control>g",
         "<Control><Shift>g",
         "<Control>plus",
         "<Control>equal",
@@ -383,7 +414,6 @@ fn accel_collisions() {
         "slash",
         "Escape",
         // The pickers (palette, quick open) and context menus; completion.
-        "<Control>n",
         "<Control>j",
         "<Shift>F10",
         "Menu",
@@ -1363,6 +1393,7 @@ fn goto_targets() {
             ("main.tex", DOC),
             ("chapters/a.tex", CHAPTER),
             ("fig.png", "not really a png"),
+            ("tabs.tex", "x\ty\n\tz\n"),
         ],
     );
     f.open("main.tex");
@@ -1396,6 +1427,41 @@ fn goto_targets() {
     ))
     .unwrap();
     wait_cursor(&f, "chapters/a.tex", CHAPTER.len());
+
+    // A line and column (Go to Line): the column as the status bar counts it (a tab reaches the
+    // next tab stop), clamped to the line's end; a line past the end is the last line with text
+    // (the empty one after the final line break is none, as in Vim); without a column, the
+    // line's first non-blank character.
+    let tabs = f.open("tabs.tex");
+    let tab = sourceview5::prelude::ViewExt::tab_width(tabs.view());
+    let go = |line, column| {
+        block_on(goto::navigate(
+            &f.state,
+            GotoTarget::LineColumn {
+                path: f.path("tabs.tex"),
+                line,
+                column,
+            },
+        ))
+        .unwrap();
+    };
+    go(0, Some(tab));
+    wait_cursor(&f, "tabs.tex", 2);
+    assert_eq!(
+        tabs.cursor_position(),
+        (1, tab + 1),
+        "the status bar's column"
+    );
+    go(0, Some(1));
+    wait_cursor(&f, "tabs.tex", 1);
+    go(0, Some(99));
+    wait_cursor(&f, "tabs.tex", 3);
+    go(1, None);
+    wait_cursor(&f, "tabs.tex", 5);
+    go(99, None);
+    wait_cursor(&f, "tabs.tex", 5);
+    go(99, Some(0));
+    wait_cursor(&f, "tabs.tex", 4);
 
     // The PDF: an error until there is one.
     let e = block_on(goto::navigate(
@@ -1747,6 +1813,9 @@ mod real_keys {
             "find-replace",
             "find-next",
             "find-prev",
+            "goto-line",
+            "new-file",
+            "save-as",
         ] {
             let log = activated.clone();
             let action = f.state.window.lookup_action(name).unwrap();
@@ -1796,6 +1865,8 @@ mod real_keys {
             (gdk::Key::k, ALT, "show-hover"),
             (gdk::Key::k, CONTROL, "agent-inline-edit"),
             (gdk::Key::F, CONTROL | SHIFT, "project-search"),
+            // No Vim key: Save As (a scripted window shows no file dialog).
+            (gdk::Key::S, CONTROL | SHIFT, "save-as"),
         ] {
             focus_view();
             hover::hide(&view);
@@ -1836,8 +1907,15 @@ mod real_keys {
         });
         common::pump_for(Duration::from_millis(50));
         assert!(take(&activated).is_empty(), "Ctrl+F ran an action");
-        // So are Ctrl+H (left) and F3: the find bar's keys are off while Vim is on.
-        for (key, mods) in [(gdk::Key::h, CONTROL), (gdk::Key::F3, 0)] {
+        // So are Ctrl+H (left) and F3: the find bar's keys are off while Vim is on; Ctrl+G (file
+        // info) too, Go to Line being off; and Ctrl+N (next line), which the key layer gives to
+        // Vim before New File's accelerator.
+        for (key, mods) in [
+            (gdk::Key::h, CONTROL),
+            (gdk::Key::F3, 0),
+            (gdk::Key::g, CONTROL),
+            (gdk::Key::n, CONTROL),
+        ] {
             reached.borrow_mut().clear();
             browser.key(key, mods);
             common::pump_until(TIMEOUT, || reached.borrow().iter().any(|(k, _)| *k == key));
@@ -1955,6 +2033,23 @@ mod real_keys {
         buffer.set_text("");
         f.state.agent.split.set_show_sidebar(false);
 
+        step!("Ctrl+G and Ctrl+N with Vim off");
+        // Go to Line (quick open with `:`) and New File (no file dialog in a scripted window).
+        for (key, action) in [(gdk::Key::g, "goto-line"), (gdk::Key::n, "new-file")] {
+            focus_view();
+            reached.borrow_mut().clear();
+            browser.key(key, CONTROL);
+            common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+            assert_eq!(take(&activated), [action]);
+            assert!(
+                !reached.borrow().iter().any(ctrl(key)),
+                "{action}'s key reached the editor"
+            );
+            if let Some(dialog) = f.state.window.visible_dialog() {
+                dialog.force_close();
+            }
+        }
+
         step!("Ctrl+F in the PDF");
         // With the PDF focused, Ctrl+F searches it.
         let pdf_file = f.dir.join("main.pdf");
@@ -1974,6 +2069,22 @@ mod real_keys {
         let pdf_search_open =
             || lemma_app::pdf::search::status(&f.state).is_some_and(|status| status.open);
         common::pump_until(TIMEOUT, pdf_search_open);
+        // In its entry Ctrl+G is the next match, not Go to Line.
+        let pdf_entry = lemma_app::pdf::search::entry(&f.state).unwrap();
+        common::pump_until(TIMEOUT, || {
+            pdf_entry
+                .state_flags()
+                .contains(gtk::StateFlags::FOCUS_WITHIN)
+        });
+        browser.text("sheaf");
+        let pdf_status = || lemma_app::pdf::search::status(&f.state).unwrap();
+        common::pump_until(TIMEOUT, || {
+            let status = pdf_status();
+            status.done && status.total == 4 && status.current == Some(1)
+        });
+        browser.key(gdk::Key::g, CONTROL);
+        common::pump_until(TIMEOUT, || pdf_status().current == Some(2));
+        assert!(take(&activated).is_empty(), "Ctrl+G ran an action");
         lemma_app::pdf::search::close(&f.state);
 
         step!("the find bar with Vim off");

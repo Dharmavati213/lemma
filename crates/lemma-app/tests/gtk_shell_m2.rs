@@ -367,7 +367,7 @@ fn editor_menus() {
     assert_eq!(editor.extra_menu().n_items(), 2);
 
     for (section, item) in [
-        (&f.state.header.menu_files, "win.save-all"),
+        (&f.state.header.menu_files, "win.new-file"),
         (&f.state.header.menu_view, "win.toggle-vim"),
     ] {
         let action = section

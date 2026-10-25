@@ -13,6 +13,7 @@ pub mod cli;
 pub mod diagnostics_panel;
 pub mod document;
 pub mod editor;
+pub mod file_commands;
 pub mod fsutil;
 pub mod heap;
 pub mod hooks;

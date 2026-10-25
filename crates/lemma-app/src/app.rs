@@ -41,6 +41,12 @@ use std::time::{Duration, Instant};
 /// bar has the focus and Vim is off, so with Vim on Ctrl+F and Ctrl+H stay Vim's own keys (page
 /// down; left, or Backspace in insert mode), and the Search page keeps its own Ctrl+H. Ctrl+F is
 /// shared with `win.pdf-search` (see [`SHARED_ACCELS`]).
+///
+/// Go to Line's Ctrl+G follows the find bar's keys: with Vim on it is Vim's (file info), and in
+/// the PDF's search entry it stays the next match. New File's Ctrl+N is Vim's next line (and
+/// insert-mode completion), so with Vim on and an editor focused it goes to Vim, as Ctrl+W and
+/// Ctrl+O do (`editor::keys`); the menu, the palette and the key elsewhere still make a new
+/// file. Save As's Ctrl+Shift+S is no Vim key.
 pub const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("app.open", &["<Control>o"]),
     ("app.quit", &["<Control>q"]),
@@ -71,6 +77,10 @@ pub const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("win.find-replace", &["<Control>h"]),
     ("win.find-next", &["F3"]),
     ("win.find-prev", &["<Shift>F3"]),
+    // Go to Line, New File and Save As.
+    ("win.goto-line", &["<Control>g"]),
+    ("win.new-file", &["<Control>n"]),
+    ("win.save-as", &["<Control><Shift>s"]),
 ];
 
 /// Accelerators that several actions share, because the shell never enables two of them at the
@@ -148,6 +158,14 @@ const fn find_info(name: &'static str, label: &'static str) -> ActionInfo {
     }
 }
 
+/// Go to Line, which works only while an editor has the focus and Vim is off, as the find bar.
+const GOTO_LINE: ActionInfo = ActionInfo {
+    name: "win.goto-line",
+    label: "Go to Line…",
+    group: ShortcutGroup::Navigation,
+    unavailable: Some("Click into the editor first; with Vim on, type :12 for line 12"),
+};
+
 /// Every action of a window and of the application that the user can run from the command
 /// palette (actions with parameters, such as `win.review-keep-turn(u)`, and the quick actions
 /// `win.quick-<slug>`, which come from `prompts.toml`, are not listed). Actions added later at
@@ -156,8 +174,10 @@ pub const ACTIONS: &[ActionInfo] = {
     use ShortcutGroup::*;
     &[
         info("app.open", "Open…", General),
+        info("win.new-file", "New File…", General),
         info("app.quit", "Quit", General),
         info("win.save", "Save", General),
+        info("win.save-as", "Save As…", General),
         info("win.save-all", "Save All", General),
         info("win.close-tab", "Close Tab", General),
         info("win.command-palette", "Command Palette", General),
@@ -173,6 +193,7 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.history", "Local History", Editing),
         info("win.history-restore", "Restore from History…", Editing),
         info("win.quick-open", "Go to File…", Navigation),
+        GOTO_LINE,
         info("win.project-search", "Find in Project", Navigation),
         info("win.goto-definition", "Go to Definition", Navigation),
         info("win.find-references", "Find References", Navigation),
@@ -1091,6 +1112,16 @@ mod tests {
                 "Ctrl+K is the inline edit"
             );
         }
+        // New File's Ctrl+N is Vim's next line: in an editor with Vim on, the key layer gives
+        // it to Vim, as Ctrl+W and Ctrl+O; Go to Line's Ctrl+G is off with Vim on.
+        let ctrl = gtk::gdk::ModifierType::CONTROL_MASK;
+        for key in [gtk::gdk::Key::n, gtk::gdk::Key::w, gtk::gdk::Key::o] {
+            assert!(editor::keys::is_vim_accelerator_key(key, ctrl), "{key:?}");
+        }
+        assert!(!editor::keys::is_vim_accelerator_key(
+            gtk::gdk::Key::s,
+            ctrl
+        ));
     }
 
     #[test]

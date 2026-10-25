@@ -38,12 +38,13 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   and `\textit{…}` (`\mathbf`, `\mathit` in math) and take it out again, and Emphasize
   (`\emph`) is in the command palette. In Vim mode, Ctrl+B and Ctrl+I stay Vim's keys.
   Optionally, `...` typed in text becomes `\dots`.
-- **Navigation.** Project outline, command palette (Ctrl+Shift+P), quick open (Ctrl+P),
-  find and replace in the current file (Ctrl+F, Ctrl+H; F3 and Shift+F3 for the next and
-  previous match), project search and replace (Ctrl+Shift+F), go to definition (F12), session
-  restore, local history and a git gutter.
-- **Optional Vim mode** (Ctrl+Alt+V), off by default. Vim keeps its own Ctrl+F and Ctrl+H; search
-  with `/`.
+- **Navigation.** Project outline, command palette (Ctrl+Shift+P), quick open (Ctrl+P), go to
+  line (Ctrl+G, or `:42` and `main.tex:42` in quick open), find and replace in the current file
+  (Ctrl+F, Ctrl+H; F3 and Shift+F3 for the next and previous match), project search and replace
+  (Ctrl+Shift+F), go to definition (F12), session restore, local history and a git gutter.
+- **Optional Vim mode** (Ctrl+Alt+V), off by default. Vim keeps its own Ctrl+F, Ctrl+H, Ctrl+G
+  and Ctrl+N; search with `/` and go to a line with `:42`. `:w file` writes a copy, `:sav file`
+  saves under a new name and `:e file` opens a file.
 
 ## Requirements
 
@@ -322,10 +323,11 @@ lemma .                    # open the current directory as the project
 ```
 
 The first `lemma` without a file (or after turning `[session] restore` off) shows an empty
-window; open a file with Ctrl+O.
+window; open a file with Ctrl+O, or make a new one with Ctrl+N.
 
-Saving builds the document. F8 toggles the PDF pane, F9 the sidebar and F10 the agent pane.
-Ctrl+? lists every shortcut, and Ctrl+, opens Preferences.
+Saving builds the document; Ctrl+Shift+S saves it under another name. F8 toggles the PDF pane,
+F9 the sidebar and F10 the agent pane. Ctrl+? lists every shortcut, and Ctrl+, opens
+Preferences.
 
 ### Setting up the agent
 

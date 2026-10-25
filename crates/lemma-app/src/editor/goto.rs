@@ -15,8 +15,9 @@
 //! name under the point: [`TextPoint::item`], [`TextPoint::control_word`]).
 //!
 //! A [`GotoTarget`] is a byte offset in a file, a line of a file (optionally the first
-//! occurrence of a text on it: `\label{eq:1}` on the line the project index gives), a place in
-//! the PDF preview, or a file that is not text (an image), which opens in the system's default
+//! occurrence of a text on it: `\label{eq:1}` on the line the project index gives), a line and
+//! column as the user typed them (Go to Line, `:12:5` in quick open), a place in the PDF
+//! preview, or a file that is not text (an image), which opens in the system's default
 //! application after the user confirms.
 //!
 //! # Triggers
@@ -47,10 +48,12 @@
 //! in [`attach_resolvers`] at the end of this file.
 
 use super::{Editor, TexView, TextPoint, Trigger, VimMode, keys};
+use crate::document::Document;
 use crate::hooks::{HookId, Hooks};
 use crate::pdf::pdf_view::Reveal;
 use crate::window::WindowState;
 use adw::prelude::*;
+use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::ops::{Deref, Range};
@@ -78,6 +81,16 @@ pub enum GotoTarget {
         path: PathBuf,
         line: u32,
         find: Option<String>,
+    },
+    /// A 0-based line and column of a file, as the status bar counts them (a tab counts up to
+    /// the next tab stop): Go to Line. The line is clamped to the file's lines as Vim counts
+    /// them ([`last_line`]: the empty line after a final line break is none), the column to the
+    /// end of the line; without a column the cursor goes to the line's first non-blank
+    /// character.
+    LineColumn {
+        path: PathBuf,
+        line: u32,
+        column: Option<u32>,
     },
     /// A place in the PDF preview: the 0-based page and a rectangle in bp (top-left origin),
     /// which is flashed as SyncTeX does.
@@ -471,6 +484,12 @@ async fn go(state: &Rc<WindowState>, target: &GotoTarget) -> Result<(), String> 
             show_offset(&editor, offset);
             Ok(())
         }
+        GotoTarget::LineColumn { path, line, column } => {
+            let editor = state.open_file(path).await?;
+            let offset = line_column_offset(&editor, *line, *column);
+            show_offset(&editor, offset);
+            Ok(())
+        }
         GotoTarget::Pdf { page, rect } => {
             let pdf = state.pdf.get().ok_or("There is no PDF preview")?;
             if pdf.pdf().is_none() {
@@ -496,6 +515,49 @@ fn line_offset(editor: &Editor, line: u32, find: Option<&str>) -> usize {
         .and_then(|f| text.find(f))
         .unwrap_or_else(|| text.len() - text.trim_start().len());
     start + column
+}
+
+/// The 0-based number of `doc`'s last line as Vim counts lines: the empty line after a final
+/// line break is none (`a\nb\n` has two lines), so Go to Line past the end stops on the last
+/// line with text.
+pub fn last_line(doc: &Document) -> u32 {
+    let index = doc.line_index();
+    let last = index.line_count().saturating_sub(1);
+    if last > 0 && index.line_range(last).is_empty() {
+        last - 1
+    } else {
+        last
+    }
+}
+
+/// The offset of the 0-based `line` (clamped, see [`last_line`]) and visual `column` (clamped to
+/// the line's end) of `editor`'s document; without a column, of the line's first non-blank
+/// character.
+fn line_column_offset(editor: &Editor, line: u32, column: Option<u32>) -> usize {
+    let doc = editor.document();
+    let line = line.min(last_line(doc));
+    let Some(column) = column else {
+        return line_offset(editor, line, None);
+    };
+    let Some(mut iter) = i32::try_from(line)
+        .ok()
+        .and_then(|l| editor.buffer().iter_at_line(l))
+    else {
+        return doc.line_index().line_start(line);
+    };
+    // Counted as `visual_column` counts, in one pass (asking it at every character would walk
+    // the line from its start each time).
+    let tab = editor.view().tab_width().max(1);
+    let mut visual = 0;
+    while !iter.ends_line() && visual < column {
+        visual = if iter.char() == '\t' {
+            (visual / tab + 1) * tab
+        } else {
+            visual + 1
+        };
+        iter.forward_char();
+    }
+    doc.byte_offset(&iter)
 }
 
 /// Puts `editor`'s cursor at `offset`, scrolls it to the middle of the view (again after the

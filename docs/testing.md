@@ -246,6 +246,13 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   in `gtk_shell_m3` (Ctrl+F shared with the PDF's search, Vim's Ctrl+F and Ctrl+H, the Search
   page's own Ctrl+H). `LEMMA_TEST_SNAPSHOTS` adds `find-bar.png` and `find-bar-narrow.png` (the
   rows wrapped).
+- **Go to Line, New File and Save As:** `gtk_palette`'s `quick_open_goes_to_lines` (`:N`,
+  `:N:C`, `file:N`, the clamping, Back) and its real keys (Ctrl+G, the digits typed after the
+  `:`, Ctrl+N in a picker is its Down); `gtk_window`'s `new_file_*` and `save_as_*` tests, with
+  the file dialog answered by `file_commands::set_dialog_hook` (the dialog's folder and name, the
+  tab's place, encodings and line breaks, the refusals); `gtk_vim`'s `:w path`, `:wq path` and
+  `:sav[eas][!]`; `GotoTarget::LineColumn` in `gtk_shell_m3`, whose real keys check Vim's Ctrl+G
+  and Ctrl+N and Ctrl+G in the PDF's search entry; `gtk_keys`, Ctrl+N with Vim in every mode.
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep

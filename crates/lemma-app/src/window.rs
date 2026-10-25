@@ -40,7 +40,7 @@ use crate::review_ui::{self, ReviewController};
 use crate::saver::SaveError;
 use crate::settings::{self, ConfigFile, LiveConfig, Settings, SettingsFiles};
 use crate::workspace::{Workspace, normalize};
-use crate::{changes_panel, diagnostics_panel, review_persist};
+use crate::{changes_panel, diagnostics_panel, file_commands, review_persist};
 use crate::{
     find_bar, git_gutter, history_ui, labels, lint, outline_panel, palette, pdf, prefs, quick_open,
     quickfix, search_panel, session, shortcuts, wordcount,
@@ -76,7 +76,8 @@ pub struct Header {
     pub review_summary: adw::Bin,
     /// The main menu (the header's menu button), in sections.
     pub menu: gio::Menu,
-    /// Its file section (Save All, Close Tab); local history adds "Restore from History…".
+    /// Its file section (New File, Save As, Save All, Close Tab); local history adds "Restore
+    /// from History…".
     pub menu_files: gio::Menu,
     /// Its navigation section (M3: Command Palette, Go to File, Find in Project).
     pub menu_go: gio::Menu,
@@ -1122,7 +1123,7 @@ impl WindowState {
             }
         }
         self.refresh_vim_status();
-        self.refresh_find_actions();
+        self.refresh_editor_actions();
     }
 
     fn enable_vim_on(self: &Rc<Self>, editor: &Rc<Editor>) {
@@ -1159,15 +1160,32 @@ impl WindowState {
     }
 
     /// VimIMContext's `write` signal (`:w [path]`), and `:w! [path]` (`overwrite`, which also
-    /// writes a file another program changed).
+    /// writes a file another program changed, or a `path` that exists). A `path` that is not
+    /// the document's own gets a copy of the text (`file_commands::write_copy`).
     fn vim_write(self: &Rc<Self>, editor: &Rc<Editor>, path: Option<&str>, overwrite: bool) {
-        let doc = editor.document();
-        match path.filter(|p| !p.is_empty()) {
-            Some(p) if normalize(&self.workspace.root().path().join(p)) != doc.path() => {
-                self.toast("Writing to another file is not supported");
-            }
-            _ => self.user_save(doc, overwrite),
+        if let Some(why) = path.and_then(vim::unsupported_file_name) {
+            self.toast(why);
+            return;
         }
+        let doc = editor.document();
+        let Some(target) = self.other_file(doc, path) else {
+            self.user_save(doc, overwrite);
+            return;
+        };
+        let (state, doc) = (self.clone(), doc.clone());
+        glib::spawn_future_local(async move {
+            if let Err(e) = file_commands::write_copy(&state, &doc, &target, overwrite).await {
+                state.toast(&e);
+            }
+        });
+    }
+
+    /// The file an ex command's `path` names (relative to the project root), when it is not
+    /// `doc`'s own.
+    fn other_file(&self, doc: &Document, path: Option<&str>) -> Option<PathBuf> {
+        let path = path.filter(|p| !p.is_empty())?;
+        let target = normalize(&self.workspace.root().path().join(path));
+        (target != doc.path()).then_some(target)
     }
 
     /// VimIMContext's `edit` signal: `:e path` opens `path`, relative to the project root; `:e`
@@ -1206,8 +1224,8 @@ impl WindowState {
 
     /// VimIMContext's `execute-command` signal, which sees every ex command before Vim runs it.
     /// The review controller gets the first look; then the file and tab commands GtkSourceView
-    /// does not implement (`:wq`, `:wa`, `:q`, `:qa`, …) are handled here. Returns true when the
-    /// command was handled.
+    /// does not implement (`:wq`, `:wa`, `:sav`, `:q`, `:qa`, …) are handled here. Returns true
+    /// when the command was handled.
     ///
     /// Runs inside the Vim context's key handling: nothing here may close the editor
     /// synchronously.
@@ -1244,18 +1262,17 @@ impl WindowState {
                 true
             }
             FileCommand::Write {
-                path: Some(_),
-                quit: true,
-                ..
-            } => {
-                self.toast("Writing to another file is not supported");
-                true
-            }
-            FileCommand::Write {
-                path: None,
+                path,
                 quit: true,
                 force,
             } => {
+                if let Some(why) = path.as_deref().and_then(vim::unsupported_file_name) {
+                    self.toast(why);
+                    return true;
+                }
+                // `:wq path` writes a copy, then closes as `:q` does (`:wq!` as `:q!`).
+                let copy = self.other_file(editor.document(), path.as_deref());
+                let discard = copy.is_some() && force;
                 // The editor may close (and go) while the save runs.
                 let (state, doc, editor) = (
                     self.clone(),
@@ -1263,15 +1280,50 @@ impl WindowState {
                     Rc::downgrade(editor),
                 );
                 glib::spawn_future_local(async move {
-                    let result = if force {
-                        doc.save_overwriting().await
-                    } else {
-                        doc.save().await
+                    let written = match copy {
+                        Some(target) => {
+                            let result =
+                                file_commands::write_copy(&state, &doc, &target, force).await;
+                            if let Err(e) = &result {
+                                state.toast(e);
+                            }
+                            result.is_ok()
+                        }
+                        None => {
+                            let result = if force {
+                                doc.save_overwriting().await
+                            } else {
+                                doc.save().await
+                            };
+                            let saved = result.is_ok();
+                            state.after_user_save(&doc, result);
+                            saved
+                        }
                     };
-                    let saved = result.is_ok();
-                    state.after_user_save(&doc, result);
-                    if saved && let Some(editor) = editor.upgrade() {
-                        state.close_editor(&editor, false);
+                    if written && let Some(editor) = editor.upgrade() {
+                        state.close_editor(&editor, discard);
+                    }
+                });
+                true
+            }
+            FileCommand::SaveAs { path: None, .. } => {
+                self.toast("Argument required: :saveas needs a file name");
+                true
+            }
+            FileCommand::SaveAs {
+                path: Some(path),
+                force,
+            } => {
+                if let Some(why) = vim::unsupported_file_name(&path) {
+                    self.toast(why);
+                    return true;
+                }
+                let path = self.workspace.root().path().join(path);
+                let (state, editor) = (self.clone(), editor.clone());
+                // The old tab closes once the file is written, long after this key.
+                glib::spawn_future_local(async move {
+                    if let Err(e) = file_commands::save_as(&state, &editor, &path, force).await {
+                        state.toast(&e);
                     }
                 });
                 true
@@ -1355,6 +1407,18 @@ impl WindowState {
             editor.buffer().set_modified(false);
         }
         self.tab_view.close_page(&page);
+    }
+
+    /// Moves `new`'s tab to where `old`'s is, selects it and closes `old`, discarding its unsaved
+    /// changes (Save As: `new` shows the file `old` was saved as). With `old`'s tab closed
+    /// already, `new` is only selected.
+    pub fn replace_tab(self: &Rc<Self>, old: &Editor, new: &Editor) {
+        if let (Some(old_page), Some(new_page)) = (self.page_of(old), self.page_of(new)) {
+            let at = self.tab_view.page_position(&old_page);
+            self.tab_view.reorder_page(&new_page, at);
+        }
+        self.select_editor(new);
+        self.close_editor(old, true);
     }
 
     /// Throws away the unsaved changes of `doc`, whose tab is about to close. A document under
@@ -1471,6 +1535,8 @@ impl WindowState {
         };
         simple("save", |s| s.save_active());
         simple("save-all", |s| s.save_all());
+        simple("new-file", file_commands::new_file_dialog);
+        simple("save-as", file_commands::save_as_dialog);
         simple("close-tab", |s| {
             if let Some(page) = s.tab_view.selected_page() {
                 s.tab_view.close_page(&page);
@@ -1546,6 +1612,7 @@ impl WindowState {
         simple("find-replace", find_bar::show_replace);
         simple("find-next", |s| find_bar::step(s, true));
         simple("find-prev", |s| find_bar::step(s, false));
+        simple("goto-line", quick_open::show_goto_line);
 
         let detach = gio::SimpleAction::new_stateful("pdf-detach", None, &false.into());
         let state = Rc::downgrade(self);
@@ -1567,9 +1634,10 @@ impl WindowState {
         ));
         // Ctrl+F searches the PDF only while it has the focus, and finds in the file only while
         // an editor or the find bar has it and Vim is off; elsewhere the key stays the focused
-        // widget's (Vim's page down).
+        // widget's (Vim's page down). Ctrl+G (Go to Line) likewise, so the PDF's search entry
+        // keeps it (next match) and Vim too.
         self.set_action_enabled(PDF_SEARCH_ACTION, false);
-        self.refresh_find_actions();
+        self.refresh_editor_actions();
         let state = Rc::downgrade(self);
         window.connect_focus_widget_notify(move |window| {
             if let Some(state) = state.upgrade() {
@@ -1590,10 +1658,10 @@ impl WindowState {
     }
 
     /// The keyboard focus moved to `focus`: `win.pdf-search` is enabled while it is inside the
-    /// PDF pane, the find actions while it is in an editor or the find bar (and Vim is off, see
-    /// [`WindowState::refresh_find_actions`]). Focus moving into a popover or a dialog (the
-    /// command palette) leaves them as they were, so the palette sees the state of the window
-    /// behind it.
+    /// PDF pane, the find actions and Go to Line while it is in an editor or the find bar (and
+    /// Vim is off, see [`WindowState::refresh_editor_actions`]). Focus moving into a popover or
+    /// a dialog (the command palette) leaves them as they were, so the palette sees the state
+    /// of the window behind it.
     fn focus_moved(&self, focus: Option<&gtk::Widget>) {
         let Some(focus) = focus else {
             return;
@@ -1608,14 +1676,15 @@ impl WindowState {
         self.set_action_enabled(PDF_SEARCH_ACTION, in_pdf);
         self.editor_focused
             .set(focus.is_ancestor(&self.tab_view) || focus.is_ancestor(&self.find_slot));
-        self.refresh_find_actions();
+        self.refresh_editor_actions();
     }
 
-    /// Enables the find actions while an editor or the find bar has the focus and Vim is off:
-    /// with Vim on, Ctrl+F and Ctrl+H are Vim's own keys, and Vim searches with `/`.
-    fn refresh_find_actions(&self) {
+    /// Enables the find actions and Go to Line while an editor or the find bar has the focus
+    /// and Vim is off: with Vim on, Ctrl+F, Ctrl+H and Ctrl+G are Vim's own keys (Vim searches
+    /// with `/` and goes to a line with `:12`).
+    fn refresh_editor_actions(&self) {
         let enabled = self.editor_focused.get() && !self.vim_enabled();
-        for name in FIND_ACTIONS {
+        for name in EDITOR_ACTIONS {
             self.set_action_enabled(name, enabled);
         }
     }
@@ -1953,9 +2022,16 @@ impl WindowState {
 /// The action enabled only while the PDF pane has the focus.
 const PDF_SEARCH_ACTION: &str = "pdf-search";
 
-/// The actions of the find bar, enabled only while an editor or the find bar has the focus and
-/// Vim is off (Ctrl+F is also `win.pdf-search`'s).
-const FIND_ACTIONS: [&str; 4] = ["find", "find-replace", "find-next", "find-prev"];
+/// The actions of the find bar and Go to Line, enabled only while an editor or the find bar has
+/// the focus and Vim is off (Ctrl+F is also `win.pdf-search`'s; Ctrl+G is the next match in the
+/// PDF's search entry).
+const EDITOR_ACTIONS: [&str; 5] = [
+    "find",
+    "find-replace",
+    "find-next",
+    "find-prev",
+    "goto-line",
+];
 
 /// Where an edit of the configuration file `path` is written: `path`, or what it points to when
 /// it is a symbolic link. Refuses a path that exists and is not a regular file (`/dev/null`).

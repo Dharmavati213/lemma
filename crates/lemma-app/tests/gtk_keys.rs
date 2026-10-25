@@ -1405,10 +1405,12 @@ mod real_input {
         f.wait("<Space>l to move two columns", || f.cursor() == (0, 2));
         assert_eq!(f.mode(), VimMode::Normal);
 
-        // 7. With Vim on, Ctrl+W and Ctrl+O in the editor are Vim's in every mode (insert mode:
-        //    Ctrl-W deletes the word before the cursor), not "close the tab" and "open a file";
-        //    with the focus elsewhere, or with Vim off, they are those actions again.
+        // 7. With Vim on, Ctrl+W, Ctrl+O and Ctrl+N in the editor are Vim's in every mode
+        //    (insert mode: Ctrl-W deletes the word before the cursor), not "close the tab",
+        //    "open a file" and "new file"; with the focus elsewhere, or with Vim off, they are
+        //    those actions again.
         let (closed, opened) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let created = Rc::new(Cell::new(0));
         let close_tab = gio::SimpleAction::new("close-tab", None);
         let count = closed.clone();
         close_tab.connect_activate(move |_, _| count.set(count.get() + 1));
@@ -1417,6 +1419,10 @@ mod real_input {
         let count = opened.clone();
         open.connect_activate(move |_, _| count.set(count.get() + 1));
         f.state.app.add_action(&open);
+        let new_file = gio::SimpleAction::new("new-file", None);
+        let count = created.clone();
+        new_file.connect_activate(move |_, _| count.set(count.get() + 1));
+        f.state.window.add_action(&new_file);
         let tabs = f.state.editors().len();
         f.set_cursor(1, 0);
         browser.keys("A foo bar");
@@ -1429,16 +1435,18 @@ mod real_input {
         });
         assert!(f.text().contains("line 1 foo \n"), "{:?}", f.text());
         browser.keys("<C-o>");
+        browser.keys("<C-n>");
         common::pump_for(Duration::from_millis(50));
         browser.keys("<Esc>");
         f.wait("normal mode after Esc", || f.mode() == VimMode::Normal);
         browser.keys("<C-w>");
         browser.keys("<C-o>");
+        browser.keys("<C-n>");
         common::pump_for(Duration::from_millis(50));
         assert_eq!(
-            (closed.get(), opened.get()),
-            (0, 0),
-            "Ctrl+W/Ctrl+O reached the accelerators while Vim had the keys"
+            (closed.get(), opened.get(), created.get()),
+            (0, 0, 0),
+            "Ctrl+W/Ctrl+O/Ctrl+N reached the accelerators while Vim had the keys"
         );
         assert_eq!(f.state.editors().len(), tabs, "no tab closed");
         // The focus outside the editor: the accelerators.
@@ -1450,6 +1458,10 @@ mod real_input {
         });
         browser.keys("<C-o>");
         f.wait("Ctrl+O outside the editor to open", || opened.get() == 1);
+        browser.keys("<C-n>");
+        f.wait("Ctrl+N outside the editor for a new file", || {
+            created.get() == 1
+        });
         // Vim off: the accelerators in the editor too.
         f.state.set_vim_enabled(false);
         f.view().grab_focus();
@@ -1458,6 +1470,8 @@ mod real_input {
         f.wait("Ctrl+W without Vim to close the tab", || closed.get() == 2);
         browser.keys("<C-o>");
         f.wait("Ctrl+O without Vim to open", || opened.get() == 2);
+        browser.keys("<C-n>");
+        f.wait("Ctrl+N without Vim for a new file", || created.get() == 2);
 
         keys::unregister(f.view(), probe);
     }

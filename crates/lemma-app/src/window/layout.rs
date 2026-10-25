@@ -180,7 +180,9 @@ fn build_header() -> Header {
 
     let menu = gio::Menu::new();
     let files = gio::Menu::new();
-    files.append(Some("Save _All"), Some("win.save-all"));
+    files.append(Some("_New File…"), Some("win.new-file"));
+    files.append(Some("Save _As…"), Some("win.save-as"));
+    files.append(Some("Save A_ll"), Some("win.save-all"));
     files.append(Some("_Close Tab"), Some("win.close-tab"));
     menu.append_section(None, &files);
     let go = gio::Menu::new();

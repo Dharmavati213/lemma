@@ -969,6 +969,44 @@ impl Picker {
         }
     }
 
+    /// Types `query` into the entry with the cursor after it, so that what the user types next
+    /// goes after it (Go to Line's `:`). The dialog's focus handling selects the entry's whole
+    /// text once it has opened (on a later main-loop turn, and in an entry that has the focus
+    /// already), and the next key would replace it: until the text first changes, such a
+    /// selection is undone before any key is handled.
+    pub fn type_query(&self, query: &str) {
+        self.entry.set_text(query);
+        self.entry.set_position(-1);
+        self.refresh();
+        let Some(text) = self.entry.delegate() else {
+            return;
+        };
+        let all = Some((0, query.chars().count() as i32));
+        let handlers: Rc<RefCell<Vec<glib::SignalHandlerId>>> = Rc::default();
+        let selected = text.connect_notify_local(Some("selection-bound"), move |text, _| {
+            if text.selection_bounds() != all {
+                return;
+            }
+            // After the selecting call is done; at a priority above the input events'.
+            let text = text.downgrade();
+            glib::idle_add_local_full(glib::Priority::HIGH, move || {
+                if let Some(text) = text.upgrade()
+                    && text.selection_bounds() == all
+                {
+                    text.set_position(-1);
+                }
+                glib::ControlFlow::Break
+            });
+        });
+        let watching = handlers.clone();
+        let changed = text.connect_changed(move |text| {
+            for id in watching.borrow_mut().drain(..) {
+                text.disconnect(id);
+            }
+        });
+        handlers.borrow_mut().extend([selected, changed]);
+    }
+
     /// Moves the selection by `delta` rows, stopping at the ends.
     pub fn move_selection(&self, delta: i32) {
         let n = self.store.n_items() as i32;

@@ -1038,7 +1038,9 @@ they conflict with the sections above, this section wins.
     matches, so typing the query never scans the file in one go (§3 rule 1).
 - **Keys (§9.3):**
   - The key layer runs before VimIMContext (verified).
-  - With Vim on and an editor focused, Ctrl+W and Ctrl+O go to Vim.
+  - With Vim on and an editor focused, Ctrl+W, Ctrl+O and Ctrl+N (New File; Vim's next line) go
+    to Vim (`keys::is_vim_accelerator_key`); the menu, the palette and the keys elsewhere still
+    run Close Tab, Open and New File.
   - Bold (Ctrl+B) and Italic (Ctrl+I) are disabled while Vim is on, so those keys are Vim's
     (page up, jump forward), as `win.pdf-search` lets Ctrl+F through outside the PDF. Toggle
     Comment (Ctrl+/) works in every mode. With another text field focused (the agent's prompt,
@@ -1058,6 +1060,10 @@ they conflict with the sections above, this section wins.
     with Up and Down, in the empty box or in a recalled prompt nobody edited, on its first
     (last) line as wrapped; while suggestions show, Up and Down are theirs. They are plain keys
     of a text field that is not an editor, so neither Vim nor the accelerators are involved.
+  - Go to Line (`win.goto-line`, Ctrl+G) is enabled under the find bar's rule, so Vim keeps
+    Ctrl+G (`:42` goes to a line there) and the PDF's search entry its Ctrl+G (next match). Save
+    As's Ctrl+Shift+S is no Vim key. The window's accelerators do not reach a dialog: in the
+    pickers Ctrl+N stays Down (verified on real keys).
 - **Memory (§7):**
   - The 60 s inactive cache trim is implemented, and closed tabs free their view and buffer.
   - Idle PSS depends on how many other GTK processes share the libraries. Under Broadway, idle measures about 92 MB RSS
@@ -1177,6 +1183,27 @@ they conflict with the sections above, this section wins.
     character boundary with `…`, and the whole length in `bytes`; a stop clears the records.
   - The API backend appends streamed text, thinking and signature deltas to their block in
     place (a block of n bytes in k deltas cost O(n·k) bytes of copying).
+- **Files and lines (2026-10-25):**
+  - Go to Line is quick open with `:` typed (`quick_open::parse_query`): `:N[:C]` in the active
+    document, `path:N[:C]` in the files that match `path` (an exact path first). It goes through
+    `goto::navigate` with `GotoTarget::LineColumn` (0-based; the column visual, as the status
+    bar's; lines counted as Vim does, `goto::last_line`), so Alt+Left returns.
+  - New File (`win.new-file`) and Save As (`win.save-as`; `:sav[eas][!] path`) are
+    `file_commands`. New File opens the path chosen in a save dialog (a missing file is an empty
+    document that its first save creates, an existing one opens as it is). Save As writes the
+    text through a new closed document of the workspace (`Workspace::insert_closed`, the old
+    document's charset, `DiskState::Absent`, so without `!` a file that exists is refused) whose
+    saver records the write as Lemma's own, opens that document in the old tab's place and closes
+    the old one discarding its unsaved changes (its file is untouched; undo history is not
+    carried over). Refused while the agent is busy (`panel::is_busy`) and while the document has
+    undecided hunks; a path that another tab, a review or unsaved changes of a closed document
+    hold is refused too (a closed document holding only what is on disk is released first).
+  - Vim's `:w path` (another file) writes a copy the same way and releases its document again;
+    the current document stays as it is. It is also refused in the agent's grace window after a
+    turn (`bridge::in_agent_window`), where the file monitor would review the new file as the
+    agent's. `:wq path` writes the copy, then closes as `:q` (`:wq!` as `:q!`). GtkSourceView
+    passes `:w`'s name on as typed, so `:w !cmd`, `:w >> file` and names with `%` or `#` are
+    refused with a toast (`vim::unsupported_file_name`) rather than written as files of that name.
 
 ## 12. macOS (2026-10-19)
 

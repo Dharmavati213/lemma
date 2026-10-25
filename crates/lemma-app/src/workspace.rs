@@ -487,7 +487,8 @@ impl Workspace {
     /// the workspace already has. The caller records what the file holds on disk
     /// (`doc.saver.set_loaded`); until then saves do not check the file. Used by the file monitor
     /// to review a file that another program changed during an agent turn against its text from
-    /// the turn snapshot.
+    /// the turn snapshot, and by Save As and `:w path` (`file_commands`) to write a new file as
+    /// Lemma's own.
     pub(crate) fn insert_closed(&self, path: &Path, text: String) -> DocRef {
         let path = normalize(path);
         if let Some(doc) = self.get(&path) {
