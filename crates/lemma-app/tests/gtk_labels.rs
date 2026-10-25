@@ -18,7 +18,7 @@ use lemma_app::editor::{Editor, annotations, completion, goto};
 use lemma_app::labels::{self, Finding, NameKind};
 use lemma_app::review_ui::{self, Decision, GroupKind};
 use lemma_app::workspace::normalize;
-use lemma_core::DiagSource;
+use lemma_core::{DiagSource, Origin, TextEdit};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -47,6 +47,10 @@ fn main() -> ExitCode {
             undefined_past_the_cap,
         ),
         ("problems_page_references_section_and_fix", problems_page),
+        (
+            "problems_keep_the_lines_of_a_file_edited_before_its_tab",
+            problems_of_a_file_opened_later,
+        ),
         ("unused_labels_and_entries_on_demand", unused),
         ("find_references_lists_uses_across_the_project", references),
         ("find_references_of_a_citation_key", cite_references),
@@ -438,6 +442,43 @@ fn undefined_past_the_cap() {
             ("missing".to_owned(), last - 10, NameKind::Cite),
             ("nowhere".to_owned(), last - 10, NameKind::Label),
         ]
+    );
+}
+
+/// A chapter's undefined reference, published while the chapter was neither open nor in the
+/// workspace, keeps its line on the Problems page when the chapter is edited without a tab (as
+/// an agent's edit loads it) and then opened: the edit leaves the finding as it was, so the
+/// check does not publish it again, and the tab's panel had no lines to follow it with.
+fn problems_of_a_file_opened_later() {
+    let f = fixture("labels-problems-later");
+    let chapter = f.path("chapters/ch1.tex");
+    std::fs::write(&chapter, format!("{CHAPTER}See \\ref{{sec:nowhere}}.\n")).unwrap();
+    let _main = f.open("main.tex");
+    f.wait_index();
+    f.wait_checks();
+    let panel = f.state.build.get().unwrap().diagnostics();
+    let line = || {
+        panel
+            .findings(DiagSource::Labels)
+            .iter()
+            .find(|x| x.problem.message.contains("sec:nowhere"))
+            .map(|x| x.problem.line)
+    };
+    assert_eq!(line(), Some(Some(4)));
+    let doc = block_on(f.state.workspace.get_or_load(&chapter)).expect("the chapter");
+    let end = doc.text().len();
+    doc.apply_edits(
+        &[TextEdit::insert(end, "% a note\n")],
+        Origin::Agent { call: 1 },
+    )
+    .expect("valid edit");
+    f.wait_checks();
+    let _chapter = f.open("chapters/ch1.tex");
+    f.wait_checks();
+    assert_eq!(
+        line(),
+        Some(Some(4)),
+        "the finding's line once the tab is open"
     );
 }
 

@@ -161,10 +161,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - The Problems page is one list that makes widgets only for the rows near the ones on screen
   (about 200) and replaces only the files whose rows changed, where it made a row of widgets for
   each of up to 500 build problems and 500 findings of each section, and made them all again
-  for any change. A build with 3000 warnings and bad boxes, the page shown, costs the page
-  about half the main thread's time it did (on a busy machine, 0.23 s instead of 0.46 s), with
-  no step over 120 ms instead of 250 ms; and the PDF is asked for before the page lists the
-  problems.
+  for any change. With the page shown, a build with 3000 warnings and bad boxes now costs the
+  page about half the main thread's time it took with those 500 rows, with no step over 120 ms
+  instead of 250 ms, and the PDF is asked for before the page lists the problems.
 - Undefined references and citations reach the Problems page at once, and only those of the
   files whose names changed, not every file's one file at a time, each of which listed the
   section's rows again. Enter in one of 40 chapters with 400 undefined references in all held
@@ -214,17 +213,17 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   the preview after typing other text costs under 0.5 ms instead of 5 ms.
 - Inline equation numbers look each label up once: a refresh of a 60k-line document with 5000
   labels takes 8 ms instead of 49 ms. The Unused dialog names its labels the same way.
-- With thousands of hunks in a file (a Format Document, a project-wide replace), the review
-  overlay re-tags only what moved: with 3000 hunks, its update after a recompute takes 10 ms
-  instead of 85 ms, and after a line break above them 36 ms instead of 0.34 s.
-- Deciding and typing in a file with thousands of hunks no longer takes a large fraction of a
-  second each time. The review overlay gave every hunk a tag of its own, and every tag in a
-  buffer slows down all of its tag changes; it also took the green of the added lines and
-  changed words off the whole file and put it back after every decision and after typing in a
-  hunk. Hunks that reserve the same space above their line now share a tag (a few tags instead
-  of thousands), and the overlay changes the tags of the lines that changed only. With 3000
-  hunks, Alt+Y or Alt+N takes 20 ms instead of 0.43 s, and the pause after typing in a hunk
-  18 ms instead of 0.37 s; with 5000 hunks, Accept all in the file takes 0.1 s instead of
+- Deciding and typing in a file with thousands of hunks (a Format Document, a project-wide
+  replace) no longer takes a large fraction of a second each time. The review overlay gave
+  every hunk a tag of its own, and every tag in a buffer slows down all of its tag changes; it
+  also looked for each hunk in its layout cache one by one, and took the green of the added
+  lines and changed words off the whole file and put it back after every decision and after
+  typing in a hunk. Hunks that reserve the same space above their line now share a tag (a few
+  tags instead of thousands), and the overlay changes the tags of the lines that changed only.
+  With 3000 hunks, its update after a recompute takes 10 ms instead of 85 ms, Alt+Y or Alt+N
+  20 ms instead of 0.43 s, and the pause after typing in a hunk 18 ms instead of 0.37 s. With
+  5000 hunks in an open file, the whole action with the overlay, measured before the review's
+  own part of Accept all got faster too (below): Accept all in the file 0.1 s instead of
   0.67 s, Keep Turn 0.1 s instead of 0.64 s, Reject all 0.4 s instead of 1.3 s, Reject Turn
   0.4 s instead of 2.2 s, the agent's edit that makes them 0.56 s instead of 1.1 s, and a
   keystroke 0.25 ms instead of 0.46 ms (p99). While typing moves hunks, the gutter's red
@@ -248,8 +247,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   about 16 MB: 200 changes of 100 KB each kept 60 MB of them.
 - Accept all, Keep Turn and Keep on a Replace in Project group of the Changes panel take
   thousands of changes in a large file at once instead of rewriting the rest of the file after
-  each one: 5000 changes in a 60 000-line file take about 10 ms instead of 0.15 s, 20 000 about
-  50 ms instead of 0.5 s.
+  each one. The review's own work for 5000 changes in a 60 000-line file (all of it for a file
+  that is not open) takes about 10 ms instead of 0.15 s, for 20 000 about 50 ms instead of
+  0.5 s.
 - With thousands of changes under review in a large file, the review no longer works out again
   which words changed in each change after every typing pause, decision or agent edit: a change
   whose text is the same as before keeps its highlighted words. With 5000 changes in a

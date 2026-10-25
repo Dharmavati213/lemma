@@ -36,7 +36,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Why a build was requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +203,7 @@ impl BuildController {
     /// Resolves to the PDF's path.
     pub fn show_existing_pdf(&self) -> impl Future<Output = Result<PathBuf, String>> + use<> {
         let inner = self.inner.clone();
-        async move { inner.show_existing_pdf().await }
+        async move { inner.show_existing_pdf(false).await }
     }
 
     /// How many root detections ran on the jobs thread (tests: a tab switch that changed
@@ -390,8 +390,11 @@ impl Inner {
     }
 
     /// [`Inner::detect_for_active`] for a tab switch (`show_existing_pdf`): while no document
-    /// changed since, the active document's last detection. Switching between tabs while no
-    /// PDF is shown copied and indexed every document again on each switch.
+    /// changed since, the active document's last detection that found a root, for
+    /// [`TAB_DETECTION_REUSE`]. Switching between tabs while no PDF is shown copied and indexed
+    /// every document again on each switch. Detection also reads files that are not open (the
+    /// documents nearby, the root), which a checkout or another editor may change: a detection
+    /// without a root is not kept, and one with a root only for a few seconds.
     async fn detect_for_tab(&self, state: &Rc<WindowState>) -> Result<Detection, Option<String>> {
         let Some(active) = state
             .active_editor()
@@ -412,13 +415,17 @@ impl Inner {
         {
             let cache = self.tab_detections.borrow();
             if cache.documents == documents
-                && let Some((made_with, detection)) = cache.by_document.get(&active)
+                && let Some((made_with, at, detection)) = cache.by_document.get(&active)
                 && *made_with == inputs
+                && at.elapsed() < TAB_DETECTION_REUSE
             {
                 return Ok(detection.clone());
             }
         }
         let detection = self.detect_for_active(state, None).await?;
+        if detection.root.is_none() {
+            return Ok(detection);
+        }
         let mut cache = self.tab_detections.borrow_mut();
         if cache.documents != documents {
             // Made from these versions: a document changed since is detected again next time.
@@ -429,7 +436,7 @@ impl Inner {
         }
         cache
             .by_document
-            .insert(active, (inputs, detection.clone()));
+            .insert(active, (inputs, Instant::now(), detection.clone()));
         Ok(detection)
     }
 
@@ -649,12 +656,16 @@ impl Inner {
         state.toasts.add_toast(toast);
     }
 
-    async fn show_existing_pdf(self: &Rc<Self>) -> Result<PathBuf, String> {
+    /// [`BuildController::show_existing_pdf`]; `tab_switch` reuses a recent detection
+    /// ([`Inner::detect_for_tab`]).
+    async fn show_existing_pdf(self: &Rc<Self>, tab_switch: bool) -> Result<PathBuf, String> {
         let state = self.state.upgrade().ok_or("the window is gone")?;
-        let detection = self
-            .detect_for_tab(&state)
-            .await
-            .map_err(|e| e.unwrap_or_else(|| "the window is gone".into()))?;
+        let detection = if tab_switch {
+            self.detect_for_tab(&state).await
+        } else {
+            self.detect_for_active(&state, None).await
+        };
+        let detection = detection.map_err(|e| e.unwrap_or_else(|| "the window is gone".into()))?;
         let root = detection.root.ok_or("could not find the main document")?;
         if self.remembered_root.borrow().is_none() {
             self.remembered_root.replace(Some(root.clone()));
@@ -949,14 +960,18 @@ struct DetectInput {
     forced_root: Option<PathBuf>,
 }
 
-/// The root detections of tab switches (`Inner::detect_for_tab`): by active document, with the
-/// roots they were made with, all from `documents` (every document's path and version when
-/// they were made).
+/// The root detections of tab switches (`Inner::detect_for_tab`) that found a root: by active
+/// document, with the roots they were made with and when, all from `documents` (every
+/// document's path and version when they were made).
 #[derive(Default)]
 struct TabDetections {
     documents: Vec<(PathBuf, u64)>,
-    by_document: HashMap<PathBuf, (MadeWith, Detection)>,
+    by_document: HashMap<PathBuf, (MadeWith, Instant, Detection)>,
 }
+
+/// How long a tab switch reuses a detection ([`TabDetections`]): long enough for switching back
+/// and forth, short enough that a change on disk (an `\include` added by a checkout) is seen.
+const TAB_DETECTION_REUSE: Duration = Duration::from_secs(5);
 
 /// The remembered root and the user's chosen root a detection was made with.
 type MadeWith = (Option<PathBuf>, Option<PathBuf>);
@@ -1285,7 +1300,7 @@ pub fn install(state: &Rc<WindowState>) -> BuildController {
             .unwrap_or(true);
         if !has_pdf {
             glib::spawn_future_local(async move {
-                if let Err(e) = inner.show_existing_pdf().await {
+                if let Err(e) = inner.show_existing_pdf(true).await {
                     tracing::debug!("no earlier PDF to show: {e}");
                 }
             });

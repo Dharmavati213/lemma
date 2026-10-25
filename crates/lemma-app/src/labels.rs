@@ -262,6 +262,13 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         changed,
     });
     underline(&labels, editor);
+    // Findings published while the document was closed and not in the workspace have no
+    // lines on the Problems page once it opens (they had nothing to follow the edits with): its
+    // findings are published again, with the lines the project index has now.
+    if !findings_for(&labels, doc.path()).is_empty() {
+        let path = crate::workspace::normalize(doc.path());
+        publish_problems(state, &labels, &BTreeSet::from([path]));
+    }
     schedule_check(state, CHECK_DELAY);
 }
 

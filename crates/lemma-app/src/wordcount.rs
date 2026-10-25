@@ -12,8 +12,8 @@
 //!   on a click). The size is that of the root and the files it includes as they are on disk,
 //!   found on the jobs thread ([`project_size`]): when a root is first shown, the project index
 //!   has not read its includes yet. A newer count stops a running one, and closing the window
-//!   or quitting stops it too: texcount is killed at once ([`Stop`]), so it never outlives
-//!   Lemma.
+//!   or quitting stops every count, a selection's too: texcount is killed at once ([`Stop`]),
+//!   so it never outlives Lemma.
 //! - **The breakdown:** clicking the item opens a popover with the parts of the total and one
 //!   row per part, chapter and section (texcount's subcounts, `\section{…}\label{…}` titles
 //!   cleaned), plus the selection's count.
@@ -32,7 +32,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -248,8 +248,18 @@ pub fn count_document(program: &Path, root: &Path, stop: &Stop) -> Result<WordCo
         let _ = stdout.read_to_end(&mut out);
         out
     });
+    let status = wait_for(child, stop);
+    let out = reader.join().unwrap_or_default();
+    let status = status?;
+    let out = String::from_utf8_lossy(&out);
+    parse(&out).ok_or_else(|| CountError::Failed(format!("unexpected output ({status})")))
+}
+
+/// Waits for texcount, held in `stop` while it runs: [`Stop::stop`] kills it
+/// ([`CountError::Cancelled`]).
+fn wait_for(child: Child, stop: &Stop) -> Result<ExitStatus, CountError> {
     stop.lock().replace(child);
-    let status = loop {
+    loop {
         let mut guard = stop.lock();
         if stop.is_stopped() {
             // Out of the lock first: `Stop::stop` on the main thread must not wait for this.
@@ -257,14 +267,13 @@ pub fn count_document(program: &Path, root: &Path, stop: &Stop) -> Result<WordCo
             drop(guard);
             let _ = child.kill();
             let _ = child.wait();
-            let _ = reader.join();
             return Err(CountError::Cancelled);
         }
         let waited = guard.as_mut().expect("the running texcount").try_wait();
         match waited {
             Ok(Some(status)) => {
                 guard.take();
-                break status;
+                return Ok(status);
             }
             Ok(None) => {
                 drop(guard);
@@ -275,10 +284,7 @@ pub fn count_document(program: &Path, root: &Path, stop: &Stop) -> Result<WordCo
                 return Err(CountError::Failed(e.to_string()));
             }
         }
-    };
-    let out = reader.join().unwrap_or_default();
-    let out = String::from_utf8_lossy(&out);
-    parse(&out).ok_or_else(|| CountError::Failed(format!("unexpected output ({status})")))
+    }
 }
 
 /// The size in bytes of `root` and the files it includes (`\input`, `\include`, `\subfile`,
@@ -331,8 +337,12 @@ fn read_source(path: &Path, cap: u64) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Counts the words of `text` (a selection; blocking).
-pub fn count_text(program: &Path, text: &str) -> Result<u64, CountError> {
+/// Counts the words of `text` (a selection; blocking). [`Stop::stop`] on `stop` kills texcount
+/// ([`CountError::Cancelled`]): a few MB of selection keep it busy for tens of seconds.
+pub fn count_text(program: &Path, text: &str, stop: &Stop) -> Result<u64, CountError> {
+    if stop.is_stopped() {
+        return Err(CountError::Cancelled);
+    }
     let mut child = lemma_core::process::command(program)
         .args(["-1", "-sum", "-utf8", "-"])
         .stdin(Stdio::piped())
@@ -341,19 +351,20 @@ pub fn count_text(program: &Path, text: &str) -> Result<u64, CountError> {
         .spawn()
         .map_err(spawn_error)?;
     let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
     let input = text.as_bytes().to_vec();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&input);
     });
-    let mut out = String::new();
-    let read = child
-        .stdout
-        .take()
-        .expect("piped stdout")
-        .read_to_string(&mut out);
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).map(|_| out)
+    });
+    let status = wait_for(child, stop);
     let _ = writer.join();
-    let _ = child.wait();
-    read.map_err(|e| CountError::Failed(e.to_string()))?;
+    let read = reader.join().unwrap_or_else(|_| Ok(String::new()));
+    status?;
+    let out = read.map_err(|e| CountError::Failed(e.to_string()))?;
     parse_single(&out).ok_or_else(|| CountError::Failed(format!("unexpected output {out:?}")))
 }
 
@@ -558,11 +569,22 @@ pub fn show(state: &Rc<WindowState>) {
         });
     glib::spawn_future_local(async move {
         let message = match selection {
-            Some(text) => gio::spawn_blocking(move || count_text(&program, &text))
-                .await
-                .map_err(|_| CountError::Failed("panicked".into()))
-                .and_then(|r| r)
-                .map(|n| format!("Selection: {}", words_label(n))),
+            Some(text) => {
+                // Stopped with the window too (`Counter::end`).
+                let stop = Arc::new(Stop::default());
+                counter.asked.borrow_mut().push(stop.clone());
+                let counting = stop.clone();
+                let result =
+                    gio::spawn_blocking(move || count_text(&program, &text, &counting)).await;
+                counter
+                    .asked
+                    .borrow_mut()
+                    .retain(|s| !Arc::ptr_eq(s, &stop));
+                result
+                    .map_err(|_| CountError::Failed("panicked".into()))
+                    .and_then(|r| r)
+                    .map(|n| format!("Selection: {}", words_label(n)))
+            }
             None => match root {
                 Some(root) => {
                     // Stopped with the window too (`Counter::end`).
@@ -807,15 +829,26 @@ impl Counter {
         {
             return;
         }
+        if self.ended.get() {
+            return;
+        }
         self.selection_running.set(true);
         let program = self.program.borrow().clone();
         let counter = self.clone();
+        // Stopped with the window too (`Counter::end`).
+        let stop = Arc::new(Stop::default());
+        self.asked.borrow_mut().push(stop.clone());
         glib::spawn_future_local(async move {
             let input = text.clone();
-            let result = gio::spawn_blocking(move || count_text(&program, &input))
+            let counting = stop.clone();
+            let result = gio::spawn_blocking(move || count_text(&program, &input, &counting))
                 .await
                 .unwrap_or_else(|_| Err(CountError::Failed("texcount panicked".into())))
                 .map_err(|e| e.to_string());
+            counter
+                .asked
+                .borrow_mut()
+                .retain(|s| !Arc::ptr_eq(s, &stop));
             counter.selection_running.set(false);
             counter.selection.replace(Some((text, result)));
             if counter.popover.is_visible() {
@@ -1069,5 +1102,36 @@ mod tests {
             let size = write("odd.tex", "\\input{fifo}\n\\input{zero}\n");
             assert_eq!(project_size(&odd, 1 << 20), size);
         }
+    }
+
+    /// A selection's count is stopped like a document's: texcount (here a stand-in that reads
+    /// its input and sleeps) is killed and the count is cancelled, whether the stop comes
+    /// while it runs or before it starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_selection_count_is_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lemma-count-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("texcount");
+        std::fs::write(&program, "#!/bin/sh\ncat > /dev/null\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stop = Arc::new(Stop::default());
+        let stopper = stop.clone();
+        let started = std::time::Instant::now();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            stopper.stop();
+        });
+        let result = count_text(&program, &"word ".repeat(100_000), &stop);
+        thread.join().unwrap();
+        assert!(matches!(result, Err(CountError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(stop.lock().is_none(), "texcount is not held after the stop");
+        assert!(matches!(
+            count_text(&program, "word", &stop),
+            Err(CountError::Cancelled)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

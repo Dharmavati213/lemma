@@ -83,6 +83,10 @@ fn main() -> ExitCode {
             "tab_switches_without_a_pdf_detect_the_root_once",
             tab_switches_detect_once,
         ),
+        (
+            "a_root_written_on_disk_is_found_on_the_next_tab_switch",
+            root_written_on_disk,
+        ),
     ])
 }
 
@@ -133,6 +137,38 @@ fn tab_switches_detect_once() {
     common::pump_until(TIMEOUT, || controller.requested_pdf().is_some());
     assert_eq!(controller.requested_pdf(), Some(dir.join("main.pdf")));
     assert_eq!(build.detections(), detections + 2);
+}
+
+/// A tab switch that found no root keeps no detection: once another program (a checkout,
+/// another editor) puts the `\input` of the active chapter back into the main document, the
+/// next switch finds it and shows the PDF an earlier build left. None of it is open in Lemma.
+fn root_written_on_disk() {
+    let dir = copy_proj("tab-detect-disk", true);
+    let main = std::fs::read_to_string(dir.join("main.tex")).unwrap();
+    let input = "\\input{chapters/yoneda}\n";
+    assert!(main.contains(input));
+    std::fs::write(dir.join("main.tex"), main.replace(input, "")).unwrap();
+    std::fs::write(dir.join("chapters/other.tex"), "Another chapter.\n").unwrap();
+    let state = window(&dir, config());
+    let other = open(&state, &dir.join("chapters/other.tex"));
+    let chapter = open(&state, &dir.join("chapters/yoneda.tex"));
+    let build = state.build.get().unwrap();
+    let controller = state.pdf.get().unwrap();
+    let switch = || {
+        state.select_editor(&other);
+        common::pump_for(Duration::from_millis(150));
+        state.select_editor(&chapter);
+        common::pump_for(Duration::from_millis(150));
+    };
+    switch();
+    switch();
+    assert_eq!(controller.requested_pdf(), None, "no root yet");
+    let detections = build.detections();
+    std::fs::write(dir.join("main.tex"), &main).unwrap();
+    switch();
+    common::pump_until(TIMEOUT, || controller.requested_pdf().is_some());
+    assert_eq!(controller.requested_pdf(), Some(dir.join("main.pdf")));
+    assert!(build.detections() > detections);
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);
