@@ -493,3 +493,6 @@ Scenarios that use `target/fixtures/*` need `scripts/build-fixtures.sh` first.
   host in a test. Key storage uses a fake `secret-tool`, never the user's keyring. latexindent
   formatting is tested through a fake script (`format::set_program`).
 - Tests write only to temp dirs, `$XDG_RUNTIME_DIR` (sockets) or `target/`.
+- No test starts another application: the PDF's Open in Another App and Show in Files go to
+  `PdfController::set_launch_hook` (`gtk_pdf`), web links in the PDF to `links::set_uri_hook`,
+  and scripted runs refuse both.

@@ -2,19 +2,26 @@
 //! generations, reloads after builds, and runs forward/inverse SyncTeX.
 //!
 //! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (page n/N, zoom
-//! out/in, fit width, dark pages) above the [`PdfView`]. The PDF thread starts with the first
-//! [`PdfController::open`]. Every open gets a new generation; the view keeps showing the previous
-//! generation until the new one has opened, and a PDF that fails to open leaves it in place. A
-//! new generation of the PDF shown keeps the scroll position; another PDF starts at the top. A
-//! build whose PDF has not changed since the last open (the same size and modification time)
-//! opens nothing ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the
-//! links, a search and a SyncTeX highlight stay as they are.
+//! out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's file) above the
+//! [`PdfView`]. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
+//! new generation; the view keeps showing the previous generation until the new one has opened,
+//! and a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the
+//! scroll position; another PDF starts at the top. A build whose PDF has not changed since the
+//! last open (the same size and modification time) opens nothing
+//! ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the links, a search
+//! and a SyncTeX highlight stay as they are.
 //!
 //! M3 (WP3.4): the controller also dispatches the PDF thread's answers to the [`links`],
 //! [`search`] and [`sidebar`] modules (each registers itself here when it installs), sends their
 //! commands, and merges the thumbnail requests of the strip and of the link preview into one
 //! latest-wins list. Its toolbar gains a search button; the search bar sits below the toolbar
 //! ([`PdfController::content`]).
+//!
+//! The PDF shown can be handed to another application: `win.pdf-open-external` opens it in the
+//! system's PDF viewer (to print it, present slides full screen, …) and `win.pdf-show-in-folder`
+//! shows it in the file manager (the build puts it in a hidden `.build` directory), both through
+//! `gtk::FileLauncher`. They are disabled until a PDF is shown. Scripted runs start no other
+//! application; tests route both with [`PdfController::set_launch_hook`].
 //!
 //! [`links`]: super::links
 //! [`search`]: super::search
@@ -31,6 +38,7 @@ use lemma_build::PdfStamp;
 use lemma_pdf::{PdfCmd, PdfEvent, PdfHandle, SyncBox, ThumbReq, Thumbnail};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -62,6 +70,32 @@ pdfview.lemma-pdf-view { background-color: color-mix(in srgb, var(--window-bg-co
 .lemma-pdf-content searchbar button { min-height: 26px; min-width: 26px; padding: 2px; }
 .lemma-pdf-search-count { min-width: 4.5em; }
 ";
+
+/// The actions that hand the PDF shown to another application (disabled while there is none).
+const HANDOFF_ACTIONS: [&str; 2] = ["pdf-open-external", "pdf-show-in-folder"];
+
+/// What another application does with the PDF shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// Opens it (the system's default application for PDFs): `win.pdf-open-external`.
+    Open,
+    /// Shows it selected in the file manager: `win.pdf-show-in-folder`.
+    ShowInFolder,
+}
+
+impl Handoff {
+    /// The toast when it fails.
+    fn failure(self) -> &'static str {
+        match self {
+            Handoff::Open => "Could not open the PDF",
+            Handoff::ShowInFolder => "Could not show the PDF in Files",
+        }
+    }
+}
+
+/// Hands the PDF to another application instead of `gtk::FileLauncher` (see
+/// [`PdfController::set_launch_hook`]); returns whether it did.
+pub type LaunchHook = dyn Fn(Handoff, &Path) -> bool;
 
 /// Who asked for thumbnails (see [`PdfController::set_thumbnail_wants`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +144,7 @@ struct Inner {
     strip: OnceCell<Rc<sidebar::Strip>>,
     /// The thumbnail requests of the preview and of the strip, sent as one list.
     thumb_wants: RefCell<(Vec<ThumbReq>, Vec<ThumbReq>)>,
+    launch_hook: RefCell<Option<Box<LaunchHook>>>,
 }
 
 struct Toolbar {
@@ -226,6 +261,13 @@ impl PdfController {
             return;
         }
         self.inner.send(PdfCmd::WantThumbnails(merged));
+    }
+
+    /// Routes `win.pdf-open-external` and `win.pdf-show-in-folder` to `hook` (with the PDF; it
+    /// returns whether it "opened" it) instead of `gtk::FileLauncher` (tests). `None` restores
+    /// the launcher.
+    pub fn set_launch_hook(&self, hook: Option<Box<LaunchHook>>) {
+        self.inner.launch_hook.replace(hook);
     }
 
     pub(super) fn set_search(&self, search: Rc<search::Search>) {
@@ -481,6 +523,7 @@ impl Inner {
         }
         self.stack.set_visible_child_name("pdf");
         self.refresh_dark();
+        self.enable_handoff();
         // M3: the modules follow the new document (after the view, which they read).
         if let Some(l) = self.links.get() {
             l.document_changed(generation);
@@ -585,6 +628,55 @@ impl Inner {
         self.refresh_dark();
     }
 
+    /// Enables the actions that hand the PDF to another application once one is shown.
+    fn enable_handoff(&self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let shown = self.shown.borrow().is_some();
+        for name in HANDOFF_ACTIONS {
+            if let Some(action) = state
+                .window
+                .lookup_action(name)
+                .and_downcast::<gio::SimpleAction>()
+            {
+                action.set_enabled(shown);
+            }
+        }
+    }
+
+    /// Hands the PDF shown to another application (or to the test hook), with a toast when it
+    /// cannot. Scripted runs start none.
+    fn hand_off(&self, handoff: Handoff) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some((_, pdf)) = self.shown.borrow().clone() else {
+            return;
+        };
+        if let Some(hook) = self.launch_hook.borrow().as_ref() {
+            if !hook(handoff, &pdf) {
+                state.toast(handoff.failure());
+            }
+            return;
+        }
+        if state.scripted {
+            state.toast("Other applications are not started from scripted runs");
+            return;
+        }
+        // The window the view is in (the PDF may have a window of its own).
+        let parent = self.view.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(&state);
+        glib::spawn_future_local(async move {
+            let result = launch(handoff, &pdf, parent.as_ref()).await;
+            if let (Err(e), Some(state)) = (result, weak.upgrade())
+                && !e.matches(gtk::DialogError::Dismissed)
+            {
+                state.toast(&format!("{}: {e}", handoff.failure()));
+            }
+        });
+    }
+
     fn refresh_toolbar(&self) {
         let view = &self.view;
         let count = view.page_count();
@@ -653,6 +745,60 @@ impl Drop for Inner {
     }
 }
 
+/// Hands `pdf` to the system: its default application for PDFs, or the file manager with the
+/// file selected.
+async fn launch(
+    handoff: Handoff,
+    pdf: &Path,
+    parent: Option<&gtk::Window>,
+) -> Result<(), glib::Error> {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(pdf)));
+    match handoff {
+        Handoff::Open => launcher.launch_future(parent).await,
+        // GTK selects the file through the file manager portal or the freedesktop file
+        // manager's D-Bus interface (on Windows, through Explorer); macOS has neither, and
+        // Finder's `open -R` selects it there.
+        Handoff::ShowInFolder if cfg!(target_os = "macos") => {
+            let argv = [
+                OsStr::new("/usr/bin/open"),
+                OsStr::new("-R"),
+                pdf.as_os_str(),
+            ];
+            gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE)?
+                .wait_check_future()
+                .await
+        }
+        Handoff::ShowInFolder => launcher.open_containing_folder_future(parent).await,
+    }
+}
+
+/// The toolbar's menu: the zoom modes, and the PDF's file. The PDF view's own keys are shown
+/// beside their items (they are no accelerators, so the menu cannot find them).
+fn toolbar_menu() -> gio::Menu {
+    let item = |label: &str, action: &str, key: Option<&str>| {
+        let item = gio::MenuItem::new(Some(label), Some(action));
+        if let Some(key) = key {
+            item.set_attribute_value("accel", Some(&key.to_variant()));
+        }
+        item
+    };
+    let zoom = gio::Menu::new();
+    zoom.append_item(&item("Fit _Width", "win.pdf-fit-width", Some("<Control>0")));
+    zoom.append_item(&item("Fit _Page", "win.pdf-fit-page", None));
+    zoom.append_item(&item(
+        "_Zoom to 100%",
+        "win.pdf-zoom-reset",
+        Some("<Control>1"),
+    ));
+    let file = gio::Menu::new();
+    file.append_item(&item("_Open in Another App", "win.pdf-open-external", None));
+    file.append_item(&item("_Show in Files", "win.pdf-show-in-folder", None));
+    let menu = gio::Menu::new();
+    menu.append_section(None, &zoom);
+    menu.append_section(None, &file);
+    menu
+}
+
 fn build_toolbar() -> Toolbar {
     let page = gtk::Entry::builder()
         .width_chars(3)
@@ -690,6 +836,13 @@ fn build_toolbar() -> Toolbar {
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
         .build();
+    let more = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("PDF Options")
+        .menu_model(&toolbar_menu())
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
     let spacer = gtk::Box::builder().hexpand(true).build();
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     bar.add_css_class("lemma-pdf-toolbar");
@@ -715,6 +868,7 @@ fn build_toolbar() -> Toolbar {
     ));
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(&dark);
+    bar.append(&more);
     Toolbar {
         bar,
         page,
@@ -778,6 +932,7 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         links: OnceCell::new(),
         strip: OnceCell::new(),
         thumb_wants: RefCell::new((Vec::new(), Vec::new())),
+        launch_hook: RefCell::new(None),
     });
 
     let weak = Rc::downgrade(&inner);
@@ -875,13 +1030,19 @@ fn install_actions(state: &Rc<WindowState>, inner: &Rc<Inner>) {
             }
         });
         window.add_action(&action);
+        action
     };
     simple("pdf-zoom-in", |i| i.view.zoom_in());
     simple("pdf-zoom-out", |i| i.view.zoom_out());
     simple("pdf-fit-width", |i| i.view.set_fit_width());
+    simple("pdf-fit-page", |i| i.view.set_fit_page());
+    simple("pdf-zoom-reset", |i| i.view.reset_zoom());
     simple("sync-forward", |i| {
         i.forward_from_cursor(Some(Reveal::Always))
     });
+    // Until a PDF is shown (`Inner::enable_handoff`).
+    simple("pdf-open-external", |i| i.hand_off(Handoff::Open)).set_enabled(false);
+    simple("pdf-show-in-folder", |i| i.hand_off(Handoff::ShowInFolder)).set_enabled(false);
 
     let invert = gio::SimpleAction::new_stateful("pdf-invert", None, &false.into());
     let weak = Rc::downgrade(inner);

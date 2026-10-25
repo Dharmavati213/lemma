@@ -6,10 +6,10 @@
 //!   `[preview] delay_ms` shows a sioyek-style popover with the destination: about a quarter of
 //!   the target page around the target, at the view's zoom (at most [`MAX_PREVIEW_ZOOM`]),
 //!   with "Page N" below it. It borrows the page's texture from the view when it is cached and
-//!   otherwise has the page rendered at exactly its width (a thumbnail request, freed when the
-//!   popover goes). The popover goes when the pointer leaves the link (after
-//!   [`LEAVE_GRACE`]), on scrolling, a click, a key or when the view is hidden. A web link shows
-//!   its address as a tooltip.
+//!   otherwise has the page rendered at exactly its width, in the view's mode (a thumbnail
+//!   request, freed when the popover goes). The popover goes when the pointer leaves the link
+//!   (after [`LEAVE_GRACE`]), on scrolling, a click, a key or when the view is hidden. A web link
+//!   shows its address as a tooltip.
 //! - **Click:** an internal link scrolls its destination to near the top of the view
 //!   ([`JUMP_MARGIN`]) and records where the view was. A web link asks first ("Open Link?")
 //!   and then opens with `gtk::UriLauncher`; runs that quit by themselves refuse (tests route it
@@ -390,6 +390,7 @@ impl Links {
                     generation: self.generation.get(),
                     page,
                     width: page_px,
+                    dark: self.view.is_dark(),
                 };
                 preview.want.set(Some(req));
                 self.want_thumbnail(Some(req));
@@ -415,7 +416,7 @@ impl Links {
             let wanted = preview.want.get() == Some(req);
             if wanted {
                 preview.want.set(None);
-                preview.picture.set_texture(Some(texture));
+                preview.picture.set_page_texture(Some(texture), req.dark);
             }
             wanted
         });

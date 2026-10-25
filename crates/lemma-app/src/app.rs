@@ -167,6 +167,16 @@ const GOTO_LINE: ActionInfo = ActionInfo {
     unavailable: Some("Click into the editor first; with Vim on, type :12 for line 12"),
 };
 
+/// An action on the PDF's file, which works once a PDF is shown.
+const fn pdf_file_info(name: &'static str, label: &'static str) -> ActionInfo {
+    ActionInfo {
+        name,
+        label,
+        group: ShortcutGroup::BuildPdf,
+        unavailable: Some("Build the document first"),
+    }
+}
+
 /// Every action of a window and of the application that the user can run from the command
 /// palette (actions with parameters, such as `win.review-keep-turn(u)`, and the quick actions
 /// `win.quick-<slug>`, which come from `prompts.toml`, are not listed). Actions added later at
@@ -239,6 +249,10 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.pdf-zoom-in", "Zoom In PDF", BuildPdf),
         info("win.pdf-zoom-out", "Zoom Out PDF", BuildPdf),
         info("win.pdf-fit-width", "Fit PDF to Width", BuildPdf),
+        info("win.pdf-fit-page", "Fit PDF to Page", BuildPdf),
+        info("win.pdf-zoom-reset", "Zoom PDF to 100%", BuildPdf),
+        pdf_file_info("win.pdf-open-external", "Open PDF in Another App"),
+        pdf_file_info("win.pdf-show-in-folder", "Show PDF in Files"),
         ActionInfo {
             name: "win.pdf-search",
             label: "Search in PDF",
@@ -342,6 +356,41 @@ pub const KEY_LAYER_SHORTCUTS: &[(&str, &str, ShortcutGroup)] = &[
     ),
     // Keys of the PDF view, the Search page and the find bar (not accelerators: they work only
     // there).
+    (
+        "j / k / Down / Up",
+        "Scroll the PDF (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "h / l / Left / Right",
+        "Scroll the PDF sideways (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "Space / Shift+Space",
+        "Scroll the PDF by a screen (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "Home / End",
+        "Go to the start / end of the PDF (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "Ctrl+Plus / Ctrl+Minus",
+        "Zoom the PDF in / out (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "Ctrl+0",
+        "Fit the PDF to the width of the view (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
+    (
+        "Ctrl+1",
+        "Show the PDF at 100% (in the PDF view)",
+        ShortcutGroup::BuildPdf,
+    ),
     (
         "/",
         "Search the PDF (in the PDF view)",

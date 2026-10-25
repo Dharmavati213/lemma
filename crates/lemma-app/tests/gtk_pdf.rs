@@ -1,8 +1,9 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
 //! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
-//! reloaded, anchored zoom, dark mode, save → build → diagnostics (and a build with nothing to
-//! do), stopping a build, and SyncTeX in both directions; with a fake latexmk, the build toasts,
-//! a latexmk that is not installed, and Clean Build Files and Rebuild.
+//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale), Fit Page
+//! and 100%, handing the PDF to another application, dark mode, save → build → diagnostics (and
+//! a build with nothing to do), stopping a build, and SyncTeX in both directions; with a fake
+//! latexmk, the build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -26,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 fn main() -> ExitCode {
     common::run(&[
@@ -35,6 +36,12 @@ fn main() -> ExitCode {
         ("reload_keeps_the_scroll_anchor", reload_keeps_anchor),
         ("an_unchanged_pdf_is_not_reloaded", unchanged_pdf),
         ("ctrl_wheel_zoom_is_anchored_at_the_pointer", anchored_zoom),
+        (
+            "zoom_out_renders_at_the_live_scale",
+            zoom_out_renders_at_the_live_scale,
+        ),
+        ("fit_page_and_100_percent", fit_page_and_100_percent),
+        ("the_pdf_is_handed_to_other_apps", pdf_handed_to_other_apps),
         ("dark_mode_toggle_inverts_the_pages", dark_toggle),
         (
             "forward_search_scrolls_to_and_flashes_the_box",
@@ -431,6 +438,240 @@ fn anchored_zoom() {
     state.window.destroy();
 }
 
+/// Fit Page (`win.pdf-fit-page`) shows the page shown whole at the top of the view and keeps it
+/// whole when the view is resized; 100% (`win.pdf-zoom-reset`, Ctrl+1 in the view) is a zoom of
+/// one bp per pixel that a resize leaves alone; Fit Width comes back.
+fn fit_page_and_100_percent() {
+    let dir = copy_proj("fit-page", true);
+    let state = window(&dir, config());
+    state.pdf.get().unwrap().open(&dir.join("main.pdf"));
+    wait_for_pages(&state);
+    let view = view(&state);
+    // A wide pane, so that the page's height decides.
+    state.paned.set_position(380);
+    common::pump_until(TIMEOUT, || view.width() > 600);
+    wait_for_pages(&state);
+    let layout = view.layout().unwrap();
+    let (_, page_height) = view.page_size(2).unwrap();
+    view.set_scroll_position(0.0, layout.page_rect(2, view.zoom(), 0.0).1 + 200.0);
+    assert_eq!(view.current_page(), 2);
+
+    let whole = |view: &PdfView| {
+        let (_, top) = view.widget_point(2, 0.0, 0.0).unwrap();
+        let (_, bottom) = view.widget_point(2, 0.0, page_height).unwrap();
+        let height = f64::from(view.height());
+        println!(
+            "  zoom {:.3} in {}x{}: page 3 from {top:.1} to {bottom:.1}",
+            view.zoom(),
+            view.width(),
+            height
+        );
+        // On screen whole, and as tall as the view less a gap above and below it.
+        top >= 0.0
+            && bottom <= height
+            && (bottom - top + 2.0 * pdf_view::PAGE_GAP - height).abs() <= 1.0
+    };
+    activate(&state, "win.pdf-fit-page");
+    assert_eq!(view.fit(), pdf_view::Fit::Page);
+    assert!(view.zoom() < layout.fit_width_zoom(f64::from(view.width())));
+    assert!(whole(&view), "page 3 fills the view");
+    let (_, top) = view.widget_point(2, 0.0, 0.0).unwrap();
+    assert!(
+        (top - pdf_view::PAGE_GAP).abs() <= 1.0,
+        "page 3 at the top: {top}"
+    );
+    wait_for_pages(&state);
+
+    // Shorter (as when the search bar opens above it): the page is fitted again, and stays in
+    // place. (Not the search bar itself: after it, gtk4-broadwayd 4.24 aborted in about half
+    // the runs of this binary, "decode_nodes: assertion failed: (node != NULL)".)
+    let height = view.height();
+    view.set_margin_bottom(60);
+    common::pump_until(TIMEOUT, || view.height() < height - 20);
+    common::pump_until(TIMEOUT, || whole(&view));
+    assert_eq!(view.fit(), pdf_view::Fit::Page);
+    assert_eq!(view.current_page(), 2);
+    wait_for_pages(&state);
+
+    activate(&state, "win.pdf-zoom-reset");
+    assert_eq!(view.zoom(), 1.0);
+    assert_eq!(view.fit(), pdf_view::Fit::None);
+    let width = view.width();
+    state.paned.set_position(300);
+    common::pump_until(TIMEOUT, || view.width() > width + 50);
+    assert_eq!(view.zoom(), 1.0, "a resize keeps 100%");
+    let wanted = lemma_pdf::scale_q(1.0, view.device_scale());
+    common::pump_until(TIMEOUT, || view.render_scale_q() == wanted);
+    wait_for_pages(&state);
+
+    activate(&state, "win.pdf-fit-width");
+    assert!(view.is_fit_width());
+    let width = f64::from(view.width());
+    assert!((view.zoom() - layout.fit_width_zoom(width)).abs() < 1e-9);
+    state.window.destroy();
+}
+
+/// The labels of the toasts `state` shows.
+fn toast_titles(state: &WindowState) -> Vec<String> {
+    fn labels(widget: &gtk::Widget, out: &mut Vec<String>) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.label().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            labels(&c, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    let mut child = state.toasts.first_child();
+    while let Some(c) = child {
+        if c.type_().name() == "AdwToastWidget" {
+            labels(&c, &mut out);
+        }
+        child = c.next_sibling();
+    }
+    out
+}
+
+/// Open PDF in Another App and Show PDF in Files hand the PDF shown to the system (here to the
+/// test's hook): unavailable, with the palette's reason, until a PDF is shown; a failure is a
+/// toast; a scripted run starts nothing.
+fn pdf_handed_to_other_apps() {
+    use lemma_app::pdf::pdf_controller::Handoff;
+    let dir = copy_proj("handoff", true);
+    let pdf = dir.join("main.pdf");
+    let state = window(&dir, config());
+    let controller = state.pdf.get().unwrap();
+    let handed = Rc::new(RefCell::new(Vec::new()));
+    let works = Rc::new(Cell::new(true));
+    let (log, ok) = (handed.clone(), works.clone());
+    controller.set_launch_hook(Some(Box::new(move |handoff, pdf| {
+        log.borrow_mut().push((handoff, pdf.to_path_buf()));
+        ok.get()
+    })));
+    for name in ["pdf-open-external", "pdf-show-in-folder"] {
+        assert!(
+            !state.window.is_action_enabled(name),
+            "{name} without a PDF"
+        );
+        let command = lemma_app::palette::commands(&state)
+            .into_iter()
+            .find(|c| c.name == format!("win.{name}"))
+            .expect("in the palette");
+        assert!(!command.enabled);
+        assert_eq!(command.reason.as_deref(), Some("Build the document first"));
+    }
+
+    controller.open(&pdf);
+    wait_for_pages(&state);
+    assert!(state.window.is_action_enabled("pdf-open-external"));
+    activate(&state, "win.pdf-open-external");
+    activate(&state, "win.pdf-show-in-folder");
+    assert_eq!(
+        *handed.borrow(),
+        [
+            (Handoff::Open, pdf.clone()),
+            (Handoff::ShowInFolder, pdf.clone())
+        ]
+    );
+    works.set(false);
+    activate(&state, "win.pdf-open-external");
+    common::pump_until(TIMEOUT, || {
+        toast_titles(&state).contains(&"Could not open the PDF".to_owned())
+    });
+    state.window.destroy();
+
+    let scripted = WindowState::new(
+        &common::application(),
+        Rc::new(config()),
+        None,
+        Workspace::new(ProjectRoot::new(&dir).unwrap()),
+        true,
+    );
+    scripted.window.present();
+    common::pump_until(TIMEOUT, || scripted.window.is_mapped());
+    scripted.pdf.get().unwrap().open(&pdf);
+    wait_for_pages(&scripted);
+    activate(&scripted, "win.pdf-show-in-folder");
+    common::pump_until(TIMEOUT, || {
+        toast_titles(&scripted)
+            .contains(&"Other applications are not started from scripted runs".to_owned())
+    });
+    scripted.window.destroy();
+}
+
+/// Zooming out brings pages into view that have no texture to stretch: they are requested at
+/// once at the new zoom's scale, not at the old one (whose bitmaps the re-render after
+/// `RERENDER_DELAY` would throw away). Zooming out further before the re-render, such a page
+/// waits for it with the bitmap it has. So each page is rendered once at the final scale (and
+/// at most once before it), and the cache stays within its cap.
+fn zoom_out_renders_at_the_live_scale() {
+    let Some(pdf) = pdf50() else {
+        return;
+    };
+    let dir = common::temp_dir("zoom-out");
+    let state = window(&dir, config());
+    state.pdf.get().unwrap().open(&pdf);
+    wait_for_pages(&state);
+    let view = view(&state);
+    view.goto_page(20);
+    wait_for_pages(&state);
+    common::pump_until(TIMEOUT, || view.outstanding_requests() == 0);
+    let old_q = view.render_scale_q();
+    let received = view.bitmaps_received();
+    let centre = (
+        f64::from(view.width()) / 2.0,
+        f64::from(view.height()) / 2.0,
+    );
+    let fitted = view.zoom();
+    // Out sixfold in two steps, the second once the first's bitmaps are there. The pages asked
+    // for in the first are rendered again at the final scale.
+    let mut early = 0;
+    let mut live = old_q;
+    for (step, factor) in [2.5, 6.0].into_iter().enumerate() {
+        view.set_zoom(fitted / factor, Some(centre));
+        live = lemma_pdf::scale_q(view.zoom(), view.device_scale());
+        assert_ne!(live, old_q);
+        // The requests of the update that follows, long before the re-render's delay is over.
+        let started = Instant::now();
+        common::pump_until(TIMEOUT, || view.outstanding_requests() > 0);
+        let asked = started.elapsed();
+        let keys = view.outstanding_keys();
+        let scales: Vec<(u32, u16)> = keys.iter().map(|k| (k.page, k.scale_q)).collect();
+        println!("  out {factor}x, scale {old_q} -> {live}: asked after {asked:?} for {scales:?}");
+        assert!(asked < pdf_view::RERENDER_DELAY, "{asked:?}");
+        assert!(keys.iter().all(|k| k.scale_q == live), "{scales:?}");
+        if step == 0 {
+            early = keys.len();
+        }
+        // Their bitmaps, while the zoom still moves (as in a pinch, which keeps the re-render
+        // waiting).
+        while view.outstanding_requests() > 0 {
+            view.set_zoom(view.zoom() * (1.0 + 1e-6), Some(centre));
+            common::pump_for(Duration::from_millis(20));
+        }
+        assert_eq!(view.render_scale_q(), old_q, "the re-render waits");
+    }
+    common::pump_until(TIMEOUT, || view.render_scale_q() == live);
+    wait_for_pages(&state);
+    common::pump_until(TIMEOUT, || view.outstanding_requests() == 0);
+    let renders = view.bitmaps_received() - received;
+    let pages = view.visible_pages().len() + 2;
+    println!(
+        "  {renders} renders for {pages} pages ({early} also at the first step's scale); cache \
+         {:.1} of {} MiB",
+        view.cache_used() as f64 / f64::from(1 << 20),
+        view.cache_cap() >> 20
+    );
+    assert!(
+        renders <= pages + early,
+        "{renders} renders for {pages} pages"
+    );
+    assert!(view.cache_used() <= view.cache_cap());
+    state.window.destroy();
+}
+
 /// Acceptance: the dark-mode toggle (Ctrl+Shift+I) inverts the pages, at once and then from
 /// pages rendered dark.
 fn dark_toggle() {
@@ -650,6 +891,21 @@ fn save_build_diagnostics() {
     common::pump_until(TIMEOUT, || {
         controller.pdf() == Some(dir.join(".build/main.pdf"))
     });
+    // Open PDF in Another App hands over the PDF the build made, in the hidden `.build`.
+    let handed = Rc::new(RefCell::new(Vec::new()));
+    let log = handed.clone();
+    controller.set_launch_hook(Some(Box::new(move |handoff, pdf| {
+        log.borrow_mut().push((handoff, pdf.to_path_buf()));
+        true
+    })));
+    activate(&state, "win.pdf-open-external");
+    assert_eq!(
+        *handed.borrow(),
+        [(
+            lemma_app::pdf::pdf_controller::Handoff::Open,
+            dir.join(".build/main.pdf")
+        )]
+    );
     buffer.place_cursor(&buffer.iter_at_line(60).unwrap());
     editor
         .view()

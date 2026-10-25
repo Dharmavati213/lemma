@@ -586,6 +586,7 @@ fn thumbnails_render_at_the_requested_width() {
         generation,
         page,
         width,
+        dark: false,
     };
     handle.send(PdfCmd::WantThumbnails(vec![
         req(3, 0, 100),
@@ -626,5 +627,38 @@ fn thumbnails_render_at_the_requested_width() {
     }
     assert_eq!(got.last(), Some(&req(4, 22, 64)));
     assert!(got.len() < 20, "{got:?}");
+    assert!(handle.shutdown_and_join(TIMEOUT));
+}
+
+/// A dark thumbnail is the light one through the dark-mode transform, as a dark page bitmap is.
+#[test]
+fn dark_thumbnails_come_back_coloured_for_dark_mode() {
+    let (handle, rx, _) = open(&fixture("pdf/stress.pdf"), 1);
+    let light = ThumbReq {
+        generation: 1,
+        page: 2,
+        width: 120,
+        dark: false,
+    };
+    let dark = ThumbReq {
+        dark: true,
+        ..light
+    };
+    handle.send(PdfCmd::WantThumbnails(vec![light, dark]));
+    let thumbnail = || match next(&rx) {
+        PdfEvent::Thumbnail(t) => t,
+        other => panic!("expected a thumbnail, got {other:?}"),
+    };
+    let (plain, darkened) = (thumbnail(), thumbnail());
+    assert_eq!((plain.req, darkened.req), (light, dark));
+    assert_eq!(
+        (darkened.width, darkened.height),
+        (plain.width, plain.height)
+    );
+    let mut expected = plain.data.to_vec();
+    lemma_pdf::dark::darken_bgra(&mut expected);
+    assert!(expected[..] == darkened.data[..]);
+    let paper = (lemma_pdf::dark::PAPER * 255.0).round() as u8;
+    assert_eq!(&darkened.data[..4], &[paper, paper, paper, 255]);
     assert!(handle.shutdown_and_join(TIMEOUT));
 }

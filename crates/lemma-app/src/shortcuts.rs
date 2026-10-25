@@ -84,9 +84,11 @@ pub fn key_accelerator(label: &str) -> Option<(String, bool)> {
         }
         let name = match *key {
             "Space" => "space".to_owned(),
-            "Tab" | "Return" | "Escape" | "BackSpace" | "Delete" | "Up" | "Down" => {
-                (*key).to_owned()
-            }
+            // "+" separates the keys, so Ctrl and + is written "Ctrl+Plus".
+            "Plus" => "plus".to_owned(),
+            "Minus" => "minus".to_owned(),
+            "Tab" | "Return" | "Escape" | "BackSpace" | "Delete" | "Left" | "Right" | "Up"
+            | "Down" | "Home" | "End" => (*key).to_owned(),
             k if k.chars().count() == 1 => {
                 let c = k.chars().next()?;
                 let lower = c.to_lowercase().next()?;

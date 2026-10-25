@@ -411,6 +411,10 @@ fn ranking_table() {
         ("all accept", &[], "win.review-accept-all"),
         ("accept file", &[], "win.review-accept-file"),
         ("zoom in", &[], "win.pdf-zoom-in"),
+        ("fit page", &[], "win.pdf-fit-page"),
+        ("100", &[], "win.pdf-zoom-reset"),
+        ("open pdf", &[], "win.pdf-open-external"),
+        ("show in files", &[], "win.pdf-show-in-folder"),
         ("dark", &[], "win.pdf-invert"),
         ("thumb", &[], "win.toggle-pdf-sidebar"),
         ("vim", &[], "win.toggle-vim"),
@@ -1154,6 +1158,13 @@ fn shortcut_labels() {
         ("Up / Down", "Up Down", false),
         ("F12", "F12", false),
         ("Alt+]", "<Alt>bracketright", false),
+        ("h / l / Left / Right", "h l Left Right", false),
+        (
+            "Ctrl+Plus / Ctrl+Minus",
+            "<Control>plus <Control>minus",
+            false,
+        ),
+        ("Ctrl+1", "<Control>1", false),
     ];
     for (label, accel, click) in cases {
         assert_eq!(

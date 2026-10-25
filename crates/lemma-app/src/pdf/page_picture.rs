@@ -1,10 +1,13 @@
 //! `PagePicture`: one PDF page (or a region of it) drawn from a texture, sized by the page's
 //! aspect ratio (height for width). The thumbnails of the PDF strip and the link previews use it.
 //!
-//! Until a texture is set the page is drawn white, so a list of thumbnails has its final layout
-//! at once. In dark mode the PDF view's dark-mode colour matrix is applied to light textures (no
-//! re-render); a texture that is dark already (the view's, for a link preview) is drawn as it is.
-//! CSS node: `pagepicture` (the strip and the link popover style it).
+//! Until a texture is set the page is drawn as blank paper, so a list of thumbnails has its final
+//! layout at once. A texture is a light or a dark page ([`PagePicture::set_page_texture`]): the
+//! strip and the link preview have their pages rendered in the mode they show, so they are drawn
+//! as they are. One of the other mode (just after a toggle, until its replacement arrives) is
+//! drawn through the PDF view's dark-mode colour matrix or its inverse, which GTK's cairo renderer
+//! runs per pixel on every frame. CSS node: `pagepicture` (the strip and the link popover style
+//! it).
 
 use super::geometry;
 use gtk::prelude::*;

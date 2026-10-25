@@ -1,10 +1,14 @@
 //! `PdfView` (ARCHITECTURE §6): one custom widget implementing `gtk::Scrollable` that draws every
 //! page of the document from textures rendered on the PDF thread. There is no widget per page.
 //!
-//! - **Layout:** continuous vertical scrolling ([`PageLayout`]), fit-width by default.
+//! - **Layout:** continuous vertical scrolling ([`PageLayout`]), fit-width by default. The zoom
+//!   follows the view's size ([`Fit`]): its width (Ctrl+0), the whole page (for slides), or
+//!   neither once zoomed (Ctrl+1 is 100%). Left and Right (h and l) scroll sideways.
 //! - **Zoom:** Ctrl+wheel, pinch ([`gtk::GestureZoom`]) and the toolbar, anchored at the pointer.
 //!   The textures on screen are stretched at once; the pages are re-rendered at
 //!   `scale_q = round(zoom × surface scale × 8)` after [`RERENDER_DELAY`] without zoom changes.
+//!   Pages that come into view meanwhile without a texture to stretch (zooming out) are rendered
+//!   at once at that scale.
 //! - **Render requests:** the visible pages from the centre outward, then the pages just before
 //!   and after (as far as their bitmaps fit in the cache beside the visible ones), are sent
 //!   through the request callback (the controller forwards them to the PDF thread as one
@@ -40,6 +44,7 @@ use lemma_pdf::{
     Anchor, PageKey, PageLayout, RenderReq, Rendered, SearchMatch, page_pixels, scale_q, tile_grid,
     tile_rect,
 };
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -60,6 +65,33 @@ const WHEEL_ZOOM_STEP: f64 = 1.1;
 const ZOOM_STEP: f64 = 1.2;
 /// Scroll step of the arrow keys, in logical pixels.
 const SCROLL_STEP: f64 = 48.0;
+
+/// How the zoom follows the view's size (the session remembers it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fit {
+    /// The widest page fills the view's width.
+    #[default]
+    Width,
+    /// The tallest page, with the gaps above and below it, fits the view's height (and no page
+    /// is wider than the view).
+    Page,
+    /// The zoom stays as it was set when the view is resized. (A mode this version does not
+    /// know, from a newer one's session, reads as this one.)
+    #[serde(other)]
+    None,
+}
+
+/// The zoom that fits `layout` to a view of `size` as `fit` says; `None` for [`Fit::None`] and
+/// before the view has the size it needs.
+fn fit_zoom(fit: Fit, layout: &PageLayout, (width, height): (f64, f64)) -> Option<f64> {
+    let zoom = match fit {
+        Fit::Width if width > 0.0 => layout.fit_width_zoom(width),
+        Fit::Page if width > 0.0 && height > 0.0 => layout.fit_page_zoom(width, height),
+        _ => return None,
+    };
+    Some(geometry::clamp_zoom(zoom))
+}
 
 /// When [`PdfView::flash_boxes`] scrolls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,9 +127,9 @@ struct Flash {
 struct Model {
     doc: Option<Doc>,
     zoom: f64,
-    fit_width: bool,
-    /// The width the zoom was last fitted to.
-    fitted_width: f64,
+    fit: Fit,
+    /// The view size the zoom was last fitted to.
+    fitted: (f64, f64),
     /// The scale textures are requested at; 0 until the first allocation after a new document.
     target_q: u16,
     device_scale: f64,
@@ -114,6 +146,9 @@ struct Model {
     gesture_start_zoom: f64,
     /// The longest `snapshot` so far (for the frame-time acceptance test).
     max_snapshot: Duration,
+    /// The bitmaps of the shown generation that arrived from the PDF thread (tests count the
+    /// renders a zoom costs).
+    received: usize,
     /// Search matches per 0-based page (M3).
     search: HashMap<u32, Vec<SearchMatch>>,
     /// The emphasised match: page and index in its page's list.
@@ -127,8 +162,8 @@ impl Default for Model {
         Self {
             doc: None,
             zoom: 1.0,
-            fit_width: true,
-            fitted_width: 0.0,
+            fit: Fit::Width,
+            fitted: (0.0, 0.0),
             target_q: 0,
             device_scale: 1.0,
             cache: TextureCache::new(DEFAULT_CACHE_BYTES),
@@ -139,6 +174,7 @@ impl Default for Model {
             pointer: None,
             gesture_start_zoom: 1.0,
             max_snapshot: Duration::ZERO,
+            received: 0,
             search: HashMap::new(),
             current_match: None,
             held: None,
@@ -180,9 +216,32 @@ impl Model {
             .all(|tile| self.cache.contains(&key(Some(tile))))
     }
 
+    /// The scale to request `page` at: the target scale, except while a zoom waits for its
+    /// re-render ([`RERENDER_DELAY`]). Then a page with a texture of the shown generation and
+    /// mode to stand in (at the target scale, or a whole page at another) keeps that scale and
+    /// waits for the re-render. A page without one (it came into view as the zoom went out) is
+    /// rendered at once at the zoom's own scale, which is what the re-render will want, rather
+    /// than at the old scale only to be rendered again 120 ms later.
+    fn request_q(&self, page: u32, generation: u64) -> u16 {
+        let live = scale_q(self.zoom, self.device_scale);
+        if live == self.target_q {
+            return live;
+        }
+        self.cache
+            .keys_of_page(page)
+            .iter()
+            .filter(|k| k.generation == generation && k.dark == self.dark)
+            .filter(|k| k.scale_q == self.target_q || k.tile.is_none())
+            .map(|k| k.scale_q)
+            // The target scale first, then the one nearest the zoom's.
+            .min_by_key(|&q| (q != self.target_q, q.abs_diff(live)))
+            .unwrap_or(live)
+    }
+
     /// The bitmaps the current view needs, most urgent first: those of the visible pages (for a
     /// tiled page, its visible tiles), then the whole pages just after and before them and the
-    /// pages `extra`, as long as all of these bitmaps fit in the cache.
+    /// pages `extra`, as long as all of these bitmaps fit in the cache. Each page is keyed at
+    /// [`Model::request_q`].
     fn working_set(&self, view: (f64, f64), scroll: (f64, f64), extra: Range<u32>) -> Vec<PageKey> {
         let Some(doc) = &self.doc else {
             return Vec::new();
@@ -208,26 +267,27 @@ impl Model {
             let Some(size) = doc.layout.page_size(page) else {
                 continue;
             };
+            let scale_q = self.request_q(page, doc.generation);
             let key = |tile| PageKey {
                 generation: doc.generation,
                 page,
-                scale_q: self.target_q,
+                scale_q,
                 tile,
                 dark: self.dark,
             };
-            if tile_grid(size, self.target_q).is_some() {
+            if tile_grid(size, scale_q).is_some() {
                 // Tiled pages: only the visible tiles of the visible pages.
                 if visible.contains(&page) {
                     let rect = page_rect(&doc.layout, page, self.zoom, width);
-                    for tile in geometry::visible_tiles(size, self.target_q, rect, viewport) {
-                        bytes += bitmap_bytes(size, self.target_q, Some(tile));
+                    for tile in geometry::visible_tiles(size, scale_q, rect, viewport) {
+                        bytes += bitmap_bytes(size, scale_q, Some(tile));
                         keys.push(key(Some(tile)));
                     }
                 }
             } else {
                 // The visible pages always; the others only while everything fits, so that a
                 // page ahead never pushes a page on screen out of the cache.
-                let page_bytes = bitmap_bytes(size, self.target_q, None);
+                let page_bytes = bitmap_bytes(size, scale_q, None);
                 if visible.contains(&page) || bytes + page_bytes <= cap {
                     bytes += page_bytes;
                     keys.push(key(None));
@@ -589,7 +649,7 @@ mod imp {
             }
         }
 
-        /// Fits the zoom to a new width (in fit-width mode), keeping the scroll anchor, and
+        /// Fits the zoom to a new size (as the [`Fit`] mode says), keeping the scroll anchor, and
         /// configures the adjustments.
         pub(super) fn relayout(&self, width: f64, height: f64) {
             let (x, y) = self.scroll();
@@ -605,16 +665,19 @@ mod imp {
                     model.held = None;
                 }
                 let held = model.held.map(|(anchor, _)| anchor);
+                let resized = match model.fit {
+                    Fit::Width => width != model.fitted.0,
+                    Fit::Page => (width, height) != model.fitted,
+                    Fit::None => false,
+                };
                 if let Some(doc) = &model.doc
-                    && model.fit_width
-                    && width > 0.0
-                    && width != model.fitted_width
+                    && resized
+                    && let Some(zoom) = fit_zoom(model.fit, &doc.layout, (width, height))
                 {
                     let anchor = held.unwrap_or_else(|| doc.layout.anchor_at(y, x, model.zoom));
-                    let zoom = geometry::clamp_zoom(doc.layout.fit_width_zoom(width));
                     refit = zoom != model.zoom;
                     model.zoom = zoom;
-                    model.fitted_width = width;
+                    model.fitted = (width, height);
                     target = (anchor.x, doc.layout.y_for_anchor(anchor, zoom));
                 } else if let (Some(doc), Some(anchor)) = (&model.doc, held) {
                     target = (anchor.x, doc.layout.y_for_anchor(anchor, model.zoom));
@@ -989,7 +1052,7 @@ impl PdfView {
     /// fitted to its width. (For another PDF, use [`PdfView::open_document`].)
     pub fn set_document(&self, generation: u64, page_sizes: Vec<(f64, f64)>) {
         let imp = self.imp();
-        let (width, _) = imp.view_size();
+        let size = imp.view_size();
         let (sx, sy) = imp.scroll();
         let layout = PageLayout::new(page_sizes, PAGE_GAP);
         let (x, y) = {
@@ -1000,19 +1063,20 @@ impl PdfView {
                 .as_ref()
                 .map(|d| d.layout.anchor_at(sy, sx, model.zoom));
             if anchor.is_none() {
-                model.fit_width = true;
+                model.fit = Fit::Width;
                 model.target_q = 0;
             }
-            if model.fit_width {
-                if width > 0.0 {
-                    model.zoom = geometry::clamp_zoom(layout.fit_width_zoom(width));
-                    model.fitted_width = width;
-                } else {
-                    model.fitted_width = 0.0;
+            if model.fit != Fit::None {
+                match fit_zoom(model.fit, &layout, size) {
+                    Some(zoom) => {
+                        model.zoom = zoom;
+                        model.fitted = size;
+                    }
+                    None => model.fitted = (0.0, 0.0),
                 }
             }
             // Also for a rebuilt PDF: its widest page, and so the fitted zoom, may have changed.
-            if width > 0.0 {
+            if size.0 > 0.0 {
                 model.target_q = scale_q(model.zoom, model.device_scale);
             }
             let position = anchor.map_or((0.0, 0.0), |a| (a.x, layout.y_for_anchor(a, model.zoom)));
@@ -1075,6 +1139,7 @@ impl PdfView {
                 return;
             }
             model.outstanding.retain(|r| r.key != key);
+            model.received += 1;
             // The bitmaps the view needs now are never evicted for this one.
             let needed: HashSet<PageKey> = model
                 .working_set(view, scroll, model.extra.clone())
@@ -1187,12 +1252,17 @@ impl PdfView {
 
     /// True while the zoom follows the view width.
     pub fn is_fit_width(&self) -> bool {
-        self.imp().model.borrow().fit_width
+        self.fit() == Fit::Width
+    }
+
+    /// How the zoom follows the view's size.
+    pub fn fit(&self) -> Fit {
+        self.imp().model.borrow().fit
     }
 
     /// Sets the zoom, keeping the document point at `anchor` (widget coordinates; the view
-    /// centre when `None`) in place. Leaves fit-width mode. The textures on screen are stretched
-    /// at once and re-rendered after [`RERENDER_DELAY`].
+    /// centre when `None`) in place. Leaves the fit modes ([`Fit::None`]). The textures on
+    /// screen are stretched at once and re-rendered after [`RERENDER_DELAY`].
     pub fn set_zoom(&self, zoom: f64, anchor: Option<(f64, f64)>) {
         let imp = self.imp();
         let (width, height) = imp.view_size();
@@ -1202,7 +1272,7 @@ impl PdfView {
         let target = {
             let mut model = imp.model.borrow_mut();
             let model = &mut *model;
-            model.fit_width = false;
+            model.fit = Fit::None;
             model.held = None;
             if (zoom - model.zoom).abs() < 1e-9 {
                 None
@@ -1217,6 +1287,8 @@ impl PdfView {
         if let Some((x, y)) = target {
             imp.configure_adjustments(x, y);
             imp.schedule_rerender();
+            // Pages that came into view are asked for now, also when the scroll offsets stayed.
+            imp.schedule_update();
             self.queue_draw();
         }
         imp.emit_changed();
@@ -1237,13 +1309,33 @@ impl PdfView {
         self.zoom_by(1.0 / ZOOM_STEP, None);
     }
 
+    /// Zooms to 100% (1 bp per logical pixel), at the view centre.
+    pub fn reset_zoom(&self) {
+        self.set_zoom(1.0, None);
+    }
+
     /// Fits the widest page to the view width and keeps doing so when the view is resized.
     pub fn set_fit_width(&self) {
+        self.set_fit(Fit::Width);
+    }
+
+    /// Fits the whole page to the view (the tallest page fills its height, unless the widest
+    /// would then be wider than the view) and keeps doing so when the view is resized. The page
+    /// shown (see [`PdfView::current_page`]) moves to the top, so it is on screen whole.
+    pub fn set_fit_page(&self) {
+        let page = self.current_page();
+        self.set_fit(Fit::Page);
+        if self.page_count() > 0 {
+            self.goto_page(page);
+        }
+    }
+
+    fn set_fit(&self, fit: Fit) {
         let imp = self.imp();
         {
             let mut model = imp.model.borrow_mut();
-            model.fit_width = true;
-            model.fitted_width = 0.0;
+            model.fit = fit;
+            model.fitted = (0.0, 0.0);
         }
         let (width, height) = imp.view_size();
         imp.relayout(width, height);
@@ -1383,6 +1475,18 @@ impl PdfView {
     /// Render requests sent and not answered yet.
     pub fn outstanding_requests(&self) -> usize {
         self.imp().model.borrow().outstanding.len()
+    }
+
+    /// The keys of the render requests sent and not answered yet, in the order sent.
+    pub fn outstanding_keys(&self) -> Vec<PageKey> {
+        let model = self.imp().model.borrow();
+        model.outstanding.iter().map(|r| r.key).collect()
+    }
+
+    /// The bitmaps of the shown generation that have arrived from the PDF thread since the view
+    /// was created.
+    pub fn bitmaps_received(&self) -> usize {
+        self.imp().model.borrow().received
     }
 
     /// Bytes of bitmap data in the texture cache.
@@ -1721,8 +1825,13 @@ impl PdfView {
         });
         add("<Control>minus|<Control>KP_Subtract", |v| v.zoom_out());
         add("<Control>0|<Control>KP_0", |v| v.set_fit_width());
+        add("<Control>1|<Control>KP_1", |v| v.reset_zoom());
         add("Down|j", |v| v.scroll_by(SCROLL_STEP));
         add("Up|k", |v| v.scroll_by(-SCROLL_STEP));
+        // Sideways; taken also when there is nothing to scroll (at fit width), so that they never
+        // go on to the window, where a key can move the focus out of the view.
+        add("Right|l", |v| v.pan_by(SCROLL_STEP));
+        add("Left|h", |v| v.pan_by(-SCROLL_STEP));
         add("Page_Down|space", |v| v.scroll_pages(1.0));
         add("Page_Up|<Shift>space", |v| v.scroll_pages(-1.0));
         add("Home", |v| {
@@ -1737,6 +1846,11 @@ impl PdfView {
     fn scroll_by(&self, dy: f64) {
         let (x, y) = self.scroll_position();
         self.set_scroll_position(x, y + dy);
+    }
+
+    fn pan_by(&self, dx: f64) {
+        let (x, y) = self.scroll_position();
+        self.set_scroll_position(x + dx, y);
     }
 
     fn scroll_pages(&self, pages: f64) {

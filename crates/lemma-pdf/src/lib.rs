@@ -105,6 +105,9 @@ pub struct ThumbReq {
     pub page: u32,
     /// The bitmap's width in device pixels (at least 1; the height follows the page's aspect).
     pub width: u16,
+    /// True for the page in dark mode, coloured like a dark [`PageKey`] bitmap, so the strip
+    /// draws it without a colour matrix.
+    pub dark: bool,
 }
 
 /// One page rendered for a [`ThumbReq`].

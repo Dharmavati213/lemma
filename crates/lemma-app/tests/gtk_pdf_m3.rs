@@ -1,9 +1,10 @@
 //! WP3.4: PDF links (geometry, hover preview, jumps and Back, the cursor, web links behind a
 //! confirmation), search (counts against `pdftotext`, navigation, case and whole words,
 //! cancellation and latest wins, highlights, a rebuilt PDF that keeps the reading place), the
-//! strip (lazy thumbnails within their budget, bound rows that need more than it, the current
-//! page, the bookmark tree), detaching the PDF into its own window
-//! and back (anchor, search, SyncTeX, dark pages, reloads), and `--demo pdf-search`.
+//! strip (lazy thumbnails within their budget, bound rows that need more than it, dark
+//! thumbnails rendered dark, the current page, the bookmark tree), detaching the PDF into its
+//! own window and back (anchor, search, SyncTeX, dark pages, reloads), `--demo pdf-search`, and
+//! the view's keys on real key events.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf_m3`. The pdf50
 //! tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`) and print `SKIP`
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
             "thumbnails_settle_when_the_rows_need_more_than_the_budget",
             thumbnails_beyond_the_budget,
         ),
+        ("dark_thumbnails_are_rendered_dark", dark_thumbnails),
         ("bookmark_tree_matches_the_golden_tree", bookmarks),
         ("detach_and_reattach_keep_the_anchor", detach_reattach),
         ("demo_pdf_search_snapshot", demo_pdf_search),
@@ -914,6 +916,94 @@ fn thumbnails_beyond_the_budget() {
     state.window.destroy();
 }
 
+/// True when `node` or a node under it is a colour matrix.
+fn has_color_matrix(node: &gtk::gsk::RenderNode) -> bool {
+    use gtk::gsk::*;
+    if node.downcast_ref::<ColorMatrixNode>().is_some() {
+        return true;
+    }
+    let children: Vec<RenderNode> = if let Some(n) = node.downcast_ref::<ContainerNode>() {
+        (0..n.n_children()).map(|i| n.child(i)).collect()
+    } else if let Some(n) = node.downcast_ref::<TransformNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<ClipNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<RoundedClipNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<OpacityNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<ShadowNode>() {
+        vec![n.child()]
+    } else if let Some(n) = node.downcast_ref::<DebugNode>() {
+        vec![n.child()]
+    } else {
+        Vec::new()
+    };
+    children.iter().any(has_color_matrix)
+}
+
+/// The first thumbnail picture inside `widget`.
+fn first_picture(widget: &gtk::Widget) -> Option<lemma_app::pdf::page_picture::PagePicture> {
+    if let Some(picture) = widget.downcast_ref::<lemma_app::pdf::page_picture::PagePicture>() {
+        return Some(picture.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(picture) = first_picture(&c) {
+            return Some(picture);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// In dark mode the PDF thread renders the strip's thumbnails dark, so the strip draws them as
+/// they are: no colour matrix, which GTK's cairo renderer runs per pixel on every frame the strip
+/// scrolls. Right after a toggle the other mode's thumbnails stand in until the new ones come.
+fn dark_thumbnails() {
+    let dir = copy_proj("dark-thumbs");
+    let state = window(&dir);
+    let view = show_pdf(&state, &dir.join("main.pdf"));
+    activate(&state, "win.toggle-pdf-sidebar");
+    common::pump_until(TIMEOUT, || sidebar::is_ready(&state));
+    let (list, _) = sidebar::thumbnail_list(&state).unwrap();
+    let initial = view.is_dark();
+    for dark in [!initial, initial] {
+        let arrived = sidebar::thumbnails_arrived(&state);
+        activate(&state, "win.pdf-invert");
+        assert_eq!(view.is_dark(), dark);
+        assert!(
+            !sidebar::is_ready(&state),
+            "the other mode's thumbnails stand in"
+        );
+        common::pump_until(TIMEOUT, || sidebar::is_ready(&state));
+        let rows = sidebar::thumbnail_rows(&state).len();
+        assert!(sidebar::thumbnails_arrived(&state) >= arrived + rows);
+        assert!(
+            !has_color_matrix(&next_frame_node(&list)),
+            "dark {dark}: the thumbnails are drawn as they are"
+        );
+        // The top margin of the first page: dark paper, or white.
+        let picture = first_picture(list.upcast_ref()).expect("a thumbnail");
+        let at = picture
+            .compute_point(&list, &graphene::Point::new(6.0, 4.0))
+            .unwrap();
+        let (width, _, pixels) = render(&list);
+        let [b, g, r, _] = pixel(&pixels, width, at.x() as i32, at.y() as i32);
+        let lightness = (f64::from(b) + f64::from(g) + f64::from(r)) / 3.0;
+        println!("  dark {dark}: {rows} thumbnails rendered again, paper {lightness:.0}");
+        assert!(
+            if dark {
+                lightness < 60.0
+            } else {
+                lightness > 240.0
+            },
+            "{lightness}"
+        );
+    }
+    state.window.destroy();
+}
+
 /// The bookmark tree of `proj` as `depth title page` lines (1-based pages).
 fn bookmark_text(rows: &[(u32, String, Option<u32>)]) -> String {
     rows.iter()
@@ -1232,7 +1322,8 @@ fn demo_pdf_search() {
 mod real_keys {
     //! The PDF's keys on real key events (a private Broadway daemon, see `tests/broadway_input`):
     //! `/`, Enter, `n`, `N` and Escape (Vim style), Ctrl+F, Enter and Shift+Enter (GNOME
-    //! style), Alt+Left after a link jump, and the detached window's Ctrl+F and Alt+Left (and
+    //! style), Alt+Left after a link jump, Left, Right, `h` and `l` (sideways, and the focus
+    //! stays in the view), Ctrl+1 and Ctrl+0, and the detached window's Ctrl+F and Alt+Left (and
     //! no Ctrl+W there).
 
     use super::*;
@@ -1325,6 +1416,42 @@ mod real_keys {
         browser.key(gdk::Key::Left, ALT);
         common::pump_until(TIMEOUT, || links::history_len(&state) == 0);
         assert_eq!(view.anchor().unwrap().page, before.page);
+
+        println!("child: Left, Right, h and l; Ctrl+1 and Ctrl+0");
+        // At fit width there is nothing to scroll sideways, and the keys stay in the view.
+        assert!(view.is_fit_width());
+        let before = view.scroll_position();
+        for key in [gdk::Key::Right, gdk::Key::Left, gdk::Key::l, gdk::Key::h] {
+            browser.key(key, 0);
+            assert_eq!(view.scroll_position(), before, "{key:?}");
+            assert!(view.has_focus(), "{key:?} keeps the focus in the view");
+        }
+        browser.key(gdk::Key::_1, CONTROL);
+        common::pump_until(TIMEOUT, || view.zoom() == 1.0);
+        assert!(
+            view.layout().unwrap().content_size(1.0).0 > f64::from(view.width()) + 100.0,
+            "at 100% the page is wider than the view"
+        );
+        let x = |view: &PdfView| view.scroll_position().0;
+        for (key, right) in [
+            (gdk::Key::Right, true),
+            (gdk::Key::l, true),
+            (gdk::Key::h, false),
+            (gdk::Key::Left, false),
+        ] {
+            let from = x(&view);
+            browser.key(key, 0);
+            common::pump_until(TIMEOUT, || {
+                if right {
+                    x(&view) > from
+                } else {
+                    x(&view) < from
+                }
+            });
+            assert!(view.has_focus(), "{key:?}");
+        }
+        browser.key(gdk::Key::_0, CONTROL);
+        common::pump_until(TIMEOUT, || view.is_fit_width());
 
         println!("child: the detached window");
         WidgetExt::activate_action(&state.window, "win.pdf-detach", None).unwrap();

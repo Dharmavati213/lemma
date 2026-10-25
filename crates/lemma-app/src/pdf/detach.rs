@@ -11,9 +11,10 @@
 //!   or a jump to a place in the PDF) brings the PDF window forward instead. Re-attaching shows
 //!   the pane again.
 //! - The PDF window has a header bar with the PDF's name and an "Attach to Main Window" button.
-//!   It shares the PDF actions of the main window (zoom, dark pages, the strip, building with
-//!   F5, back from link jumps with Alt+Left; not the editing ones such as Ctrl+W) and has its own
-//!   Ctrl+F for the search bar. Its size is remembered for the next time in the session.
+//!   It shares the PDF actions of the main window (zoom, dark pages, the strip, opening the PDF
+//!   in another application, building with F5, back from link jumps with Alt+Left; not the
+//!   editing ones such as Ctrl+W) and has its own Ctrl+F for the search bar. Its size is
+//!   remembered for the next time in the session.
 //! - Closing the PDF window re-attaches the view (and sets `win.pdf-detach` back to false);
 //!   closing the main window closes it too.
 //!
@@ -39,6 +40,10 @@ const SHARED_ACTIONS: &[&str] = &[
     "pdf-zoom-in",
     "pdf-zoom-out",
     "pdf-fit-width",
+    "pdf-fit-page",
+    "pdf-zoom-reset",
+    "pdf-open-external",
+    "pdf-show-in-folder",
     "pdf-invert",
     "pdf-detach",
     "pdf-search",

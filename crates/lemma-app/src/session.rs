@@ -154,8 +154,11 @@ pub struct PdfPlace {
     pub page: u32,
     pub frac: f64,
     pub x: f64,
-    /// `None`: fit width.
+    /// The zoom set by hand; `None`: the zoom fits the view, as `fit` says.
     pub zoom: Option<f64>,
+    /// How the zoom follows the view's size: its width (the default, and what an older file
+    /// without the field means), the whole page, or [`pdf_view::Fit::None`] with `zoom`.
+    pub fit: pdf_view::Fit,
     /// The user's dark-mode choice for this PDF (Ctrl+Shift+I); `None`: it follows the style.
     pub dark: Option<bool>,
 }
@@ -809,11 +812,13 @@ impl Session {
         };
         let follows = state.config.pdf.dark_invert && adw::StyleManager::default().is_dark();
         let dark = view.is_dark();
+        let fit = view.fit();
         let place = PdfPlace {
             page: anchor.page,
             frac: anchor.frac,
             x: anchor.x,
-            zoom: (!view.is_fit_width()).then(|| view.zoom()),
+            zoom: (fit == pdf_view::Fit::None).then(|| view.zoom()),
+            fit,
             dark: (dark != follows).then_some(dark),
         };
         (Some(file), Some(place))
@@ -1267,10 +1272,17 @@ impl Session {
         }
         self.pending_pdf.replace(None);
         self.pdf_place_done();
+        // Without a zoom, the width is fitted unless the page was (also for a mode this version
+        // does not know).
+        let fit = match place.fit {
+            pdf_view::Fit::Page => pdf_view::Fit::Page,
+            _ => pdf_view::Fit::Width,
+        };
         match place.zoom {
-            None if !view.is_fit_width() => view.set_fit_width(),
-            None => {}
             Some(zoom) => view.set_zoom(zoom, None),
+            None if view.fit() == fit => {}
+            None if fit == pdf_view::Fit::Page => view.set_fit_page(),
+            None => view.set_fit_width(),
         }
         if let Some(layout) = view.layout() {
             let anchor = lemma_pdf::Anchor {
@@ -1528,6 +1540,7 @@ mod tests {
                     frac: 0.25,
                     x: 0.0,
                     zoom: None,
+                    fit: pdf_view::Fit::Page,
                     dark: Some(true),
                 }),
             },
@@ -1540,6 +1553,16 @@ mod tests {
         assert_eq!(partial.tabs[0].line, 2);
         assert_eq!(partial.tabs[0].top, 0);
         assert_eq!(partial.sidebar.visible, None);
+        // A PDF place written before the fit modes fits the width, unless it has a zoom.
+        let old = parse(br#"{"pdf":{"place":{"page":2,"frac":0.5,"x":0,"zoom":null}}}"#).unwrap();
+        let place = old.pdf.place.unwrap();
+        assert_eq!((place.page, place.zoom), (2, None));
+        assert_eq!(place.fit, pdf_view::Fit::Width);
+        // An unknown mode (from a newer version) leaves the zoom to `zoom`: `None` fits the width.
+        let newer = parse(br#"{"pdf":{"place":{"fit":"sideways"}}}"#).unwrap();
+        assert_eq!(newer.pdf.place.unwrap().fit, pdf_view::Fit::None);
+        let page = parse(br#"{"pdf":{"place":{"fit":"page"}}}"#).unwrap();
+        assert_eq!(page.pdf.place.unwrap().fit, pdf_view::Fit::Page);
         assert!(parse(b"{oops").is_err());
     }
 

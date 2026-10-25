@@ -1301,6 +1301,34 @@ they conflict with the sections above, this section wins.
     for 180 days or whose root is missing from a parent directory that still exists (a project
     whose parent is gone too, as on a removable drive that is not mounted, keeps its session);
     never `last.json` or the sessions of the open windows' roots.
+- **PDF view (§6, §10.3), 2026-10-25:**
+  - `ThumbReq` gains `dark`: the PDF thread colours a dark thumbnail (the strip's, a link
+    preview's) with `dark::darken_bgra`, as it does a dark `PageKey` bitmap, so `PagePicture`
+    draws it as it is. After a toggle the other mode's thumbnail stands in through the colour
+    matrix until its replacement arrives, as the view's pages do; a thumbnail of the other mode
+    that arrives late is not shown.
+  - While a zoom waits for its re-render (`RERENDER_DELAY`), a page with no texture of the shown
+    generation and mode to stand in (one that came into view as the zoom went out) is requested
+    at the zoom's own scale, not at the old target scale (`Model::request_q`). A page with a
+    stand-in keeps its scale and waits for the timer: the target scale as before, or that of a
+    whole page rendered earlier in the same zoom (a pinch, several Ctrl+wheel notches), which
+    is not asked for again at the old scale.
+  - The zoom follows the view in one of three modes (`pdf_view::Fit`: width, page, none);
+    `PageLayout::fit_page_zoom` fits the tallest page and its gaps to the height, at most the
+    width's zoom. The session's `PdfPlace` gains `fit` (default width, so older files load; a
+    mode a newer version wrote reads as none, which leaves the zoom to `zoom`, and without one
+    fits the width).
+  - `win.pdf-fit-page` (Fit PDF to Page), `win.pdf-zoom-reset` (Zoom PDF to 100%),
+    `win.pdf-open-external` (Open PDF in Another App) and `win.pdf-show-in-folder` (Show PDF in
+    Files) have no default keys; the toolbar's menu has them. The last two are disabled ("Build
+    the document first") until a PDF is shown and hand it to `gtk::FileLauncher` (`launch`,
+    `open_containing_folder`; GTK reveals a file through the portal or the freedesktop file
+    manager on Linux and through Explorer on Windows, and has no way on macOS, where `open -R`
+    does it). Scripted runs start no other application; tests set
+    `PdfController::set_launch_hook`.
+  - The view's own keys gain Ctrl+1 (100%), and Left and Right, `h` and `l` (sideways, taken
+    also when there is nothing to scroll). They work only while the view has the focus, which no
+    editor's Vim sees; Ctrl+1 is no accelerator (`gtk_shell_m3` checks it), like Ctrl+0.
 
 ## 12. macOS (2026-10-19)
 

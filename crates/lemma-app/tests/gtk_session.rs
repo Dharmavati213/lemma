@@ -410,6 +410,14 @@ fn pdf_round_trip() {
     WidgetExt::activate_action(&b.window, "win.pdf-detach", None).unwrap();
     common::pump_for(Duration::from_millis(30));
     assert!(!lemma_app::pdf::detach::is_detached(&b));
+    // Fit Page is saved as a mode, without a zoom.
+    WidgetExt::activate_action(&b.window, "win.pdf-fit-page", None).unwrap();
+    common::pump_for(Duration::from_millis(30));
+    b.save_session_now();
+    session::flush(&b);
+    let fitted = session_file(&b);
+    let place = fitted.pdf.place.unwrap();
+    assert_eq!((place.fit, place.zoom), (pdf_view::Fit::Page, None));
     close(b);
 
     // A session whose place belongs to another PDF leaves the view at the top.
@@ -424,6 +432,25 @@ fn pdf_round_trip() {
     let anchor = pdf_view::anchor_of(c.pdf.get().unwrap().view()).unwrap();
     assert_eq!(anchor.page, 0, "{anchor:?}");
     close(c);
+
+    // And comes back as Fit Page.
+    write_session(&paths, &dir, &fitted);
+    let d = window(&dir, &paths, |_| {});
+    let _main = open(&d, &dir, "main.tex");
+    block_on(session::restore(&d)).unwrap();
+    wait_pdf(&d);
+    common::pump_until(TIMEOUT, || !session::pdf_place_pending(&d));
+    let view = d.pdf.get().unwrap().view().clone();
+    assert_eq!(view.fit(), pdf_view::Fit::Page);
+    let (_, height) = view.page_size(1).unwrap();
+    assert!(
+        view.zoom() <= (f64::from(view.height()) - 2.0 * pdf_view::PAGE_GAP) / height + 1e-9,
+        "zoom {} in a view {} high",
+        view.zoom(),
+        view.height()
+    );
+    assert_eq!(view.current_page(), place.page);
+    close(d);
 }
 
 fn missing_and_clamped() {

@@ -2,7 +2,8 @@
 
 use std::ops::Range;
 
-/// The smallest zoom [`PageLayout::fit_width_zoom`] returns, so a tiny view never yields a zero zoom.
+/// The smallest zoom [`PageLayout::fit_width_zoom`] and [`PageLayout::fit_page_zoom`] return, so a tiny
+/// view never yields a zero zoom.
 const MIN_FIT_ZOOM: f64 = 0.05;
 
 /// Continuous vertical layout. Zoom 1.0 = 1 bp per logical pixel; gap between pages in logical px.
@@ -21,6 +22,7 @@ pub struct PageLayout {
     /// Prefix sums of the page heights in bp: `heights_before[i]` is the total height of pages `0..i`.
     heights_before: Vec<f64>,
     max_width: f64,
+    max_height: f64,
 }
 
 /// Scroll anchor that survives reloads: page and fraction of the page height at the viewport top, plus x.
@@ -45,11 +47,13 @@ impl PageLayout {
             heights_before.push(total);
         }
         let max_width = sizes.iter().map(|s| s.0).fold(0.0, f64::max);
+        let max_height = sizes.iter().map(|s| s.1).fold(0.0, f64::max);
         Self {
             sizes,
             gap: gap.max(0.0),
             heights_before,
             max_width,
+            max_height,
         }
     }
 
@@ -171,6 +175,19 @@ impl PageLayout {
             return 1.0;
         }
         ((view_width - 2.0 * self.gap) / self.max_width).max(MIN_FIT_ZOOM)
+    }
+
+    /// The largest zoom at which every page, with the gaps above and below it, fits a view of
+    /// `view_width` × `view_height`: at most [`PageLayout::fit_width_zoom`], and the tallest page
+    /// fills the height (1.0 when there are no pages; never below 0.05).
+    pub fn fit_page_zoom(&self, view_width: f64, view_height: f64) -> f64 {
+        let width = self.fit_width_zoom(view_width);
+        if self.max_height <= 0.0 {
+            return width;
+        }
+        ((view_height - 2.0 * self.gap) / self.max_height)
+            .min(width)
+            .max(MIN_FIT_ZOOM)
     }
 
     fn clamp_page(&self, page: u32) -> Option<usize> {
@@ -312,6 +329,25 @@ mod tests {
         assert!(close(l.content_size(z).0, 800.0));
         assert_eq!(l.fit_width_zoom(1.0), MIN_FIT_ZOOM);
         assert_eq!(PageLayout::new(Vec::new(), 12.0).fit_width_zoom(800.0), 1.0);
+    }
+
+    #[test]
+    fn fit_page_shows_the_tallest_page_whole() {
+        let l = PageLayout::new(vec![LETTER, (500.0, 900.0)], 12.0);
+        // A tall view: the width decides, as at fit width.
+        assert_eq!(l.fit_page_zoom(800.0, 5000.0), l.fit_width_zoom(800.0));
+        // A wide one: the tallest page and its two gaps fill the height.
+        let z = l.fit_page_zoom(800.0, 600.0);
+        assert!(close(z, (600.0 - 24.0) / 900.0));
+        let (_, y, w, h) = l.page_rect(1, z, 800.0);
+        assert!(close(h + 2.0 * 12.0, 600.0));
+        assert!(w < 800.0);
+        assert_eq!(l.visible(y - 12.0, y - 12.0 + 600.0, z), 1..2);
+        assert_eq!(l.fit_page_zoom(800.0, 1.0), MIN_FIT_ZOOM);
+        assert_eq!(
+            PageLayout::new(Vec::new(), 12.0).fit_page_zoom(800.0, 600.0),
+            1.0
+        );
     }
 
     #[test]

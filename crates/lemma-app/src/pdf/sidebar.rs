@@ -18,7 +18,11 @@
 //!   for each other: while they need more than the budget (a HiDPI screen, a small
 //!   `cache_mib`), the cache holds just them, as the view's cache does with the pages on screen,
 //!   and a row that shows a current thumbnail is never rendered again. A rebuilt PDF keeps the
-//!   old thumbnails on screen until the new ones arrive.
+//!   old thumbnails on screen until the new ones arrive. In dark mode the PDF thread renders the
+//!   thumbnails dark ([`ThumbReq::dark`]), so they are drawn as they are, like the view's pages
+//!   (a colour matrix costs GTK's cairo renderer a per-pixel pass on every frame the strip
+//!   scrolls); after a toggle the other mode's thumbnails stand in, recoloured, until the new
+//!   ones arrive.
 //! - **Bookmarks:** the PDF's outline (hyperref's bookmarks) as a tree (`gtk::TreeListModel`),
 //!   with each entry's page label. It is read when the strip is first shown and after each
 //!   rebuild; the entries that were expanded stay expanded (otherwise the PDF's own `/Count`
@@ -100,23 +104,29 @@ struct Thumb {
     generation: u64,
     /// The width it was rendered at, in device pixels.
     width: u16,
+    /// True when it was rendered dark.
+    dark: bool,
     texture: gdk::Texture,
     /// The size of its bitmap.
     bytes: usize,
 }
 
+/// What a row's picture shows: the generation, width and mode of its thumbnail.
+type Shown = (u64, u16, bool);
+
 /// A bound thumbnail row.
 struct Row {
     picture: PagePicture,
-    /// The generation and width of the thumbnail the picture shows.
-    shows: Option<(u64, u16)>,
+    /// The thumbnail the picture shows.
+    shows: Option<Shown>,
 }
 
 impl Row {
     /// Shows `thumb` (or the blank page).
     fn show(&mut self, thumb: Option<&Thumb>) {
-        self.picture.set_texture(thumb.map(|t| &t.texture));
-        self.shows = thumb.map(|t| (t.generation, t.width));
+        self.picture
+            .set_page_texture(thumb.map(|t| &t.texture), thumb.is_some_and(|t| t.dark));
+        self.shows = thumb.map(|t| (t.generation, t.width, t.dark));
     }
 }
 
@@ -158,6 +168,8 @@ pub struct Strip {
     /// it needs asks for no more).
     arrived: Cell<usize>,
     generation: Cell<u64>,
+    /// The view's dark mode, which the thumbnails follow.
+    dark: Cell<bool>,
     sizes: RefCell<Vec<(f64, f64)>>,
     labels: RefCell<Vec<String>>,
     labels_generation: Cell<u64>,
@@ -344,7 +356,7 @@ impl Strip {
         if let Some(size) = self.sizes.borrow().get(page as usize) {
             picture.set_page_size(*size);
         }
-        picture.set_dark(self.view.is_dark());
+        picture.set_dark(self.dark.get());
         label.set_text(&self.page_label(page));
         let mut row = Row {
             picture: picture.clone(),
@@ -399,14 +411,15 @@ impl Strip {
     }
 
     /// The thumbnails the bound rows lack (none while the thumbnails are not shown), nearest
-    /// the page shown first. A row whose picture shows a thumbnail of the current generation,
-    /// at least as wide as the row needs, lacks nothing.
+    /// the page shown first. A row whose picture shows a thumbnail of the current generation
+    /// in the view's mode, at least as wide as the row needs, lacks nothing.
     fn update_wants(&self) {
         if !self.active.get() || self.page() != Page::Thumbnails || !self.thumbs.is_mapped() {
             self.set_wants(Vec::new());
             return;
         }
         let generation = self.generation.get();
+        let dark = self.dark.get();
         let scale = self
             .thumbs
             .native()
@@ -421,11 +434,12 @@ impl Strip {
                 let width = render_width(row.picture.width(), scale)?;
                 let have = row
                     .shows
-                    .is_some_and(|(g, w)| g == generation && w >= width);
+                    .is_some_and(|(g, w, d)| g == generation && w >= width && d == dark);
                 (!have).then_some(ThumbReq {
                     generation,
                     page,
                     width,
+                    dark,
                 })
             })
             .collect();
@@ -444,7 +458,12 @@ impl Strip {
     /// A page rendered for a thumbnail request (`PdfEvent::Thumbnail`).
     pub(super) fn thumbnail(&self, req: ThumbReq, texture: &gdk::Texture, bytes: usize) {
         self.arrived.set(self.arrived.get() + 1);
-        if req.generation != self.generation.get() || !self.active.get() {
+        // Of the shown generation and in the view's mode only: a thumbnail asked for before a
+        // toggle leaves the row its stand-in until the new one arrives.
+        if req.generation != self.generation.get()
+            || req.dark != self.dark.get()
+            || !self.active.get()
+        {
             return;
         }
         // Only for a row that wants it (the link preview's pages come here too).
@@ -467,6 +486,7 @@ impl Strip {
         let thumb = Thumb {
             generation: req.generation,
             width: req.width,
+            dark: req.dark,
             texture: texture.clone(),
             bytes,
         };
@@ -494,6 +514,18 @@ impl Strip {
         }
         cache.set_cap(thumbnail_budget(self.total).max(needed));
         cache.insert(page, thumb, bytes);
+    }
+
+    /// The view's dark mode changed: the pictures show their thumbnails recoloured until the
+    /// ones of the new mode arrive.
+    fn dark_changed(&self, dark: bool) {
+        if self.dark.replace(dark) == dark {
+            return;
+        }
+        for row in self.bound.borrow().values() {
+            row.picture.set_dark(dark);
+        }
+        self.schedule_wants();
     }
 
     // ----- bookmarks -----
@@ -975,6 +1007,7 @@ pub fn install(state: &Rc<WindowState>) {
             cache: RefCell::new(ByteLru::new(thumbnail_budget(total))),
             arrived: Cell::new(0),
             generation: Cell::new(0),
+            dark: Cell::new(view.is_dark()),
             sizes: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
             labels_generation: Cell::new(0),
@@ -1053,10 +1086,7 @@ pub fn install(state: &Rc<WindowState>) {
         if let Some(strip) = weak.upgrade() {
             strip.shown_changed();
             strip.follow_view();
-            let dark = view.is_dark();
-            for row in strip.bound.borrow().values() {
-                row.picture.set_dark(dark);
-            }
+            strip.dark_changed(view.is_dark());
         }
     });
     let weak = Rc::downgrade(&strip);
@@ -1095,12 +1125,13 @@ pub fn thumbnails_arrived(state: &WindowState) -> usize {
 }
 
 /// The pages whose thumbnail rows are bound and laid out, with whether each shows a thumbnail of
-/// the current generation at its width, which the cache holds too.
+/// the current generation at its width in the view's mode, which the cache holds too.
 pub fn thumbnail_rows(state: &WindowState) -> Vec<(u32, bool)> {
     let Some(strip) = strip_of(state) else {
         return Vec::new();
     };
     let generation = strip.generation.get();
+    let dark = strip.dark.get();
     let scale = strip
         .thumbs
         .native()
@@ -1114,11 +1145,11 @@ pub fn thumbnail_rows(state: &WindowState) -> Vec<(u32, bool)> {
         .filter(|(_, row)| row.picture.width() > 0)
         .map(|(&page, row)| {
             let ready = render_width(row.picture.width(), scale).is_some_and(|w| {
-                let current = |(g, width): (u64, u16)| g == generation && width >= w;
+                let current = |(g, width, d): Shown| g == generation && width >= w && d == dark;
                 row.shows.is_some_and(current)
                     && cache
                         .get(&page)
-                        .is_some_and(|t| current((t.generation, t.width)))
+                        .is_some_and(|t| current((t.generation, t.width, t.dark)))
             }) && row.picture.texture().is_some();
             (page, ready)
         })

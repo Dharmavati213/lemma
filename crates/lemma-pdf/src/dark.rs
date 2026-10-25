@@ -2,8 +2,9 @@
 //! but keeps hues (a red link stays red), mapped into [`PAPER`]..[`INK`] so white paper becomes a
 //! soft dark grey and black ink a soft light grey.
 //!
-//! The PDF thread applies it to the bitmaps of [`PageKey::dark`](crate::PageKey::dark) requests,
-//! once per bitmap, so the view draws dark pages as plain textures. (A colour matrix over the
+//! The PDF thread applies it to the bitmaps of [`PageKey::dark`](crate::PageKey::dark) requests
+//! (and of [`ThumbReq::dark`](crate::ThumbReq::dark) thumbnails), once per bitmap, so the view
+//! and the thumbnail strip draw dark pages as plain textures. (A colour matrix over the
 //! pages at draw time costs GTK's cairo renderer a per-pixel pass over the whole view on every
 //! frame, which made scrolling miss frames.) The PDF view builds the same transform as a colour
 //! matrix from these constants for the brief moments it shows a page of the other mode.

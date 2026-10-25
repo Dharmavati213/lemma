@@ -145,7 +145,7 @@ pub(crate) fn height_for_width(size_bp: (f64, f64), width: u16) -> i32 {
 }
 
 /// Renders the whole `page` `req.width` pixels wide (thumbnails, link previews), on a white
-/// background like [`render`].
+/// background like [`render`], coloured for dark mode when `req.dark`.
 pub(crate) fn render_thumbnail(
     page: &poppler::Page,
     req: ThumbReq,
@@ -153,7 +153,7 @@ pub(crate) fn render_thumbnail(
     let size = page.size();
     let width = i32::from(req.width.max(1));
     let height = height_for_width(size, req.width.max(1));
-    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
     {
         let cr = cairo::Context::new(&surface)?;
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -165,6 +165,9 @@ pub(crate) fn render_thumbnail(
         cr.status()?;
     }
     let stride = surface.stride();
+    if req.dark {
+        crate::dark::darken_bgra(&mut surface.data()?);
+    }
     let data = surface.take_data()?;
     Ok(Thumbnail {
         req,

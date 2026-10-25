@@ -410,6 +410,7 @@ fn accel_collisions() {
         "<Control>equal",
         "<Control>minus",
         "<Control>0",
+        "<Control>1",
         "BackSpace",
         "slash",
         "Escape",

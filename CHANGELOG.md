@@ -57,6 +57,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   (the last 50), as in a shell: Up in the empty box shows the last one, Down past the newest
   empties the box again. In a prompt of several lines they move between its lines first, and
   once you edit a prompt they only move the cursor. Listed in the shortcuts window.
+- Open PDF in Another App and Show PDF in Files, in the PDF toolbar's new menu and the command
+  palette: the system's PDF viewer opens the built PDF (to print it or present slides), or the
+  file manager shows it, since the build writes it to the hidden `.build` folder.
+- Fit Page and Zoom to 100% for the PDF (in the toolbar's menu and the command palette; Ctrl+1
+  in the PDF is 100%). Fit Page shows the current page whole and keeps doing so when the pane is
+  resized, and the session remembers it.
+- In the PDF, Left and Right (and h and l) scroll sideways when zoomed in. The shortcuts window
+  lists the PDF's own keys.
 
 ### Changed
 
@@ -76,6 +84,13 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   per window; the status bar says "latexmk not found".
 - Auto-saving several documents requests one build once they are all written, not one per
   document, which ran latexmk a second time for nothing and wrote the documents twice.
+- In dark mode the PDF strip's thumbnails (and link previews) are rendered dark by the PDF
+  thread instead of being recoloured on every frame: drawing a 120 × 612 strip takes 0.3 ms
+  instead of 2.1 ms with the cairo renderer, Lemma's default.
+- Zooming the PDF out renders the pages that come into view at the new zoom right away, instead
+  of at the old zoom and then again 120 ms later (over several Ctrl+wheel notches or a pinch,
+  such a page then waits for the final zoom): zooming pdf50 out sixfold now renders 9 pages
+  instead of 14, and the texture cache holds 7.8 MiB instead of 13 MiB meanwhile.
 - The Problems page builds its rows only when it is shown, and lists at most 500 of a build's
   problems, the most severe ones (errors, then warnings, then bad boxes), followed by a line
   saying how many more there are. The ones left out keep their gutter marks and are still
