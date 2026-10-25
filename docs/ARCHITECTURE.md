@@ -1048,6 +1048,16 @@ they conflict with the sections above, this section wins.
     Ctrl+H. An accelerator may be shared by actions that are never enabled together
     (`app::SHARED_ACCELS`), and GTK runs the enabled one: Ctrl+F is also `win.pdf-search`,
     enabled only while the PDF has the focus.
+  - A key controller in the capture phase of a text view runs before the view's input method,
+    so it leaves every key to the input method while the view shows preedit text
+    (`preedit-changed`), as the snippet driver and the typing helpers do: the agent's prompt
+    box sends on Enter and drives its suggestions only without preedit (verified on real keys
+    with a dead key), and a box with preedit text is not empty, so a permission card does not
+    take the focus from it.
+  - The agent's prompt box recalls the last 50 prompts sent from it (per window, in memory)
+    with Up and Down, in the empty box or in a recalled prompt nobody edited, on its first
+    (last) line as wrapped; while suggestions show, Up and Down are theirs. They are plain keys
+    of a text field that is not an editor, so neither Vim nor the accelerators are involved.
 - **Memory (§7):**
   - The 60 s inactive cache trim is implemented, and closed tabs free their view and buffer.
   - Idle PSS depends on how many other GTK processes share the libraries. Under Broadway, idle measures about 92 MB RSS

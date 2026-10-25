@@ -127,7 +127,14 @@ Where the agent is tested:
   with `basic`, `permission`, `cancel`, and `resume`: an idle stop with the pane hidden ends the
   fake agent's process, a start that fails keeps the conversation, and the next message loads
   the same session in a new one, in the mode it had, without the replayed conversation):
-  in-process.
+  in-process. `gtk_agent_panel` also types into the prompt box on real key events
+  (`prompt_box_on_real_key_events`: a dead key's preedit keeps Enter from sending, and Up and
+  Down recall earlier prompts through the text view's own cursor moves; the binary sets
+  `GTK_IM_MODULE=gtk-im-context-simple`, since GTK would otherwise pick an installed IBus or
+  Fcitx module, which talks to the desktop's daemon and answers keys asynchronously); in
+  process, its `prompt_keys_go_to_the_input_method_while_it_composes` emits the text view's
+  `preedit-changed` as a CJK input method would, and `streaming_table_updates_in_place` checks
+  that a streaming table keeps its grid and cell labels.
 - `tests/gtk_e2e_agent.rs`: the real `lemma` binary with `--demo agent` (below).
 - `scripts/e2e-agent.sh [case…]`: every scenario through the real binary, offscreen. Each case
   copies `proj` to `target/e2e-agent/<case>/`, runs the demo, checks the report line and the
@@ -228,8 +235,9 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `lemma-build` (`tests/chktex.rs`, `tests/explain.rs`). `gtk_pdf_m3` needs
   `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`) for some tests and prints `SKIP`
   without it. Keys are tested on real key events (private Broadway daemons) in `gtk_shell_m3`,
-  `gtk_palette`, `gtk_pairs`, `gtk_outline` and `gtk_pdf_m3`; pointer hovers through the modules'
-  `pointer_moved` functions (GTK cannot inject pointer events).
+  `gtk_palette`, `gtk_pairs`, `gtk_outline`, `gtk_pdf_m3` and `gtk_agent_panel` (the prompt
+  box); pointer hovers through the modules' `pointer_moved` functions (GTK cannot inject
+  pointer events).
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
   `find_bar_*` tests (counts and wrapping, the options and invalid expressions, the actions
   following the focus and Vim, the prefill and the query a match keeps, Replace and Replace All
@@ -265,6 +273,7 @@ check the budgets only in release builds:
 | `lemma-complete` `perf_complete` | completion ≤ 3 ms p99 with all tables and a 7k-line project index |
 | `agent::markdown` `perf_render_long_message` | re-rendering a streaming 100 kB answer ≤ 2 ms per frame |
 | `lemma-agent` `perf_text_deltas_append_in_place` | the API backend's streamed deltas appended to their block: 32k deltas of 16 bytes ≤ 20 ms, and twice the deltas ≤ 3× the time (measured 0.8 ms; 230 ms when every delta copied the block) |
+| `gtk_agent_panel` `perf_streamed_table` | a 60-row, 5-column table streaming in 10-byte chunks: each chunk's re-render and layout of the table ≤ 2 ms p99, and the table is never built again |
 | `lemma-syntax` `perf_index_pathological` | `index_file` on 14 pathological shapes (unclosed groups, stray `\end`, unterminated `\iffalse`, …) stays linear: twice the size ≤ 3× the time, ≤ 200 ms per MB |
 | `gtk_outline` `perf_outline_keystroke` | the outline's work per keystroke on the 7k-line corpus (first 7000 lines of `large.tex`) ≤ 1 ms (p99 and mean); `perf_outline_large_tex` prints the first outline and a patch on `large.tex` |
 | `gtk_pairs` `perf_pairs_cursor_moves_large_tex` | delimiter-pair highlight per cursor move on `large.tex` ≤ 0.5 ms p99 |

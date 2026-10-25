@@ -356,6 +356,11 @@ pub const KEY_LAYER_SHORTCUTS: &[(&str, &str, ShortcutGroup)] = &[
         "Answer the agent's permission card: once / always / reject",
         ShortcutGroup::Agent,
     ),
+    (
+        "Up / Down",
+        "Prompt box: the previous / next prompt you sent",
+        ShortcutGroup::Agent,
+    ),
 ];
 
 /// State shared by the application's callbacks.

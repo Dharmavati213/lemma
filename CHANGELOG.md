@@ -30,6 +30,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   mode on, Ctrl+B and Ctrl+I stay Vim's keys and Bold and Italic are off.
 - Preferences: auto-save (off, when the window loses the focus, or two seconds after a change),
   session restore, the git gutter, the word count, chktex and typing replacements.
+- Up and Down in the agent's prompt box bring back the prompts you sent from it in this window
+  (the last 50), as in a shell: Up in the empty box shows the last one, Down past the newest
+  empties the box again. In a prompt of several lines they move between its lines first, and
+  once you edit a prompt they only move the cursor. Listed in the shortcuts window.
 
 ### Changed
 
@@ -52,9 +56,21 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   length on the agent's thread (32,000 pieces: under 1 ms instead of 230 ms).
 - Of the last 64 tool calls, the editor keeps the first 2 KB of each reply instead of the whole
   reply (often a whole file), and forgets them when the agent stops.
+- A table in an agent's answer is no longer built again on every frame while it streams: only
+  the cells that changed are updated and new rows are added. With a 60-row table, each update
+  kept the main thread busy for about 25 ms (over 50 ms at times), which made typing and
+  scrolling stutter while the answer streamed; it now takes about 0.5 ms. A selection in the
+  table is no longer lost while it streams.
 
 ### Fixed
 
+- With an input method that composes text (Japanese, Chinese or Korean input through IBus,
+  Fcitx, macOS or Windows; dead keys), Enter in the agent's prompt box confirms the conversion
+  instead of sending the prompt without the text being composed. Up, Down, Tab and Escape go to
+  the input method too while it composes, and a permission card no longer takes the focus from
+  the empty prompt box then (the next keys of the conversion, such as `n`, answered it).
+- A table in an agent's answer no longer makes GTK warn ("Trying to measure GtkGrid …") each
+  time it is laid out.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive
   (`C:/texlive/…/geometry.sty:1005: …`), such as an unknown package option, reach the Problems
   page.

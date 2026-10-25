@@ -356,6 +356,11 @@ continues the conversation where it left off, in the mode and with the model you
 An agent that cannot resume conversations is only stopped before your first message to it.
 `[agent] idle_stop_min` sets the minutes; 0 keeps the agent running.
 
+In the pane's prompt box, Enter sends and Shift+Enter starts a new line. Up and Down bring back
+the prompts you sent from the box in this window (the last 50), as in a shell; once you edit
+one, they move the cursor again. While an input method composes (Japanese, Chinese or Korean
+input, dead keys), Enter, Up and Down are its keys.
+
 How each ACP agent starts can be changed in `config.toml`; every key is optional:
 
 ```toml

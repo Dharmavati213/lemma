@@ -953,6 +953,11 @@ fn shortcuts_groups() {
             "Answer the agent's permission card: once / always / reject",
             "y <Shift>y n",
         ),
+        (
+            Agent,
+            "Prompt box: the previous / next prompt you sent",
+            "Up Down",
+        ),
         (BuildPdf, "Build", "F5"),
         (BuildPdf, "Next Problem", "F4"),
         (BuildPdf, "Previous Problem", "<Shift>F4"),
@@ -1062,6 +1067,7 @@ fn shortcut_labels() {
         ("Ctrl+O", "<Control>o", false),
         ("%", "percent", false),
         ("y / Shift+Y / n", "y <Shift>y n", false),
+        ("Up / Down", "Up Down", false),
         ("F12", "F12", false),
         ("Alt+]", "<Alt>bracketright", false),
     ];

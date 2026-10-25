@@ -12,11 +12,15 @@
 //!
 //! The process environment is isolated before GTK starts: `HOME` and the `XDG_*` directories
 //! point into a temporary directory, and `PATH` is a temporary `bin` directory plus `/usr/bin`
-//! and `/bin`, so nothing here can find or run the real node, npm or claude.
+//! and `/bin`, so nothing here can find or run the real node, npm or claude. Text views use
+//! GTK's own input method (`GTK_IM_MODULE`), never the desktop's input method daemon.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_agent_panel`.
-//! `LEMMA_TEST_SNAPSHOTS=dir` saves `f-agent-panel.png` there.
+//! `LEMMA_TEST_SNAPSHOTS=dir` saves `f-agent-panel.png` there. The ignored `perf_streamed_table`
+//! times a long table while it streams (release: `cargo test --release -p lemma-app --test
+//! gtk_agent_panel -- --ignored perf`).
 
+mod broadway_input;
 mod common;
 
 use adw::prelude::*;
@@ -46,13 +50,19 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
+    if broadway_input::is_child() {
+        isolate_environment();
+        return common::run(&[(real_keys::CHILD, real_keys::child)]);
+    }
+    let ignored = std::env::args().any(|a| a == "--ignored" || a == "--include-ignored");
     // `e2e_*` need the fake agent and the MCP bridge; cargo needs the real HOME and PATH.
     common::require_agent_binaries();
     isolate_environment();
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         ("streaming_renders_in_order", streaming_renders_in_order),
         ("streaming_cost_per_chunk", streaming_cost_per_chunk),
         ("markdown_rows", markdown_rows),
+        ("streaming_table_updates_in_place", streaming_table),
         ("permission_card_keys", permission_card_keys),
         (
             "permission_card_buttons_and_plan_options",
@@ -66,6 +76,12 @@ fn main() -> ExitCode {
         ("pickers_send_mode_and_config", pickers),
         ("usage_ring_updates", usage_ring),
         ("prompt_box_enter_and_shift_enter", prompt_box),
+        ("prompt_history_up_and_down", prompt_history),
+        (
+            "prompt_keys_go_to_the_input_method_while_it_composes",
+            prompt_preedit,
+        ),
+        ("prompt_box_on_real_key_events", real_keys::parent),
         (
             "prompt_is_restored_when_the_turn_cannot_start",
             prompt_restored,
@@ -119,7 +135,11 @@ fn main() -> ExitCode {
             "e2e_idle_stop_resumes_the_conversation",
             e2e_idle_stop_resumes,
         ),
-    ])
+    ];
+    if ignored {
+        tests.push(("perf_streamed_table", perf_streamed_table));
+    }
+    common::run(&tests)
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -160,6 +180,10 @@ fn isolate_environment() {
         std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
         std::env::set_var("LEMMA_CONFIG", &config);
         std::env::remove_var("MISE_DATA_DIR");
+        // GTK's own input method, never the desktop's (IBus or Fcitx, which GTK would pick
+        // when their module is installed, and which answer keys asynchronously): the real-key
+        // test composes a dead key with it.
+        std::env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
     }
     let _ = ENV.set(TestEnv { home, bin, config });
 }
@@ -584,6 +608,191 @@ fn markdown_rows() {
         copied.as_deref(),
         Some("\\begin{align}\n  a &< b\n\\end{align}")
     );
+}
+
+/// An answer with a table of `rows` rows of `columns` cells (with code, bold and math) between
+/// two paragraphs, and the offset where the table's first row starts. Plain ASCII, so it can be
+/// streamed in byte chunks.
+fn table_message(rows: usize, columns: usize) -> (String, usize) {
+    let mut message = String::from("Here is how the packages compare:\n\n|");
+    for c in 0..columns {
+        message.push_str(&format!(" Column {c} |"));
+    }
+    message.push_str("\n|");
+    message.push_str(&"---|".repeat(columns));
+    message.push('\n');
+    let body = message.len();
+    for r in 0..rows {
+        message.push('|');
+        for c in 0..columns {
+            let cell = match c % 4 {
+                0 => format!("`pkg{r}`"),
+                1 => format!("sets **{r}** things in $x_{r}$"),
+                2 => format!("main.tex:{r}"),
+                _ => format!("draft, final, and {r} more options"),
+            };
+            message.push_str(&format!(" {cell} |"));
+        }
+        message.push('\n');
+    }
+    message.push_str("\nThat is all.");
+    (message, body)
+}
+
+/// The tables in the pane, each with its cell labels in the order they were attached.
+fn tables(panel: &panel::Panel) -> Vec<(gtk::Grid, Vec<gtk::Label>)> {
+    descendants(&panel.widget())
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Grid>().ok())
+        .filter(|g| g.has_css_class("lemma-md-table"))
+        .map(|grid| {
+            let mut labels = Vec::new();
+            let mut child = grid.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                labels.extend(c.downcast::<gtk::Label>().ok());
+            }
+            (grid, labels)
+        })
+        .collect()
+}
+
+/// A table that is still streaming keeps its grid and its cells' labels: a frame sets the
+/// markup of the cells that changed and attaches the rows that came, instead of building every
+/// cell again; a row that turns out not to be one (the start of a code fence) goes again.
+fn streaming_table() {
+    let f = fixture("stream-table", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    f.begin("compare the packages", PromptOrigin::Panel);
+    let (table, body) = table_message(20, 3);
+    let end = table.find("\n\nThat").unwrap() + 1;
+    let table = &table[..end];
+    // The header first; the rows are created during layout.
+    f.event(AgentEvent::MessageChunk(table[..body].into()));
+    panel.flush();
+    f.frames(2);
+    let [(grid, mut shown)] = <[_; 1]>::try_from(tables(&panel)).expect("one table");
+    assert_eq!(shown.len(), 3, "the header's cells");
+    let stream = |text: &str| {
+        f.event(AgentEvent::MessageChunk(text.into()));
+        panel.flush();
+        let [(now, labels)] = <[_; 1]>::try_from(tables(&panel)).expect("one table");
+        assert_eq!(now, grid, "the table keeps its grid");
+        labels
+    };
+    for chunk in table.as_bytes()[body..].chunks(7) {
+        let labels = stream(std::str::from_utf8(chunk).unwrap());
+        assert!(
+            labels.len() >= shown.len() && labels[..shown.len()] == shown[..],
+            "the table keeps its cells"
+        );
+        shown = labels;
+    }
+    assert_eq!(shown.len(), 21 * 3);
+    // "`" and "``" are a row of their own, "```" opens a code block after the table.
+    let labels = stream("`");
+    assert_eq!(labels.len(), 22 * 3);
+    assert_eq!(labels[..shown.len()], shown[..]);
+    assert_eq!(stream("`"), labels);
+    assert_eq!(stream("`"), shown);
+    let rest = "\n\\frac{a}{b}\n```\n\nThat is all.";
+    assert_eq!(stream(rest), shown);
+    f.end(StopReason::EndTurn);
+    panel.flush();
+    f.frames(1);
+    let message = format!("{table}```{rest}");
+    let blocks = lemma_app::agent::markdown::render(&message);
+    let Some(lemma_app::agent::markdown::Block::Table { header, rows }) = blocks.get(1) else {
+        panic!("{blocks:#?}")
+    };
+    assert_eq!(rows.len(), 20);
+    let expected: Vec<String> = header
+        .iter()
+        .map(|h| format!("<b>{h}</b>"))
+        .chain(rows.iter().flatten().cloned())
+        .collect();
+    let [(now, labels)] = <[_; 1]>::try_from(tables(&panel)).expect("one table");
+    assert_eq!(now, grid);
+    let cells: Vec<String> = labels.iter().map(|l| l.label().to_string()).collect();
+    assert_eq!(cells, expected);
+    let text = &panel.row_texts()[1];
+    assert!(
+        text.contains("\\frac{a}{b}") && text.ends_with("That is all."),
+        "{text}"
+    );
+}
+
+/// A long table while it streams: 60 rows of 5 cells in chunks of 10 bytes, each chunk followed
+/// by a frame's re-render (`flush`) and by measuring the table at the pane's width, which is
+/// the layout that frame does (Broadway draws about one frame a second, so the test does not
+/// wait for frames). Prints the cost per chunk and how often the table was built again. Release
+/// builds check that the table was never built again and that a chunk costs at most 2 ms p99
+/// (ARCHITECTURE §7, as for `perf_render_long_message`). Measured (release, Broadway, a busy
+/// machine): 0.4–0.6 ms a chunk, 0.8–1.9 ms p99, 0.3 s for the whole table; building it again
+/// on every frame cost 23 ms a chunk, 53 ms p99 and 15 s.
+fn perf_streamed_table() {
+    let f = fixture("perf-table", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    f.begin("compare the packages", PromptOrigin::Panel);
+    let (message, body) = table_message(60, 5);
+    f.event(AgentEvent::MessageChunk(message[..body].into()));
+    panel.flush();
+    f.frames(2);
+    let width = panel.widget().width();
+    let mut grid = tables(&panel).remove(0).0;
+    let (mut costs, mut flushes, mut layouts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut rebuilt = 0;
+    let end = message.find("\n\nThat").unwrap();
+    for chunk in message.as_bytes()[body..end].chunks(10) {
+        f.event(AgentEvent::MessageChunk(
+            std::str::from_utf8(chunk).unwrap().into(),
+        ));
+        let t = Instant::now();
+        panel.flush();
+        let flush = t.elapsed();
+        let now = tables(&panel).remove(0).0;
+        if now != grid {
+            rebuilt += 1;
+            grid = now;
+        }
+        let t = Instant::now();
+        grid.measure(gtk::Orientation::Horizontal, -1);
+        grid.measure(gtk::Orientation::Vertical, width);
+        let layout = t.elapsed();
+        flushes.push(flush);
+        layouts.push(layout);
+        costs.push(flush + layout);
+    }
+    let cells = tables(&panel).remove(0).1.len();
+    f.end(StopReason::EndTurn);
+    let p = |v: &mut Vec<Duration>, q: usize| {
+        v.sort();
+        v[(v.len() * q / 100).min(v.len() - 1)]
+    };
+    let chunks = costs.len();
+    let total: Duration = costs.iter().sum();
+    println!(
+        "perf_streamed_table: {cells} cells, {chunks} chunks, built again {rebuilt} times; per \
+         chunk: flush p50 {:.2?} p99 {:.2?}, layout p50 {:.2?} p99 {:.2?}, both p50 {:.2?} p99 \
+         {:.2?} max {:.2?}; {total:.2?} in all",
+        p(&mut flushes, 50),
+        p(&mut flushes, 99),
+        p(&mut layouts, 50),
+        p(&mut layouts, 99),
+        p(&mut costs, 50),
+        p(&mut costs, 99),
+        costs.last().unwrap(),
+    );
+    assert_eq!(cells, 61 * 5);
+    if cfg!(debug_assertions) {
+        println!("    (debug build: budgets not checked)");
+        return;
+    }
+    assert_eq!(rebuilt, 0, "the table is updated in place");
+    let p99 = p(&mut costs, 99);
+    assert!(p99 <= Duration::from_millis(2), "p99 {p99:?}");
 }
 
 // ----- permissions -----
@@ -1064,6 +1273,314 @@ fn prompt_box() {
     assert_eq!(buffer.char_count(), 9, "the text stays");
     f.end(StopReason::EndTurn);
     assert!(panel.send_button().is_sensitive());
+}
+
+/// The prompt box's text.
+fn prompt_text(view: &gtk::TextView) -> String {
+    let buffer = view.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
+}
+
+/// The cursor's line and offset in the prompt box.
+fn prompt_cursor(view: &gtk::TextView) -> (i32, i32) {
+    let buffer = view.buffer();
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    (cursor.line(), cursor.offset())
+}
+
+/// Up or Down in the prompt box as the text view gets it: the panel's key handler first, then,
+/// when that lets the key through, the text view's own cursor move.
+fn press(panel: &panel::Panel, key: Key) -> glib::Propagation {
+    let propagation = panel.prompt_key(key, ModifierType::empty());
+    if propagation == glib::Propagation::Proceed {
+        let count = if key == Key::Up { -1 } else { 1 };
+        panel
+            .prompt_view()
+            .emit_move_cursor(gtk::MovementStep::DisplayLines, count, false);
+    }
+    propagation
+}
+
+/// Up and Down recall the prompts sent from the box: in the empty box or a recalled prompt
+/// nobody edited, on its first (last) line; Down past the newest empties the box again. The
+/// box keeps the last `HISTORY_LEN`, each once in a row.
+fn prompt_history() {
+    use glib::Propagation::{Proceed, Stop};
+    let f = fixture("prompt-history", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    let view = panel.prompt_view();
+    let buffer = view.buffer();
+    f.event(AgentEvent::Commands(vec![(
+        "compact".into(),
+        "Compact the conversation".into(),
+    )]));
+    let send = |text: &str| {
+        buffer.set_text(text);
+        panel.send();
+    };
+    send("Fix the abstract");
+    send("/compact");
+    send("First line\nsecond line");
+    // The same once trimmed: not kept twice.
+    send("  First line\nsecond line\n");
+    common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 4);
+    let text = || prompt_text(&view);
+    let two_lines = "First line\nsecond line";
+    let end = two_lines.chars().count() as i32;
+
+    // Up in the empty box: the newest prompt, the cursor at its end. Up then moves through its
+    // lines before it goes on.
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), two_lines);
+    assert_eq!(prompt_cursor(&view), (1, end));
+    assert_eq!(press(&panel, Key::Up), Proceed);
+    assert_eq!(prompt_cursor(&view).0, 0);
+    // A recalled `/command` shows no suggestions, so Up goes on.
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), "/compact");
+    assert!(panel.suggestions().is_empty());
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), "Fix the abstract");
+    // Nothing older: the text view's Up.
+    assert_eq!(press(&panel, Key::Up), Proceed);
+    assert_eq!(text(), "Fix the abstract");
+    // Down: the newer ones, the cursor at their start, through their lines.
+    assert_eq!(press(&panel, Key::Down), Stop);
+    assert_eq!(text(), "/compact");
+    assert_eq!(press(&panel, Key::Down), Stop);
+    assert_eq!(text(), two_lines);
+    assert_eq!(prompt_cursor(&view), (0, 0));
+    assert_eq!(press(&panel, Key::Down), Proceed);
+    assert_eq!(prompt_cursor(&view).0, 1);
+    // Past the newest: the empty box, and nothing newer.
+    assert_eq!(press(&panel, Key::Down), Stop);
+    assert_eq!(text(), "");
+    assert_eq!(press(&panel, Key::Down), Proceed);
+    assert_eq!(text(), "");
+    // The keypad's arrows (Num Lock off) too.
+    assert_eq!(panel.prompt_key(Key::KP_Up, ModifierType::empty()), Stop);
+    assert_eq!(text(), two_lines);
+    assert_eq!(panel.prompt_key(Key::KP_Down, ModifierType::empty()), Stop);
+    assert_eq!(text(), "");
+
+    // Editing a recalled prompt makes it a draft: Up and Down move the cursor again.
+    assert_eq!(press(&panel, Key::Up), Stop);
+    type_into(&view, "!");
+    buffer.place_cursor(&buffer.start_iter());
+    assert_eq!(press(&panel, Key::Up), Proceed);
+    assert_eq!(press(&panel, Key::Down), Proceed);
+    assert_eq!(press(&panel, Key::Down), Proceed);
+    assert_eq!(text(), "First line\nsecond line!");
+    // So do typed text and Up with a modifier (Shift+Up selects).
+    buffer.set_text("typed");
+    buffer.place_cursor(&buffer.start_iter());
+    assert_eq!(press(&panel, Key::Up), Proceed);
+    assert_eq!(text(), "typed");
+    buffer.set_text("");
+    assert_eq!(panel.prompt_key(Key::Up, ModifierType::SHIFT_MASK), Proceed);
+    assert_eq!(text(), "");
+    // While suggestions show, Up and Down choose among them.
+    type_into(&view, "/co");
+    assert_eq!(panel.suggestions(), ["/compact"]);
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), "/co");
+    assert_eq!(panel.suggestions(), ["/compact"]);
+    panel.prompt_key(Key::Escape, ModifierType::empty());
+    buffer.set_text("");
+
+    // A recalled prompt sent again is not kept twice; an older one becomes the newest.
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(press(&panel, Key::Up), Proceed);
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), "/compact");
+    panel.send();
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), "/compact");
+    assert_eq!(press(&panel, Key::Up), Stop);
+    assert_eq!(text(), two_lines);
+    buffer.set_text("");
+    common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 5);
+
+    // The last `HISTORY_LEN` prompts.
+    for i in 0..60 {
+        send(&format!("prompt {i}"));
+    }
+    common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 65);
+    let mut recalled = Vec::new();
+    while panel.prompt_key(Key::Up, ModifierType::empty()) == Stop {
+        recalled.push(text());
+        assert!(recalled.len() <= panel::HISTORY_LEN, "{recalled:?}");
+    }
+    assert_eq!(recalled.len(), panel::HISTORY_LEN);
+    assert_eq!(recalled[0], "prompt 59");
+    assert_eq!(recalled.last().map(String::as_str), Some("prompt 10"));
+}
+
+/// While the input method composes (preedit text shows), the prompt box's keys are its own:
+/// Enter confirms the conversion instead of sending, and Up, Down, Tab and Escape neither
+/// choose suggestions nor recall prompts. No input method runs here, so the test emits the
+/// text view's `preedit-changed` as one would.
+fn prompt_preedit() {
+    use glib::Propagation::{Proceed, Stop};
+    let f = fixture("prompt-preedit", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    let view = panel.prompt_view();
+    let preedit = |text: &str| view.emit_by_name::<()>("preedit-changed", &[&text]);
+    f.event(AgentEvent::Commands(vec![
+        ("compact".into(), "Compact the conversation".into()),
+        ("context".into(), "Show the context usage".into()),
+    ]));
+    view.buffer().set_text("Fix the abstract");
+    panel.send();
+    common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 1);
+
+    // Composing in the empty box: Up is a candidate key, not the last prompt.
+    preedit("にほん");
+    assert_eq!(panel.prompt_key(Key::Up, ModifierType::empty()), Proceed);
+    assert_eq!(prompt_text(&view), "");
+    // Composing after some text: no key sends.
+    type_into(&view, "日本語の");
+    preedit("ぶんしょう");
+    for key in [
+        Key::Return,
+        Key::KP_Enter,
+        Key::Up,
+        Key::Down,
+        Key::Tab,
+        Key::Escape,
+    ] {
+        assert_eq!(
+            panel.prompt_key(key, ModifierType::empty()),
+            Proceed,
+            "{key:?}"
+        );
+    }
+    common::pump_for(Duration::from_millis(50));
+    assert_eq!(prompts(&f.commands()).len(), 1, "nothing was sent");
+    // The conversion is committed and the preedit ends: Enter sends all of it.
+    type_into(&view, "文章");
+    preedit("");
+    assert_eq!(panel.prompt_key(Key::Return, ModifierType::empty()), Stop);
+    common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 2);
+    assert_eq!(text_of(&prompts(&f.commands())[1].0), "日本語の文章");
+
+    // Suggestions wait for the input method too.
+    type_into(&view, "/co");
+    assert_eq!(panel.suggestions(), ["/compact", "/context"]);
+    preedit("´");
+    for key in [Key::Down, Key::Tab, Key::Return, Key::Escape] {
+        assert_eq!(
+            panel.prompt_key(key, ModifierType::empty()),
+            Proceed,
+            "{key:?}"
+        );
+    }
+    assert_eq!(prompt_text(&view), "/co");
+    assert_eq!(panel.suggestions(), ["/compact", "/context"]);
+    preedit("");
+    panel.prompt_key(Key::Down, ModifierType::empty());
+    assert_eq!(panel.prompt_key(Key::Tab, ModifierType::empty()), Stop);
+    assert_eq!(prompt_text(&view), "/context ");
+
+    // A box that shows only preedit text is not empty: a permission card does not take the
+    // focus from it, where the next keys of the conversion (`n`, `y`) would answer the card.
+    let window = f.state.window.clone();
+    let prompt_focused = || gtk::prelude::RootExt::focus(&window) == Some(view.clone().upcast());
+    view.buffer().set_text("");
+    view.grab_focus();
+    common::pump_until(TIMEOUT, prompt_focused);
+    preedit("にゅ");
+    f.begin("compile it", PromptOrigin::Panel);
+    f.event(bash_permission(1));
+    panel.flush();
+    common::pump_until(TIMEOUT, || !panel.permission_buttons(1).is_empty());
+    // Longer than the card waits for its row (30 tries 16 ms apart).
+    common::pump_for(Duration::from_millis(700));
+    assert!(
+        prompt_focused(),
+        "the card took the focus from the composing box"
+    );
+    preedit("");
+    f.end(StopReason::EndTurn);
+}
+
+// ----- real key events -----
+
+mod real_keys {
+    //! The prompt box on real key events (a private Broadway daemon, see `tests/broadway_input`):
+    //! the keys take GDK's real path through the pane's and the prompt box's key controllers to
+    //! the text view and its input method (GTK's own, which composes dead keys).
+
+    use super::*;
+    use broadway_input::{Browser, SHIFT};
+
+    pub const CHILD: &str = "prompt_real_keys_child";
+
+    pub fn parent() {
+        broadway_input::run_child(CHILD, 43);
+    }
+
+    pub fn child() {
+        let f = fixture("real-keys", &[("main.tex", MAIN)], Hook::Swallow);
+        f.show_panel();
+        let panel = f.panel();
+        let view = panel.prompt_view();
+        common::pump_until(TIMEOUT, || f.state.window.is_active());
+        view.grab_focus();
+        common::pump_until(TIMEOUT, || view.has_focus());
+        // Frames are drawn: Up and Down look at the lines as laid out.
+        let mut browser = Browser::connect_drawing();
+        browser.settle = Duration::from_millis(20);
+        let sent = || prompts(&f.commands());
+
+        // A dead key composes (the input method shows it as preedit), so Enter is the input
+        // method's and sends nothing (before, it sent "abc" and the é went into the empty
+        // box); `e` completes the composition, and Enter then sends.
+        browser.text("abc");
+        browser.key(Key::dead_acute, 0);
+        browser.key(Key::Return, 0);
+        common::pump_for(Duration::from_millis(100));
+        assert!(sent().is_empty(), "Enter while composing sent {:?}", sent());
+        browser.text("e");
+        common::pump_until(TIMEOUT, || prompt_text(&view) == "abcé");
+        browser.key(Key::Return, 0);
+        common::pump_until(TIMEOUT, || sent().len() == 1);
+        assert_eq!(text_of(&sent()[0].0), "abcé");
+
+        // Up and Down: a two-line prompt (Shift+Enter), then back to the first one.
+        browser.text("one");
+        browser.key(Key::Return, SHIFT);
+        browser.text("two");
+        browser.key(Key::Return, 0);
+        common::pump_until(TIMEOUT, || sent().len() == 2);
+        assert_eq!(text_of(&sent()[1].0), "one\ntwo");
+        assert_eq!(prompt_text(&view), "");
+        browser.key(Key::Up, 0);
+        common::pump_until(TIMEOUT, || prompt_text(&view) == "one\ntwo");
+        assert_eq!(prompt_cursor(&view), (1, 7));
+        browser.key(Key::Up, 0);
+        common::pump_until(TIMEOUT, || prompt_cursor(&view).0 == 0);
+        assert_eq!(prompt_text(&view), "one\ntwo");
+        browser.key(Key::Up, 0);
+        common::pump_until(TIMEOUT, || prompt_text(&view) == "abcé");
+        browser.key(Key::Down, 0);
+        common::pump_until(TIMEOUT, || prompt_text(&view) == "one\ntwo");
+        assert_eq!(prompt_cursor(&view), (0, 0));
+        browser.key(Key::Down, 0);
+        common::pump_until(TIMEOUT, || prompt_cursor(&view).0 == 1);
+        browser.key(Key::Down, 0);
+        common::pump_until(TIMEOUT, || prompt_text(&view).is_empty());
+        // Sending a recalled prompt.
+        browser.key(Key::Up, 0);
+        common::pump_until(TIMEOUT, || prompt_text(&view) == "one\ntwo");
+        browser.key(Key::Return, 0);
+        common::pump_until(TIMEOUT, || sent().len() == 3);
+        assert_eq!(text_of(&sent()[2].0), "one\ntwo");
+    }
 }
 
 fn prompt_restored() {

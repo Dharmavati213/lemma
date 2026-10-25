@@ -38,18 +38,25 @@
 //!   (a tick callback), and only the Markdown blocks that changed are touched. An agent message
 //!   is a list row per Markdown block, so GtkListView (which keeps about 200 rows alive) bounds
 //!   the widgets of a long session; a code block or an open thought is a column of labels of a
-//!   few lines each, so a frame lays out its last lines only.
+//!   few lines each, so a frame lays out its last lines only, and a table keeps its cells'
+//!   labels, so a frame sets the cells that changed and attaches the rows that came.
+//! - The prompt box: Enter sends, Shift+Enter is a newline; `/` and `@` show suggestions (Up,
+//!   Down, Tab, Enter, Esc). Up and Down recall the last [`HISTORY_LEN`] prompts sent from it
+//!   (per window, in memory) when it is empty or shows a recalled prompt unedited and the cursor
+//!   is on its first (last) line; Down past the newest empties it again. While the input method
+//!   shows preedit text (a CJK conversion, a dead key), every key goes to the input method, so
+//!   Enter confirms the conversion instead of sending.
 //! - Permission cards: buttons per option, and `y` (first `allow_once`), `Shift+Y`
 //!   (`allow_always`; Caps Lock alone never makes `y` one), `n` (`reject_once`) while the focus
 //!   is in the pane but not in the prompt box. Options that would switch the session to
 //!   `bypassPermissions`, `auto` or `acceptEdits` (the adapter's plan-exit variants) are never
 //!   offered (ARCHITECTURE §9.6); neither are those modes in the mode picker. A card appearing
-//!   while the prompt box has the focus and is empty takes the focus (the card itself, never a
-//!   button that Space or Enter would press; and only if the box is still empty when the card
-//!   is on screen), so `y`/`n` answer it, after [`AUTO_FOCUS_GRACE`]. A request shows the pane,
-//!   except in a narrow window while the user types in the editor (or another text field): the
-//!   overlay would take the keyboard focus, so a toast with an Answer button (Ctrl+L) tells
-//!   about it instead.
+//!   while the prompt box has the focus and is empty (no text, no preedit) takes the focus (the
+//!   card itself, never a button that Space or Enter would press; and only if the box is still
+//!   empty when the card is on screen), so `y`/`n` answer it, after [`AUTO_FOCUS_GRACE`]. A
+//!   request shows the pane, except in a narrow window while the user types in the editor (or
+//!   another text field): the overlay would take the keyboard focus, so a toast with an Answer
+//!   button (Ctrl+L) tells about it instead.
 //! - Tool cards have a name and icon for Lemma's MCP tools and the CLI's built-in ones
 //!   ([`tool_display`]); the CLI's `ToolSearch` (loading the deferred MCP tools) is a subdued
 //!   "Loading tools" row.
@@ -120,6 +127,8 @@ const MAX_FILES: usize = 2000;
 pub const MAX_ATTACHMENTS: usize = 20;
 /// Suggestions shown at once.
 const MAX_SUGGESTIONS: usize = 8;
+/// Prompts the prompt box remembers for Up and Down (per window, in memory only).
+pub const HISTORY_LEN: usize = 50;
 /// Lines of npm output kept in the set-up card.
 const MAX_LOG_LINES: usize = 400;
 /// How long a permission card that took the focus by itself (from the empty prompt box) does
@@ -423,7 +432,9 @@ impl Panel {
 
     /// What a key press in the prompt box does (its key controller calls it; tests too): Enter
     /// sends, Shift+Enter is a newline, and while suggestions show, Up/Down choose, Tab/Enter
-    /// accept and Esc closes them.
+    /// accept and Esc closes them; otherwise Up and Down recall the prompts sent before (on
+    /// the first or last line of an empty box or of a recalled prompt nobody edited). While the
+    /// input method composes (preedit), every key is the input method's.
     pub fn prompt_key(
         &self,
         keyval: gtk::gdk::Key,
@@ -908,6 +919,8 @@ struct BlockWidget {
     labels: Vec<gtk::Label>,
     /// A code block's text in chunks, and the whole text for its copy button.
     code: Option<(Chunks, Rc<RefCell<String>>)>,
+    /// A table's cells.
+    table: Option<Cells>,
 }
 
 /// Lines per label of a code block or a thought (see [`Chunks`]).
@@ -981,6 +994,90 @@ fn chunk_text(text: &str, max_lines: usize, max_bytes: usize) -> Vec<&str> {
     }
     parts.push(&text[start..]);
     parts
+}
+
+/// A table's cells in a grid, each label with the markup it shows: while the table streams,
+/// only the cells whose markup changed (normally the last one) are set again, and rows are
+/// attached or removed at the end, so a frame lays out those labels alone, not every cell of
+/// the table (built again every frame, a table of 60 rows cost about 25 ms a frame).
+struct Cells {
+    grid: gtk::Grid,
+    /// The labels of each row, the header first, with the markup each shows.
+    rows: Vec<Vec<(gtk::Label, String)>>,
+}
+
+impl Cells {
+    fn new() -> Self {
+        // At the start both ways: a widget aligned in one direction only is measured for the
+        // height it is given, which is less than the height of its cells wrapped to their
+        // narrowest, and GTK warns ("Trying to measure GtkGrid … for height of 36, but it
+        // needs at least 129") whenever it lays the table out.
+        let grid = gtk::Grid::builder()
+            .column_spacing(0)
+            .row_spacing(0)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .build();
+        grid.add_css_class("lemma-md-table");
+        Self {
+            grid,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Shows `header` and `rows`, touching only the cells that changed.
+    fn set(&mut self, header: &[String], rows: &[Vec<String>]) {
+        let all = std::iter::once(header).chain(rows.iter().map(Vec::as_slice));
+        let mut count = 0;
+        for (r, cells) in all.enumerate() {
+            count = r + 1;
+            if self.rows.len() == r {
+                self.rows.push(Vec::new());
+            }
+            let shown = &mut self.rows[r];
+            for (c, markup) in cells.iter().enumerate() {
+                if let Some((label, old)) = shown.get_mut(c) {
+                    if old != markup {
+                        set_cell_markup(label, markup, r == 0);
+                        old.clone_from(markup);
+                    }
+                } else {
+                    let label = table_cell(markup, r == 0);
+                    self.grid.attach(&label, c as i32, r as i32, 1, 1);
+                    shown.push((label, markup.clone()));
+                }
+            }
+            for (label, _) in shown.drain(cells.len()..) {
+                self.grid.remove(&label);
+            }
+        }
+        for row in self.rows.drain(count..) {
+            for (label, _) in row {
+                self.grid.remove(&label);
+            }
+        }
+    }
+}
+
+/// A label of a table cell.
+fn table_cell(markup: &str, header: bool) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .selectable(true)
+        .build();
+    set_cell_markup(&label, markup, header);
+    label
+}
+
+/// Sets a table cell's markup (the header's in bold).
+fn set_cell_markup(label: &gtk::Label, markup: &str, header: bool) {
+    if header {
+        set_markup(label, &format!("<b>{markup}</b>"));
+    } else {
+        set_markup(label, markup);
+    }
 }
 
 impl TranscriptRow {
@@ -1162,6 +1259,16 @@ fn update_block_widget(widget: &mut BlockWidget, old: &Block, new: &Block) -> bo
             set_markup(&widget.labels[1], markup);
             true
         }
+        // A table that streams keeps its columns: its grid and unchanged cells stay.
+        (Block::Table { header: h0, .. }, Block::Table { header, rows })
+            if h0.len() == header.len() =>
+        {
+            let Some(cells) = widget.table.as_mut() else {
+                return false;
+            };
+            cells.set(header, rows);
+            true
+        }
         _ => false,
     }
 }
@@ -1175,6 +1282,7 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
                 root: label.clone().upcast(),
                 labels: vec![label],
                 code: None,
+                table: None,
             }
         }
         Block::Quote(markup) => {
@@ -1187,6 +1295,7 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
                 root: quote.upcast(),
                 labels: vec![label],
                 code: None,
+                table: None,
             }
         }
         Block::Item {
@@ -1211,6 +1320,7 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
                 root: row.upcast(),
                 labels: vec![bullet, label],
                 code: None,
+                table: None,
             }
         }
         Block::Code { lang, text } => {
@@ -1251,52 +1361,24 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
                 root: card.upcast(),
                 labels: vec![lang_label],
                 code: Some((chunks, full)),
+                table: None,
             }
         }
         Block::Table { header, rows } => {
-            let grid = gtk::Grid::builder()
-                .column_spacing(0)
-                .row_spacing(0)
-                .halign(gtk::Align::Start)
-                .build();
-            grid.add_css_class("lemma-md-table");
-            let mut labels = Vec::new();
-            let cell = |markup: &str, bold: bool| {
-                let label = gtk::Label::builder()
-                    .wrap(true)
-                    .wrap_mode(pango::WrapMode::WordChar)
-                    .xalign(0.0)
-                    .selectable(true)
-                    .build();
-                if bold {
-                    set_markup(&label, &format!("<b>{markup}</b>"));
-                } else {
-                    set_markup(&label, markup);
-                }
-                label
-            };
-            for (c, h) in header.iter().enumerate() {
-                let label = cell(h, true);
-                grid.attach(&label, c as i32, 0, 1, 1);
-                labels.push(label);
-            }
-            for (r, row) in rows.iter().enumerate() {
-                for (c, text) in row.iter().enumerate() {
-                    let label = cell(text, false);
-                    grid.attach(&label, c as i32, r as i32 + 1, 1, 1);
-                    labels.push(label);
-                }
-            }
+            let mut cells = Cells::new();
+            cells.set(header, rows);
             BlockWidget {
-                root: grid.upcast(),
-                labels,
+                root: cells.grid.clone().upcast(),
+                labels: Vec::new(),
                 code: None,
+                table: Some(cells),
             }
         }
         Block::Rule => BlockWidget {
             root: gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
             labels: Vec::new(),
             code: None,
+            table: None,
         },
     }
 }
@@ -1916,6 +1998,15 @@ pub(crate) struct Inner {
     scrolling: Cell<bool>,
     // prompt data
     pending_prompt: RefCell<Option<String>>,
+    /// The last [`HISTORY_LEN`] prompts sent from the box, the newest last.
+    history: RefCell<VecDeque<String>>,
+    /// The entry of `history` that Up or Down put into the box, while nobody edited it.
+    recalled: Cell<Option<usize>>,
+    /// True while a recall replaces the box's text (that change is not an edit).
+    recalling: Cell<bool>,
+    /// True while the input method shows preedit text in the box (a CJK conversion, a dead
+    /// key): keys then belong to the input method.
+    preedit: Cell<bool>,
     /// Files and images attached to the next prompt.
     attachments: RefCell<Vec<Attachment>>,
     /// The attachments of the prompt being sent (they go back with its text if it is refused).
@@ -2259,6 +2350,10 @@ impl Inner {
             stick: Cell::new(true),
             scrolling: Cell::new(false),
             pending_prompt: RefCell::new(None),
+            history: RefCell::new(VecDeque::new()),
+            recalled: Cell::new(None),
+            recalling: Cell::new(false),
+            preedit: Cell::new(false),
             attachments: RefCell::new(Vec::new()),
             pending_attachments: RefCell::new(Vec::new()),
             attaching: Cell::new(0),
@@ -2474,6 +2569,14 @@ impl Inner {
             None => glib::Propagation::Proceed,
         });
         self.prompt.add_controller(keys);
+        // The input method's preedit: the key controller above runs before the text view hands
+        // a key to its input method (see `prompt_key`).
+        let weak = Rc::downgrade(self);
+        self.prompt.connect_preedit_changed(move |_, text| {
+            if let Some(inner) = weak.upgrade() {
+                inner.preedit.set(!text.is_empty());
+            }
+        });
         let weak = Rc::downgrade(self);
         self.send_button.connect_clicked(move |_| {
             if let Some(inner) = weak.upgrade() {
@@ -3844,7 +3947,7 @@ impl Inner {
         // Take the focus from an empty prompt box, so y/n answer at once: once the card is on
         // screen, unless the user typed meanwhile; the card itself takes it, never one of its
         // buttons.
-        if self.prompt_focused() && self.prompt_text().is_empty() {
+        if self.prompt_focused() && self.prompt_empty() {
             self.schedule_card_focus(request, true);
         }
     }
@@ -3864,7 +3967,7 @@ impl Inner {
                 .pending_permissions()
                 .iter()
                 .any(|c| c.request == request);
-            if !pending || !inner.prompt_focused() || !inner.prompt_text().is_empty() {
+            if !pending || !inner.prompt_focused() || !inner.prompt_empty() {
                 return glib::ControlFlow::Break;
             }
             if inner.focus_card(request) {
@@ -4422,7 +4525,17 @@ impl Inner {
             .to_string()
     }
 
+    /// True when the box shows nothing: no text, and no preedit text of an input method that
+    /// composes (a conversion not in the buffer yet, whose next keys would go to a card).
+    fn prompt_empty(&self) -> bool {
+        !self.preedit.get() && self.prompt_text().is_empty()
+    }
+
     fn prompt_changed(self: &Rc<Self>) {
+        // An edit makes a recalled prompt an ordinary draft.
+        if !self.recalling.get() {
+            self.recalled.set(None);
+        }
         let text = self.prompt_text();
         self.placeholder.set_visible(text.is_empty());
         self.refresh_send();
@@ -4447,14 +4560,20 @@ impl Inner {
         state: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
         use gtk::gdk::{Key, ModifierType as M};
+        // While the input method composes, every key is its own: Enter confirms a conversion,
+        // Up and Down choose a candidate, Escape cancels. This controller runs in the capture
+        // phase, before the text view gives the key to the input method.
+        if self.preedit.get() {
+            return glib::Propagation::Proceed;
+        }
         let suggesting =
             self.suggest_revealer.reveals_child() && !self.suggestions.borrow().is_empty();
         if suggesting {
             match keyval {
-                Key::Up | Key::Down => {
+                Key::Up | Key::KP_Up | Key::Down | Key::KP_Down => {
                     let n = self.suggestions.borrow().len() as i32;
                     let current = self.suggest_list.selected_row().map_or(-1, |r| r.index());
-                    let next = if keyval == Key::Down {
+                    let next = if matches!(keyval, Key::Down | Key::KP_Down) {
                         (current + 1).rem_euclid(n)
                     } else {
                         (current - 1).rem_euclid(n)
@@ -4479,6 +4598,14 @@ impl Inner {
                 _ => {}
             }
         }
+        let modified = state.intersects(
+            M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::META_MASK,
+        );
+        let older = matches!(keyval, Key::Up | Key::KP_Up);
+        if (older || matches!(keyval, Key::Down | Key::KP_Down)) && !modified && self.recall(older)
+        {
+            return glib::Propagation::Stop;
+        }
         if matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
             && !state.contains(M::SHIFT_MASK)
         {
@@ -4486,6 +4613,85 @@ impl Inner {
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
+    }
+
+    /// Up (`older`) or Down without suggestions: steps through the prompts sent from the box
+    /// while it is empty or shows one of them unedited, and the cursor is on its first line (Up)
+    /// or its last line (Down) as wrapped on screen. Down past the newest empties the box again,
+    /// as it was before the first Up. A prompt recalled with Up has the cursor at its end and
+    /// one recalled with Down at its start, so the keys move through a prompt's lines before
+    /// going on, as if the earlier prompts stood above the box. False when the key is the text
+    /// view's: it moves the cursor.
+    fn recall(&self, older: bool) -> bool {
+        let buffer = self.prompt.buffer();
+        let recalled = self.recalled.get();
+        if recalled.is_none() && buffer.char_count() > 0 {
+            return false;
+        }
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let at_edge = if older {
+            self.on_first_line(cursor)
+        } else {
+            self.on_last_line(cursor)
+        };
+        if !at_edge {
+            return false;
+        }
+        let len = self.history.borrow().len();
+        let next = match (recalled, older) {
+            (None, true) if len > 0 => Some(len - 1),
+            (Some(i), true) if i > 0 => Some(i - 1),
+            (Some(i), false) if i + 1 < len => Some(i + 1),
+            (Some(_), false) => None,
+            // Nothing older, or nothing newer than an empty box.
+            _ => return false,
+        };
+        let text = next
+            .and_then(|i| self.history.borrow().get(i).cloned())
+            .unwrap_or_default();
+        // Set first: a recalled prompt shows no suggestions.
+        self.recalled.set(next);
+        self.recalling.set(true);
+        buffer.set_text(&text);
+        buffer.place_cursor(&if older {
+            buffer.end_iter()
+        } else {
+            buffer.start_iter()
+        });
+        self.recalling.set(false);
+        self.prompt.scroll_mark_onscreen(&buffer.get_insert());
+        true
+    }
+
+    /// True when `iter` is on the prompt box's first line as it is shown (wrapped).
+    fn on_first_line(&self, iter: gtk::TextIter) -> bool {
+        let mut start = iter;
+        if !self.prompt.starts_display_line(&start) {
+            self.prompt.backward_display_line_start(&mut start);
+        }
+        start.is_start()
+    }
+
+    /// True when `iter` is on the prompt box's last line as it is shown (wrapped).
+    fn on_last_line(&self, iter: gtk::TextIter) -> bool {
+        let mut end = iter;
+        if !end.ends_line() {
+            self.prompt.forward_display_line_end(&mut end);
+        }
+        end.is_end()
+    }
+
+    /// Keeps a prompt sent from the box for Up and Down: the newest last, at most
+    /// [`HISTORY_LEN`], and not again when it is the newest already.
+    fn remember(&self, text: &str) {
+        let mut history = self.history.borrow_mut();
+        if text.is_empty() || history.back().is_some_and(|last| last == text) {
+            return;
+        }
+        if history.len() == HISTORY_LEN {
+            history.pop_front();
+        }
+        history.push_back(text.to_owned());
     }
 
     fn send_from_box(self: &Rc<Self>) {
@@ -4509,6 +4715,7 @@ impl Inner {
             return;
         }
         let text = trimmed.to_owned();
+        self.remember(&text);
         self.prompt.buffer().set_text("");
         self.hide_suggestions();
         self.pending_prompt.replace(Some(text.clone()));
@@ -4776,7 +4983,12 @@ impl Inner {
     }
 
     fn update_suggestions(self: &Rc<Self>) {
-        let Some((offset, kind, query)) = self.current_token() else {
+        // A recalled prompt is not being typed (Up and Down go on through the earlier ones).
+        let token = match self.recalled.get() {
+            Some(_) => None,
+            None => self.current_token(),
+        };
+        let Some((offset, kind, query)) = token else {
             self.hide_suggestions();
             return;
         };
