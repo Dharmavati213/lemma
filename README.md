@@ -48,7 +48,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   (Ctrl+Shift+F), go to definition (F12), session restore, local history and a git gutter.
 - **Optional Vim mode** (Ctrl+Alt+V), off by default. Vim keeps its own Ctrl+F, Ctrl+H, Ctrl+G
   and Ctrl+N; search with `/` and go to a line with `:42`. `:w file` writes a copy, `:sav file`
-  saves under a new name and `:e file` opens a file.
+  saves under a new name and `:e file` opens a file. `:[range]s/pattern/replacement/[gi]`
+  substitutes with PCRE patterns (groups as `(…)`) and GRegex replacements (`\1`, `\U`), as
+  GtkSourceView's Vim does, in one undo step.
 
 ## Requirements
 

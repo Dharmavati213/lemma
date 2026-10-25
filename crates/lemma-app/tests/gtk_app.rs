@@ -27,6 +27,10 @@ fn main() -> ExitCode {
         ),
         ("usage_errors_and_help", usage),
         ("several_files_and_lines", several_files),
+        (
+            "quitting_stops_the_word_count",
+            quitting_stops_the_word_count,
+        ),
         // M5 (WP5.4)
         ("perf_mode_prints_startup_and_typing", perf_mode),
         ("perf_mode_rejects_unknown_scenarios", perf_unknown),
@@ -137,6 +141,62 @@ fn snapshot_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("--demo completion"), "{stderr}");
+}
+
+/// The root shown at the start is counted (texcount on the jobs thread). Quitting ends the
+/// process without destroying its window, and the count's texcount is killed then: here a
+/// stand-in on `PATH` that writes its process id and sleeps.
+fn quitting_stops_the_word_count() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let dir = copy_project(
+        &common::fixtures().join("proj"),
+        PROJECT_FILES,
+        "quit-count",
+    );
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pid_file = dir.join("texcount.pid");
+    let script = bin.join("texcount");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let main = dir.join("main.tex");
+    // Long enough for the count to start in a debug build under load.
+    let out = lemma_env(
+        "quit-count-settings",
+        &[main.to_str().unwrap(), "--quit-after-ms", "3000"],
+        &[("PATH", &path)],
+        "[spell]\nenabled = false\n",
+    );
+    assert!(out.status.success());
+    let pid = std::fs::read_to_string(&pid_file).expect("texcount started before the quit");
+    let proc = PathBuf::from(format!("/proc/{}", pid.trim()));
+    // Gone (an orphan's zombie is reaped at once).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while proc.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if proc.exists() {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+        panic!("texcount outlived Lemma");
+    }
 }
 
 /// Copies `files` (paths relative to `from`) into a fresh directory named `name`.

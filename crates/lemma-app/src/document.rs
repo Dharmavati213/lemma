@@ -1271,16 +1271,24 @@ pub fn buffer_text(buffer: &impl IsA<gtk::TextBuffer>) -> glib::GString {
     buffer.slice(&start, &end, true)
 }
 
-/// A buffer configured for `path`: the built-in `latex` language for `.tex`/`.sty`/`.cls`/…,
-/// `bibtex` for `.bib`, a guess from the file name otherwise; bracket matching; and no implicit
-/// trailing newline, so the buffer holds exactly the bytes of the file.
+/// A buffer configured for `path`: no language for LaTeX files (`.tex`/`.sty`/`.cls`/…, which
+/// `editor::highlight` colours with Lemma's scanner), `bibtex` for `.bib`, a guess from the file
+/// name otherwise; bracket matching; and no implicit trailing newline, so the buffer holds
+/// exactly the bytes of the file.
+///
+/// A LaTeX buffer never gets GtkSourceView's `latex` language, not even until the highlighter
+/// attaches: GtkSourceView frees a language's parsed definitions with the last buffer that
+/// uses it, so setting it and taking it away again read and validated `latex.lang` and
+/// `def.lang` once more for every document opened (25–40 ms of the main thread each, N of them
+/// in a session of N tabs).
 pub fn new_buffer(path: &Path) -> sourceview5::Buffer {
     let buffer = sourceview5::Buffer::new(None);
     buffer.set_implicit_trailing_newline(false);
     buffer.set_highlight_matching_brackets(true);
     buffer.set_highlight_syntax(true);
     buffer.set_enable_undo(true);
-    buffer.set_language(language_for(path).as_ref());
+    let language = language_for(path).filter(|l| l.id() != "latex");
+    buffer.set_language(language.as_ref());
     buffer
 }
 

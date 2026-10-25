@@ -120,6 +120,11 @@ struct Inner {
     /// The user's answers to "which is the main document?", by the directory of the file they
     /// were given for. They apply to the files in that directory and below it.
     chosen_roots: RefCell<HashMap<PathBuf, PathBuf>>,
+    /// The root detections of the tab switches that look for an earlier PDF (see
+    /// `Inner::detect_for_tab`).
+    tab_detections: RefCell<TabDetections>,
+    /// Root detections run on the jobs thread (tests).
+    detections: Cell<u64>,
     last: RefCell<Option<BuildOutcome>>,
     finished: RefCell<Vec<Rc<FinishedFn>>>,
     /// The toast of the last build or failed request, while it is shown or waits to be.
@@ -199,6 +204,12 @@ impl BuildController {
     pub fn show_existing_pdf(&self) -> impl Future<Output = Result<PathBuf, String>> + use<> {
         let inner = self.inner.clone();
         async move { inner.show_existing_pdf().await }
+    }
+
+    /// How many root detections ran on the jobs thread (tests: a tab switch that changed
+    /// nothing runs none).
+    pub fn detections(&self) -> u64 {
+        self.inner.detections.get()
     }
 }
 
@@ -341,40 +352,85 @@ impl Inner {
         forced_root: Option<PathBuf>,
     ) -> Result<Detection, Option<String>> {
         let remembered = self.remembered_root.borrow().clone();
-        let (file, text) = match state.active_editor() {
-            Some(editor) => {
-                let doc = editor.document();
-                (doc.path().to_path_buf(), doc.text())
-            }
+        // The active document is one of the workspace's, whose texts go along anyway.
+        let file = match state.active_editor() {
+            Some(editor) => editor.document().path().to_path_buf(),
             None => match forced_root.clone().or_else(|| remembered.clone()) {
-                Some(root) => (root, String::new()),
+                Some(root) => root,
                 None => return Err(Some("Open a document to build".to_owned())),
             },
         };
-        let open = state
+        let open: Vec<(PathBuf, String)> = state
             .workspace
             .documents()
             .iter()
             .map(|d| (d.path().to_path_buf(), d.text()))
             .collect();
-        let chosen = {
-            let chosen_roots = self.chosen_roots.borrow();
-            file.ancestors()
-                .skip(1)
-                .find_map(|dir| chosen_roots.get(dir))
-                .cloned()
-        };
+        let chosen = self.chosen_root(&file);
         let input = DetectInput {
             file,
-            text,
             open,
             remembered,
             chosen,
             forced_root,
         };
+        self.detections.set(self.detections.get() + 1);
         gio::spawn_blocking(move || detect(input))
             .await
             .map_err(|_| Some("Root detection failed unexpectedly".to_owned()))
+    }
+
+    /// The user's answer to "which is the main document?" for `file`'s directory or one above.
+    fn chosen_root(&self, file: &Path) -> Option<PathBuf> {
+        let chosen_roots = self.chosen_roots.borrow();
+        file.ancestors()
+            .skip(1)
+            .find_map(|dir| chosen_roots.get(dir))
+            .cloned()
+    }
+
+    /// [`Inner::detect_for_active`] for a tab switch (`show_existing_pdf`): while no document
+    /// changed since, the active document's last detection. Switching between tabs while no
+    /// PDF is shown copied and indexed every document again on each switch.
+    async fn detect_for_tab(&self, state: &Rc<WindowState>) -> Result<Detection, Option<String>> {
+        let Some(active) = state
+            .active_editor()
+            .map(|e| e.document().path().to_path_buf())
+        else {
+            return self.detect_for_active(state, None).await;
+        };
+        let documents: Vec<(PathBuf, u64)> = state
+            .workspace
+            .documents()
+            .iter()
+            .map(|d| (d.path().to_path_buf(), d.version()))
+            .collect();
+        let inputs = (
+            self.remembered_root.borrow().clone(),
+            self.chosen_root(&active),
+        );
+        {
+            let cache = self.tab_detections.borrow();
+            if cache.documents == documents
+                && let Some((made_with, detection)) = cache.by_document.get(&active)
+                && *made_with == inputs
+            {
+                return Ok(detection.clone());
+            }
+        }
+        let detection = self.detect_for_active(state, None).await?;
+        let mut cache = self.tab_detections.borrow_mut();
+        if cache.documents != documents {
+            // Made from these versions: a document changed since is detected again next time.
+            *cache = TabDetections {
+                documents,
+                by_document: HashMap::new(),
+            };
+        }
+        cache
+            .by_document
+            .insert(active, (inputs, detection.clone()));
+        Ok(detection)
     }
 
     /// Asks the user once which file is the main document (interactive runs only).
@@ -596,7 +652,7 @@ impl Inner {
     async fn show_existing_pdf(self: &Rc<Self>) -> Result<PathBuf, String> {
         let state = self.state.upgrade().ok_or("the window is gone")?;
         let detection = self
-            .detect_for_active(&state, None)
+            .detect_for_tab(&state)
             .await
             .map_err(|e| e.unwrap_or_else(|| "the window is gone".into()))?;
         let root = detection.root.ok_or("could not find the main document")?;
@@ -881,9 +937,8 @@ fn spawn_failed(error: &io::Error) -> BuildOutcome {
 
 /// Root detection input, copied from the main thread.
 struct DetectInput {
-    /// The active document.
+    /// The active document (its text is in `open`), or the root to build without one.
     file: PathBuf,
-    text: String,
     /// Every document of the workspace (open or closed) with its current text.
     open: Vec<(PathBuf, String)>,
     /// The root of the last build.
@@ -894,7 +949,20 @@ struct DetectInput {
     forced_root: Option<PathBuf>,
 }
 
+/// The root detections of tab switches (`Inner::detect_for_tab`): by active document, with the
+/// roots they were made with, all from `documents` (every document's path and version when
+/// they were made).
+#[derive(Default)]
+struct TabDetections {
+    documents: Vec<(PathBuf, u64)>,
+    by_document: HashMap<PathBuf, (MadeWith, Detection)>,
+}
+
+/// The remembered root and the user's chosen root a detection was made with.
+type MadeWith = (Option<PathBuf>, Option<PathBuf>);
+
 /// What the jobs thread found out.
+#[derive(Clone, Debug)]
 struct Detection {
     root: Option<PathBuf>,
     root_exists: bool,
@@ -908,6 +976,11 @@ fn detect(input: DetectInput) -> Detection {
     for (path, text) in &input.open {
         index.update_file(path.clone(), Arc::new(index_file(text)));
     }
+    let text = input
+        .open
+        .iter()
+        .find(|(path, _)| *path == input.file)
+        .map_or("", |(_, text)| text.as_str());
     let guess = match &input.forced_root {
         Some(root) => RootGuess {
             root: Some(root.clone()),
@@ -918,7 +991,7 @@ fn detect(input: DetectInput) -> Detection {
                 .files
                 .get(&input.file)
                 .cloned()
-                .unwrap_or_else(|| Arc::new(index_file(&input.text)));
+                .unwrap_or_else(|| Arc::new(index_file(text)));
             let standalone = own.magic.root.is_some()
                 || own.magic.subfiles_parent.is_some()
                 || (own.has_documentclass && own.has_begin_document);
@@ -926,7 +999,7 @@ fn detect(input: DetectInput) -> Detection {
                 index_nearby(&input.file, &mut index);
             }
             let remembered = input.chosen.as_deref().or(input.remembered.as_deref());
-            let guess = detect_root(&input.file, &input.text, &index, remembered);
+            let guess = detect_root(&input.file, text, &index, remembered);
             match (&guess.root, &input.chosen) {
                 // The user chose this root for the file's directory, wherever the root lives.
                 (None, Some(chosen)) => RootGuess {
@@ -1163,6 +1236,8 @@ pub fn install(state: &Rc<WindowState>) -> BuildController {
         running: RefCell::new(None),
         remembered_root: RefCell::new(None),
         chosen_roots: RefCell::new(HashMap::new()),
+        tab_detections: RefCell::new(TabDetections::default()),
+        detections: Cell::new(0),
         last: RefCell::new(None),
         finished: RefCell::new(Vec::new()),
         toast: RefCell::new(None),
@@ -1352,7 +1427,6 @@ mod tests {
         // A chapter finds its root through the include graph of the parent directory.
         let detection = detect(DetectInput {
             file: chapter.clone(),
-            text: "Some text.\n".into(),
             open: vec![(chapter.clone(), "Some text.\n".into())],
             remembered: None,
             chosen: None,
@@ -1373,8 +1447,7 @@ mod tests {
         let lone = dir.join("chapters/lone.tex");
         let input = |forced_root| DetectInput {
             file: lone.clone(),
-            text: "x\n".into(),
-            open: Vec::new(),
+            open: vec![(lone.clone(), "x\n".into())],
             remembered: None,
             chosen: None,
             forced_root,
@@ -1479,8 +1552,7 @@ mod tests {
         std::fs::write(&notes, "Notes.\n").unwrap();
         let input = |remembered: Option<&Path>, chosen: Option<&Path>| DetectInput {
             file: notes.clone(),
-            text: "Notes.\n".into(),
-            open: Vec::new(),
+            open: vec![(notes.clone(), "Notes.\n".into())],
             remembered: remembered.map(Path::to_path_buf),
             chosen: chosen.map(Path::to_path_buf),
             forced_root: None,

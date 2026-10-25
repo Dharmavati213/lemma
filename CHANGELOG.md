@@ -286,6 +286,35 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   changes of a file and about 48 KB of diff in all, and counts the rest with the lines they
   span, which `read_file` shows (that reply is now 52 KB, made in 5.5 ms instead of 40 ms); a
   change too long to quote by itself, such as a new file the agent wrote, is counted too.
+- Opening a LaTeX document no longer loads GtkSourceView's LaTeX syntax definitions again each
+  time (they were given to every new document and taken away at once, which freed them): a
+  400-line chapter opens in 14 ms instead of 44 ms, and a session of 20 such tabs restores in
+  0.3 s instead of 1.1 s.
+- Vim's `:s` and `:%s` find all their matches at once and replace them in one edit, instead of
+  searching the document again from its start after every replacement, with the window frozen
+  meanwhile: `:%s` of 3300 matches in 10 000 lines takes 0.27 s instead of 18–50 s, a range of
+  1000 of those lines 34 ms instead of 4–8 s, `:%s` of 20 000 matches in 60 000 lines, which
+  did not finish in ten minutes, 1.5 s, and `:s` on a line near the end of that document 21 ms
+  instead of about 0.4 s. Patterns, flags, ranges and where the cursor ends up are as before;
+  `n` still finds the pattern and Ctrl+O still goes back, and it is still one undo step.
+- After a large paste, the highlighting before the next frame colours the screen around the
+  cursor instead of every pasted line: 0.75 ms instead of 35 ms for 1000 lines. The rest is
+  coloured in the background.
+- While no PDF is shown, switching to a tab no longer copies and indexes every open document to
+  find its main document again when nothing changed since that tab was last shown, and copies
+  the active document once instead of twice when something did.
+
+### Fixed
+
+- The word count of a project over 1 MiB whose main document is small (a book or thesis with
+  `\include`d chapters) is no longer started when the main document is first shown: the size
+  limit looked at the project index before it had read the chapters. texcount then kept a core
+  busy at every start (31 s for 1.2 MB, 74 s for 11 MB). The item offers to count on a click,
+  as for other large projects.
+- A word count still running when Lemma quits is stopped: texcount ran on after the quit.
+- Vim's `:s` no longer stops halfway, with a critical warning, or leaves a wrong text where a
+  match that could have gone on (`ab?`, `(a)(b)?`) is directly followed by another one, and no
+  longer hangs on some commands (`:2,4s/x|\s/<\1>/` on some texts never returned).
 - An editor that went away with its hover popover still on it no longer hangs Lemma in an
   endless loop of "GtkPopover is not a child of LemmaTexView" warnings (seen with GTK's own
   input method, when no IBus or Fcitx module is installed).

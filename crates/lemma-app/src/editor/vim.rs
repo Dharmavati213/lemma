@@ -4,6 +4,11 @@
 //! Application accelerators (Ctrl+S, F5, …) still win: GTK handles them in the window's capture
 //! phase, before the view's controllers run. Between the two, a guard on the view's parent stops
 //! the few keys Vim must not see (see [`Vim::blocks_key`]).
+//!
+//! Lemma runs some ex commands itself (`WindowState::vim_execute`): the file commands below,
+//! and [`substitute`], GtkSourceView's `:s` done in one edit.
+
+pub mod substitute;
 
 use super::TexView;
 use gtk::gdk;

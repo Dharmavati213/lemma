@@ -73,6 +73,14 @@ fn main() -> ExitCode {
         ("word_count_selection", word_count_selection),
         ("word_count_after_a_build", word_count_after_build),
         ("word_count_missing_texcount_and_config", word_count_hidden),
+        (
+            "word_count_of_a_large_project_waits_for_a_click",
+            word_count_large_project,
+        ),
+        (
+            "word_count_stops_texcount_with_the_window",
+            word_count_stops_with_the_window,
+        ),
     ];
     if ignored {
         tests.push(("perf_problems_long_list", perf_long_list));
@@ -1700,6 +1708,92 @@ fn word_count_after_build() {
         wordcount::status_text(&f.state),
         Some(wordcount::words_label(direct))
     );
+}
+
+/// A texcount stand-in in `dir` that appends its arguments to `log` and prints a count of 42
+/// words; with `hold`, it writes its process id to `log` and sleeps for a minute instead.
+fn fake_texcount(dir: &Path, log: &Path, hold: bool) -> PathBuf {
+    let script = dir.join("texcount");
+    let body = if hold {
+        format!("echo $$ > '{}'\nexec sleep 60\n", log.display())
+    } else {
+        format!(
+            "echo \"$@\" >> '{}'\necho 'Sum count: 42'\necho 'Words in text: 42'\n",
+            log.display()
+        )
+    };
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
+/// A project over `AUTO_MAX_BYTES` whose root is small: when the root is first shown, the
+/// project index knows only the root, but the size counts the chapters it includes (read from
+/// disk), so texcount does not run until the item is clicked.
+fn word_count_large_project() {
+    if !cfg!(unix) {
+        return;
+    }
+    let chapter = "Some words of a long chapter.\n".repeat(20_000);
+    let f = fixture_with(
+        "wordcount-large",
+        &[
+            (
+                "main.tex",
+                "\\documentclass{book}\n\\begin{document}\n\\include{ch1}\n\\include{ch2}\n\
+                 \\end{document}\n",
+            ),
+            ("ch1.tex", &chapter),
+            ("ch2.tex", &chapter),
+        ],
+        |c| c.lint.chktex = false,
+    );
+    let log = f.dir.join("texcount.log");
+    wordcount::set_program(&f.state, &fake_texcount(&f.dir, &log, false));
+    f.open("main.tex");
+    f.wait_count(1);
+    assert_eq!(
+        wordcount::status_text(&f.state).as_deref(),
+        Some("Count Words")
+    );
+    assert!(
+        !log.exists(),
+        "texcount ran automatically on a large project"
+    );
+    // A click counts.
+    let popover = wordcount::popover(&f.state).unwrap();
+    popover.popup();
+    f.wait_count(2);
+    assert!(log.exists(), "the click ran texcount");
+    assert_eq!(
+        wordcount::status_text(&f.state),
+        Some(wordcount::words_label(42))
+    );
+    popover.popdown();
+}
+
+/// Closing the window kills a texcount that is still counting.
+fn word_count_stops_with_the_window() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let f = proj("wordcount-stop");
+    let log = f.dir.join("texcount.pid");
+    wordcount::set_program(&f.state, &fake_texcount(&f.dir, &log, true));
+    wordcount::count_now(&f.state, &f.path("main.tex"));
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(&log).is_ok_and(|s| s.ends_with('\n'))
+    });
+    let pid = std::fs::read_to_string(&log).unwrap().trim().to_owned();
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    assert!(proc.exists(), "texcount runs");
+    // The window goes (its `destroy` comes with the last reference).
+    drop(f);
+    common::pump_until(Duration::from_secs(5), || !proc.exists());
 }
 
 fn word_count_hidden() {

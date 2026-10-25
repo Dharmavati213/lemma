@@ -1855,6 +1855,31 @@ they conflict with the sections above, this section wins.
     without a review). Tag operations, which do not depend on the load (`gtk_review`
     `tags_change_only_where_the_hunks_do`, 200 hunks): accepting one 470 → 2, rejecting one
     462 → 2.
+- **Opening and editing (§5, §7, 2026-10-25):**
+  - A LaTeX buffer never gets GtkSourceView's `latex` language (`document::new_buffer`), not
+    even until `highlight::attach`, which tells LaTeX documents by their file name
+    (`completion::is_latex`). GtkSourceView frees a language's parsed definitions with the last
+    buffer that uses it, so setting the language and taking it away again parsed and validated
+    `latex.lang` and `def.lang` for every document opened (25–40 ms of the main thread each).
+  - Vim's `:[range]s/pattern/replacement/[flags]` is Lemma's (`editor/vim/substitute.rs`,
+    from `WindowState::vim_execute`) with GtkSourceView's meaning (PCRE2 patterns as typed, only
+    `g` and `i`, GRegex replacements, GtkSourceView's ranges and cursor): all matches found in
+    one pass over the text, one `Document::apply_edits(Origin::User)`, without live rename.
+    GtkSourceView's loop searched the buffer again from its start after every replacement. For
+    Vim's search pattern and jump list, GtkSourceView's own command runs first on the empty
+    range `1,1`, which stops at the first match. A substitution that replaces nothing, and one
+    Lemma cannot read (other separators, Vim's own marks), stay GtkSourceView's.
+  - The highlighter's visible lines are at most 1.5 screens around the cursor when there are
+    more of them than the view's height holds rows of its font (lines GTK has not measured yet
+    count as empty: after a 1000-line paste all of them were "visible").
+  - The word count's size limit (`AUTO_MAX_BYTES`) reads the root's includes from disk on the
+    jobs thread (`wordcount::project_size`); the project index knew only the root when it was
+    first shown, so large projects were counted. `wordcount::Stop` kills texcount from the main
+    thread when the window goes or the application shuts down (`GApplication::shutdown`: a
+    quit ends the process without destroying its windows).
+  - A tab switch that looks for an earlier PDF (none shown yet) reuses the active document's
+    root detection while no document's version changed (`build_ui::TabDetections`); a build
+    always detects again.
 
 ## 12. macOS (2026-10-19)
 

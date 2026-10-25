@@ -9,7 +9,11 @@
 //!   `[status] word_count` is false, and for good when `texcount` is missing.
 //! - **Cost:** texcount is slow (about 80 kB of source per second), so these automatic counts
 //!   skip projects larger than [`AUTO_MAX_BYTES`] (the item then reads "Count Words" and counts
-//!   on a click), a newer count stops a running one, and closing the window stops it too.
+//!   on a click). The size is that of the root and the files it includes as they are on disk,
+//!   found on the jobs thread ([`project_size`]): when a root is first shown, the project index
+//!   has not read its includes yet. A newer count stops a running one, and closing the window
+//!   or quitting stops it too: texcount is killed at once ([`Stop`]), so it never outlives
+//!   Lemma.
 //! - **The breakdown:** clicking the item opens a popover with the parts of the total and one
 //!   row per part, chapter and section (texcount's subcounts, `\section{…}\label{…}` titles
 //!   cleaned), plus the selection's count.
@@ -23,13 +27,15 @@
 use crate::window::WindowState;
 use adw::prelude::*;
 use lemma_build::BuildStatus;
+use lemma_syntax::ProjectIndex;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// Styles of the status item and its popover.
@@ -187,19 +193,46 @@ fn clean_title(title: &str) -> String {
 /// `large.tex`). The status item then offers to count on a click.
 pub const AUTO_MAX_BYTES: u64 = 1 << 20;
 
-/// Counts `root` and the files it includes (blocking; in the root's directory). Setting
-/// `cancel` kills texcount ([`CountError::Cancelled`]).
-pub fn count_document(
-    program: &Path,
-    root: &Path,
-    cancel: &AtomicBool,
-) -> Result<WordCount, CountError> {
+/// Stops a document count from another thread: [`Stop::stop`] kills texcount right away, so a
+/// count stopped by the window closing or the application quitting (whose jobs thread ends with
+/// the process) leaves no texcount running.
+#[derive(Debug, Default)]
+pub struct Stop {
+    stopped: AtomicBool,
+    /// texcount, while it runs.
+    child: Mutex<Option<Child>>,
+}
+
+impl Stop {
+    /// Stops the count ([`CountError::Cancelled`]).
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(child) = self.lock().as_mut() {
+            let _ = child.kill();
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
+        self.child.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Counts `root` and the files it includes (blocking; in the root's directory). [`Stop::stop`]
+/// on `stop` kills texcount ([`CountError::Cancelled`]).
+pub fn count_document(program: &Path, root: &Path, stop: &Stop) -> Result<WordCount, CountError> {
     let dir = root.parent().unwrap_or(Path::new("."));
     let name = root
         .file_name()
         .ok_or_else(|| CountError::Failed("no file name".into()))?;
     let mut file = std::ffi::OsString::from("./");
     file.push(name);
+    if stop.is_stopped() {
+        return Err(CountError::Cancelled);
+    }
     let mut child = lemma_core::process::command(program)
         .args(["-merge", "-sum", "-sub=section"])
         .arg(&file)
@@ -215,17 +248,32 @@ pub fn count_document(
         let _ = stdout.read_to_end(&mut out);
         out
     });
+    stop.lock().replace(child);
     let status = loop {
-        if cancel.load(Ordering::SeqCst) {
+        let mut guard = stop.lock();
+        if stop.is_stopped() {
+            // Out of the lock first: `Stop::stop` on the main thread must not wait for this.
+            let mut child = guard.take().expect("the running texcount");
+            drop(guard);
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
             return Err(CountError::Cancelled);
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(CountError::Failed(e.to_string())),
+        let waited = guard.as_mut().expect("the running texcount").try_wait();
+        match waited {
+            Ok(Some(status)) => {
+                guard.take();
+                break status;
+            }
+            Ok(None) => {
+                drop(guard);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                guard.take();
+                return Err(CountError::Failed(e.to_string()));
+            }
         }
     };
     let out = reader.join().unwrap_or_default();
@@ -233,13 +281,54 @@ pub fn count_document(
     parse(&out).ok_or_else(|| CountError::Failed(format!("unexpected output ({status})")))
 }
 
-/// The total size of `files` in bytes (blocking; missing files count 0).
-fn total_size(files: &[PathBuf]) -> u64 {
-    files
-        .iter()
-        .filter_map(|f| std::fs::metadata(f).ok())
-        .map(|m| m.len())
-        .sum()
+/// The size in bytes of `root` and the files it includes (`\input`, `\include`, `\subfile`,
+/// `\import`, resolved as the project index resolves them), as they are on disk; once the sum
+/// passes `limit`, the sum so far. Blocking: reads and indexes the files, but none whose size
+/// would pass `limit`, so at most `limit` bytes. Missing files, and anything but a regular file
+/// (a FIFO, a device), count 0 and are not read.
+pub fn project_size(root: &Path, limit: u64) -> u64 {
+    let mut index = ProjectIndex::default();
+    let mut sizes: HashMap<PathBuf, u64> = HashMap::new();
+    loop {
+        let mut total = 0;
+        let mut unread = Vec::new();
+        for file in index.project_files(root) {
+            total += *sizes.entry(file.clone()).or_insert_with(|| {
+                std::fs::metadata(&file)
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)
+                    .map_or(0, |m| m.len())
+            });
+            if total > limit {
+                return total;
+            }
+            if !index.files.contains_key(&file) {
+                unread.push(file);
+            }
+        }
+        if unread.is_empty() {
+            return total;
+        }
+        for file in unread {
+            let text = read_source(&file, limit);
+            index.update_file(file, Arc::new(lemma_syntax::index_file(&text)));
+        }
+    }
+}
+
+/// The text of the regular file at `path`, at most `cap` bytes, with invalid UTF-8 replaced (a
+/// Latin-1 chapter includes its files as a UTF-8 one does); empty for anything else. Opening a
+/// FIFO does not wait for a writer, and a device such as `/dev/zero` is not read.
+fn read_source(path: &Path, cap: u64) -> String {
+    let Ok(file) = crate::fsutil::open_nonblocking(path) else {
+        return String::new();
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.take(cap).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Counts the words of `text` (a selection; blocking).
@@ -296,10 +385,14 @@ struct Counter {
     popover: gtk::Popover,
     content: gtk::Box,
     last: RefCell<Option<(PathBuf, WordCount)>>,
-    /// A count runs (set its flag to stop it); `again` asks for another one after it (of that
+    /// A count runs (stop it with its [`Stop`]); `again` asks for another one after it (of that
     /// root; `true` for an automatic one).
-    running: RefCell<Option<Arc<AtomicBool>>>,
+    running: RefCell<Option<Arc<Stop>>>,
     again: RefCell<Option<(PathBuf, bool)>>,
+    /// The counts [`show`] runs for a toast, while they run.
+    asked: RefCell<Vec<Arc<Stop>>>,
+    /// The window closed or the application quit: no more counts.
+    ended: Cell<bool>,
     /// A root too large to count automatically: the item offers a count on a click.
     offer: RefCell<Option<PathBuf>>,
     /// The selection's count (and the text it counted), once computed.
@@ -360,6 +453,8 @@ pub fn install(state: &Rc<WindowState>) {
         last: RefCell::new(None),
         running: RefCell::new(None),
         again: RefCell::new(None),
+        asked: RefCell::new(Vec::new()),
+        ended: Cell::new(false),
         offer: RefCell::new(None),
         selection: RefCell::new(None),
         selection_running: Cell::new(false),
@@ -380,13 +475,22 @@ pub fn install(state: &Rc<WindowState>) {
             counter.fill_popover();
         }
     });
+    // Quitting ends the process without destroying the windows (the jobs thread goes with it,
+    // texcount would not): a count still running is stopped then, or with its window.
     let weak = Rc::downgrade(&counter);
-    state.window.connect_destroy(move |_| {
-        // A count still running is stopped with the window.
+    let quit = state.app.connect_shutdown(move |_| {
         if let Some(counter) = weak.upgrade() {
-            if let Some(flag) = counter.running.borrow().as_ref() {
-                flag.store(true, Ordering::SeqCst);
-            }
+            counter.end();
+        }
+    });
+    let (weak, app) = (Rc::downgrade(&counter), state.app.clone());
+    let quit = Cell::new(Some(quit));
+    state.window.connect_destroy(move |_| {
+        if let Some(id) = quit.take() {
+            app.disconnect(id);
+        }
+        if let Some(counter) = weak.upgrade() {
+            counter.end();
             COUNTERS.with_borrow_mut(|c| c.retain(|x| !Rc::ptr_eq(x, &counter)));
         }
     });
@@ -460,13 +564,23 @@ pub fn show(state: &Rc<WindowState>) {
                 .and_then(|r| r)
                 .map(|n| format!("Selection: {}", words_label(n))),
             None => match root {
-                Some(root) => gio::spawn_blocking(move || {
-                    count_document(&program, &root, &AtomicBool::new(false))
-                })
-                .await
-                .map_err(|_| CountError::Failed("panicked".into()))
-                .and_then(|r| r)
-                .map(|c| format!("Document: {}", words_label(c.total))),
+                Some(root) => {
+                    // Stopped with the window too (`Counter::end`).
+                    let stop = Arc::new(Stop::default());
+                    counter.asked.borrow_mut().push(stop.clone());
+                    let counting = stop.clone();
+                    let result =
+                        gio::spawn_blocking(move || count_document(&program, &root, &counting))
+                            .await;
+                    counter
+                        .asked
+                        .borrow_mut()
+                        .retain(|s| !Arc::ptr_eq(s, &stop));
+                    result
+                        .map_err(|_| CountError::Failed("panicked".into()))
+                        .and_then(|r| r)
+                        .map(|c| format!("Document: {}", words_label(c.total)))
+                }
                 None => Err(CountError::Failed("there is no document".into())),
             },
         };
@@ -560,6 +674,19 @@ fn is_root_document(doc: &crate::document::Document) -> bool {
 const ROOT_SCAN_LINES: u32 = 2000;
 
 impl Counter {
+    /// The window closed or the application quits: stops the running counts (texcount is
+    /// killed) and starts none after them.
+    fn end(&self) {
+        self.ended.set(true);
+        self.again.take();
+        if let Some(stop) = self.running.borrow().as_ref() {
+            stop.stop();
+        }
+        for stop in self.asked.borrow().iter() {
+            stop.stop();
+        }
+    }
+
     fn refresh_visibility(&self, state: &WindowState) {
         let shown = self.available.get()
             && state.config.status.word_count
@@ -592,32 +719,26 @@ impl Counter {
     /// of a project larger than [`AUTO_MAX_BYTES`] only offers a count on a click. A count
     /// requested while one runs stops that one and runs after it.
     fn count(self: &Rc<Self>, root: PathBuf, automatic: bool) {
-        if !self.available.get() {
+        if !self.available.get() || self.ended.get() {
             return;
         }
-        if let Some(flag) = self.running.borrow().as_ref() {
-            flag.store(true, Ordering::SeqCst);
+        if let Some(stop) = self.running.borrow().as_ref() {
+            stop.stop();
             self.again.replace(Some((root, automatic)));
             return;
         }
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.running.replace(Some(cancel.clone()));
+        let stop = Arc::new(Stop::default());
+        self.running.replace(Some(stop.clone()));
         let program = self.program.borrow().clone();
-        // The sources texcount will read, for the size limit.
-        let files = self.state.upgrade().map_or_else(Vec::new, |state| {
-            state.workspace.index.borrow().project_files(&root)
-        });
         let counter = self.clone();
         glib::spawn_future_local(async move {
             let target = root.clone();
             let result = gio::spawn_blocking(move || {
-                if automatic
-                    && total_size(&files).max(total_size(std::slice::from_ref(&target)))
-                        > AUTO_MAX_BYTES
-                {
+                // The sources texcount will read, for the size limit.
+                if automatic && project_size(&target, AUTO_MAX_BYTES) > AUTO_MAX_BYTES {
                     return Err(CountError::TooLarge);
                 }
-                count_document(&program, &target, &cancel)
+                count_document(&program, &target, &stop)
             })
             .await
             .unwrap_or_else(|_| Err(CountError::Failed("texcount panicked".into())));
@@ -900,5 +1021,53 @@ mod tests {
         assert_eq!(parse("nothing"), None);
         assert_eq!(parse_single("1047\n (errors:1)\n"), Some(1047));
         assert_eq!(parse_single("7\n"), Some(7));
+    }
+
+    /// The size counts the root's includes, read from disk (nested, `\include` and `\input`,
+    /// with or without `.tex`), once each, and stops reading past the limit.
+    #[test]
+    fn project_size_follows_the_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            text.len() as u64
+        };
+        let root = write(
+            "main.tex",
+            "\\documentclass{book}\n\\begin{document}\n\\include{ch/one}\n\\input{ch/two.tex}\n\
+             \\input{ch/one}\n\\input{missing}\n\\end{document}\n",
+        );
+        let one = write("ch/one.tex", "One.\n\\input{ch/deep}\n");
+        let two = write("ch/two.tex", &"Two words. ".repeat(100));
+        let deep = write("ch/deep.tex", "Deep.\n");
+        write("unrelated.tex", &"x".repeat(5000));
+        let main = dir.path().join("main.tex");
+        let all = root + one + two + deep;
+        assert_eq!(project_size(&main, u64::MAX), all);
+        assert_eq!(project_size(&main, all), all);
+        // Past the limit: what was summed when it was passed.
+        assert_eq!(project_size(&main, root + one), root + one + two);
+        assert_eq!(project_size(&main, 10), root);
+        assert_eq!(project_size(&dir.path().join("none.tex"), 10), 0);
+
+        // Not regular files: never read (a FIFO would block, /dev/zero never ends).
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.tex");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let zero = dir.path().join("zero.tex");
+            std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+            assert_eq!(read_source(&fifo, 1024), "");
+            assert_eq!(read_source(&zero, 1024), "");
+            let odd = dir.path().join("odd.tex");
+            let size = write("odd.tex", "\\input{fifo}\n\\input{zero}\n");
+            assert_eq!(project_size(&odd, 1 << 20), size);
+        }
     }
 }

@@ -79,7 +79,60 @@ fn main() -> ExitCode {
         ("build_toasts_replace_each_other", build_toasts_replace),
         ("a_missing_latexmk_is_explained_once", missing_latexmk),
         ("clean_build_files_and_rebuild", clean_and_rebuild),
+        (
+            "tab_switches_without_a_pdf_detect_the_root_once",
+            tab_switches_detect_once,
+        ),
     ])
+}
+
+/// While no PDF is shown, each tab switch looks for the PDF of an earlier build, which needs
+/// the active document's root (detected on the jobs thread from a copy of every document). A
+/// tab whose detection was made from the documents as they are runs none again; an edit makes
+/// the next switch detect again; and a PDF that appears is still found.
+fn tab_switches_detect_once() {
+    let dir = copy_proj("tab-detect", false);
+    let state = window(&dir, config());
+    let main = open(&state, &dir.join("main.tex"));
+    let chapter = open(&state, &dir.join("chapters/yoneda.tex"));
+    let build = state.build.get().unwrap();
+    let settle = || common::pump_for(Duration::from_millis(150));
+    let switch = |n: usize| {
+        for _ in 0..n {
+            state.select_editor(&main);
+            settle();
+            state.select_editor(&chapter);
+            settle();
+        }
+    };
+    // Both tabs once with both documents open.
+    switch(1);
+    let detections = build.detections();
+    switch(3);
+    assert_eq!(
+        build.detections(),
+        detections,
+        "switches that changed nothing"
+    );
+    main.buffer().insert_at_cursor("x");
+    switch(1);
+    assert_eq!(
+        build.detections(),
+        detections + 2,
+        "after an edit, once per tab"
+    );
+    switch(2);
+    assert_eq!(build.detections(), detections + 2);
+    let controller = state.pdf.get().unwrap();
+    assert_eq!(controller.requested_pdf(), None);
+    let src = common::fixtures().join("proj");
+    for file in ["main.pdf", "main.synctex.gz"] {
+        std::fs::copy(src.join(file), dir.join(file)).unwrap();
+    }
+    state.select_editor(&main);
+    common::pump_until(TIMEOUT, || controller.requested_pdf().is_some());
+    assert_eq!(controller.requested_pdf(), Some(dir.join("main.pdf")));
+    assert_eq!(build.detections(), detections + 2);
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);

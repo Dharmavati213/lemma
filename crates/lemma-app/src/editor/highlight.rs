@@ -4,10 +4,11 @@
 //!
 //! [`attach`] runs right after an editor is created, before Vim, the review renderer and the
 //! diagnostics attach, so the tags those create later take precedence over ours. For a LaTeX
-//! buffer (GtkSourceView language `latex`: `.tex`, `.sty`, `.cls`, …) it switches the buffer's
-//! language off and colours the text from `lemma_syntax` tokens instead (GtkSourceView's
-//! bracket matching is replaced by `editor::pairs`, which switches it off while attached). Other
-//! buffers (`.bib`, plain text) keep their GtkSourceView language.
+//! document (one whose file name gets GtkSourceView's `latex` language: `.tex`, `.sty`, `.cls`,
+//! …; `completion::is_latex`) it colours the text from `lemma_syntax` tokens (GtkSourceView's
+//! bracket matching is replaced by `editor::pairs`, which switches it off while attached). Such
+//! buffers never get a GtkSourceView language (`document::new_buffer`). Other buffers (`.bib`,
+//! plain text) keep their GtkSourceView language.
 //!
 //! **Tags.** The token kinds have one `TextTag` each in the buffer's tag table, named by
 //! [`tag_name`], except [`TokenKind::Text`], [`TokenKind::Brace`] and [`TokenKind::Bracket`]
@@ -29,7 +30,9 @@
 //! carry outdated tags). Only the *window* — the visible lines ± one screen — is ever tagged:
 //! - on attach and whenever the view scrolls or resizes, a high-priority idle (before the next
 //!   frame is drawn) tags the visible lines that are not tagged, and a background idle then tags
-//!   the rest of the window within a time budget;
+//!   the rest of the window within a time budget. Lines GTK has not measured yet (a large
+//!   paste) all count as visible, so the visible lines are at most 1.5 screens around the
+//!   cursor;
 //! - every change reports its lines through `Document::connect_edit` (marks follow inserted and
 //!   removed lines; the changed lines become stale, as inserted text can carry tags) and
 //!   `Document::connect_retag` (the lines `LineStates::apply_edit` re-scanned until the state
@@ -79,6 +82,9 @@ pub const MATH_TAG: &str = "lemma-syntax-math";
 const UNSIZED_HEIGHT: i32 = 1200;
 /// Smallest "screen" (in lines) for the margin of the window.
 const MIN_SCREEN: u32 = 10;
+/// No row of text is less than this many pixels high: more visible lines than fit the view's
+/// height at this include lines GTK has not measured yet (see `unmeasured_rows`).
+const MIN_ROW_HEIGHT: i32 = 8;
 /// Time the background idle spends per run on the lines around the visible ones.
 const MARGIN_BUDGET: Duration = Duration::from_millis(4);
 /// While a document's scanner states are being built, lines below this one are not tagged (the
@@ -432,11 +438,9 @@ pub fn highlighter_for(view: &TexView) -> Option<Rc<Highlighter>> {
     })
 }
 
-/// Starts scanner highlighting in `editor` when its buffer is LaTeX (see the module docs).
+/// Starts scanner highlighting in `editor` when its document is LaTeX (see the module docs).
 pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
-    let buffer = editor.buffer();
-    let latex = buffer.language().is_some_and(|l| l.id() == "latex");
-    if !latex || highlighter(editor).is_some() {
+    if !super::completion::is_latex(editor.document().path()) || highlighter(editor).is_some() {
         return;
     }
     // Highlighters whose view is gone without a detach (cannot happen in the app) go first.
@@ -448,7 +452,6 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     for highlighter in dead {
         highlighter.shutdown();
     }
-    buffer.set_language(None::<&sourceview5::Language>);
     let highlighter = Highlighter::new(state, editor);
     ACTIVE.with_borrow_mut(|active| active.push(highlighter.clone()));
     highlighter.queue_visible();
@@ -507,8 +510,8 @@ impl Highlighter {
         let doc = editor.document();
         let (tags, existed) = Tags::new(&buffer);
         if existed {
-            // Tags from an earlier highlighter (or GtkSourceView's engine): we do not know where
-            // they are, so start from a clean text.
+            // Tags from an earlier highlighter (a closed document's buffer shown again): we do
+            // not know where they are, so start from a clean text.
             let (start, end) = buffer.bounds();
             for tag in &tags.all {
                 buffer.remove_tag(tag, &start, &end);
@@ -998,6 +1001,25 @@ impl Highlighter {
         let (first, last) = (line_of(&top), line_of(&bottom));
         let last = last.min(count.saturating_sub(1)).max(first.min(count));
         let first = first.min(last);
+        // Right after a large insertion GTK has not measured the new lines and counts them as
+        // empty, so all of them fall in the visible rectangle (a 1000-line paste: 1000 lines
+        // tagged before the frame, 25 ms). No more than a screen of rows fits there: the
+        // visible lines are then 1.5 screens around the cursor, where the view scrolls after a
+        // paste (from the top line when the cursor is elsewhere). The background pass tags the
+        // rest of the window, and GTK's measuring brings a recheck (`queue_recheck`).
+        let (first, last) = match unmeasured_rows(&view, rect.height(), last - first + 1) {
+            Some(rows) => {
+                let cursor = line_of(&self.buffer.iter_at_mark(&self.buffer.get_insert()));
+                let start = if (first..=last).contains(&cursor) {
+                    cursor.saturating_sub(rows).max(first)
+                } else {
+                    first
+                };
+                let span = (rows * 3 / 2).max(MIN_SCREEN);
+                (start, start.saturating_add(span - 1).min(last))
+            }
+            None => (first, last),
+        };
         let screen = (last - first + 1).max(MIN_SCREEN);
         Some(TagWindow {
             visible: first..(last + 1).min(count),
@@ -1209,6 +1231,20 @@ impl Highlighter {
             }
         }
     }
+}
+
+/// When `lines` visible lines are more than 1.5 times the rows of `view`'s font that fit in
+/// `height` pixels (GTK counts the lines it has not measured yet as empty), the number of rows
+/// that fit; `None` otherwise. The font is looked at only when the lines would be less than
+/// [`MIN_ROW_HEIGHT`] pixels high each.
+fn unmeasured_rows(view: &TexView, height: i32, lines: u32) -> Option<u32> {
+    if i64::from(lines) * i64::from(MIN_ROW_HEIGHT) <= i64::from(height) {
+        return None;
+    }
+    let metrics = view.pango_context().metrics(None, None);
+    let row = (metrics.height() / pango::SCALE).max(1);
+    let rows = u32::try_from(height / row).unwrap_or(0).max(1);
+    (lines > rows * 3 / 2).then_some(rows)
 }
 
 /// About how many lines fit on `view`'s screen before it has a size: its window's height (or

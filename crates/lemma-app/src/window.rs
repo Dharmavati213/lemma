@@ -1313,6 +1313,10 @@ impl WindowState {
                 return true;
             }
         }
+        // GtkSourceView's `:s` scans the buffer again for every match it replaces.
+        if vim::substitute::execute(editor, command) {
+            return true;
+        }
         let Some(command) = parse_file_command(command) else {
             return false;
         };

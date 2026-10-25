@@ -54,6 +54,7 @@ fn main() -> ExitCode {
             "lines_moved_into_view_by_layout_are_tagged",
             lines_moved_into_view,
         ),
+        ("a_large_paste_tags_a_screen_before_the_frame", large_paste),
         ("edits_retag_the_converged_range", edits_retag),
         ("random_edits_match_a_fresh_scan", random_edits),
         (
@@ -70,6 +71,8 @@ fn main() -> ExitCode {
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_highlight_keystroke_large_tex", perf_keystroke));
+        tests.push(("perf_highlight_paste_10k", perf_paste));
+        tests.push(("perf_open_tex_documents", perf_open_documents));
     }
     common::run(&tests)
 }
@@ -355,6 +358,13 @@ fn latex_buffers() {
             ("notes.txt", "plain\n"),
         ],
     );
+    // A LaTeX buffer never gets GtkSourceView's language, not even before the highlighter
+    // attaches (taking it away again freed its parsed definitions, so every document opened
+    // parsed `latex.lang` once more).
+    for name in ["x.tex", "x.sty", "x.cls", "x.ltx", "x.dtx"] {
+        let buffer = lemma_app::document::new_buffer(std::path::Path::new(name));
+        assert!(buffer.language().is_none(), "{name}");
+    }
     let tex = f.open("main.tex");
     assert!(
         tex.buffer().language().is_none(),
@@ -829,6 +839,67 @@ fn lines_moved_into_view() {
     });
     assert_eq!(adjustment.value(), value, "no scroll happened");
     h.flush();
+    window_matches(&ed, &h);
+}
+
+/// Pastes `text` at the cursor as GTK's paste does: one insertion at the cursor, which ends up
+/// after it, and the view scrolls to the cursor (`gtk_text_view_scroll_mark_onscreen`, done
+/// once the new lines are measured).
+fn paste(ed: &Editor, text: &str) {
+    let buffer = ed.buffer();
+    buffer.insert_at_cursor(text);
+    ed.view().scroll_mark_onscreen(&buffer.get_insert());
+}
+
+/// Lines `first..last` of `large.tex`.
+fn large_lines(first: usize, last: usize) -> String {
+    fixture_text("large.tex")
+        .split_inclusive('\n')
+        .skip(first)
+        .take(last - first)
+        .collect()
+}
+
+/// A paste of 1000 lines: GTK has not measured them when the highlighter looks before the
+/// frame, and all of them fall in the visible rectangle. Only about a screen around the cursor
+/// (the end of the pasted lines, where the view scrolls) is tagged then; the rest of the window
+/// follows in the background, and the screen the view scrolls to is coloured exactly.
+fn large_paste() {
+    let f = fixture("paste", &[("main.tex", &large_lines(0, 3000))]);
+    let ed = f.open("main.tex");
+    let h = hl(&ed);
+    let buffer = ed.buffer();
+    let at = buffer.iter_at_line(1500).unwrap();
+    buffer.place_cursor(&at);
+    ed.view()
+        .scroll_to_iter(&mut at.clone(), 0.0, true, 0.0, 0.5);
+    common::pump_for(Duration::from_millis(100));
+    h.flush();
+    paste(&ed, &large_lines(10_000, 11_000));
+    h.flush_visible();
+    let window = h.window().unwrap();
+    let cursor = ed.document().line_index().line_of(
+        ed.document()
+            .byte_offset(&buffer.iter_at_mark(&buffer.get_insert())),
+    );
+    assert_eq!(cursor, 2500);
+    println!("    visible after the paste: {:?}", window.visible);
+    assert!(window.visible.contains(&cursor), "{window:?}");
+    assert!(window.visible.len() < 150, "{window:?}");
+    let pasted = (1500..2500).filter(|&l| h.is_current(l)).count();
+    assert!(
+        pasted < 150,
+        "{pasted} pasted lines tagged before the frame"
+    );
+    // Once GTK has measured the lines and scrolled, the screen and its window are exact.
+    common::pump_for(Duration::from_millis(300));
+    h.flush();
+    let (first, last) = visible_lines(&ed);
+    assert!(
+        (first..=last).contains(&cursor),
+        "the view shows the cursor"
+    );
+    assert!((first..=last).all(|l| h.is_current(l)));
     window_matches(&ed, &h);
 }
 
@@ -1507,5 +1578,93 @@ fn perf_keystroke() {
         println!("    (debug build: the budget is checked in release)");
     } else {
         assert!(p99 <= Duration::from_micros(500), "p99 {p99:?} over 0.5 ms");
+    }
+}
+
+/// The median and the maximum.
+fn median(mut v: Vec<Duration>) -> (Duration, Duration) {
+    v.sort();
+    (v[v.len() / 2], *v.last().unwrap())
+}
+
+/// The highlighting before the frame after pasting 1000 lines into the middle of a 10 000-line
+/// document (5 rounds, each undone): about a screen of lines, 0.75 ms (before, every pasted
+/// line: 35 ms).
+fn perf_paste() {
+    let f = fixture("perf-paste", &[("main.tex", &large_lines(0, 10_000))]);
+    let ed = f.open("main.tex");
+    let h = hl(&ed);
+    let buffer = ed.buffer().clone();
+    let block = large_lines(30_000, 31_000);
+    let (mut times, mut lines) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        let at = buffer.iter_at_line(5000).unwrap();
+        buffer.place_cursor(&at);
+        ed.view()
+            .scroll_to_iter(&mut at.clone(), 0.0, true, 0.0, 0.5);
+        common::pump_for(Duration::from_millis(100));
+        h.flush();
+        paste(&ed, &block);
+        let t = Instant::now();
+        h.flush_visible();
+        times.push(t.elapsed());
+        lines.push((5000..6000).filter(|&l| h.is_current(l)).count());
+        common::pump_for(Duration::from_millis(100));
+        h.flush();
+        buffer.undo();
+        common::pump_for(Duration::from_millis(100));
+    }
+    let (time, max) = median(times);
+    println!(
+        "    after a 1000-line paste, before the frame: median {time:?} (max {max:?}), pasted \
+         lines tagged {lines:?}"
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(time <= Duration::from_millis(5), "median {time:?}");
+    }
+}
+
+/// Opening 20 LaTeX chapters of 400 lines in background tabs, as a session restore does: each
+/// `open_file_in_background` (printed), and a new LaTeX buffer alone, before each, which has no
+/// GtkSourceView language to load (before, every buffer parsed `latex.lang` again: 29 ms, and a
+/// chapter took 44 ms to open instead of 14 ms).
+fn perf_open_documents() {
+    let chapters: Vec<(String, String)> = (0..20)
+        .map(|i| {
+            (
+                format!("ch{i:02}.tex"),
+                large_lines(1000 + 400 * i, 1400 + 400 * i),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = chapters
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    let f = fixture_with("perf-open", &files, |c| c.spell.enabled = false);
+    let mut times = Vec::new();
+    let mut buffers = Vec::new();
+    for (name, _) in &chapters {
+        let path = f.dir.join(name);
+        let t = Instant::now();
+        drop(lemma_app::document::new_buffer(&path));
+        buffers.push(t.elapsed());
+        let t = Instant::now();
+        block_on(f.state.open_file_in_background(&path)).expect("open");
+        times.push(t.elapsed());
+    }
+    let total: Duration = times.iter().sum();
+    let (time, max) = median(times);
+    let (buffer, buffer_max) = median(buffers);
+    println!(
+        "    opening a 400-line chapter: median {time:?} (max {max:?}), 20 in {total:?}; a new \
+         buffer alone: median {buffer:?} (max {buffer_max:?})"
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(buffer <= Duration::from_millis(2), "median {buffer:?}");
     }
 }

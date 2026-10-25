@@ -397,6 +397,26 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   tab's place, encodings and line breaks, the refusals); `gtk_vim`'s `:w path`, `:wq path` and
   `:sav[eas][!]`; `GotoTarget::LineColumn` in `gtk_shell_m3`, whose real keys check Vim's Ctrl+G
   and Ctrl+N and Ctrl+G in the PDF's search entry; `gtk_keys`, Ctrl+N with Vim in every mode.
+- **Vim's `:s`** (`editor/vim/substitute.rs`): unit tests for the parsing (what GtkSourceView
+  runs as a substitution and what stays its own), the matches (measured against GtkSourceView
+  5.22) and GTK's line numbering; `gtk_vim`'s `colon_s_does_what_gtksourceview_does` types the
+  same keys into Lemma's editor and into a bare GtkSourceView view with Vim and none of Lemma's
+  handlers, and compares the text, the cursor and the selection after the command, the place
+  Ctrl+O goes to (Vim's jump list), the match `n` finds (Vim's search pattern) and the text after
+  `u`, on fixed cases (ranges, `'<,'>` from visual mode, flags, groups, `\n` and `\U` in
+  replacements, matches across lines, adjacent matches, CRLF line breaks, nothing to replace)
+  and on random ones (`LEMMA_TEST_SEED`, `LEMMA_TEST_OPS`, default 60; cases where
+  GtkSourceView's own replace logs a critical are counted, not compared);
+  `colon_s_is_one_edit_and_one_undo_step`.
+- **The word count** (`wordcount.rs`): `gtk_lint`'s `word_count_*` tests; with a stand-in
+  texcount (a shell script), `word_count_of_a_large_project_waits_for_a_click` (a small root
+  whose chapters pass the limit is not counted when it is first shown) and
+  `word_count_stops_texcount_with_the_window`; `gtk_app`'s `quitting_stops_the_word_count` runs
+  the binary with the stand-in on `PATH` and checks that its texcount is gone once Lemma quits.
+- **An earlier build's PDF on tab switches:** `gtk_pdf`'s
+  `tab_switches_without_a_pdf_detect_the_root_once` counts the root detections
+  (`BuildController::detections`): none for a switch after which no document changed, one per
+  tab after an edit, and a PDF that appears on disk is still shown.
 - **The project index and the disk:** `gtk_labels` `undefined_follows_files_changed_on_disk`,
   `gtk_completion` `the_project_feed_follows_files_on_disk` and `gtk_outline`
   `a_chapter_changed_on_disk_updates_the_tree` write files with `std::fs` as another program
@@ -494,6 +514,8 @@ check the budgets only in release builds:
 | Test | Budget |
 |---|---|
 | `gtk_highlight` `perf_highlight_keystroke_large_tex` | highlighting cost per keystroke on `large.tex` ≤ 0.5 ms p99 |
+| `gtk_highlight` `perf_highlight_paste_10k` | the highlighting before the frame after a 1000-line paste into a 10 000-line document ≤ 5 ms median (measured 0.75 ms, 32 of the pasted lines; 35 ms when all of them counted as visible) |
+| `gtk_highlight` `perf_open_tex_documents` | 20 LaTeX chapters of 400 lines opened in background tabs: a new LaTeX buffer ≤ 2 ms median (measured 30 µs; 29 ms when every buffer parsed `latex.lang` again); prints each opening (measured 14 ms; 44 ms) |
 | `gtk_typing` `perf_typing_keys` | typing-helper keys on a 5k-line document ≤ 2 ms p99 |
 | `gtk_typing` `perf_typing_large_tex` | Enter and `\end` keys (which scan environments) on `large.tex` ≤ 2 ms p90 |
 | `gtk_completion` `perf_completion_keystroke` | keystroke to frame with completion, autosnippets and highlighting on a 5k-line document ≤ 8 ms p99 |
@@ -511,6 +533,10 @@ check the budgets only in release builds:
 | `gtk_search` `perf_find_bar_replace_all_large_tex` | the find bar's Replace All of 20 000 matches on `large.tex`, and what the same line index updates take alone (printed) |
 | `gtk_search` `perf_find_bar_replace_all_under_review_large_tex` | the same Replace All with 5000 hunks under review and without a review, and the recompute after it (printed) |
 | `gtk_search` `perf_find_bar_step_before_the_scan_large_tex` | F3, Shift+F3 and Enter right after a new query, before the search has counted, on `large.tex` and its first 10 000 lines: the key's own work ≤ 2 ms on 10 000 lines; prints the longest main-loop step until the match and the key once counted |
+| `gtk_vim` `perf_vim_substitute_range_10k` | Vim's `:5000,6000s/with/WITH/g` (336 matches) in the first 10 000 lines of `large.tex`, the Return key: ≤ 100 ms median (measured 34 ms; 4–8 s in GtkSourceView); prints the undo |
+| `gtk_vim` `perf_vim_substitute_whole_10k` | `:%s/with/WITH/g` (3328 matches) in the same lines ≤ 600 ms median (measured 0.27 s; 18–50 s in GtkSourceView) |
+| `gtk_vim` `perf_vim_substitute_line_large_tex` | `:s/with/WITH/g` on one of the last lines of `large.tex` ≤ 60 ms median (measured 21 ms; 0.27–0.55 s in GtkSourceView); prints `:s/a/A/g` there (measured 25 ms; 1.3–2.4 s) |
+| `gtk_vim` `perf_vim_substitute_large_tex` | `:%s/with/WITH/g` (20 000 matches) in `large.tex` ≤ 4 s median (measured 1.5 s at a load of 15–20; more than ten minutes in GtkSourceView); prints the undo |
 | `lemma-review` `perf_unaccept_accept_all` | Alt+U of an Accept all of 5000 hunks ≤ 100 ms |
 | `lemma-review` `perf_accept_all_large_tex` | Accept all and Keep Turn of 5001 hunks in `large.tex` ≤ 50 ms, of 20 001 ≤ 200 ms (measured 7–21 and 35–54 ms, about what Reject all takes; 0.12–0.19 s and 0.50–0.67 s when each accept moved the baseline after it); prints an accept of every other hunk |
 | `lemma-review` `perf_recompute_keeps_word_spans_large_tex` | the recompute after a keystroke outside 5001 and 20 001 hunks of `large.tex`, whose texts keep their word spans: ≤ 80% of a recompute that refines them all, timed in turn with it, and ≤ 0.25 s (measured 18–31 ms and 55–88 ms; 37–52 ms and 115–171 ms while every recompute refined every hunk's spans) |
