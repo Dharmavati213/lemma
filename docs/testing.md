@@ -268,6 +268,27 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   on a hunk that holds the waiting partner: the rename goes in, the reject applies, one
   `Rejected` event, and Alt+U brings the hunk back with its turn; each failed without its
   settle).
+- The review overlay's tags: `editor::review_overlay::tests` check how the edits since the last
+  apply are recorded (`Edits`) and that `follow` keeps exactly the ranges GTK moves with the
+  text, against a model of GTK's ranges under edits (text inserted strictly inside a range is
+  in it, at either end outside), also on 3000 random cases. `gtk_review`
+  `tags_change_only_where_the_hunks_do` (200 hunks and one with changed words) counts the
+  tag operations on the buffer (`apply-tag`, `remove-tag`) and compares the tags with the hunks
+  line by line and byte by byte after each step: a tag per reserved space, not per hunk, and
+  decisions, typing in a hunk or in a changed word with the recompute, a line break above the
+  hunks and Ctrl+Z each make 0 to 4 of them (a decision made 199 to 663 with a tag per hunk),
+  a tag added to the table later does not outrank the anchor tags, and Accept all takes the
+  green background off in one go. `bands_follow_typing_before_the_recompute` types above the
+  hunks, inside one and at the start of one, and after the last line of a file whose end the
+  agent deleted, and checks after each, before the recompute, that every band is drawn and
+  marked in the gutter where its line reserves the space (`ViewReview::band_tops`,
+  `hunks_at_line`; the last case failed while the band followed the hunk's kind of anchor).
+  `tags_follow_random_edits` makes 150 random steps on 200 lines with non-ASCII text (typing,
+  line breaks, deletions across hunks, pastes, decisions, Ctrl+Z, agent writes) and checks the
+  tags against the hunks after each recompute and, before it too, that every band drawn is on
+  a line that reserves its space (it failed when a deletion joined two anchor lines that share
+  a tag: both bands were drawn on that line). The text has no `\r`: GTK breaks lines at a lone
+  one, where `LineIndex` does not.
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -451,7 +472,8 @@ check the budgets only in release builds:
 | `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
 | `gtk_math_preview` `perf_math_preview_large_tex` | on `large.tex` with the live preview (needs `pdflatex`): the main loop's work after the card appears or goes away ≤ 20 ms median (measured under 0.5 ms; 1.2 s while its tag was removed from the whole text, which GTK lays out again), and the hover of a rendered formula right after a one-character edit ≤ 2 ms median |
 | `gtk_labels` `perf_equation_numbers_large_tex` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`: a refresh ≤ 15 ms median (measured 8 ms; 49 ms with a search per label), and the main loop's work after a new undefined reference is underlined ≤ 50 ms |
-| `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms; prints a line break above the hunks and accepting one (with the main loop's work after it) |
+| `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms, Alt+Y and Alt+N on the middle hunk (`decide_and_advance`) ≤ 50 ms median and the recompute after typing in a hunk ≤ 40 ms (measured 20 ms and 18 ms; 0.43 s and 0.37 s while the overlay re-tagged every added line and changed word, with a tag per hunk that moved for every hunk after a decided one); prints a line break above the hunks and accepting the last one (with the main loop's work after it) |
+| `gtk_review` `perf_review_5000_hunks` | 5000 one-line hunks of agent turns in a 15 000-line file: a keystroke outside them ≤ 2 ms p99 (measured 0.25 ms, 0.46 ms with a tag per hunk; the same keys with no review are printed, 0.05 ms), Accept all in the file and Keep Turn ≤ 300 ms, Reject all and Reject Turn ≤ 300 ms more than the same 10 000 buffer changes cost without a review (measured 0.10 s, 0.10 s, 0.40 s and 0.38 s, the buffer changes alone 0.20 s; 0.67 s, 0.64 s, 1.3 s and 2.2 s with a tag per hunk); prints the agent's write and the main loop's work after each |
 
 `perf_completion_keystroke` lays the document out before it measures and reports the window
 frames Broadway renders meanwhile separately (about 40–50 ms each in software, about once a

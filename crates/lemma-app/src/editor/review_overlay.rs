@@ -1,23 +1,27 @@
-//! Inline review rendering (WP1.2, ARCHITECTURE §4.3): per-hunk anchor tags, the cached layouts
-//! of deleted lines, painting, and the pool of 8 `ReviewBar` overlays.
+//! Inline review rendering (WP1.2, ARCHITECTURE §4.3): the anchor tags that reserve space, the
+//! cached layouts of deleted lines, painting, and the pool of 8 `ReviewBar` overlays.
 //!
 //! The buffer always holds the agent's proposal. For every hunk of the document's review:
 //!
 //! - its current (added) lines carry the shared `lemma-review-added` tag, a green paragraph
 //!   background, and its changed words `lemma-review-added-word`, a stronger green;
 //! - its **anchor line** (the first current line; for a pure deletion the line after it) carries
-//!   a pooled anchor tag whose `pixels-above-lines` reserves a header band plus the height of the
+//!   an anchor tag whose `pixels-above-lines` reserves a header band plus the height of the
 //!   deleted text. A deletion at the end of the file, where no line follows, reserves the space
-//!   with `pixels-below-lines` on the last line with text instead;
+//!   with `pixels-below-lines` on the last line with text instead. Anchors that reserve the same
+//!   space share one tag ([`SpaceTag`]): one-line hunks need a few heights, so thousands of
+//!   hunks make tens of tags, where a tag per hunk slowed every tag operation of the buffer;
 //! - [`paint`] (called from `TexView::snapshot_layer(AboveText)`, in buffer coordinates) fills
 //!   the reserved space: an opaque base, the band, then the deleted text in red with its deleted
 //!   words darker, laid out like the view's text (font, tabs, wrapping to the text width);
 //! - one of [`BAR_POOL`] action bars (Accept Alt+Y · Reject Alt+N · i/n, with the shortcuts
 //!   actually bound) is placed in the band with `TextView::add_overlay`, so it never covers text.
 //!
-//! The plan (which hunk reserves what where) is rebuilt after every recompute; tags are only
-//! touched when it changes. Reading mode (Alt+D) shrinks each band to its header and hides the
-//! deleted text.
+//! The plan (which hunk reserves what where) is rebuilt after every recompute. Tags change only
+//! where the plan or the text did: each tag's ranges from the last apply are followed through
+//! the edits since ([`Edits`]), and only the bytes that should be tagged and are not, or the
+//! other way round, are tagged or untagged. Reading mode (Alt+D) shrinks each band to its header
+//! and hides the deleted text.
 
 use crate::document::{DocRef, Document, ObserverId};
 use crate::editor::{TexView, highlight, remove_spacing_tag, remove_tag_everywhere};
@@ -51,6 +55,9 @@ const PHANTOM_TAIL: usize = 100;
 const PHANTOM_CHUNK_LINES: usize = 50;
 const ADDED_TAG: &str = "lemma-review-added";
 const WORD_TAG: &str = "lemma-review-added-word";
+/// Separate places of the text [`Edits`] follows; past them the next apply reads the tags'
+/// ranges from the text (a replace_all, a Reject all).
+const MAX_EDIT_SPANS: usize = 128;
 
 /// Called with a hunk and a decision when a bar button is clicked.
 pub type DecideFn = Box<dyn Fn(HunkId, Decision)>;
@@ -85,26 +92,123 @@ pub struct Block {
     pub touched: bool,
     /// Offset of this block in the space reserved at its anchor (blocks sharing an anchor stack).
     pub offset: i32,
-    /// Index of the anchor tag (blocks sharing an anchor share it).
+    /// Index of its anchor in the plan (blocks sharing an anchor stack there).
     pub group: usize,
+}
+
+/// One anchor of the plan: where blocks reserve space, how much in all, and which blocks.
+#[derive(Clone, Debug, PartialEq)]
+struct Group {
+    anchor: Anchor,
+    space: i32,
+    /// Indices of its blocks in [`Plan::blocks`].
+    blocks: Range<usize>,
+}
+
+impl Group {
+    /// The anchor line (`None` for [`Anchor::Top`]).
+    fn line(&self) -> Option<u32> {
+        match self.anchor {
+            Anchor::Above(line) | Anchor::Below(line) => Some(line),
+            Anchor::Top => None,
+        }
+    }
 }
 
 /// Everything derived from the hunks that the tags and the painting use.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Plan {
     blocks: Vec<Block>,
-    /// Space reserved per anchor tag (index = `Block::group`), with its anchor.
-    groups: Vec<(Anchor, i32)>,
+    /// The anchors, in text order (index = `Block::group`).
+    groups: Vec<Group>,
     /// Line ranges with the added-line background.
     added: Vec<Range<u32>>,
     /// Changed words: line and byte range within the line.
     words: Vec<(u32, Range<u32>)>,
-    /// The blocks drawn at a line (anchored [`Anchor::Above`] or [`Anchor::Below`] it): the
-    /// line and the block's index, by line and then in block order, for the gutter.
-    anchored: Vec<(u32, usize)>,
     header: i32,
     /// Width the deleted text wraps at (`None`: no wrapping).
     wrap: Option<i32>,
+}
+
+/// An anchor tag: it reserves `space` pixels above the lines it covers, or below them
+/// (`below`). Anchors that reserve the same space share it, so its properties never change.
+struct SpaceTag {
+    tag: gtk::TextTag,
+    below: bool,
+    space: i32,
+    /// The ranges the last [`ViewReview::apply`] gave it (see [`ViewReview::added_ranges`]).
+    ranges: Vec<Range<usize>>,
+}
+
+/// The changes to the text since the last [`ViewReview::apply`]: the spans of the current text
+/// they made (spans that meet are one), each with the length it had before them.
+///
+/// GTK moves a tag's ranges with the text, and text inserted where a range starts or ends goes
+/// outside it, so a range no span meets or touches is where it was, shifted by the spans before
+/// it (see [`follow`]); only the others are read from the text again.
+#[derive(Debug, Default)]
+struct Edits {
+    spans: Vec<Changed>,
+    /// More than [`MAX_EDIT_SPANS`] places changed and the spans were dropped: the tags' ranges
+    /// are read from the whole text.
+    lost: bool,
+}
+
+/// One span of [`Edits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Changed {
+    /// Its byte offset and length in the current text.
+    start: usize,
+    len: usize,
+    /// Its length before the changes.
+    old_len: usize,
+}
+
+impl Changed {
+    fn end(&self) -> usize {
+        self.start + self.len
+    }
+}
+
+impl Edits {
+    /// Nothing changed since the last apply.
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty() && !self.lost
+    }
+
+    /// Records the change of the bytes `range` (offsets of the text before it) to `inserted`
+    /// bytes.
+    fn record(&mut self, range: Range<usize>, inserted: usize) {
+        if self.lost || (range.is_empty() && inserted == 0) {
+            return;
+        }
+        // The spans the change meets or touches become one with it.
+        let first = self.spans.partition_point(|s| s.end() < range.start);
+        let met = self.spans[first..]
+            .iter()
+            .take_while(|s| s.start <= range.end)
+            .count();
+        let (mut start, mut end, mut grown) = (range.start, range.end, 0);
+        for s in &self.spans[first..first + met] {
+            start = start.min(s.start);
+            end = end.max(s.end());
+            grown += signed(s.len) - signed(s.old_len);
+        }
+        let delta = signed(inserted) - signed(range.len());
+        let merged = Changed {
+            start,
+            len: shifted(end - start, delta),
+            old_len: shifted(end - start, -grown),
+        };
+        self.spans.splice(first..first + met, [merged]);
+        for s in &mut self.spans[first + 1..] {
+            s.start = shifted(s.start, delta);
+        }
+        if self.spans.len() > MAX_EDIT_SPANS {
+            self.spans = Vec::new();
+            self.lost = true;
+        }
+    }
 }
 
 /// The cached layouts of a hunk's deleted text.
@@ -164,8 +268,18 @@ pub struct ViewReview {
     buffer: sourceview5::Buffer,
     added: gtk::TextTag,
     word: gtk::TextTag,
-    anchors: RefCell<Vec<gtk::TextTag>>,
+    /// The byte ranges the last [`ViewReview::apply`] gave `added` and `word`, in the text as it
+    /// was then (sorted, apart): with [`Self::edits`] they tell where the tags are now.
+    added_ranges: RefCell<Vec<Range<usize>>>,
+    word_ranges: RefCell<Vec<Range<usize>>>,
+    /// The anchor tags, in priority order (the last is the highest).
+    anchors: RefCell<Vec<SpaceTag>>,
+    /// The changes to the text since the last apply.
+    edits: RefCell<Edits>,
     plan: RefCell<Plan>,
+    /// The block of each hunk of the plan, by id, for frames drawn after the text changed (see
+    /// [`ViewReview::groups_on`]); made the first time one needs it.
+    block_of: RefCell<Option<HashMap<HunkId, usize>>>,
     /// Deleted-text layouts of the current plan's hunks (see [`Phantom`]), by [`phantom_key`].
     phantoms: RefCell<HashMap<u64, Vec<Rc<Phantom>>>>,
     /// The phantom of each hunk of the current plan.
@@ -180,19 +294,18 @@ pub struct ViewReview {
     applying: Cell<bool>,
     /// The review's tags may cover more than the ranges [`ViewReview::apply`] gave them: set
     /// until the first apply, and when something else applies one (a paste copies the tags of
-    /// the text it copies); the next sync tags everything again. Otherwise GTK's edits move the
-    /// ranges with the text and never add one, so the ends of a range tell whether it is where
-    /// the plan wants it, which keeps a sync with thousands of hunks linear: each search or
-    /// change of a tag costs GTK time that grows with the number of tags.
+    /// the text it copies); the next apply reads their ranges from the whole text. Otherwise
+    /// GTK's edits move the ranges with the text and never add one, so the ranges of the last
+    /// apply and the edits since tell where they are, which keeps a sync with thousands of
+    /// hunks linear and its tag changes to what changed: each search or change of a tag costs
+    /// GTK time, and a tag changed over text makes GTK draw or lay out that text again.
     tags_unsure: Cell<bool>,
-    /// How many ranges the added-lines and changed-words tags got from the last apply.
-    shared_ranges: Cell<(usize, usize)>,
     /// Document version the plan was last checked against.
     plan_version: Cell<Option<u64>>,
     /// The view's own top margin, restored when no hunk needs the space above line 1.
     base_top_margin: i32,
     decide: DecideFn,
-    observer: Cell<Option<ObserverId>>,
+    observers: RefCell<Vec<ObserverId>>,
     handlers: RefCell<Vec<(glib::Object, glib::SignalHandlerId)>>,
 }
 
@@ -220,8 +333,12 @@ impl ViewReview {
             buffer: buffer.clone(),
             added,
             word,
+            added_ranges: RefCell::new(Vec::new()),
+            word_ranges: RefCell::new(Vec::new()),
             anchors: RefCell::new(Vec::new()),
+            edits: RefCell::new(Edits::default()),
             plan: RefCell::new(Plan::default()),
+            block_of: RefCell::new(None),
             phantoms: RefCell::new(HashMap::new()),
             phantom_of: RefCell::new(HashMap::new()),
             bar_height: Cell::new(None),
@@ -231,11 +348,10 @@ impl ViewReview {
             relayout_queued: Cell::new(false),
             applying: Cell::new(false),
             tags_unsure: Cell::new(true),
-            shared_ranges: Cell::new((0, 0)),
             plan_version: Cell::new(None),
             base_top_margin: view.top_margin(),
             decide,
-            observer: Cell::new(None),
+            observers: RefCell::new(Vec::new()),
             handlers: RefCell::new(Vec::new()),
         });
         for bar in &review.bars {
@@ -250,11 +366,21 @@ impl ViewReview {
 
     fn connect(self: &Rc<Self>, view: &TexView, doc: &DocRef) {
         let weak = Rc::downgrade(self);
-        self.observer.set(Some(doc.connect_hunks_changed(move || {
+        let hunks = doc.connect_hunks_changed(move || {
             if let Some(review) = weak.upgrade() {
                 review.sync();
             }
-        })));
+        });
+        let weak = Rc::downgrade(self);
+        let edits = doc.connect_edit(move |_, edit, _| {
+            if let Some(review) = weak.upgrade() {
+                review
+                    .edits
+                    .borrow_mut()
+                    .record(edit.range.clone(), edit.text.len());
+            }
+        });
+        self.observers.replace(vec![hunks, edits]);
         let mut handlers = self.handlers.borrow_mut();
         let adjustments = [view.vadjustment(), view.hadjustment()];
         for adjustment in adjustments.into_iter().flatten() {
@@ -304,17 +430,22 @@ impl ViewReview {
 
     /// Removes the tags, bars and signal handlers; the view no longer shows the review.
     pub fn detach(&self) {
-        if let (Some(doc), Some(id)) = (self.doc.upgrade(), self.observer.take()) {
-            doc.disconnect(id);
+        let observers = self.observers.take();
+        if let Some(doc) = self.doc.upgrade() {
+            for id in observers {
+                doc.disconnect(id);
+            }
         }
         for (object, id) in self.handlers.borrow_mut().drain(..) {
             object.disconnect(id);
         }
         remove_tag_everywhere(&self.buffer, &self.added);
         remove_tag_everywhere(&self.buffer, &self.word);
-        for tag in self.anchors.borrow().iter() {
-            remove_tag_everywhere(&self.buffer, tag);
+        // The highest priority first: the table renumbers only the tags above the one it loses.
+        for anchor in self.anchors.take().into_iter().rev() {
+            remove_spacing_tag(&self.buffer, &anchor.tag);
         }
+        self.tags_unsure.set(true);
         if let Some(view) = self.view.upgrade() {
             // A closed tab's view was disposed first, which already removed its children.
             let parent = Some(view.clone().upcast::<gtk::Widget>());
@@ -398,6 +529,41 @@ impl ViewReview {
         self.cursor_hunk.get()
     }
 
+    /// The bands near the visible area as the next frame draws them: each block's hunk and the
+    /// top of its band (buffer coordinates), in text order (tests).
+    pub fn band_tops(&self) -> Vec<(HunkId, i32)> {
+        let (Some(view), Some(doc)) = (self.view.upgrade(), self.doc.upgrade()) else {
+            return Vec::new();
+        };
+        let plan = self.plan.borrow();
+        let vis = view.visible_rect();
+        self.tops(&view, &doc, &plan, vis.y(), vis.y() + vis.height())
+            .into_iter()
+            .flat_map(|(g, top)| {
+                plan.blocks[plan.groups[g].blocks.clone()]
+                    .iter()
+                    .map(move |b| (b.id, top + b.offset))
+            })
+            .collect()
+    }
+
+    /// The hunks whose bands the gutter marks next to line `line` of the current text (in
+    /// `LineIndex` numbering), in order (tests).
+    pub fn hunks_at_line(&self, line: u32) -> Vec<HunkId> {
+        let Some(doc) = self.doc.upgrade() else {
+            return Vec::new();
+        };
+        let plan = self.plan.borrow();
+        self.groups_on(&doc, &plan, line..line + 1)
+            .into_iter()
+            .flat_map(|(g, _)| {
+                plan.blocks[plan.groups[g].blocks.clone()]
+                    .iter()
+                    .map(|b| b.id)
+            })
+            .collect()
+    }
+
     /// Rebuilds the plan from the document's hunks and updates tags, bars and drawing.
     pub fn sync(&self) {
         let (Some(view), Some(doc)) = (self.view.upgrade(), self.doc.upgrade()) else {
@@ -424,12 +590,14 @@ impl ViewReview {
                 !layouts.is_empty()
             });
         }
+        // The tags are as the plan wants them unless it or the text changed since the last apply.
         let changed = self.tags_unsure.get()
-            || *self.plan.borrow() != plan
-            || !self.tags_in_place(&doc, &plan);
+            || !self.edits.borrow().is_empty()
+            || *self.plan.borrow() != plan;
         if changed {
             self.apply(&view, &doc, &plan);
             self.plan.replace(plan);
+            self.block_of.replace(None);
         }
         self.plan_version.set(Some(doc.version()));
         self.update_cursor_hunk();
@@ -463,13 +631,18 @@ impl ViewReview {
             };
             let space = header + deleted;
             let (group, offset) = match plan.groups.last_mut() {
-                Some((a, total)) if *a == anchor => {
-                    let offset = *total;
-                    *total += space;
+                Some(group) if group.anchor == anchor => {
+                    let offset = group.space;
+                    group.space += space;
+                    group.blocks.end = i + 1;
                     (plan.groups.len() - 1, offset)
                 }
                 _ => {
-                    plan.groups.push((anchor, space));
+                    plan.groups.push(Group {
+                        anchor,
+                        space,
+                        blocks: i..i + 1,
+                    });
                     (plan.groups.len() - 1, 0)
                 }
             };
@@ -496,16 +669,6 @@ impl ViewReview {
                     .map(|w| (hunk.cur_lines.start + w.line, w.bytes.clone())),
             );
         }
-        plan.anchored = plan
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, block)| match block.anchor {
-                Anchor::Above(line) | Anchor::Below(line) => Some((line, i)),
-                Anchor::Top => None,
-            })
-            .collect();
-        plan.anchored.sort_by_key(|&(line, _)| line);
         self.phantom_of.replace(phantom_of);
         plan
     }
@@ -528,56 +691,16 @@ impl ViewReview {
         ((f64::from(line) * HEADER_SCALE).round() as i32).max(bar + 4)
     }
 
-    /// True when every anchor tag covers exactly its planned line (GTK moves tags with the text,
-    /// but an edit can split or extend a tagged line).
-    fn tags_in_place(&self, doc: &Document, plan: &Plan) -> bool {
-        let anchors = self.anchors.borrow();
-        anchors.len() == plan.groups.len()
-            && plan
-                .groups
-                .iter()
-                .zip(anchors.iter())
-                .all(|((anchor, _), tag)| self.anchor_in_place(doc, tag, *anchor))
-    }
-
-    /// True when `tag` covers exactly the line of `anchor` (nothing for [`Anchor::Top`]).
-    fn anchor_in_place(&self, doc: &Document, tag: &gtk::TextTag, anchor: Anchor) -> bool {
-        let line = match anchor {
-            Anchor::Above(l) | Anchor::Below(l) => l,
-            Anchor::Top => return tag_start(&self.buffer, tag).is_none(),
-        };
-        let index = doc.line_index();
-        if line >= index.line_count() {
-            return false;
-        }
-        let (want_start, want_end) = (index.line_start(line), line_end(&index, line + 1));
-        drop(index);
-        if !self.tags_unsure.get() {
-            // Its one range starts and ends there (see `tags_unsure`).
-            return ranges_in_place(doc, tag, std::slice::from_ref(&(want_start..want_end)));
-        }
-        let Some(start) = tag_start(&self.buffer, tag) else {
-            return false;
-        };
-        let mut end = start;
-        end.forward_to_tag_toggle(Some(tag));
-        let mut rest = end;
-        doc.iter_at_byte(want_start).as_ref() == Some(&start)
-            && doc.iter_at_byte(want_end).as_ref() == Some(&end)
-            && !rest.forward_to_tag_toggle(Some(tag))
-    }
-
-    /// Re-tags the buffer for `plan`. The shared tags and each anchor tag are left alone where
-    /// GTK moved them with the text to where the plan wants them; otherwise they are removed
-    /// only where they are and applied again. Surplus anchor tags leave the tag table, so their
-    /// cost does not outlive their hunks.
+    /// Re-tags the buffer for `plan`, where it differs from what the tags cover now: the ranges
+    /// of the last apply, followed through the edits since ([`Edits`]), or read from the text
+    /// when that cannot tell ([`Self::tags_unsure`], too many edits). A decision thus changes
+    /// the tags of the decided hunk's lines only, and typing those of the lines typed on.
+    ///
+    /// Anchors share a tag per space they reserve ([`SpaceTag`]); a space no anchor reserves any
+    /// more takes its tag out of the tag table, so its cost does not outlive its hunks.
     fn apply(&self, view: &TexView, doc: &Document, plan: &Plan) {
-        let buffer = &self.buffer;
         self.applying.set(true);
-        self.resize_anchor_pool(plan.groups.len());
-        let anchors = self.anchors.borrow();
         let index = doc.line_index();
-        let at = |offset: usize| doc.iter_at_byte(offset);
         // The added lines and the changed words, as GTK keeps them: ranges that touch are one.
         let added = joined(
             plan.added
@@ -594,61 +717,151 @@ impl ViewReview {
                     base + bytes.start as usize..base + bytes.end as usize
                 }),
         );
-        // Usually only a few hunks changed: the others' ranges moved with the text.
-        let kept = !self.tags_unsure.get()
-            && self.shared_ranges.get() == (added.len(), words.len())
-            && ranges_in_place(doc, &self.added, &added)
-            && ranges_in_place(doc, &self.word, &words);
-        if !kept {
-            remove_tag_everywhere(buffer, &self.added);
-            remove_tag_everywhere(buffer, &self.word);
-            let tag_all = |tag: &gtk::TextTag, ranges: &[Range<usize>]| {
-                let mut tagged = 0;
-                for range in ranges {
-                    if let (Some(a), Some(b)) = (at(range.start), at(range.end)) {
-                        buffer.apply_tag(tag, &a, &b);
-                        tagged += 1;
-                    }
-                }
-                tagged
-            };
-            self.shared_ranges
-                .set((tag_all(&self.added, &added), tag_all(&self.word, &words)));
-        }
-        let range = |line: u32| (index.line_start(line), line_end(&index, line + 1));
+        // The anchor lines by the space they reserve, above or below them.
         let mut top = 0;
-        for ((anchor, space), tag) in plan.groups.iter().zip(anchors.iter()) {
-            let (above, below) = match *anchor {
-                Anchor::Above(_) => (*space, 0),
-                Anchor::Below(_) => (0, *space),
-                Anchor::Top => {
-                    top += space;
-                    (0, 0)
+        let mut lines: Vec<((bool, i32), Range<usize>)> = Vec::new();
+        for group in &plan.groups {
+            match group.anchor {
+                Anchor::Above(line) | Anchor::Below(line) if line < line_count => {
+                    let below = matches!(group.anchor, Anchor::Below(_));
+                    let range = index.line_start(line)..line_end(&index, line + 1);
+                    lines.push(((below, group.space), range));
                 }
-            };
-            // Only real changes: setting a tag property re-lays out the text it covers.
-            if tag.pixels_above_lines() != above {
-                tag.set_pixels_above_lines(above);
-            }
-            if tag.pixels_below_lines() != below {
-                tag.set_pixels_below_lines(below);
-            }
-            if self.anchor_in_place(doc, tag, *anchor) {
-                continue;
-            }
-            remove_tag_everywhere(buffer, tag);
-            if let Anchor::Above(line) | Anchor::Below(line) = *anchor
-                && line < line_count
-            {
-                let (start, end) = range(line);
-                if let (Some(a), Some(b)) = (at(start), at(end)) {
-                    buffer.apply_tag(tag, &a, &b);
-                }
+                Anchor::Top => top += group.space,
+                _ => {}
             }
         }
+        drop(index);
+        // Stable: each space's lines stay in text order.
+        lines.sort_by_key(|&(space, _)| space);
+        let edits = std::mem::take(&mut *self.edits.borrow_mut());
+        let edits = (!self.tags_unsure.get() && !edits.lost).then_some(&edits.spans[..]);
+        // Backgrounds: they change no sizes.
+        let mut exact = self.retag(
+            doc,
+            &self.added,
+            false,
+            &mut self.added_ranges.borrow_mut(),
+            added,
+            edits,
+        );
+        exact &= self.retag(
+            doc,
+            &self.word,
+            false,
+            &mut self.word_ranges.borrow_mut(),
+            words,
+            edits,
+        );
+        let mut anchors = self.anchors.borrow_mut();
+        let table = self.buffer.tag_table();
+        for chunk in lines.chunk_by(|a, b| a.0 == b.0) {
+            let (below, space) = chunk[0].0;
+            if !anchors.iter().any(|a| a.below == below && a.space == space) {
+                // Highest priority: nothing else may override the reserved space.
+                let tag = gtk::TextTag::new(None);
+                if below {
+                    tag.set_pixels_below_lines(space);
+                } else {
+                    tag.set_pixels_above_lines(space);
+                }
+                table.add(&tag);
+                tag.set_priority(table.size() - 1);
+                anchors.push(SpaceTag {
+                    tag,
+                    below,
+                    space,
+                    ranges: Vec::new(),
+                });
+            }
+        }
+        for anchor in anchors.iter_mut() {
+            let first = lines.partition_point(|&(space, _)| space < (anchor.below, anchor.space));
+            let want = lines[first..]
+                .iter()
+                .take_while(|&&(space, _)| space == (anchor.below, anchor.space))
+                .map(|(_, range)| range.clone());
+            let want = joined(want);
+            exact &= self.retag(doc, &anchor.tag, true, &mut anchor.ranges, want, edits);
+        }
+        // Spaces no anchor reserves now: the highest priority first, as the table renumbers
+        // the tags above the one it loses.
+        for i in (0..anchors.len()).rev() {
+            if anchors[i].ranges.is_empty() {
+                remove_spacing_tag(&self.buffer, &anchors.remove(i).tag);
+            }
+        }
+        // A tag added to the table since outranks ours: they go back to the top.
+        let size = table.size();
+        let ours = i32::try_from(anchors.len()).unwrap_or(i32::MAX);
+        if anchors.iter().any(|a| a.tag.priority() < size - ours) {
+            for anchor in anchors.iter() {
+                anchor.tag.set_priority(size - 1);
+            }
+        }
+        drop(anchors);
         view.set_top_margin(self.base_top_margin + top);
         self.applying.set(false);
-        self.tags_unsure.set(false);
+        // A range that could not be tagged (no iter at its offsets) is not where its record
+        // says: the next apply reads the tags from the text.
+        self.tags_unsure.set(!exact);
+    }
+
+    /// Makes `tag` cover exactly `want` (sorted, apart), and records it in `applied`, which holds
+    /// the ranges the last apply gave the tag. With `edits` (the spans of [`Edits`]) it covers
+    /// those ranges moved with the text, except near an edit, where its ranges are read from
+    /// the text; without, all its ranges are read. Only the difference is tagged or untagged:
+    /// GTK draws or lays out again whatever text a tag changes over. False when a range could
+    /// not be changed.
+    ///
+    /// A tag that changes no sizes (`sizes` false) is taken off in one go across text it should
+    /// not cover: GTK then only draws that text again, and Accept all takes the added lines'
+    /// background off thousands of hunks at once. One that does would have that text laid out
+    /// again.
+    fn retag(
+        &self,
+        doc: &Document,
+        tag: &gtk::TextTag,
+        sizes: bool,
+        applied: &mut Vec<Range<usize>>,
+        want: Vec<Range<usize>>,
+        edits: Option<&[Changed]>,
+    ) -> bool {
+        let have = match edits {
+            Some(spans) => {
+                let (mut have, unsure) = follow(applied, spans);
+                if !unsure.is_empty() {
+                    for region in unsure {
+                        have.extend(tag_ranges(doc, tag, region));
+                    }
+                    have = joined(have.into_iter());
+                }
+                have
+            }
+            None => tag_ranges(doc, tag, 0..doc.line_index().text_len()),
+        };
+        let mut exact = true;
+        let at = |range: &Range<usize>| {
+            Some((doc.iter_at_byte(range.start)?, doc.iter_at_byte(range.end)?))
+        };
+        let mut untag = difference(&have, &want);
+        if !sizes {
+            untag = joined_outside(untag, &want);
+        }
+        for range in untag {
+            match at(&range) {
+                Some((start, end)) => self.buffer.remove_tag(tag, &start, &end),
+                None => exact = false,
+            }
+        }
+        for range in difference(&want, &have) {
+            match at(&range) {
+                Some((start, end)) => self.buffer.apply_tag(tag, &start, &end),
+                None => exact = false,
+            }
+        }
+        *applied = want;
+        exact
     }
 
     /// True for the review's own tags.
@@ -657,25 +870,7 @@ impl ViewReview {
         *tag == self.added
             || *tag == self.word
             || ((tag.is_pixels_above_lines_set() || tag.is_pixels_below_lines_set())
-                && self.anchors.borrow().contains(tag))
-    }
-
-    /// Makes the pool of anchor tags exactly `n` long: new tags get the highest priority, surplus
-    /// ones leave the text and the tag table (without laying out the whole text again).
-    fn resize_anchor_pool(&self, n: usize) {
-        let mut anchors = self.anchors.borrow_mut();
-        let table = self.buffer.tag_table();
-        let keep = n.min(anchors.len());
-        for tag in anchors.drain(keep..) {
-            remove_spacing_tag(&self.buffer, &tag);
-        }
-        while anchors.len() < n {
-            let tag = gtk::TextTag::new(None);
-            table.add(&tag);
-            // Highest priority: nothing else may override the reserved space.
-            tag.set_priority(table.size() - 1);
-            anchors.push(tag);
-        }
+                && self.anchors.borrow().iter().any(|a| a.tag == *tag))
     }
 
     fn update_tag_colors(&self) {
@@ -735,55 +930,144 @@ impl ViewReview {
         }
     }
 
-    /// Top of the space reserved by anchor tag `group` (buffer coordinates), or `None` when the
-    /// tag is not where the plan put it (a change since the last recompute).
-    fn group_top(&self, view: &TexView, group: usize, anchor: Anchor, space: i32) -> Option<i32> {
-        if anchor == Anchor::Top {
-            let (y, _) = view.line_yrange(&self.buffer.start_iter());
-            return Some(y - space);
+    /// The groups of `plan` anchored on `lines` of the current text, in text order, each with
+    /// its line ([`Anchor::Top`] left out). While the plan matches the text these are its lines.
+    /// After an edit (typing, until the recompute 50 ms later) they come from the review's
+    /// hunks, which follow every edit, and the line must start with the group's tag: that is
+    /// where its space is reserved.
+    fn groups_on(&self, doc: &Document, plan: &Plan, lines: Range<u32>) -> Vec<(usize, u32)> {
+        if self.plan_version.get() == Some(doc.version()) {
+            let first = plan
+                .groups
+                .partition_point(|g| g.line().is_none_or(|l| l < lines.start));
+            return plan.groups[first..]
+                .iter()
+                .map_while(|g| g.line().filter(|l| *l < lines.end))
+                .enumerate()
+                .map(|(k, line)| (first + k, line))
+                .collect();
         }
+        let review = doc.review.borrow();
+        let Some(review) = review.as_ref() else {
+            return Vec::new();
+        };
+        let mut block_of = self.block_of.borrow_mut();
+        let block_of = block_of.get_or_insert_with(|| {
+            plan.blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.id, i))
+                .collect()
+        });
+        let index = doc.line_index();
+        let hunks = review.hunks();
+        // A hunk's anchor is on one of its lines, the line after a pure deletion, or the line
+        // before a deletion at the end.
+        let first =
+            hunks.partition_point(|h| h.cur_lines.end.max(h.cur_lines.start + 1) <= lines.start);
+        let mut out: Vec<(usize, u32)> = Vec::new();
+        for hunk in hunks[first..]
+            .iter()
+            .take_while(|h| h.cur_lines.start <= lines.end)
+        {
+            let Some(&block) = block_of.get(&hunk.id) else {
+                continue;
+            };
+            let group = plan.blocks[block].group;
+            if out.last().is_some_and(|&(g, _)| g == group) {
+                continue;
+            }
+            let below = matches!(plan.groups[group].anchor, Anchor::Below(_));
+            if let Some(line) = self.moved_anchor(doc, &index, &plan.groups[group], hunk)
+                && lines.contains(&line)
+                // A line reserves one space above it and one below. When an edit joined two
+                // anchor lines whose groups share a tag, the line is the first group's.
+                && !out.iter().any(|&(g, l)| {
+                    l == line && matches!(plan.groups[g].anchor, Anchor::Below(_)) == below
+                })
+            {
+                out.push((group, line));
+            }
+        }
+        out
+    }
+
+    /// The line of the current text that starts with `group`'s tag, found from `hunk`, the hunk
+    /// of one of its blocks as the review has it now: the hunk's anchor line, or a later line of
+    /// the hunk when text typed at its start went in front of the tag (GTK leaves text inserted
+    /// where a range starts outside it). `None` when neither starts with the tag.
+    ///
+    /// The line is where the group's kind of anchor puts it (see [`anchor_of`]), whatever the
+    /// hunk would get now: typing after the last line gives a deletion at the end a line of its
+    /// own, but its tag stays below the line before until the recompute.
+    fn moved_anchor(
+        &self,
+        doc: &Document,
+        index: &LineIndex,
+        group: &Group,
+        hunk: &Hunk,
+    ) -> Option<u32> {
+        let line = hunk.cur_lines.start.min(index.line_count() - 1);
+        let (below, line) = match group.anchor {
+            Anchor::Above(_) => (false, line),
+            Anchor::Below(_) => (true, line.checked_sub(1)?),
+            Anchor::Top => return None,
+        };
         let anchors = self.anchors.borrow();
-        let start = tag_start(&self.buffer, anchors.get(group)?)?;
-        if !start.starts_line() {
+        let tag = &anchors
+            .iter()
+            .find(|a| a.below == below && a.space == group.space)?
+            .tag;
+        let mut iter = doc.iter_at_byte(index.line_start(line))?;
+        if iter.has_tag(tag) {
+            return Some(line);
+        }
+        if below || !iter.forward_to_tag_toggle(Some(tag)) || !iter.starts_tag(Some(tag)) {
             return None;
         }
-        let (y, height) = view.line_yrange(&start);
-        Some(match anchor {
-            Anchor::Below(_) => y + height - space,
+        let offset = doc.byte_offset(&iter);
+        let moved = index.line_of(offset);
+        (moved < hunk.cur_lines.end && index.line_start(moved) == offset).then_some(moved)
+    }
+
+    /// Top of the space `group` reserves when its anchor is on `line` (buffer coordinates).
+    fn group_top(&self, view: &TexView, doc: &Document, group: &Group, line: u32) -> Option<i32> {
+        let offset = doc.line_index().line_start(line);
+        let (y, height) = view.line_yrange(&doc.iter_at_byte(offset)?);
+        Some(match group.anchor {
+            Anchor::Below(_) => y + height - group.space,
             _ => y,
         })
     }
 
-    /// [`Self::group_top`] of the groups whose space may lie in the buffer-y range `y0..y1`:
-    /// those anchored on the lines there while the plan matches the text, else all of them (the
-    /// plan's line numbers are stale until the next recompute). Other groups get `None`.
-    fn group_tops(
+    /// The groups whose space may lie in the buffer-y range `y0..y1` (those anchored on the
+    /// lines there, and one above the first line), with the top of their space, in text order.
+    fn tops(
         &self,
         view: &TexView,
         doc: &Document,
         plan: &Plan,
         y0: i32,
         y1: i32,
-    ) -> Vec<Option<i32>> {
-        let lines = (self.plan_version.get() == Some(doc.version())).then(|| {
-            let line_at = |y: i32| {
-                let (iter, _) = view.line_at_y(y);
-                doc.line_index().line_of(doc.byte_offset(&iter))
-            };
-            line_at(y0).saturating_sub(1)..line_at(y1) + 2
-        });
-        plan.groups
-            .iter()
-            .enumerate()
-            .map(|(i, &(anchor, space))| {
-                let near = match (anchor, &lines) {
-                    (Anchor::Above(l) | Anchor::Below(l), Some(lines)) => lines.contains(&l),
-                    _ => true,
-                };
-                near.then(|| self.group_top(view, i, anchor, space))
-                    .flatten()
-            })
-            .collect()
+    ) -> Vec<(usize, i32)> {
+        let mut tops = Vec::new();
+        if let Some(group) = plan.groups.first()
+            && group.anchor == Anchor::Top
+        {
+            let (y, _) = view.line_yrange(&self.buffer.start_iter());
+            tops.push((0, y - group.space));
+        }
+        let line_at = |y: i32| {
+            let (iter, _) = view.line_at_y(y);
+            doc.line_index().line_of(doc.byte_offset(&iter))
+        };
+        let lines = line_at(y0).saturating_sub(1)..line_at(y1) + 2;
+        for (g, line) in self.groups_on(doc, plan, lines) {
+            if let Some(top) = self.group_top(view, doc, &plan.groups[g], line) {
+                tops.push((g, top));
+            }
+        }
+        tops
     }
 
     fn paint(&self, view: &TexView, snapshot: &gtk::Snapshot) {
@@ -800,7 +1084,7 @@ impl ViewReview {
         };
         let vis = view.visible_rect();
         let palette = Palette::new(Some(view), &self.buffer);
-        let tops = self.group_tops(view, &doc, &plan, vis.y(), vis.y() + vis.height());
+        let tops = self.tops(view, &doc, &plan, vis.y(), vis.y() + vis.height());
         // As wide as the added lines' paragraph background (the text area without its right
         // margin).
         let (x, width) = (
@@ -809,10 +1093,12 @@ impl ViewReview {
         );
         let text_x = text_origin(view) as f32;
         let header = plan.header;
-        for block in &plan.blocks {
-            let Some(top) = tops[block.group] else {
-                continue;
-            };
+        let blocks = tops.iter().flat_map(|&(g, top)| {
+            plan.blocks[plan.groups[g].blocks.clone()]
+                .iter()
+                .map(move |block| (block, top))
+        });
+        for (block, top) in blocks {
             let band_y = top + block.offset;
             if band_y > vis.y() + vis.height() || band_y + header + block.deleted < vis.y() {
                 continue;
@@ -865,18 +1151,26 @@ impl ViewReview {
         }
         if let Some(id) = self.cursor_hunk.get()
             && let Some(block) = plan.blocks.iter().find(|b| b.id == id)
-            && let Some(top) = tops[block.group]
+            && let Some(&(_, top)) = tops.iter().find(|(g, _)| *g == block.group)
         {
             let y0 = top + block.offset;
-            let y1 = match block.lines.end.checked_sub(1) {
-                Some(last) if !block.lines.is_empty() => {
+            // The hunk's lines now: the plan's until the text changes, then the review's.
+            let lines = if self.plan_version.get() == Some(doc.version()) {
+                block.lines.clone()
+            } else {
+                review
+                    .hunk(id)
+                    .map_or(block.lines.clone(), |h| h.cur_lines.clone())
+            };
+            let y1 = match lines.end.checked_sub(1) {
+                Some(last) if !lines.is_empty() => {
                     let index = doc.line_index();
                     let last = last.min(index.line_count().saturating_sub(1));
                     let offset = index.line_start(last);
                     drop(index);
                     doc.iter_at_byte(offset).map_or(y0 + header, |iter| {
                         let (y, h) = view.line_yrange(&iter);
-                        y + h - self.below_space_on(&plan, last)
+                        y + h - self.below_space_on(&doc, &plan, last)
                     })
                 }
                 _ => y0 + header + block.deleted,
@@ -894,12 +1188,13 @@ impl ViewReview {
         }
     }
 
-    /// Space reserved below `line` by deletions at the end of the file.
-    fn below_space_on(&self, plan: &Plan, line: u32) -> i32 {
-        plan.groups
-            .iter()
-            .filter(|(a, _)| *a == Anchor::Below(line))
-            .map(|(_, space)| *space)
+    /// Space reserved below `line` of the current text by deletions at the end of the file.
+    fn below_space_on(&self, doc: &Document, plan: &Plan, line: u32) -> i32 {
+        self.groups_on(doc, plan, line..line + 1)
+            .into_iter()
+            .map(|(g, _)| &plan.groups[g])
+            .filter(|group| matches!(group.anchor, Anchor::Below(_)))
+            .map(|group| group.space)
             .sum()
     }
 
@@ -911,33 +1206,39 @@ impl ViewReview {
             added: iter.has_tag(&self.added),
             ..GutterMarks::default()
         };
-        if plan.blocks.is_empty() {
+        let Some(doc) = self.doc.upgrade().filter(|_| !plan.blocks.is_empty()) else {
             return marks;
-        }
-        let first = plan.blocks.partition_point(|b| b.lines.end <= line);
-        marks.touched = plan.blocks[first..]
-            .iter()
-            .take_while(|b| b.lines.start <= line)
-            .any(|b| b.touched && b.lines.contains(&line));
-        let anchors = self.anchors.borrow();
-        let at = plan.anchored.partition_point(|&(l, _)| l < line);
-        for &(_, i) in plan.anchored[at..].iter().take_while(|&&(l, _)| l == line) {
-            let block = &plan.blocks[i];
-            let below = matches!(block.anchor, Anchor::Below(_));
-            if !anchors.get(block.group).is_some_and(|t| iter.has_tag(t)) {
-                continue;
-            }
+        };
+        marks.touched = if self.plan_version.get() == Some(doc.version()) {
+            let first = plan.blocks.partition_point(|b| b.lines.end <= line);
+            plan.blocks[first..]
+                .iter()
+                .take_while(|b| b.lines.start <= line)
+                .any(|b| b.touched && b.lines.contains(&line))
+        } else {
+            // The plan's lines are stale until the recompute; the review's follow the text.
+            doc.review.borrow().as_ref().is_some_and(|review| {
+                review
+                    .hunk_at_line(line)
+                    .is_some_and(|h| h.user_touched && h.cur_lines.contains(&line))
+            })
+        };
+        for (g, _) in self.groups_on(&doc, &plan, line..line + 1) {
+            let group = &plan.groups[g];
+            let below = matches!(group.anchor, Anchor::Below(_));
             if below {
-                marks.below_total = plan.groups[block.group].1;
+                marks.below_total = group.space;
             }
-            marks.blocks.push(GutterBlock {
-                below,
-                offset: block.offset,
-                header: plan.header,
-                deleted: block.deleted,
-                has_old: block.has_old,
-                touched: block.touched,
-            });
+            for block in &plan.blocks[group.blocks.clone()] {
+                marks.blocks.push(GutterBlock {
+                    below,
+                    offset: block.offset,
+                    header: plan.header,
+                    deleted: block.deleted,
+                    has_old: block.has_old,
+                    touched: block.touched,
+                });
+            }
         }
         marks
     }
@@ -973,7 +1274,7 @@ impl ViewReview {
         let mut wanted: Vec<(i32, usize, i32)> = Vec::new();
         if vis.height() > 0 {
             let margin = vis.height();
-            let tops = self.group_tops(
+            let tops = self.tops(
                 &view,
                 &doc,
                 &plan,
@@ -981,17 +1282,16 @@ impl ViewReview {
                 vis.y() + vis.height() + margin,
             );
             let center = vis.y() + vis.height() / 2;
-            for (i, block) in plan.blocks.iter().enumerate() {
-                let Some(top) = tops[block.group] else {
-                    continue;
-                };
-                let y = top + block.offset;
-                if y + plan.header < vis.y() - margin || y > vis.y() + vis.height() + margin {
-                    continue;
+            for (g, top) in tops {
+                for i in plan.groups[g].blocks.clone() {
+                    let y = top + plan.blocks[i].offset;
+                    if y + plan.header < vis.y() - margin || y > vis.y() + vis.height() + margin {
+                        continue;
+                    }
+                    let visible = y + plan.header > vis.y() && y < vis.y() + vis.height();
+                    let distance = if visible { 0 } else { (y - center).abs() };
+                    wanted.push((distance, i, y));
                 }
-                let visible = y + plan.header > vis.y() && y < vis.y() + vis.height();
-                let distance = if visible { 0 } else { (y - center).abs() };
-                wanted.push((distance, i, y));
             }
         }
         wanted.sort_by_key(|&(distance, _, y)| (distance, y));
@@ -1205,23 +1505,130 @@ fn joined(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
     out
 }
 
-/// True when ranges of `tag` start and end where each of `ranges` (sorted, apart) does. With as
-/// many ranges as `tag` has, those are exactly its ranges: their starts and ends are all
-/// toggles of the tag.
-fn ranges_in_place(doc: &Document, tag: &gtk::TextTag, ranges: &[Range<usize>]) -> bool {
-    ranges.iter().all(|range| {
-        doc.iter_at_byte(range.start)
-            .is_some_and(|start| start.starts_tag(Some(tag)))
-            && doc
-                .iter_at_byte(range.end)
-                .is_some_and(|end| end.ends_tag(Some(tag)))
-    })
+/// Where the changes `spans` (of [`Edits`]) left `ranges` (sorted, apart; offsets of the text
+/// before them): the ranges no span meets or touches, moved with the text, and the parts of the
+/// current text where the others may be now (sorted, apart). A range that a span meets keeps
+/// the ends outside the span, where the text did not change, and may reach anywhere in it.
+fn follow(ranges: &[Range<usize>], spans: &[Changed]) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    // Each span's place in the text before the changes, and the shift of the text after it.
+    let mut old = Vec::with_capacity(spans.len());
+    let mut shift = 0;
+    for span in spans {
+        let start = shifted(span.start, -shift);
+        shift += signed(span.len) - signed(span.old_len);
+        old.push((start..start + span.old_len, shift));
+    }
+    let (mut kept, mut unsure): (Vec<Range<usize>>, Vec<Range<usize>>) = (Vec::new(), Vec::new());
+    // The first span that does not end before the range, and the shift of the text before it.
+    let (mut i, mut before) = (0, 0);
+    for range in ranges {
+        while i < old.len() && old[i].0.end < range.start {
+            before = old[i].1;
+            i += 1;
+        }
+        let met = old[i..]
+            .iter()
+            .take_while(|(span, _)| span.start <= range.end)
+            .count();
+        if met == 0 {
+            kept.push(shifted(range.start, before)..shifted(range.end, before));
+            continue;
+        }
+        let (first, last) = (i, i + met - 1);
+        let start = if range.start < old[first].0.start {
+            shifted(range.start, before)
+        } else {
+            spans[first].start
+        };
+        let end = if range.end > old[last].0.end {
+            shifted(range.end, old[last].1)
+        } else {
+            spans[last].end()
+        };
+        match unsure.last_mut() {
+            // Nothing is left of a range deleted with its text.
+            _ if start >= end => {}
+            Some(region) if start <= region.end => region.end = region.end.max(end),
+            _ => unsure.push(start..end),
+        }
+    }
+    (kept, unsure)
 }
 
-/// The first position where `tag` applies.
-fn tag_start(buffer: &sourceview5::Buffer, tag: &gtk::TextTag) -> Option<gtk::TextIter> {
-    let mut iter = buffer.start_iter();
-    (iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag))).then_some(iter)
+/// The bytes of `a` that are not in `b` (both sorted, apart), as sorted ranges.
+fn difference(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut j = 0;
+    for range in a {
+        while j < b.len() && b[j].end <= range.start {
+            j += 1;
+        }
+        let mut start = range.start;
+        for cut in b[j..].iter().take_while(|cut| cut.start < range.end) {
+            if cut.start > start {
+                out.push(start..cut.start);
+            }
+            start = start.max(cut.end);
+        }
+        if start < range.end {
+            out.push(start..range.end);
+        }
+    }
+    out
+}
+
+/// `cuts` (sorted, apart) with those that no range of `keep` (sorted, apart from them) lies
+/// between made one, from the first one's start to the last one's end.
+fn joined_outside(cuts: Vec<Range<usize>>, keep: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::with_capacity(cuts.len());
+    let mut j = 0;
+    for cut in cuts {
+        if let Some(last) = out.last_mut() {
+            while j < keep.len() && keep[j].end <= last.end {
+                j += 1;
+            }
+            if keep.get(j).is_none_or(|k| k.start >= cut.start) {
+                last.end = cut.end;
+                continue;
+            }
+        }
+        out.push(cut);
+    }
+    out
+}
+
+/// The ranges of `tag` that start in `region` of the text, or reach into it from before (from
+/// where they start), as byte offsets in text order.
+fn tag_ranges(doc: &Document, tag: &gtk::TextTag, region: Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let Some(mut iter) = doc.iter_at_byte(region.start) else {
+        return out;
+    };
+    if iter.has_tag(tag) && !iter.starts_tag(Some(tag)) {
+        iter.backward_to_tag_toggle(Some(tag));
+    }
+    // At a toggle off, or where the tag is not, the next toggle turns it on.
+    while iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag)) {
+        let start = doc.byte_offset(&iter);
+        if start >= region.end && start > region.start {
+            break;
+        }
+        iter.forward_to_tag_toggle(Some(tag));
+        out.push(start..doc.byte_offset(&iter));
+        if iter.is_end() {
+            break;
+        }
+    }
+    out
+}
+
+fn signed(n: usize) -> isize {
+    isize::try_from(n).unwrap_or(isize::MAX)
+}
+
+/// `n` moved by `by` bytes.
+fn shifted(n: usize, by: isize) -> usize {
+    n.saturating_add_signed(by)
 }
 
 /// Byte offset where the line before `line` ends: the start of `line`, or the end of the text
@@ -1514,6 +1921,7 @@ const REVIEW_CSS: &str = "
 ";
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // tagged ranges are lists
 mod tests {
     use super::*;
 
@@ -1556,5 +1964,176 @@ mod tests {
         // At the limit nothing is left out.
         let old: String = (0..PHANTOM_MAX_LINES).map(|i| format!("l{i}\n")).collect();
         assert_eq!(phantom_lines(&old).len(), PHANTOM_MAX_LINES);
+    }
+
+    fn span(start: usize, len: usize, old_len: usize) -> Changed {
+        Changed {
+            start,
+            len,
+            old_len,
+        }
+    }
+
+    #[test]
+    fn edits_merge_spans_that_meet() {
+        let mut edits = Edits::default();
+        assert!(edits.is_empty());
+        // Typing "ab" at 10, then deleting 3 bytes at 29.
+        edits.record(10..10, 1);
+        edits.record(11..11, 1);
+        edits.record(29..32, 0);
+        assert_eq!(edits.spans, [span(10, 2, 0), span(29, 0, 3)]);
+        // A change before both moves them; one that touches a span joins it, with the
+        // unchanged bytes between them.
+        edits.record(0..2, 5);
+        assert_eq!(edits.spans, [span(0, 5, 2), span(13, 2, 0), span(32, 0, 3)]);
+        edits.record(15..20, 1);
+        assert_eq!(edits.spans, [span(0, 5, 2), span(13, 3, 5), span(28, 0, 3)]);
+        // One across all of them makes a single span of the text they cover: the three spans'
+        // 2 + 5 + 3 bytes before the changes and the 8 + 12 + 1 unchanged ones.
+        edits.record(3..29, 0);
+        assert_eq!(edits.spans, [span(0, 3, 2 + 5 + 3 + 8 + 12 + 1)]);
+        assert!(!edits.is_empty());
+        // No change at all is not one.
+        let mut none = Edits::default();
+        none.record(4..4, 0);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn edits_in_too_many_places_are_lost() {
+        let mut edits = Edits::default();
+        for i in 0..=MAX_EDIT_SPANS {
+            edits.record(10 * i..10 * i, 1);
+        }
+        assert!(edits.lost && edits.spans.is_empty() && !edits.is_empty());
+        edits.record(0..0, 1);
+        assert!(edits.lost && edits.spans.is_empty());
+    }
+
+    /// Applies `changes` (range, text) to `text` and to [`Edits`], and checks [`follow`] against
+    /// where GTK puts `ranges`: each range keeps the bytes it covered that remain, plus text
+    /// inserted strictly inside it (text inserted at either end goes outside).
+    fn check_follow(text: &str, ranges: &[Range<usize>], changes: &[(Range<usize>, &str)]) {
+        // Mark each byte with whether it is tagged: a byte inserted inside a range is.
+        let mut bytes: Vec<(u8, bool)> = text
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| (b, ranges.iter().any(|r| r.contains(&i))))
+            .collect();
+        let mut edits = Edits::default();
+        for (range, insert) in changes {
+            edits.record(range.clone(), insert.len());
+            bytes.drain(range.clone());
+            let a = range.start;
+            let inside = a > 0 && a < bytes.len() && bytes[a - 1].1 && bytes[a].1;
+            for (k, b) in insert.bytes().enumerate() {
+                bytes.insert(a + k, (b, inside));
+            }
+        }
+        let mut actual: Vec<Range<usize>> = Vec::new();
+        for (i, &(_, tagged)) in bytes.iter().enumerate() {
+            match actual.last_mut() {
+                Some(r) if tagged && i == r.end => r.end += 1,
+                _ if tagged => actual.push(i..i + 1),
+                _ => {}
+            }
+        }
+        let (kept, unsure) = follow(ranges, &edits.spans);
+        // Every kept range is a range of the tag, and every range is kept or in a region.
+        for r in &kept {
+            assert!(
+                actual.contains(r),
+                "{r:?} is kept but the tag has {actual:?}"
+            );
+        }
+        for r in &actual {
+            let within = |u: &Range<usize>| u.start <= r.start && r.end <= u.end;
+            assert!(
+                kept.contains(r) || unsure.iter().any(within),
+                "{r:?} is neither kept nor in {unsure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_moves_ranges_no_edit_meets() {
+        let text = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let ranges = [2..5, 10..14, 20..22, 30..34];
+        // Typing between ranges, at a range's start and at its end, and inside one.
+        check_follow(text, &ranges, &[(7..7, "xy")]);
+        check_follow(text, &ranges, &[(12..12, "in")]);
+        check_follow(text, &ranges, &[(10..10, "at")]);
+        check_follow(text, &ranges, &[(14..14, "end")]);
+        // Deleting the gap between two ranges joins them; deleting a range removes it.
+        check_follow(text, &ranges, &[(14..20, "")]);
+        check_follow(text, &ranges, &[(9..15, "")]);
+        // A line break inside a range, and edits in several places.
+        check_follow(text, &ranges, &[(3..3, "\n"), (25..27, "ww"), (0..1, "")]);
+        let (kept, unsure) = follow(&ranges, &[span(7, 2, 0)]);
+        assert_eq!(kept, [2..5, 12..16, 22..24, 32..36]);
+        assert!(unsure.is_empty());
+        let (kept, unsure) = follow(&ranges, &[span(12, 4, 2)]);
+        assert_eq!(kept, [2..5, 22..24, 32..36]);
+        assert_eq!(unsure, [10..16]);
+        // A range that ends where an edit starts is in doubt too (the edit may extend it).
+        let (kept, unsure) = follow(&ranges, &[span(5, 1, 1)]);
+        assert_eq!((kept, unsure), (vec![10..14, 20..22, 30..34], vec![2..6]));
+    }
+
+    #[test]
+    fn follow_agrees_with_random_edits() {
+        // xorshift64: the same cases on every run.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for _ in 0..3000 {
+            let mut ranges = Vec::new();
+            let mut at = next(4);
+            while at + 1 < text.len() && ranges.len() < 6 {
+                let end = (at + 1 + next(6)).min(text.len());
+                ranges.push(at..end);
+                at = end + 1 + next(8);
+            }
+            let mut len = text.len();
+            let mut changes = Vec::new();
+            for _ in 0..1 + next(6) {
+                let start = next(len + 1);
+                let end = (start + next(4)).min(len);
+                let insert = ["", "x", "yz", "\n"][next(4)];
+                len = len - (end - start) + insert.len();
+                changes.push((start..end, insert));
+            }
+            check_follow(text, &ranges, &changes);
+        }
+    }
+
+    #[test]
+    fn difference_of_ranges() {
+        assert_eq!(difference(&[0..10], &[2..3, 5..7]), [0..2, 3..5, 7..10]);
+        assert_eq!(difference(&[0..10, 20..30], &[5..25]), [0..5, 25..30]);
+        assert_eq!(difference(&[0..10], &[0..10]), Vec::<Range<usize>>::new());
+        assert_eq!(difference(&[0..4, 6..8], &[]), [0..4, 6..8]);
+        assert_eq!(difference(&[], &[1..2]), Vec::<Range<usize>>::new());
+        assert_eq!(difference(&[3..6], &[0..1, 8..9]), [3..6]);
+    }
+
+    #[test]
+    fn cuts_join_across_what_is_not_kept() {
+        let cuts = vec![0..2, 4..5, 8..10, 12..13];
+        assert_eq!(joined_outside(cuts.clone(), &[]), [0..13]);
+        assert_eq!(joined_outside(cuts.clone(), &[6..7]), [0..5, 8..13]);
+        assert_eq!(
+            joined_outside(cuts.clone(), &[2..3, 10..12]),
+            [0..2, 4..10, 12..13]
+        );
+        // Kept ranges before the first cut or after the last one keep nothing apart.
+        assert_eq!(joined_outside(cuts, &[20..22]), [0..13]);
+        assert_eq!(joined_outside(vec![5..6], &[0..1]), [5..6]);
     }
 }

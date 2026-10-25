@@ -186,9 +186,10 @@ Rules:
 
 ### 4.3 Inline rendering
 - **Added lines:** the shared tag `review-added` gives a green paragraph background (alpha 0.18). Changed words get `review-added-word` (alpha 0.35).
-- **Anchor and reserved space.** Each hunk gets a pooled per-hunk anchor tag with the highest priority. It sets `pixels-above-lines = header_h + deleted_h`:
+- **Anchor and reserved space.** Each hunk's anchor line gets an anchor tag with the highest priority. It sets `pixels-above-lines = header_h + deleted_h`:
   - `header_h` is about 0.9 of a line height;
   - `deleted_h` is the height of the cached `pango::Layout` of `old_text`, wrapped to the text width when soft-wrap is on.
+  - Anchors that reserve the same space share one tag (one per value of `pixels-above-lines`, and one per value of `pixels-below-lines`), not one per hunk: see §11, "Review overlay tags".
 - **Where the anchor goes:**
   - the first `cur` line; for a pure deletion, the line after it;
   - at the end of the file, when no following line exists, the last line, using `pixels-below-lines` and drawing below it;
@@ -1647,6 +1648,52 @@ they conflict with the sections above, this section wins.
   - `recovery::prune_once`, with the session sweep (10 s after an interactive start, once per
     process, on the jobs thread): removes `*.tmp` files older than 10 minutes, `*.lock` files
     as old that no process holds, and recovery files not written for 180 days.
+- **Review overlay tags (§4.3, 2026-10-25):** anchors that reserve the same space share one
+  anchor tag (`review_overlay::SpaceTag`: one per value of `pixels-above-lines`, one per value
+  of `pixels-below-lines`; a tag's properties never change), so thousands of one-line hunks
+  make a few anchor tags. There was a tag per hunk from a pool, pool tag i on the plan's anchor
+  i: every tag in a buffer slows each of GTK's tag operations (the highlighter's and every
+  keystroke's too; 25–100× with 5000 of them), a decision on hunk k moved the tags of the n − k
+  anchors after it, and shrinking the pool after Accept all renumbered the priorities of the
+  tags left for each tag it removed. A space no anchor reserves any more takes its tag out of
+  the table, the highest priority first (`editor::remove_spacing_tag`); when a tag added to the
+  table since outranks the anchor tags, they go back to the top.
+  - Where a band is: on the plan's anchor line while the plan matches the text
+    (`plan_version`). After an edit, until the recompute (typing: 50 ms), the review's hunks,
+    which `on_edit` keeps exact, and the line index give the line (`ViewReview::groups_on`):
+    a hunk's anchor line, or a later line of the hunk when text typed at its start went in
+    front of the tag (GTK leaves text inserted where a range starts outside it), if that line
+    starts with the tag of its group's space, which is where GTK reserves the space. The line
+    is the one the plan's kind of anchor gives (a deletion at the end stays below the line
+    before it while the user types after it), and a line holds one band above and one below
+    it (when an edit joins two anchor lines that share a tag, the first group keeps it).
+    Painting, the bars, the gutter's wedges and the cursor's outline all use it. A band whose
+    hunk an edit merged into another, or whose line an edit joined to another anchor line, is
+    not drawn until the recompute; there is no mark per hunk.
+  - Re-tagging (`ViewReview::apply`) changes only what differs, for the tags of added lines
+    and changed words as for the anchor tags. Each tag's ranges from the last apply are
+    followed through the edits since: a `Document::connect_edit` observer records them as the
+    spans of the current text they made, with their old lengths (`Edits`); a range no span
+    meets or touches is where it was, shifted, and the tag's ranges in the regions the others
+    may now cover are read from the text (`follow`, `tag_ranges`). Then the bytes the tag
+    covers but should not are untagged and those it should cover but does not are tagged (a
+    diff over bytes, so ranges that touch and are one in GTK need no care). Before the first
+    apply, after a paste copied a tag (`tags_unsure`), and after edits in more than 128 places
+    (`MAX_EDIT_SPANS`: a replace_all, a Reject all), the tag's ranges are read from the whole
+    text instead. The tags of added lines and changed words used to be taken off the whole
+    text and put back whenever their number of ranges changed (every decision) or one of them
+    moved (typing in a hunk), and GTK drew or laid out again every line under them.
+  - Measured (release, `gtk_review` `perf_review_many_hunks` and `perf_review_5000_hunks`,
+    five interleaved runs each at a load average of 5–7, medians): with 3000 hunks in 9000
+    lines, Alt+Y or Alt+N on the middle hunk 0.43 s → 20 ms (the main loop's work after it
+    46 → 2 ms), the recompute after typing in a hunk 0.37 s → 18 ms, accepting the last hunk
+    0.38 s → 20 ms, the sync with nothing to change 15 → 5 ms; with 5000 hunks in 15 000 lines,
+    Accept all in the file 0.67 → 0.10 s, Keep Turn 0.64 → 0.10 s, Reject all 1.3 → 0.40 s
+    and Reject Turn 2.2 → 0.38 s (their 10 000 buffer changes take 0.20 s without a review),
+    the agent's write that makes them 1.1 → 0.56 s, a keystroke's p99 0.46 → 0.25 ms (0.05 ms
+    without a review). Tag operations, which do not depend on the load (`gtk_review`
+    `tags_change_only_where_the_hunks_do`, 200 hunks): accepting one 470 → 2, rejecting one
+    462 → 2.
 
 ## 12. macOS (2026-10-19)
 

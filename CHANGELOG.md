@@ -175,6 +175,18 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - With thousands of hunks in a file (a Format Document, a project-wide replace), the review
   overlay re-tags only what moved: with 3000 hunks, its update after a recompute takes 10 ms
   instead of 85 ms, and after a line break above them 36 ms instead of 0.34 s.
+- Deciding and typing in a file with thousands of hunks no longer takes a large fraction of a
+  second each time. The review overlay gave every hunk a tag of its own, and every tag in a
+  buffer slows down all of its tag changes; it also took the green of the added lines and
+  changed words off the whole file and put it back after every decision and after typing in a
+  hunk. Hunks that reserve the same space above their line now share a tag (a few tags instead
+  of thousands), and the overlay changes the tags of the lines that changed only. With 3000
+  hunks, Alt+Y or Alt+N takes 20 ms instead of 0.43 s, and the pause after typing in a hunk
+  18 ms instead of 0.37 s; with 5000 hunks, Accept all in the file takes 0.1 s instead of
+  0.67 s, Keep Turn 0.1 s instead of 0.64 s, Reject all 0.4 s instead of 1.3 s, Reject Turn
+  0.4 s instead of 2.2 s, the agent's edit that makes them 0.56 s instead of 1.1 s, and a
+  keystroke 0.25 ms instead of 0.46 ms (p99). While typing moves hunks, the gutter's red
+  wedges stay next to their bands until the recompute instead of disappearing.
 - With the Outline shown, typing prose no longer makes it recompute the whole outline at every
   pause: a document whose headings, theorems, labels, captions and includes stay as they were
   keeps its place in the project index, and only the words for completion are collected again.

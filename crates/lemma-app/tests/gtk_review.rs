@@ -10,6 +10,7 @@ use adw::prelude::*;
 use lemma_agent::{EditorRequest, ToolReply};
 use lemma_app::agent_edits;
 use lemma_app::document::DocRef;
+use lemma_app::editor::review_overlay::Anchor;
 use lemma_app::editor::{Editor, envtools};
 use lemma_app::review_ui::{self, Decision};
 use lemma_app::testmode::{self, review::reply_text};
@@ -71,11 +72,21 @@ fn main() -> ExitCode {
         ("reading_mode_shrinks_bands", reading_mode),
         ("gutter_numbers_follow_the_text", gutter_alignment),
         ("a_pasted_anchor_line_reserves_nothing", pasted_anchor_line),
+        (
+            "tags_change_only_where_the_hunks_do",
+            tags_change_where_hunks_do,
+        ),
+        (
+            "bands_follow_typing_before_the_recompute",
+            bands_follow_typing,
+        ),
+        ("tags_follow_random_edits", tags_follow_random_edits),
         ("emptied_file_draws_above_the_first_line", emptied_file),
         ("binary_apply_as_agent_and_demo", binary_runs),
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_review_many_hunks", perf_many_hunks));
+        tests.push(("perf_review_5000_hunks", perf_5000_hunks));
     }
     common::run(&tests)
 }
@@ -1443,11 +1454,53 @@ fn perf_many_hunks() {
     let decided = started.elapsed();
     let relaid = drain();
     assert_eq!(f.hunks("big.tex").len(), 2999);
+    // Alt+Y and Alt+N on the hunk in the middle (`decide_and_advance`), five of each in turn:
+    // every hunk after it keeps its band, and a reject moves no line.
+    let (mut middle, mut middle_loop) = (Vec::new(), Vec::new());
+    for k in 0..10 {
+        let ids = f.ids("big.tex");
+        let decision = if k % 2 == 0 {
+            Decision::Accept
+        } else {
+            Decision::Reject
+        };
+        drain();
+        let started = Instant::now();
+        review_ui::decide_and_advance(&f.state, &doc, ids[ids.len() / 2], decision);
+        middle.push(started.elapsed());
+        middle_loop.push(drain());
+    }
+    assert_eq!(f.hunks("big.tex").len(), 2989);
+    // Typing at the end of a hunk's changed line, which changes its changed words, and the
+    // recompute after the pause.
+    let mut inside = Vec::new();
+    for k in 0..5 {
+        let line = f.hunks("big.tex")[300 + 400 * k].cur_lines.start;
+        let mut at = buffer.iter_at_line(line as i32).unwrap();
+        at.forward_to_line_end();
+        buffer.insert(&mut at, "y");
+        let started = Instant::now();
+        review_ui::recompute(&doc);
+        inside.push(started.elapsed());
+    }
+    assert_eq!(f.hunks("big.tex").len(), 2989);
+    let spread = |mut times: Vec<Duration>| {
+        times.sort();
+        (times[times.len() / 2], times[times.len() - 1])
+    };
+    let ((middle, middle_max), (middle_loop, middle_loop_max)) =
+        (spread(middle), spread(middle_loop));
+    let (inside, inside_max) = spread(inside);
     println!(
         "    3000 hunks: the agent's write {first:?}; sync median {sync:?}; recompute (with the \
          sync) median {recompute:?}, after typing {typed:?}, after a line break {broken:?}; \
-         gutter snapshot median {gutter:?}; accepting one {decided:?}, then the main loop \
+         gutter snapshot median {gutter:?}; accepting the last {decided:?}, then the main loop \
          {relaid:?}"
+    );
+    println!(
+        "    deciding the middle hunk median {middle:?} (max {middle_max:?}), then the main loop \
+         {middle_loop:?} (max {middle_loop_max:?}); typing inside a hunk, the recompute median \
+         {inside:?} (max {inside_max:?})"
     );
     if cfg!(debug_assertions) {
         println!("    (debug build: the budget is checked in release)");
@@ -1455,6 +1508,697 @@ fn perf_many_hunks() {
         assert!(sync <= Duration::from_millis(15), "sync {sync:?}");
         assert!(typed <= Duration::from_millis(40), "after typing {typed:?}");
         assert!(gutter <= Duration::from_millis(1), "gutter {gutter:?}");
+        assert!(middle <= Duration::from_millis(50), "a decision {middle:?}");
+        assert!(
+            inside <= Duration::from_millis(40),
+            "typing inside {inside:?}"
+        );
+    }
+}
+
+/// `text` with `tag` added to every third line (the second of each three): an agent's proposal
+/// in [`perf_5000_hunks`].
+fn every_third_changed(text: &str, tag: &str) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i % 3 == 1 {
+                format!("{line} {tag}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect()
+}
+
+/// 5000 one-line hunks in a 15 000-line file, from agent turns: keystrokes outside the hunks
+/// (against the same keystrokes with no review), Accept all in the file, Keep Turn, Reject all
+/// and Reject Turn, each with the main loop's work after it. A reject changes the buffer 10 000
+/// times, which costs what as many changes cost without a review (the buffer, its highlighting
+/// and observers), measured too; the review's part comes on top of that.
+fn perf_5000_hunks() {
+    let f = fixture("perf-5000", &[("big.tex", &lines(15_000))]);
+    let editor = f.open("big.tex");
+    let doc = f.doc("big.tex");
+    let buffer = editor.buffer();
+    let context = glib::MainContext::default();
+    let drain = || {
+        let started = Instant::now();
+        while context.pending() {
+            context.iteration(false);
+        }
+        started.elapsed()
+    };
+    // One character at a time on an unchanged line in the middle, as typing does, with the main
+    // loop's work between keys (less than the 50 ms before a recompute).
+    let keys = |count: usize| {
+        let mut times = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut at = buffer.iter_at_line(7500).unwrap();
+            at.forward_to_line_end();
+            let started = Instant::now();
+            buffer.insert(&mut at, "k");
+            times.push(started.elapsed());
+            drain();
+        }
+        common::pump_for(Duration::from_millis(80));
+        times.sort();
+        let p = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+        (p(0.5), p(0.99), times[times.len() - 1])
+    };
+    f.frames(1);
+    let plain = keys(200);
+    // A character of every third line replaced, as one `apply_edits`: what a reject of 5000
+    // hunks does to the buffer.
+    let mut ends = Vec::new();
+    let mut at = 0;
+    for (i, line) in doc.text().split_inclusive('\n').enumerate() {
+        at += line.len();
+        if i % 3 == 1 {
+            ends.push(at - 1);
+        }
+    }
+    let edits: Vec<TextEdit> = ends
+        .iter()
+        .rev()
+        .map(|&end| TextEdit {
+            range: end - 1..end,
+            text: "Z".into(),
+        })
+        .collect();
+    drain();
+    let started = Instant::now();
+    doc.apply_edits(&edits, Origin::User).unwrap();
+    let changes = started.elapsed();
+    drain();
+    let mut turn = 0;
+    let mut propose = |f: &Fixture| {
+        turn += 1;
+        review_ui::on_turn_started(&f.state, turn);
+        let started = Instant::now();
+        let proposal = every_third_changed(&f.doc("big.tex").text(), &format!("v{turn}"));
+        f.write("big.tex", &proposal);
+        let written = started.elapsed();
+        review_ui::on_turn_ended(&f.state, turn);
+        drain();
+        assert_eq!(f.hunks("big.tex").len(), 5000);
+        (turn, written)
+    };
+    let decide = |what: &dyn Fn()| {
+        drain();
+        let started = Instant::now();
+        what();
+        let decided = started.elapsed();
+        (decided, drain())
+    };
+    let (_, written) = propose(&f);
+    f.frames(1);
+    let reviewed = keys(200);
+    let accept_all = decide(&|| review_ui::decide_document(&f.state, &doc, Decision::Accept));
+    assert!(f.hunks("big.tex").is_empty());
+    let (kept, _) = propose(&f);
+    let keep_turn = decide(&|| {
+        review_ui::decide_turn(&f.state, kept, Decision::Accept);
+    });
+    assert!(f.hunks("big.tex").is_empty());
+    propose(&f);
+    let reject_all = decide(&|| review_ui::decide_document(&f.state, &doc, Decision::Reject));
+    assert!(f.hunks("big.tex").is_empty());
+    let (rejected, _) = propose(&f);
+    let reject_turn = decide(&|| {
+        review_ui::decide_turn(&f.state, rejected, Decision::Reject);
+    });
+    assert!(f.hunks("big.tex").is_empty());
+    println!(
+        "    5000 hunks: the agent's write {written:?}; keystrokes p50/p99/max {:?}/{:?}/{:?} \
+         (no review: {:?}/{:?}/{:?}); 10 000 buffer changes without a review {changes:?}",
+        reviewed.0, reviewed.1, reviewed.2, plain.0, plain.1, plain.2
+    );
+    println!(
+        "    then the main loop: Accept all {:?} + {:?}, Keep Turn {:?} + {:?}, Reject all \
+         {:?} + {:?}, Reject Turn {:?} + {:?}",
+        accept_all.0,
+        accept_all.1,
+        keep_turn.0,
+        keep_turn.1,
+        reject_all.0,
+        reject_all.1,
+        reject_turn.0,
+        reject_turn.1
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(reviewed.1 <= Duration::from_millis(2), "keystroke p99");
+        let budget = Duration::from_millis(300);
+        for (what, (decided, _), own) in [
+            ("Accept all", accept_all, Duration::ZERO),
+            ("Keep Turn", keep_turn, Duration::ZERO),
+            ("Reject all", reject_all, changes),
+            ("Reject Turn", reject_turn, changes),
+        ] {
+            assert!(decided <= own + budget, "{what} {decided:?}");
+        }
+    }
+}
+
+/// The lines of `editor`'s text that hunks of `file` make green, the space each line reserves
+/// above and below its text, and the bytes of changed words, as the review wants them and as
+/// the buffer's tags have them: they must be equal after every apply.
+fn assert_tags_match_review(f: &Fixture, file: &str, editor: &Editor, what: &str) {
+    let doc = f.doc(file);
+    let review = editor.view().review_state().unwrap();
+    let buffer = editor.buffer();
+    let table = buffer.tag_table();
+    let (added, word) = (
+        table.lookup("lemma-review-added").unwrap(),
+        table.lookup("lemma-review-added-word").unwrap(),
+    );
+    let index = doc.line_index();
+    let lines = index.line_count();
+    let hunks = f.hunks(file);
+    let header = review.header_height();
+    let mut want_added = vec![false; lines as usize];
+    let mut want_space = vec![(0, 0); lines as usize];
+    let mut want_words = Vec::new();
+    for h in &hunks {
+        for line in h.cur_lines.clone() {
+            want_added[line as usize] = true;
+        }
+        for w in h.words.iter().filter(|w| w.side == lemma_review::Side::New) {
+            let base = index.line_start(h.cur_lines.start + w.line);
+            want_words.extend(base + w.bytes.start as usize..base + w.bytes.end as usize);
+        }
+    }
+    for block in review.blocks() {
+        let space = header + block.deleted;
+        match block.anchor {
+            Anchor::Above(line) => want_space[line as usize].0 += space,
+            Anchor::Below(line) => want_space[line as usize].1 += space,
+            Anchor::Top => {}
+        }
+    }
+    // `LineIndex` lines, as the overlay's: GTK also breaks lines at a lone '\r'.
+    let starts: Vec<usize> = (0..lines).map(|line| index.line_start(line)).collect();
+    drop(index);
+    for line in 0..lines {
+        let iter = doc.iter_at_byte(starts[line as usize]).unwrap();
+        let tags = iter.tags();
+        let above = tags
+            .iter()
+            .filter(|t| t.is_pixels_above_lines_set())
+            .map(|t| t.pixels_above_lines())
+            .sum::<i32>();
+        let below = tags
+            .iter()
+            .filter(|t| t.is_pixels_below_lines_set())
+            .map(|t| t.pixels_below_lines())
+            .sum::<i32>();
+        assert_eq!(
+            (iter.has_tag(&added), (above, below)),
+            (want_added[line as usize], want_space[line as usize]),
+            "{what}: line {}",
+            line + 1
+        );
+    }
+    let mut words = Vec::new();
+    let text = doc.text();
+    for (offset, _) in text.char_indices() {
+        if doc.iter_at_byte(offset).unwrap().has_tag(&word) {
+            words.push(offset);
+        }
+    }
+    let want_words: Vec<usize> = want_words
+        .into_iter()
+        .filter(|&b| text.is_char_boundary(b))
+        .collect();
+    assert_eq!(words, want_words, "{what}: changed words");
+}
+
+/// Number of tags in `buffer`'s table that reserve space above or below lines.
+fn spacing_tags(buffer: &sourceview5::Buffer) -> usize {
+    let mut n = 0;
+    buffer.tag_table().foreach(|tag| {
+        if tag.is_pixels_above_lines_set() || tag.is_pixels_below_lines_set() {
+            n += 1;
+        }
+    });
+    n
+}
+
+/// Anchors that reserve the same space share a tag, and a decision, typing in a hunk and the
+/// recompute after it change the tags of the lines they touch only: counted as the tag
+/// operations on the buffer, with the tags checked against the hunks after each.
+fn tags_change_where_hunks_do() {
+    // 200 hunks, and a first one that changes words.
+    let (base, new) = many_hunks();
+    let (base, new) = (format!("{WORD_OLD}\n{base}"), format!("{WORD_NEW}\n{new}"));
+    let f = fixture("retag", &[("big.tex", &base)]);
+    let editor = f.open("big.tex");
+    f.write("big.tex", &new);
+    assert_eq!(f.hunks("big.tex").len(), 201);
+    assert!(!f.hunks("big.tex")[0].words.is_empty());
+    let doc = f.doc("big.tex");
+    let buffer = editor.buffer();
+    assert_tags_match_review(&f, "big.tex", &editor, "the agent's write");
+    // Replacements and deletions of one line reserve the same space; insertions only a header.
+    assert_eq!(spacing_tags(buffer), 2, "a tag per space, not per hunk");
+    let ops = Rc::new(std::cell::Cell::new(0));
+    let ours = |tag: &gtk::TextTag| {
+        tag.name().is_some_and(|n| n.starts_with("lemma-review-"))
+            || tag.is_pixels_above_lines_set()
+            || tag.is_pixels_below_lines_set()
+    };
+    let count = ops.clone();
+    let applied = buffer.connect_apply_tag(move |_, tag, _, _| {
+        if ours(tag) {
+            count.set(count.get() + 1);
+        }
+    });
+    let count = ops.clone();
+    let removed = buffer.connect_remove_tag(move |_, tag, _, _| {
+        if ours(tag) {
+            count.set(count.get() + 1);
+        }
+    });
+    let step = |what: &str, change: &dyn Fn(), most: usize| {
+        ops.set(0);
+        change();
+        let n = ops.get();
+        assert!(n <= most, "{what}: {n} tag operations");
+        assert_tags_match_review(&f, "big.tex", &editor, what);
+    };
+    // A hunk in the middle: a replacement, a deletion or an insertion of a line.
+    let middle = |shape: fn(&Hunk) -> bool| {
+        f.hunks("big.tex")
+            .into_iter()
+            .skip(100)
+            .find(shape)
+            .unwrap()
+            .id
+    };
+    let replacement: fn(&Hunk) -> bool = |h| !h.cur_lines.is_empty() && !h.old_text.is_empty();
+    let decide = |id: HunkId, decision: Decision| {
+        review_ui::decide_hunks(&f.state, &doc, &[id], decision);
+    };
+    // Each decision changes its own lines' tags: the green line and the anchor.
+    step(
+        "accepting a replacement",
+        &|| decide(middle(replacement), Decision::Accept),
+        2,
+    );
+    step(
+        "accepting a deletion",
+        &|| decide(middle(|h| h.cur_lines.is_empty()), Decision::Accept),
+        1,
+    );
+    step(
+        "rejecting a replacement",
+        &|| decide(middle(replacement), Decision::Reject),
+        2,
+    );
+    // The inserted line goes, and its tags with it.
+    step(
+        "rejecting an insertion",
+        &|| decide(middle(|h| h.old_text.is_empty()), Decision::Reject),
+        2,
+    );
+    // Typing at the end of a changed line and the recompute.
+    step(
+        "typing at the end of a hunk",
+        &|| {
+            let line = f.hunks("big.tex")[60].cur_lines.start;
+            let mut at = buffer.iter_at_line(line as i32).unwrap();
+            at.forward_to_line_end();
+            buffer.insert(&mut at, " typed");
+            review_ui::recompute(&doc);
+        },
+        2,
+    );
+    // Typing inside a changed word ("exactly") changes it.
+    step(
+        "typing in a changed word",
+        &|| {
+            let at = WORD_NEW.find("exactly").unwrap() + 3;
+            buffer.insert(&mut buffer.iter_at_offset(at as i32), "ct");
+            review_ui::recompute(&doc);
+        },
+        2,
+    );
+    // A line break above every hunk but the first moves them, and GTK moves the tags with the
+    // text.
+    step(
+        "a line break above the hunks",
+        &|| {
+            buffer.insert(&mut buffer.iter_at_line(2).unwrap(), "\n");
+            review_ui::recompute(&doc);
+        },
+        0,
+    );
+    // Ctrl+Z of the line break, the typing and the rejects brings the hunks back.
+    step(
+        "undo",
+        &|| {
+            for _ in 0..5 {
+                buffer.undo();
+            }
+            review_ui::recompute(&doc);
+        },
+        12,
+    );
+    assert_eq!(f.hunks("big.tex").len(), 199);
+    step(
+        "accepting the changed words",
+        &|| decide(f.ids("big.tex")[0], Decision::Accept),
+        4,
+    );
+    // Reading mode moves every anchor to the tag of the header's space.
+    let anchors = f.hunks("big.tex").len();
+    step(
+        "reading mode",
+        &|| review_ui::set_reading_mode(&f.state, true),
+        2 * anchors,
+    );
+    assert_eq!(spacing_tags(buffer), 1, "one space: the header's");
+    step(
+        "reading mode off",
+        &|| review_ui::set_reading_mode(&f.state, false),
+        2 * anchors,
+    );
+    // A tag added to the table later outranks the anchor tags: the next apply puts them back on
+    // top, so nothing else overrides the space they reserve.
+    let later = gtk::TextTag::new(None);
+    buffer.tag_table().add(&later);
+    step(
+        "a decision after another tag came",
+        &|| decide(middle(replacement), Decision::Accept),
+        2,
+    );
+    buffer.tag_table().foreach(|tag| {
+        if tag.is_pixels_above_lines_set() || tag.is_pixels_below_lines_set() {
+            assert!(
+                tag.priority() > later.priority(),
+                "an anchor tag is outranked"
+            );
+        }
+    });
+    buffer.tag_table().remove(&later);
+    // Accept all: every tag goes from the text, and the anchor tags from the table. The green
+    // background goes in one removal, the anchors one by one (removing one where it is not
+    // would lay that text out again).
+    step(
+        "accept all",
+        &|| review_ui::decide_document(&f.state, &doc, Decision::Accept),
+        anchors + 2,
+    );
+    assert_eq!(spacing_tags(buffer), 0);
+    buffer.disconnect(applied);
+    buffer.disconnect(removed);
+}
+
+/// Typing moves the bands before the recompute 50 ms later, while the plan's lines are stale:
+/// each band is drawn and marked in the gutter where its line reserves the space, also when
+/// text typed at the start of a hunk goes in front of its anchor tag.
+fn bands_follow_typing() {
+    let f = fixture("stale", &[("main.tex", &lines(30))]);
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "line 4\n", "line four\n");
+    f.edit("main.tex", "line 9\nline 10\n", "");
+    f.edit(
+        "main.tex",
+        "line 14\n",
+        "line fourteen\nline fourteen and a half\n",
+    );
+    f.frames(2);
+    let view = editor.view().clone();
+    let review = view.review_state().unwrap();
+    let buffer = editor.buffer();
+    let doc = f.doc("main.tex");
+    let header = review.header_height();
+    // Each hunk's band is at the top of the line whose text is `anchors[i]`, which reserves its
+    // space there, and the gutter marks it at that line only.
+    let check = |what: &str, anchors: &[&str]| {
+        let ids = f.ids("main.tex");
+        let blocks = review.blocks();
+        let tops = review.band_tops();
+        let text = doc.text();
+        assert_eq!(ids.len(), anchors.len());
+        for (id, anchor) in ids.iter().zip(anchors) {
+            let line = text.lines().position(|l| l == *anchor).unwrap() as u32;
+            let iter = buffer.iter_at_line(line as i32).unwrap();
+            let (y, _) = view.line_yrange(&iter);
+            let block = blocks.iter().find(|b| b.id == *id).unwrap();
+            assert_eq!(
+                view.iter_location(&iter).y() - y,
+                header + block.deleted,
+                "{what}: the space above {anchor:?}"
+            );
+            let top = tops.iter().find(|(i, _)| i == id).map(|&(_, top)| top);
+            assert_eq!(top, Some(y), "{what}: the band of {anchor:?}");
+            assert_eq!(
+                review.hunks_at_line(line),
+                [*id],
+                "{what}: the gutter at {anchor:?}"
+            );
+        }
+        let marked = (0..doc.line_index().line_count())
+            .filter(|&l| !review.hunks_at_line(l).is_empty())
+            .count();
+        assert_eq!(
+            marked,
+            anchors.len(),
+            "{what}: the gutter marks no other line"
+        );
+    };
+    let anchors = ["line four", "line 11", "line fourteen"];
+    check("before typing", &anchors);
+    // Nothing runs the main loop until the checks are done: the recompute waits 50 ms.
+    buffer.insert(&mut buffer.iter_at_line(1).unwrap(), "\n");
+    check("a line break above the hunks", &anchors);
+    // Enter inside the first hunk's line moves the others.
+    let mut at = buffer.iter_at_line(4).unwrap();
+    at.forward_chars(7);
+    buffer.insert(&mut at, "\n");
+    check(
+        "a line break inside a hunk",
+        &["line fo", "line 11", "line fourteen"],
+    );
+    // Enter at the start of a hunk: the new line is in the hunk, the tag stays on the text.
+    let line = doc
+        .text()
+        .lines()
+        .position(|l| l == "line fourteen")
+        .unwrap();
+    buffer.insert(&mut buffer.iter_at_line(line as i32).unwrap(), "\n");
+    check(
+        "a line break at the start of a hunk",
+        &["line fo", "line 11", "line fourteen"],
+    );
+    // After the recompute the plan matches the text again.
+    common::pump_for(Duration::from_millis(150));
+    f.frames(1);
+    let blocks = review.blocks();
+    let tops = review.band_tops();
+    for block in &blocks {
+        let Anchor::Above(line) = block.anchor else {
+            panic!("{:?}", block.anchor);
+        };
+        let iter = buffer.iter_at_line(line as i32).unwrap();
+        let (y, _) = view.line_yrange(&iter);
+        assert_eq!(view.iter_location(&iter).y() - y, header + block.deleted);
+        assert_eq!(
+            tops.iter().find(|(i, _)| *i == block.id).map(|t| t.1),
+            Some(y)
+        );
+        assert_eq!(review.hunks_at_line(line), [block.id]);
+    }
+    // A deletion at the end of the file reserves its space below the last line with text, and
+    // keeps it there while the user types after that line (the hunk then has a line of its own
+    // until the recompute).
+    drop(f);
+    let f = fixture("stale-end", &[("main.tex", &lines(8))]);
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "line 8\n", "");
+    f.frames(2);
+    let view = editor.view().clone();
+    let review = view.review_state().unwrap();
+    let buffer = editor.buffer();
+    let [block] = &review.blocks()[..] else {
+        panic!("one block");
+    };
+    assert_eq!(block.anchor, Anchor::Below(6));
+    let space = review.header_height() + block.deleted;
+    let below_line_7 = || {
+        let (y, height) = view.line_yrange(&buffer.iter_at_line(6).unwrap());
+        y + height - space
+    };
+    assert_eq!(review.band_tops(), [(block.id, below_line_7())]);
+    buffer.insert(&mut buffer.end_iter(), "x");
+    assert_eq!(
+        review.band_tops(),
+        [(block.id, below_line_7())],
+        "typing after the last line"
+    );
+    assert_eq!(review.hunks_at_line(6), [block.id]);
+}
+
+/// The space GTK reserves above the line that starts at `iter`, or below it: that of the tag of
+/// the highest priority that sets it.
+fn reserved_at(iter: &gtk::TextIter, below: bool) -> i32 {
+    iter.tags()
+        .into_iter()
+        .filter(|t| {
+            if below {
+                t.is_pixels_below_lines_set()
+            } else {
+                t.is_pixels_above_lines_set()
+            }
+        })
+        .max_by_key(|t| t.priority())
+        .map_or(0, |t| {
+            if below {
+                t.pixels_below_lines()
+            } else {
+                t.pixels_above_lines()
+            }
+        })
+}
+
+/// An agent's proposal for [`tags_follow_random_edits`]: every 5th line of `text` changes a word,
+/// every 11th goes, and a line follows every 13th.
+fn mixed_proposal(text: &str, round: usize) -> String {
+    let mut out = String::new();
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let (body, end) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        match (i + round) % 65 {
+            k if k % 11 == 4 => {}
+            k if k % 5 == 1 => out.push_str(&format!("{body} r{round}é{end}")),
+            k if k % 13 == 7 => out.push_str(&format!("{line}nouveau 漢 {i}\n")),
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// Random typing, deletions and line breaks (also across hunks, with non-ASCII text), pastes,
+/// decisions, Ctrl+Z and agent edits: after each recompute the tags are exactly what the hunks
+/// want (each tag's ranges followed through the edits since the last apply, or read again), and
+/// before it every band the overlay draws is on a line that reserves its space.
+fn tags_follow_random_edits() {
+    let base: String = (1..=200)
+        .map(|i| match i % 9 {
+            0 => format!("ligne {i} déjà vu\n"),
+            4 => format!("行 {i} 漢字かな\n"),
+            _ => format!("line {i} plain text\n"),
+        })
+        .collect();
+    let f = fixture("random-tags", &[("big.tex", &base)]);
+    let editor = f.open("big.tex");
+    let doc = f.doc("big.tex");
+    let view = editor.view().clone();
+    let buffer = editor.buffer();
+    let review = view.review_state().unwrap();
+    let mut round = 0;
+    f.write("big.tex", &mixed_proposal(&base, round));
+    assert!(f.hunks("big.tex").len() > 40);
+    assert_tags_match_review(&f, "big.tex", &editor, "the agent's write");
+    // xorshift64: the same steps on every run.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n.max(1) as u64) as usize
+    };
+    // Every band drawn at a line is where that line reserves its space.
+    let bands_on_space = |what: &str| {
+        let blocks = review.blocks();
+        let header = review.header_height();
+        for line in 0..doc.line_index().line_count() {
+            let ids = review.hunks_at_line(line);
+            if ids.is_empty() {
+                continue;
+            }
+            let start = doc.iter_at_byte(doc.line_index().line_start(line)).unwrap();
+            for below in [false, true] {
+                let drawn: i32 = blocks
+                    .iter()
+                    .filter(|b| ids.contains(&b.id))
+                    .filter(|b| matches!(b.anchor, Anchor::Below(_)) == below)
+                    .map(|b| header + b.deleted)
+                    .sum();
+                if drawn > 0 {
+                    let side = if below { "below" } else { "above" };
+                    assert_eq!(
+                        reserved_at(&start, below),
+                        drawn,
+                        "{what}: the space {side} line {}",
+                        line + 1
+                    );
+                }
+            }
+        }
+    };
+    for step in 0..150 {
+        let chars = buffer.char_count() as usize;
+        let what = match next(20) {
+            0..=6 => {
+                let at = next(chars + 1) as i32;
+                let text = ["x", "é", "\n", "ab cd", "漢", " mot\n", "\n\n"][next(7)];
+                buffer.insert(&mut buffer.iter_at_offset(at), text);
+                "typing"
+            }
+            7..=9 => {
+                let a = next(chars) as i32;
+                let most = if next(4) == 0 { 60 } else { 6 };
+                let b = (a + 1 + next(most) as i32).min(chars as i32);
+                buffer.delete(&mut buffer.iter_at_offset(a), &mut buffer.iter_at_offset(b));
+                "a deletion"
+            }
+            10 => {
+                let a = next(chars) as i32;
+                let b = (a + 1 + next(40) as i32).min(chars as i32);
+                let (start, end) = (buffer.iter_at_offset(a), buffer.iter_at_offset(b));
+                let mut at = buffer.iter_at_offset(next(chars + 1) as i32);
+                buffer.insert_range(&mut at, &start, &end);
+                "a paste"
+            }
+            11..=13 => {
+                review_ui::recompute_if_stale(&doc);
+                let ids = f.ids("big.tex");
+                if ids.is_empty() {
+                    continue;
+                }
+                let decision = if next(2) == 0 {
+                    Decision::Accept
+                } else {
+                    Decision::Reject
+                };
+                review_ui::decide_hunks(&f.state, &doc, &[ids[next(ids.len())]], decision);
+                "a decision"
+            }
+            14 | 15 => {
+                buffer.undo();
+                "Ctrl+Z"
+            }
+            16 => {
+                round += 1;
+                review_ui::recompute_if_stale(&doc);
+                f.write("big.tex", &mixed_proposal(&doc.text(), round));
+                "an agent's write"
+            }
+            _ => "nothing",
+        };
+        let what = format!("step {step}, {what}");
+        bands_on_space(&what);
+        // Sometimes the next edit comes before the recompute.
+        if next(3) > 0 {
+            review_ui::recompute(&doc);
+            assert_tags_match_review(&f, "big.tex", &editor, &what);
+            bands_on_space(&what);
+        }
     }
 }
 
