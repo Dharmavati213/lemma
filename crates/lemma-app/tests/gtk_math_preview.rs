@@ -1,12 +1,14 @@
 //! WP3.3: the math hover preview in the editor (`editor/math_preview.rs`), with real TeX: the
 //! hover on inline, display, `align*` and `tikzcd` formulas of the fixture project, the root's
 //! preamble and macros for a chapter, errors and timeouts, the format following the live
-//! preamble, the cache bound, latest-wins, the off switch, light and dark, the live preview,
-//! detaching, the keyboard, and that nothing happens before the first hover.
+//! preamble, the definitions read again only after edits that can change them (and for a file
+//! opened again), the cache bound, latest-wins, the off switch, light and dark, the live
+//! preview, detaching, the keyboard, and that nothing happens before the first hover.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_math_preview`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `k-math-preview-light.png` and `k-math-preview-dark.png`
-//! (the window with a hover) and `k-math-live.png` (the live preview) there. The latency test:
+//! (the window with a hover) and `k-math-live.png` (the live preview) there. The latency test
+//! and the live preview on `large.tex`:
 //! `scripts/broadway.sh cargo test --release -p lemma-app --test gtk_math_preview -- --ignored perf`.
 
 mod common;
@@ -36,6 +38,11 @@ fn main() -> ExitCode {
             "the_format_follows_the_live_preamble",
             format_follows_preamble,
         ),
+        (
+            "definitions_are_read_again_only_after_edits_that_change_them",
+            definitions_follow_edits,
+        ),
+        ("a_file_opened_again_is_read_again", opened_again),
         ("the_cache_is_bounded_and_answers_at_once", cache_bound),
         ("the_latest_request_wins", latest_wins),
         ("math_hover_off_and_other_documents", off_switch),
@@ -46,6 +53,7 @@ fn main() -> ExitCode {
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_math_preview_hover_latency", perf_latency));
+        tests.push(("perf_math_preview_large_tex", perf_large));
     }
     common::run(&tests)
 }
@@ -222,6 +230,19 @@ fn picture(w: &gtk::Widget) -> Rc<math_preview::Picture> {
         .downcast_ref::<FormulaPicture>()
         .unwrap_or_else(|| panic!("a formula, not {}", texts(w)));
     p.picture().unwrap()
+}
+
+/// The 0-based line where each range of `tag` starts.
+fn tag_lines(buffer: &sourceview5::Buffer, tag: &gtk::TextTag) -> Vec<i32> {
+    let mut lines = Vec::new();
+    let mut iter = buffer.start_iter();
+    while iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag)) {
+        lines.push(iter.line());
+        if !iter.forward_to_tag_toggle(Some(tag)) {
+            break;
+        }
+    }
+    lines
 }
 
 /// The resident set size of this process in kB.
@@ -458,6 +479,87 @@ fn format_follows_preamble() {
     ));
     assert_eq!(math_preview::stats().format_builds, 2);
     assert!(f.cache.read_dir().unwrap().count() >= 1);
+}
+
+/// A document's preamble and definitions are read from its whole text again only after an edit
+/// that can change them: typing in the body keeps them (and the cached picture), editing a
+/// definition in the body does not.
+fn definitions_follow_edits() {
+    if !tex_available() {
+        return;
+    }
+    let f = fixture("follow", |_| {});
+    let editor = f.open("main.tex");
+    let doc = editor.document().clone();
+    let buffer = editor.buffer().clone();
+    let at = offset_of(&editor, "Let $X$ be a scheme", 0);
+    buffer.insert(
+        &mut editor.iter_near(at).unwrap(),
+        "\\newcommand{\\Qq}{\\mathbb{Q}}\nSee $\\Qq^2$. ",
+    );
+    common::pump_until(TIMEOUT, || doc.has_line_states());
+    let formula = |editor: &Editor| offset_of(editor, "\\Qq^2", 1);
+    let first = picture(&hover_at(&f, &editor, formula(&editor)));
+    hover::hide(editor.view());
+    let reads = math_preview::stats().doc_reads;
+    assert!(reads > 0);
+    // Typing in the body, a character at a time.
+    for typed in ["s", "o", " "] {
+        let at = offset_of(&editor, "be a scheme", 0);
+        buffer.insert(&mut editor.iter_near(at).unwrap(), typed);
+    }
+    let again = picture(&hover_at(&f, &editor, formula(&editor)));
+    hover::hide(editor.view());
+    assert_eq!(math_preview::stats().doc_reads, reads, "not read again");
+    assert!(Rc::ptr_eq(&first, &again), "the cached picture");
+    // Editing the definition.
+    let renders = math_preview::stats().renders;
+    let at = offset_of(&editor, "\\mathbb{Q}}", 8);
+    buffer.insert(&mut editor.iter_near(at).unwrap(), "Z");
+    let changed = picture(&hover_at(&f, &editor, formula(&editor)));
+    assert_eq!(math_preview::stats().doc_reads, reads + 1, "read again");
+    assert_eq!(math_preview::stats().renders, renders + 1);
+    assert!(!Rc::ptr_eq(&first, &changed));
+}
+
+/// A file closed, changed on disk and opened again is a new document whose versions start over:
+/// its definitions are read again, not taken from the document that was closed.
+fn opened_again() {
+    if !tex_available() {
+        return;
+    }
+    let f = fixture("again", |_| {});
+    let main = f.dir.join("main.tex");
+    let text = std::fs::read_to_string(&main).unwrap();
+    let with = |cs: &str| {
+        let defined = format!("\\newcommand{{\\Qq}}{{\\{cs}{{Q}}}}\nSee $\\Qq^2$. ");
+        text.replacen(
+            "Let $X$ be a scheme",
+            &format!("{defined}Let $X$ be a scheme"),
+            1,
+        )
+    };
+    std::fs::write(&main, with("mathbb")).unwrap();
+    let editor = f.open("main.tex");
+    let formula = |editor: &Editor| offset_of(editor, "\\Qq^2", 1);
+    let first = picture(&hover_at(&f, &editor, formula(&editor)));
+    hover::hide(editor.view());
+    f.state.close_editor(&editor, false);
+    common::pump_for(Duration::from_millis(100));
+    // As long, so that only reading it tells the texts apart.
+    std::fs::write(&main, with("mathrm")).unwrap();
+    let (reads, renders) = (
+        math_preview::stats().doc_reads,
+        math_preview::stats().renders,
+    );
+    let again = f.open("main.tex");
+    assert!(!Rc::ptr_eq(editor.document(), again.document()));
+    assert_eq!(again.document().version(), editor.document().version());
+    let other = picture(&hover_at(&f, &again, formula(&again)));
+    hover::hide(again.view());
+    assert_eq!(math_preview::stats().doc_reads, reads + 1, "read again");
+    assert_eq!(math_preview::stats().renders, renders + 1);
+    assert!(!Rc::ptr_eq(&first, &other));
 }
 
 fn cache_bound() {
@@ -744,6 +846,19 @@ fn live() {
         editor.iter_near(inline).unwrap().line(),
         "below the inline formula's line"
     );
+    // The space is reserved on that line alone: the tag left the align's line where it was
+    // (not the whole text, which GTK would lay out again).
+    assert_eq!(tag_lines(&buffer, &tag), vec![inline_line]);
+    // A line break above moves the space with the formula, at once.
+    let mut above = editor
+        .iter_near(offset_of(&editor, "Inline $u_1$", 0))
+        .unwrap();
+    buffer.insert(&mut above, "\n");
+    assert_eq!(
+        math_preview::live_reserved(&editor).map(|(line, _)| line),
+        Some(inline_line + 1)
+    );
+    assert_eq!(tag_lines(&buffer, &tag), vec![inline_line + 1]);
     assert!(editor.place_cursor_at(out));
     assert!(math_preview::live_card(&editor).is_none());
     // Vim's normal mode: none.
@@ -839,5 +954,98 @@ fn perf_latency() {
         println!("    (debug build: the budget is checked in release)");
     } else {
         assert!(p50 <= Duration::from_millis(250), "p50 {p50:?} over 250 ms");
+    }
+}
+
+/// Runs the main loop until nothing is ready (GtkTextView's layout idles included); returns how
+/// long that took.
+fn drain() -> Duration {
+    let context = glib::MainContext::default();
+    let started = Instant::now();
+    while context.pending() {
+        context.iteration(false);
+    }
+    started.elapsed()
+}
+
+/// `tests/fixtures/large.tex` (60k lines) with the live preview: what showing and hiding the
+/// card costs the main loop afterwards (a size-affecting tag removed or applied makes GtkTextView
+/// lay out again the text it covers), and the math hover right after a one-character edit in the
+/// body (the document's preamble and definitions).
+fn perf_large() {
+    if !tex_available() {
+        return;
+    }
+    let f = fixture("perf-large", |c| c.preview.live = true);
+    std::fs::copy(
+        common::fixtures().join("large.tex"),
+        f.dir.join("large.tex"),
+    )
+    .unwrap();
+    let editor = f.open("large.tex");
+    let buffer = editor.buffer().clone();
+    // The first layout of the whole text, in the background: once, before the measurement.
+    drain();
+    let at = offset_of(&editor, "\\int_{X} f", 1);
+    let out = offset_of(&editor, "Let $X$ be", 0);
+    reveal(&f, &editor, at);
+    assert!(editor.place_cursor_at(at));
+    common::pump_until(TIMEOUT, || {
+        math_preview::live_content(&editor).is_some_and(|(p, _)| p.is_some())
+    });
+    drain();
+    let (mut shown, mut hidden) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        let started = Instant::now();
+        assert!(editor.place_cursor_at(out));
+        assert!(math_preview::live_card(&editor).is_none());
+        drain();
+        hidden.push(started.elapsed());
+        assert!(editor.place_cursor_at(at));
+        common::pump_until(TIMEOUT, || math_preview::live_reserved(&editor).is_some());
+        shown.push(drain());
+    }
+    shown.sort();
+    hidden.sort();
+    println!(
+        "    live card on {} lines: shown, then the main loop {:?} (median {:?}); hidden, \
+         with the main loop {:?} (median {:?})",
+        buffer.line_count(),
+        shown,
+        shown[shown.len() / 2],
+        hidden,
+        hidden[hidden.len() / 2]
+    );
+    // The hover after a one-character edit after the formula: it is rendered already.
+    assert!(editor.place_cursor_at(out));
+    drain();
+    let after = at + editor.document().text()[at..].find(" and text.").unwrap();
+    let mut hovers = Vec::new();
+    for i in 0..20 {
+        hover::hide(editor.view());
+        let mut iter = editor.iter_near(after).unwrap();
+        buffer.insert(&mut iter, if i % 2 == 0 { "x" } else { "y" });
+        let started = Instant::now();
+        assert!(hover::show_at(&editor, at, Trigger::Pointer));
+        hovers.push(started.elapsed());
+        picture(&wait_shown(&editor));
+    }
+    hovers.sort();
+    let median = hovers[hovers.len() / 2];
+    println!(
+        "    math hover right after an edit: median {median:?}, max {:?}",
+        hovers[hovers.len() - 1]
+    );
+    // Closing the tab takes the hover's popover back from the view, which GTK could not dispose
+    // of otherwise.
+    hover::hide(editor.view());
+    f.state.close_editor(&editor, false);
+    common::pump_for(Duration::from_millis(100));
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        let median = shown[shown.len() / 2].max(hidden[hidden.len() / 2]);
+        assert!(median <= Duration::from_millis(20), "{median:?}");
+        assert!(hovers[hovers.len() / 2] <= Duration::from_millis(2));
     }
 }

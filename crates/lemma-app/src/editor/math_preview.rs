@@ -31,7 +31,10 @@
 //! one replaces (the latest wins); rendered formulas are kept in an LRU cache of `[preview]
 //! cache` entries (and at most [`CACHE_BYTES`] of pixels), keyed by the preamble, the
 //! definitions, the formula and the scale, so hovering a formula again shows it at once. No TeX
-//! process stays alive.
+//! process stays alive. A document's preamble and definitions are read from its whole text, and
+//! kept through the edits that cannot change them (`lemma_preview::EditWatch`: typing in the
+//! body, outside definitions and environment names), so a pause in typing does not read the
+//! text again.
 //!
 //! The formats live in `Paths::preview_cache_dir()`; scripted runs (and windows without
 //! paths) use a temporary directory that goes with the window, and tests set their own
@@ -54,15 +57,16 @@
 
 use super::hover::{self, HoverContent, HoverCtx, ProviderId};
 use super::{Editor, TexView, Trigger, VimMode};
-use crate::document::Document;
+use crate::document::{DocRef, Document, ObserverId};
 use crate::settings::ConfigFile;
 use crate::window::WindowState;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, graphene, gsk};
+use lemma_core::TextEdit;
 use lemma_preview::{
-    DEFAULT_PREAMBLE, Formula, Job, Lru, Outcome, Point, PreambleSource, PreviewError, Previewer,
-    cache_key, definitions, find_formula, preamble_hash, split_preamble,
+    DEFAULT_PREAMBLE, EditWatch, Formula, Job, Lru, Outcome, Point, PreambleSource, PreviewError,
+    Previewer, cache_key, doc_parts, find_formula, preamble_hash,
 };
 use lemma_syntax::Lines;
 use std::borrow::Cow;
@@ -89,7 +93,7 @@ pub const LIVE_CSS_CLASS: &str = "lemma-math-live";
 const BASE_ZOOM: f64 = 1.7;
 /// Space between the formula's last line and the live card, and around the card.
 const LIVE_GAP: i32 = 6;
-/// Documents whose preamble and definitions are remembered (per version).
+/// Documents whose preamble and definitions are remembered.
 const DOC_INFOS: usize = 32;
 
 // ----- the pipeline (one per process, created at the first hover) -----
@@ -174,6 +178,8 @@ pub struct Stats {
     pub running: bool,
     /// A request waits for the running render.
     pub queued: bool,
+    /// Documents read whole for their preamble and definitions.
+    pub doc_reads: u64,
 }
 
 struct Pipeline {
@@ -195,14 +201,16 @@ thread_local! {
     static PIPELINE: RefCell<Option<Rc<Pipeline>>> = const { RefCell::new(None) };
     static CACHE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static ATTACHED: RefCell<Vec<Rc<Attached>>> = const { RefCell::new(Vec::new()) };
-    static DOCS: RefCell<HashMap<PathBuf, (u64, Rc<DocInfo>)>> = RefCell::new(HashMap::new());
+    static DOCS: RefCell<HashMap<PathBuf, Remembered>> = RefCell::new(HashMap::new());
+    static DOC_READS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Uses `dir` for the formats from now on (`None`: the default choice, see the module docs),
-/// dropping the pipeline and its cache. For tests.
+/// dropping the pipeline and its cache, and the [`stats`]. For tests.
 pub fn set_cache_dir(dir: Option<PathBuf>) {
     CACHE_DIR.with_borrow_mut(|d| *d = dir);
     PIPELINE.with_borrow_mut(|p| *p = None);
+    DOC_READS.set(0);
 }
 
 /// True once the first hover over a formula created the pipeline.
@@ -210,21 +218,29 @@ pub fn is_loaded() -> bool {
     PIPELINE.with_borrow(Option::is_some)
 }
 
-/// The pipeline's counters (all zero before it exists).
+/// The pipeline's counters (all zero before it exists), and the documents read for previews.
 pub fn stats() -> Stats {
+    let doc_reads = DOC_READS.get();
     PIPELINE.with_borrow(|p| {
-        p.as_ref().map_or_else(Stats::default, |p| {
-            let cache = p.cache.borrow();
-            Stats {
-                renders: p.renders.get(),
-                cache_hits: p.hits.get(),
-                cache_entries: cache.len(),
-                cache_bytes: cache.bytes(),
-                format_builds: p.previewer.format_builds(),
-                running: p.running.get().is_some(),
-                queued: p.queued.borrow().is_some(),
-            }
-        })
+        p.as_ref().map_or_else(
+            || Stats {
+                doc_reads,
+                ..Stats::default()
+            },
+            |p| {
+                let cache = p.cache.borrow();
+                Stats {
+                    renders: p.renders.get(),
+                    cache_hits: p.hits.get(),
+                    cache_entries: cache.len(),
+                    cache_bytes: cache.bytes(),
+                    format_builds: p.previewer.format_builds(),
+                    running: p.running.get().is_some(),
+                    queued: p.queued.borrow().is_some(),
+                    doc_reads,
+                }
+            },
+        )
     })
 }
 
@@ -445,8 +461,8 @@ pub fn find_at(doc: &Document, offset: usize, envs: &[String]) -> Option<(Range<
     Some((start..end, formula))
 }
 
-/// What a document gives a preview, remembered per version: its preamble (when it is a complete
-/// document) and the definitions outside it.
+/// What a document gives a preview: its preamble (when it is a complete document) and the
+/// definitions outside it.
 struct DocInfo {
     preamble: Option<Arc<str>>,
     preamble_hash: u64,
@@ -455,48 +471,103 @@ struct DocInfo {
     complete: bool,
 }
 
-fn doc_info(doc: &Document) -> Rc<DocInfo> {
+/// A document's [`DocInfo`], for a version of its text.
+struct Remembered {
+    /// The document read: one opened again is another document, whose versions start over.
+    doc: Weak<Document>,
+    version: u64,
+    info: Rc<DocInfo>,
+    /// Where an edit could change `info`: an edit that cannot moves `version` on
+    /// ([`follow_edit`]), so typing does not read the whole text again.
+    watch: EditWatch,
+}
+
+impl Remembered {
+    /// True when this was read from `doc` (the weak reference keeps its address from being
+    /// reused).
+    fn is_of(&self, doc: &Document) -> bool {
+        std::ptr::eq(self.doc.as_ptr(), doc)
+    }
+}
+
+fn doc_info(doc: &DocRef) -> Rc<DocInfo> {
     let version = doc.version();
-    let path = doc.path().to_path_buf();
     if let Some(info) = DOCS.with_borrow(|d| {
-        d.get(&path)
-            .filter(|(v, _)| *v == version)
-            .map(|(_, i)| i.clone())
+        d.get(doc.path())
+            .filter(|r| r.is_of(doc) && r.version == version)
+            .map(|r| r.info.clone())
     }) {
         return info;
     }
-    // A preamble may load the class from a file of its own (`\\input{preamble}`).
-    let info = Rc::new(doc.with_text(|text| match split_preamble(text) {
-        Some((preamble, body))
-            if preamble.contains("\\documentclass") || preamble.contains("\\input") =>
-        {
-            DocInfo {
-                preamble_hash: preamble_hash(preamble),
-                preamble: Some(preamble.into()),
-                definitions: definitions(body),
-                complete: true,
-            }
-        }
-        _ => DocInfo {
-            preamble: None,
-            preamble_hash: 0,
-            definitions: definitions(text),
-            complete: false,
-        },
-    }));
+    DOC_READS.set(DOC_READS.get() + 1);
+    let (info, watch) = doc.with_text(|text| {
+        let (parts, watch) = doc_parts(text);
+        let info = DocInfo {
+            preamble: parts.preamble.map(Arc::from),
+            preamble_hash: parts.preamble.map_or(0, preamble_hash),
+            definitions: parts.definitions,
+            complete: parts.preamble.is_some(),
+        };
+        (Rc::new(info), watch)
+    });
     DOCS.with_borrow_mut(|d| {
         if d.len() >= DOC_INFOS {
             d.clear();
         }
-        d.insert(path, (version, info.clone()));
+        d.insert(
+            doc.path().to_path_buf(),
+            Remembered {
+                doc: Rc::downgrade(doc),
+                version,
+                info: info.clone(),
+                watch,
+            },
+        );
     });
     info
+}
+
+/// Runs before every change of an attached editor's document: when `doc`'s remembered
+/// [`DocInfo`] is current and `edit` cannot change it (`EditWatch::keeps`: typing in the body,
+/// outside definitions and environment names), it stays current for the text after the edit.
+/// Any other edit leaves it to be computed again the next time it is needed.
+fn follow_edit(doc: &Document, edit: &TextEdit) {
+    DOCS.with_borrow_mut(|docs| {
+        let Some(known) = docs
+            .get_mut(doc.path())
+            .filter(|r| r.is_of(doc) && r.version == doc.version())
+        else {
+            return;
+        };
+        let index = doc.line_index();
+        // While GTK numbers lines differently (a lone `\r`), reading a line reads the whole
+        // text: such an edit is not followed.
+        if doc
+            .buffer()
+            .is_some_and(|b| u32::try_from(b.line_count()).ok() != Some(index.line_count()))
+        {
+            return;
+        }
+        let line = index.line_of(edit.range.start);
+        let line_start = index.line_start(line);
+        drop(index);
+        let Some(text) = doc.line_text(line) else {
+            return;
+        };
+        if known
+            .watch
+            .keeps(&text, line_start, edit.range.clone(), &edit.text)
+        {
+            known.version = doc.version() + 1;
+            known.watch.follow(edit.range.clone(), edit.text.len());
+        }
+    });
 }
 
 /// The root document of `doc` (see the module docs), or `None`: its `% !TEX root` or subfiles
 /// parent, else itself when it is a complete document, else a root of the project index that
 /// includes it, else the last build's root when `doc` is in its directory.
-pub fn root_for(state: &WindowState, doc: &Document) -> Option<PathBuf> {
+pub fn root_for(state: &WindowState, doc: &DocRef) -> Option<PathBuf> {
     let path = crate::workspace::normalize(doc.path());
     let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
     let index = state.workspace.index.borrow();
@@ -586,7 +657,7 @@ fn request_for(
         }
         Some(root) => {
             let open = state.workspace.get(root);
-            let info = open.as_ref().map(|d| doc_info(d));
+            let info = open.as_ref().map(doc_info);
             match info.filter(|i| i.complete) {
                 Some(info) => {
                     defs.push_str(&info.definitions);
@@ -880,6 +951,8 @@ struct Attached {
     editor: Weak<Editor>,
     state: Weak<WindowState>,
     provider: Cell<Option<ProviderId>>,
+    /// The document's edits, for [`follow_edit`].
+    edits: Cell<Option<ObserverId>>,
     live: RefCell<Option<Rc<Live>>>,
     /// The live card's widgets, created on its first use and kept (hidden) for the view's
     /// lifetime: GTK 4.22 cannot take an overlay back out of a text view
@@ -927,11 +1000,15 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     if !super::completion::is_latex(editor.document().path()) || attached(editor.view()).is_some() {
         return;
     }
+    let edits = editor
+        .document()
+        .connect_edit(|doc, edit, _| follow_edit(doc, edit));
     let a = Rc::new(Attached {
         view: editor.view().downgrade(),
         editor: Rc::downgrade(editor),
         state: Rc::downgrade(state),
         provider: Cell::new(None),
+        edits: Cell::new(Some(edits)),
         live: RefCell::new(None),
         card: Rc::default(),
     });
@@ -970,6 +1047,9 @@ pub fn detach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
     ATTACHED.with_borrow_mut(|all| all.retain(|x| !Rc::ptr_eq(x, &a)));
     if let Some(id) = a.provider.take() {
         hover::unregister(editor.view(), id);
+    }
+    if let Some(id) = a.edits.take() {
+        editor.document().disconnect(id);
     }
     if let Some(live) = a.live.take() {
         live.stop();
@@ -1310,8 +1390,9 @@ impl Live {
         let (_, natural, _, _) = card.frame.measure(gtk::Orientation::Vertical, -1);
         let reserved = natural + 2 * LIVE_GAP;
         if card.line.get() != line || card.tag.pixels_below_lines() != reserved {
-            let (all_start, all_end) = buffer.bounds();
-            buffer.remove_tag(&card.tag, &all_start, &all_end);
+            // Where it is (edits above the card move the tagged line), not over the whole text,
+            // which GTK would lay out again.
+            super::remove_tag_everywhere(buffer, &card.tag);
             let line_start = buffer.iter_at_line(line).unwrap_or(end);
             let mut line_end = line_start;
             if !line_end.ends_line() {
@@ -1344,9 +1425,7 @@ impl Live {
         };
         if card.frame.is_visible() {
             card.frame.set_visible(false);
-            let buffer = editor.buffer();
-            let (start, end) = buffer.bounds();
-            buffer.remove_tag(&card.tag, &start, &end);
+            super::remove_tag_everywhere(editor.buffer(), &card.tag);
             card.line.set(-1);
         }
     }
@@ -1371,7 +1450,7 @@ impl Live {
             let buffer = editor.buffer();
             buffer.delete_mark(&card.start);
             buffer.delete_mark(&card.end);
-            buffer.tag_table().remove(&card.tag);
+            super::remove_spacing_tag(buffer, &card.tag);
         }
     }
 }

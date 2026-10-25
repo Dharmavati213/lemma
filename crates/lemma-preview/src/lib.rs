@@ -35,6 +35,7 @@ mod body;
 mod defs;
 mod formula;
 mod lru;
+mod parts;
 mod raster;
 mod run;
 
@@ -42,6 +43,7 @@ pub use body::{Body, DEFAULT_PREAMBLE, Route, body, format_source, split_preambl
 pub use defs::{MAX_DEFINITIONS, definitions};
 pub use formula::{Formula, FormulaKind, MAX_BYTES, MAX_LINES, Point, find_formula};
 pub use lru::Lru;
+pub use parts::{DocParts, EditWatch, doc_parts};
 pub use raster::{Image, Pixels, rasterize};
 
 use lemma_build::{Engine, parse_log};

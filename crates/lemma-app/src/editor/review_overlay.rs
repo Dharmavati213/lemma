@@ -20,7 +20,7 @@
 //! deleted text.
 
 use crate::document::{DocRef, Document, ObserverId};
-use crate::editor::{TexView, highlight};
+use crate::editor::{TexView, highlight, remove_spacing_tag, remove_tag_everywhere};
 use crate::review_ui::{self, Decision};
 use gtk::prelude::*;
 use gtk::{gdk, graphene, gsk};
@@ -30,7 +30,8 @@ use lemma_syntax::Context;
 use sourceview5::prelude::*;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::rc::{Rc, Weak};
 
@@ -98,6 +99,9 @@ struct Plan {
     added: Vec<Range<u32>>,
     /// Changed words: line and byte range within the line.
     words: Vec<(u32, Range<u32>)>,
+    /// The blocks drawn at a line (anchored [`Anchor::Above`] or [`Anchor::Below`] it): the
+    /// line and the block's index, by line and then in block order, for the gutter.
+    anchored: Vec<(u32, usize)>,
     header: i32,
     /// Width the deleted text wraps at (`None`: no wrapping).
     wrap: Option<i32>,
@@ -162,8 +166,8 @@ pub struct ViewReview {
     word: gtk::TextTag,
     anchors: RefCell<Vec<gtk::TextTag>>,
     plan: RefCell<Plan>,
-    /// Deleted-text layouts of the current plan's hunks (see [`Phantom`]).
-    phantoms: RefCell<Vec<Rc<Phantom>>>,
+    /// Deleted-text layouts of the current plan's hunks (see [`Phantom`]), by [`phantom_key`].
+    phantoms: RefCell<HashMap<u64, Vec<Rc<Phantom>>>>,
     /// The phantom of each hunk of the current plan.
     phantom_of: RefCell<HashMap<HunkId, Rc<Phantom>>>,
     /// Height of an action bar, measured for this line height and (un)rooted view.
@@ -172,6 +176,17 @@ pub struct ViewReview {
     reading: Cell<bool>,
     cursor_hunk: Cell<Option<HunkId>>,
     relayout_queued: Cell<bool>,
+    /// [`ViewReview::apply`] is tagging the buffer.
+    applying: Cell<bool>,
+    /// The review's tags may cover more than the ranges [`ViewReview::apply`] gave them: set
+    /// until the first apply, and when something else applies one (a paste copies the tags of
+    /// the text it copies); the next sync tags everything again. Otherwise GTK's edits move the
+    /// ranges with the text and never add one, so the ends of a range tell whether it is where
+    /// the plan wants it, which keeps a sync with thousands of hunks linear: each search or
+    /// change of a tag costs GTK time that grows with the number of tags.
+    tags_unsure: Cell<bool>,
+    /// How many ranges the added-lines and changed-words tags got from the last apply.
+    shared_ranges: Cell<(usize, usize)>,
     /// Document version the plan was last checked against.
     plan_version: Cell<Option<u64>>,
     /// The view's own top margin, restored when no hunk needs the space above line 1.
@@ -207,13 +222,16 @@ impl ViewReview {
             word,
             anchors: RefCell::new(Vec::new()),
             plan: RefCell::new(Plan::default()),
-            phantoms: RefCell::new(Vec::new()),
+            phantoms: RefCell::new(HashMap::new()),
             phantom_of: RefCell::new(HashMap::new()),
             bar_height: Cell::new(None),
             bars: (0..BAR_POOL).map(|i| ReviewBar::new(weak, i)).collect(),
             reading: Cell::new(false),
             cursor_hunk: Cell::new(None),
             relayout_queued: Cell::new(false),
+            applying: Cell::new(false),
+            tags_unsure: Cell::new(true),
+            shared_ranges: Cell::new((0, 0)),
             plan_version: Cell::new(None),
             base_top_margin: view.top_margin(),
             decide,
@@ -263,6 +281,16 @@ impl ViewReview {
         });
         handlers.push((self.buffer.clone().upcast(), id));
         let weak = Rc::downgrade(self);
+        let id = self.buffer.connect_apply_tag(move |_, tag, _, _| {
+            if let Some(review) = weak.upgrade()
+                && !review.applying.get()
+                && review.is_own_tag(tag)
+            {
+                review.tags_unsure.set(true);
+            }
+        });
+        handlers.push((self.buffer.clone().upcast(), id));
+        let weak = Rc::downgrade(self);
         let id = self.buffer.connect_style_scheme_notify(move |_| {
             if let Some(review) = weak.upgrade() {
                 review.update_tag_colors();
@@ -282,11 +310,10 @@ impl ViewReview {
         for (object, id) in self.handlers.borrow_mut().drain(..) {
             object.disconnect(id);
         }
-        let (start, end) = self.buffer.bounds();
-        self.buffer.remove_tag(&self.added, &start, &end);
-        self.buffer.remove_tag(&self.word, &start, &end);
+        remove_tag_everywhere(&self.buffer, &self.added);
+        remove_tag_everywhere(&self.buffer, &self.word);
         for tag in self.anchors.borrow().iter() {
-            self.buffer.remove_tag(tag, &start, &end);
+            remove_tag_everywhere(&self.buffer, tag);
         }
         if let Some(view) = self.view.upgrade() {
             // A closed tab's view was disposed first, which already removed its children.
@@ -390,12 +417,16 @@ impl ViewReview {
         };
         // Keep only the layouts this plan uses.
         {
-            let used = self.phantom_of.borrow();
-            self.phantoms
-                .borrow_mut()
-                .retain(|p| used.values().any(|u| Rc::ptr_eq(u, p)));
+            let used: HashSet<*const Phantom> =
+                self.phantom_of.borrow().values().map(Rc::as_ptr).collect();
+            self.phantoms.borrow_mut().retain(|_, layouts| {
+                layouts.retain(|p| used.contains(&Rc::as_ptr(p)));
+                !layouts.is_empty()
+            });
         }
-        let changed = *self.plan.borrow() != plan || !self.tags_in_place(&doc, &plan);
+        let changed = self.tags_unsure.get()
+            || *self.plan.borrow() != plan
+            || !self.tags_in_place(&doc, &plan);
         if changed {
             self.apply(&view, &doc, &plan);
             self.plan.replace(plan);
@@ -465,6 +496,16 @@ impl ViewReview {
                     .map(|w| (hunk.cur_lines.start + w.line, w.bytes.clone())),
             );
         }
+        plan.anchored = plan
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, block)| match block.anchor {
+                Anchor::Above(line) | Anchor::Below(line) => Some((line, i)),
+                Anchor::Top => None,
+            })
+            .collect();
+        plan.anchored.sort_by_key(|&(line, _)| line);
         self.phantom_of.replace(phantom_of);
         plan
     }
@@ -510,6 +551,11 @@ impl ViewReview {
             return false;
         }
         let (want_start, want_end) = (index.line_start(line), line_end(&index, line + 1));
+        drop(index);
+        if !self.tags_unsure.get() {
+            // Its one range starts and ends there (see `tags_unsure`).
+            return ranges_in_place(doc, tag, std::slice::from_ref(&(want_start..want_end)));
+        }
         let Some(start) = tag_start(&self.buffer, tag) else {
             return false;
         };
@@ -521,37 +567,53 @@ impl ViewReview {
             && !rest.forward_to_tag_toggle(Some(tag))
     }
 
-    /// Re-tags the buffer for `plan`. The shared tags are removed only where they are; an anchor
-    /// tag already covering its planned line (GTK moved it with the text) is left alone, and
-    /// surplus anchor tags leave the tag table, so their cost does not outlive their hunks.
+    /// Re-tags the buffer for `plan`. The shared tags and each anchor tag are left alone where
+    /// GTK moved them with the text to where the plan wants them; otherwise they are removed
+    /// only where they are and applied again. Surplus anchor tags leave the tag table, so their
+    /// cost does not outlive their hunks.
     fn apply(&self, view: &TexView, doc: &Document, plan: &Plan) {
         let buffer = &self.buffer;
-        remove_tag_everywhere(buffer, &self.added);
-        remove_tag_everywhere(buffer, &self.word);
+        self.applying.set(true);
         self.resize_anchor_pool(plan.groups.len());
         let anchors = self.anchors.borrow();
         let index = doc.line_index();
         let at = |offset: usize| doc.iter_at_byte(offset);
-        for lines in &plan.added {
-            if let (Some(a), Some(b)) = (
-                at(index.line_start(lines.start)),
-                at(line_end(&index, lines.end)),
-            ) {
-                buffer.apply_tag(&self.added, &a, &b);
-            }
-        }
+        // The added lines and the changed words, as GTK keeps them: ranges that touch are one.
+        let added = joined(
+            plan.added
+                .iter()
+                .map(|lines| index.line_start(lines.start)..line_end(&index, lines.end)),
+        );
         let line_count = index.line_count();
-        for (line, bytes) in &plan.words {
-            if *line >= line_count {
-                continue;
-            }
-            let base = index.line_start(*line);
-            if let (Some(a), Some(b)) = (
-                at(base + bytes.start as usize),
-                at(base + bytes.end as usize),
-            ) {
-                buffer.apply_tag(&self.word, &a, &b);
-            }
+        let words = joined(
+            plan.words
+                .iter()
+                .filter(|(line, _)| *line < line_count)
+                .map(|(line, bytes)| {
+                    let base = index.line_start(*line);
+                    base + bytes.start as usize..base + bytes.end as usize
+                }),
+        );
+        // Usually only a few hunks changed: the others' ranges moved with the text.
+        let kept = !self.tags_unsure.get()
+            && self.shared_ranges.get() == (added.len(), words.len())
+            && ranges_in_place(doc, &self.added, &added)
+            && ranges_in_place(doc, &self.word, &words);
+        if !kept {
+            remove_tag_everywhere(buffer, &self.added);
+            remove_tag_everywhere(buffer, &self.word);
+            let tag_all = |tag: &gtk::TextTag, ranges: &[Range<usize>]| {
+                let mut tagged = 0;
+                for range in ranges {
+                    if let (Some(a), Some(b)) = (at(range.start), at(range.end)) {
+                        buffer.apply_tag(tag, &a, &b);
+                        tagged += 1;
+                    }
+                }
+                tagged
+            };
+            self.shared_ranges
+                .set((tag_all(&self.added, &added), tag_all(&self.word, &words)));
         }
         let range = |line: u32| (index.line_start(line), line_end(&index, line + 1));
         let mut top = 0;
@@ -585,16 +647,27 @@ impl ViewReview {
             }
         }
         view.set_top_margin(self.base_top_margin + top);
+        self.applying.set(false);
+        self.tags_unsure.set(false);
+    }
+
+    /// True for the review's own tags.
+    fn is_own_tag(&self, tag: &gtk::TextTag) -> bool {
+        // Anchor tags are the ones that reserve space.
+        *tag == self.added
+            || *tag == self.word
+            || ((tag.is_pixels_above_lines_set() || tag.is_pixels_below_lines_set())
+                && self.anchors.borrow().contains(tag))
     }
 
     /// Makes the pool of anchor tags exactly `n` long: new tags get the highest priority, surplus
-    /// ones leave the tag table (which removes them from the text).
+    /// ones leave the text and the tag table (without laying out the whole text again).
     fn resize_anchor_pool(&self, n: usize) {
         let mut anchors = self.anchors.borrow_mut();
         let table = self.buffer.tag_table();
         let keep = n.min(anchors.len());
         for tag in anchors.drain(keep..) {
-            table.remove(&tag);
+            remove_spacing_tag(&self.buffer, &tag);
         }
         while anchors.len() < n {
             let tag = gtk::TextTag::new(None);
@@ -618,12 +691,12 @@ impl ViewReview {
         let words = old_words(hunk);
         // Syntax colours (WP2.7): the deleted text starts where the hunk's current lines do.
         let context = highlight::phantom_context(view, hunk.cur_lines.start);
-        if let Some(p) = self
-            .phantoms
-            .borrow()
-            .iter()
-            .find(|p| p.matches(hunk, &words, wrap, dark, &context))
-        {
+        let key = phantom_key(&hunk.old_text, wrap, dark);
+        if let Some(p) = self.phantoms.borrow().get(&key).and_then(|layouts| {
+            layouts
+                .iter()
+                .find(|p| p.matches(hunk, &words, wrap, dark, &context))
+        }) {
             return p.clone();
         }
         let syntax = context
@@ -640,7 +713,11 @@ impl ViewReview {
             chunks,
             height,
         });
-        self.phantoms.borrow_mut().push(phantom.clone());
+        self.phantoms
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .push(phantom.clone());
         phantom
     }
 
@@ -843,13 +920,11 @@ impl ViewReview {
             .take_while(|b| b.lines.start <= line)
             .any(|b| b.touched && b.lines.contains(&line));
         let anchors = self.anchors.borrow();
-        for block in &plan.blocks {
-            let (below, at) = match block.anchor {
-                Anchor::Above(l) => (false, l),
-                Anchor::Below(l) => (true, l),
-                Anchor::Top => continue,
-            };
-            if at != line || !anchors.get(block.group).is_some_and(|t| iter.has_tag(t)) {
+        let at = plan.anchored.partition_point(|&(l, _)| l < line);
+        for &(_, i) in plan.anchored[at..].iter().take_while(|&&(l, _)| l == line) {
+            let block = &plan.blocks[i];
+            let below = matches!(block.anchor, Anchor::Below(_));
+            if !anchors.get(block.group).is_some_and(|t| iter.has_tag(t)) {
                 continue;
             }
             if below {
@@ -1108,33 +1183,45 @@ fn anchor_of(hunk: &Hunk, index: &LineIndex) -> Anchor {
     }
 }
 
+/// The key of deleted text `old_text` laid out at `wrap` in a light or dark style in
+/// [`ViewReview::phantoms`]: equal texts share it.
+fn phantom_key(old_text: &str, wrap: Option<i32>, dark: bool) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (old_text, wrap, dark).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `ranges` with those that touch or overlap made one, in text order; empty ones left out.
+fn joined(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut sorted: Vec<Range<usize>> = ranges.filter(|r| r.start < r.end).collect();
+    sorted.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<usize>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match out.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => out.push(range),
+        }
+    }
+    out
+}
+
+/// True when ranges of `tag` start and end where each of `ranges` (sorted, apart) does. With as
+/// many ranges as `tag` has, those are exactly its ranges: their starts and ends are all
+/// toggles of the tag.
+fn ranges_in_place(doc: &Document, tag: &gtk::TextTag, ranges: &[Range<usize>]) -> bool {
+    ranges.iter().all(|range| {
+        doc.iter_at_byte(range.start)
+            .is_some_and(|start| start.starts_tag(Some(tag)))
+            && doc
+                .iter_at_byte(range.end)
+                .is_some_and(|end| end.ends_tag(Some(tag)))
+    })
+}
+
 /// The first position where `tag` applies.
 fn tag_start(buffer: &sourceview5::Buffer, tag: &gtk::TextTag) -> Option<gtk::TextIter> {
     let mut iter = buffer.start_iter();
     (iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag))).then_some(iter)
-}
-
-/// Removes `tag` from the ranges it covers. Unlike one `remove_tag` over the whole buffer, whose
-/// cost grows with the buffer's length, this costs little for a tag on a few ranges.
-fn remove_tag_everywhere(buffer: &sourceview5::Buffer, tag: &gtk::TextTag) {
-    let mut ranges = Vec::new();
-    let mut iter = buffer.start_iter();
-    while iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag)) {
-        let start = iter.offset();
-        iter.forward_to_tag_toggle(Some(tag));
-        ranges.push((start, iter.offset()));
-        if iter.is_end() {
-            break;
-        }
-    }
-    // Removing a tag changes no offsets.
-    for (start, end) in ranges {
-        buffer.remove_tag(
-            tag,
-            &buffer.iter_at_offset(start),
-            &buffer.iter_at_offset(end),
-        );
-    }
 }
 
 /// Byte offset where the line before `line` ends: the start of `line`, or the end of the text

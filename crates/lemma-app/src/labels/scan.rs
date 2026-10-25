@@ -8,7 +8,8 @@ use lemma_syntax::{
     BibEntry, FileIndex, IncludeKind, Label, LineStates, MacroDef, ProjectIndex, ScanConfig,
     StrLines, Token, TokenKind,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -516,78 +517,111 @@ fn theorem_title(env: &str, theorems: &BTreeMap<&str, &MacroDef>) -> Option<Stri
 /// The kind of thing `label` (in `file`) labels: from its environment, else the section it is
 /// in.
 pub fn label_kind(index: &ProjectIndex, file: &FileIndex, label: &Label) -> (String, bool) {
-    let Some(env) = label.env.as_deref() else {
-        let level = file
-            .outline
-            .iter()
-            .rfind(|o| o.level < 7 && o.line <= label.line)
-            .map(|o| o.level);
-        let kind = match level {
-            Some(0) => "Part",
-            Some(1) => "Chapter",
-            Some(2..=4) => "Section",
-            Some(_) => "Paragraph",
-            None => "Label",
-        };
-        return (kind.to_owned(), false);
-    };
-    let base = env.strip_suffix('*').unwrap_or(env);
-    if EQUATION_ENVS.contains(&base) {
-        return ("Equation".to_owned(), true);
-    }
-    let named = match base {
-        "figure" | "subfigure" | "wrapfigure" | "SCfigure" => Some("Figure"),
-        "table" | "subtable" | "wraptable" | "longtable" => Some("Table"),
-        "enumerate" => Some("Item"),
-        "algorithm" => Some("Algorithm"),
-        "lstlisting" | "listing" => Some("Listing"),
-        "footnote" => Some("Footnote"),
-        _ => None,
-    };
-    if let Some(named) = named {
-        return (named.to_owned(), false);
-    }
-    let theorems: BTreeMap<&str, &MacroDef> = index
-        .files
-        .values()
-        .flat_map(|f| f.macros.iter().filter(|m| m.is_theorem))
-        .map(|m| (m.name.as_str(), m))
-        .collect();
-    let in_file = file
-        .macros
-        .iter()
-        .find(|m| m.is_theorem && m.name == base)
-        .and_then(|m| {
-            let title = m.body.as_deref().map(detex).unwrap_or_default();
-            (!title.trim().is_empty()).then(|| title.trim().to_owned())
-        });
-    let kind = in_file
-        .or_else(|| theorem_title(base, &theorems))
-        .or_else(|| {
-            COMMON_THEOREMS
-                .iter()
-                .find(|(n, _)| *n == base)
-                .map(|(_, t)| (*t).to_owned())
-        })
-        .unwrap_or_else(|| capitalized(base));
-    (kind, false)
+    LabelNamer::new(index).kind(file, label)
 }
 
 /// What the project knows about `label` (defined in `file`).
 pub fn label_info(index: &ProjectIndex, file: &FileIndex, label: &Label) -> LabelInfo {
-    let (kind, equation) = label_kind(index, file, label);
-    let (number, page) = match index.aux.labels.get(&label.name) {
-        Some((number, page)) => (
-            Some(detex(number)).filter(|n| !n.is_empty()),
-            Some(page.clone()).filter(|p| !p.is_empty()),
-        ),
-        None => (None, None),
-    };
-    LabelInfo {
-        kind,
-        number,
-        page,
-        equation,
+    LabelNamer::new(index).info(file, label)
+}
+
+/// [`label_kind`] and [`label_info`] for many labels of one project: what they look up in the
+/// whole project (its theorem-like environments) is gathered once, when first needed.
+pub struct LabelNamer<'a> {
+    index: &'a ProjectIndex,
+    theorems: OnceCell<BTreeMap<&'a str, &'a MacroDef>>,
+}
+
+impl<'a> LabelNamer<'a> {
+    pub fn new(index: &'a ProjectIndex) -> Self {
+        Self {
+            index,
+            theorems: OnceCell::new(),
+        }
+    }
+
+    /// See [`label_kind`].
+    pub fn kind(&self, file: &FileIndex, label: &Label) -> (String, bool) {
+        let Some(env) = label.env.as_deref() else {
+            // The outline is in line order: the last heading at or above the label.
+            let above = file.outline.partition_point(|o| o.line <= label.line);
+            let level = file.outline[..above]
+                .iter()
+                .rfind(|o| o.level < 7)
+                .map(|o| o.level);
+            let kind = match level {
+                Some(0) => "Part",
+                Some(1) => "Chapter",
+                Some(2..=4) => "Section",
+                Some(_) => "Paragraph",
+                None => "Label",
+            };
+            return (kind.to_owned(), false);
+        };
+        let base = env.strip_suffix('*').unwrap_or(env);
+        if EQUATION_ENVS.contains(&base) {
+            return ("Equation".to_owned(), true);
+        }
+        let named = match base {
+            "figure" | "subfigure" | "wrapfigure" | "SCfigure" => Some("Figure"),
+            "table" | "subtable" | "wraptable" | "longtable" => Some("Table"),
+            "enumerate" => Some("Item"),
+            "algorithm" => Some("Algorithm"),
+            "lstlisting" | "listing" => Some("Listing"),
+            "footnote" => Some("Footnote"),
+            _ => None,
+        };
+        if let Some(named) = named {
+            return (named.to_owned(), false);
+        }
+        let in_file = file
+            .macros
+            .iter()
+            .find(|m| m.is_theorem && m.name == base)
+            .and_then(|m| {
+                let title = m.body.as_deref().map(detex).unwrap_or_default();
+                (!title.trim().is_empty()).then(|| title.trim().to_owned())
+            });
+        let kind = in_file
+            .or_else(|| theorem_title(base, self.theorems()))
+            .or_else(|| {
+                COMMON_THEOREMS
+                    .iter()
+                    .find(|(n, _)| *n == base)
+                    .map(|(_, t)| (*t).to_owned())
+            })
+            .unwrap_or_else(|| capitalized(base));
+        (kind, false)
+    }
+
+    /// See [`label_info`].
+    pub fn info(&self, file: &FileIndex, label: &Label) -> LabelInfo {
+        let (kind, equation) = self.kind(file, label);
+        let (number, page) = match self.index.aux.labels.get(&label.name) {
+            Some((number, page)) => (
+                Some(detex(number)).filter(|n| !n.is_empty()),
+                Some(page.clone()).filter(|p| !p.is_empty()),
+            ),
+            None => (None, None),
+        };
+        LabelInfo {
+            kind,
+            number,
+            page,
+            equation,
+        }
+    }
+
+    /// The project's theorem-like environments by name.
+    fn theorems(&self) -> &BTreeMap<&'a str, &'a MacroDef> {
+        self.theorems.get_or_init(|| {
+            self.index
+                .files
+                .values()
+                .flat_map(|f| f.macros.iter().filter(|m| m.is_theorem))
+                .map(|m| (m.name.as_str(), m))
+                .collect()
+        })
     }
 }
 
@@ -603,6 +637,20 @@ pub fn find_label<'a>(
             .find(|l| l.name == name)
             .map(|l| (path.as_path(), &**file, l))
     })
+}
+
+/// Every label of the project by name, each as [`find_label`] finds it (the first by path when
+/// it is defined twice): for looking up many.
+pub fn labels_by_name(index: &ProjectIndex) -> HashMap<&str, (&Path, &FileIndex, &Label)> {
+    let mut found = HashMap::new();
+    for (path, file) in &index.files {
+        for label in &file.labels {
+            found
+                .entry(label.name.as_str())
+                .or_insert((path.as_path(), &**file, label));
+        }
+    }
+    found
 }
 
 /// The bibliography entry of `key`, with its `.bib` file.

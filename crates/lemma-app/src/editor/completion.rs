@@ -1155,10 +1155,8 @@ impl Attached {
         // After `\end{`, the environment that is open at the cursor comes first.
         let closing = argument_command(&position.line_before) == Some("end");
         if closing {
-            let open = doc.with_text(|text| {
-                open_environment(&text[..position.offset.min(text.len())]).map(str::to_owned)
-            });
-            if let Some(open) = open {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            if let Some(open) = open_environment(lines_before(&cursor)) {
                 promote_open_environment(&mut items, &open, typed);
             }
         }
@@ -1403,29 +1401,57 @@ fn promote_open_environment(items: &mut Vec<Item>, open: &str, typed: &str) {
 /// Bytes looked back for the environment open at a position.
 const OPEN_ENV_SCAN: usize = 256 << 10;
 
-/// The innermost environment open at the end of `text`: its `\begin{name}` has no `\end{name}`
-/// after it (a backward scan of at most [`OPEN_ENV_SCAN`] bytes; comments are skipped).
-pub fn open_environment(text: &str) -> Option<&str> {
-    let mut from = text.len().saturating_sub(OPEN_ENV_SCAN);
-    while !text.is_char_boundary(from) {
-        from += 1;
-    }
-    let mut closed: Vec<&str> = Vec::new();
-    for line in text[from..].rsplit('\n') {
-        for (begin, name) in env_tokens(line).into_iter().rev() {
+/// The innermost environment open at the end of a text, given its lines from the last one up
+/// (each without its line break): its `\begin{name}` has no `\end{name}` after it. A backward
+/// scan of at most [`OPEN_ENV_SCAN`] bytes, which usually stops a few lines up; comments are
+/// skipped.
+pub fn open_environment<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Option<String> {
+    let mut left = OPEN_ENV_SCAN;
+    let mut closed: Vec<String> = Vec::new();
+    for line in lines {
+        let line = line.as_ref();
+        // The line where the budget ends counts from that byte on.
+        let mut from = line.len().saturating_sub(left);
+        while !line.is_char_boundary(from) {
+            from += 1;
+        }
+        for (begin, name) in env_tokens(&line[from..]).into_iter().rev() {
             if !begin {
-                closed.push(name);
+                closed.push(name.to_owned());
             } else if closed.is_empty() {
-                return Some(name);
-            } else if let Some(i) = closed.iter().rposition(|n| *n == name) {
+                return Some(name.to_owned());
+            } else if let Some(i) = closed.iter().rposition(|n| n == name) {
                 closed.truncate(i);
             } else {
                 // A `\begin` whose `\end` is missing in between: it encloses the end.
-                return Some(name);
+                return Some(name.to_owned());
             }
         }
+        // The line and the line break before it.
+        left = left.checked_sub(line.len() + 1)?;
     }
     None
+}
+
+/// The text before `cursor`, line by line from its own line up (each without its line break),
+/// read from the buffer one line at a time.
+fn lines_before(cursor: &gtk::TextIter) -> impl Iterator<Item = glib::GString> {
+    let buffer = cursor.buffer();
+    let mut next = Some(*cursor);
+    std::iter::from_fn(move || {
+        let end = next.take()?;
+        let mut start = end;
+        start.set_line_offset(0);
+        if start.line() > 0 {
+            let mut above = start;
+            above.backward_line();
+            if !above.ends_line() {
+                above.forward_to_line_end();
+            }
+            next = Some(above);
+        }
+        Some(buffer.slice(&start, &end, true))
+    })
 }
 
 /// The `\begin{name}` (`true`) and `\end{name}` (`false`) of `line` before its comment.
@@ -3104,6 +3130,55 @@ fn read_wanted(wanted: Wanted) -> Discovered {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`open_environment`] at the end of `text`.
+    fn open_at_end(text: &str) -> Option<String> {
+        open_environment(text.rsplit('\n'))
+    }
+
+    #[test]
+    fn open_environments() {
+        for (text, open) in [
+            ("\\begin{align}\n  a &= b\n\\end{al", Some("align")),
+            ("\\begin{equation}\n  a = b\n", Some("equation")),
+            (
+                "\\begin{itemize}\n\\item a\n\\begin{enumerate}\n\\item b\n",
+                Some("enumerate"),
+            ),
+            // A closed inner environment in between, several lines up.
+            (
+                "\\begin{proof}\nWe have\n\\begin{align*}\na\n\\end{align*}\nhence\n\n",
+                Some("proof"),
+            ),
+            ("\\begin{a}\\begin{b}x\\end{b} y", Some("a")),
+            // Comments are skipped; a missing `\end` encloses the end.
+            (
+                "\\begin{itemize}\n\\item a % \\end{itemize}\n",
+                Some("itemize"),
+            ),
+            ("\\begin{a}\n\\begin{b}\n\\end{c}\n", Some("b")),
+            ("\\begin{a}\n\\end{a}\n", None),
+            ("plain text", None),
+            ("", None),
+        ] {
+            assert_eq!(open_at_end(text).as_deref(), open, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn open_environments_within_the_budget() {
+        let filler = "x".repeat(99) + "\n";
+        let lines = OPEN_ENV_SCAN / filler.len();
+        let near = format!("\\begin{{near}}\n{}", filler.repeat(lines - 1));
+        assert_eq!(open_at_end(&near).as_deref(), Some("near"));
+        let far = format!("\\begin{{far}}\n{}", filler.repeat(lines + 1));
+        assert_eq!(open_at_end(&far), None, "more than the budget up");
+        // A line longer than the budget is read from where it ends, on a character boundary.
+        let long = format!("\\begin{{a}}{}\\begin{{b}}", "é".repeat(OPEN_ENV_SCAN));
+        assert_eq!(open_at_end(&long).as_deref(), Some("b"));
+        let long = format!("\\begin{{a}}{}", "é".repeat(OPEN_ENV_SCAN));
+        assert_eq!(open_at_end(&long), None);
+    }
 
     #[test]
     fn argument_commands() {

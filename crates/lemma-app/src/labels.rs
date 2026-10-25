@@ -70,7 +70,7 @@ pub use rename::{
 pub use scan::{Finding, NameKind};
 
 use crate::document::{DocRef, ObserverId};
-use crate::editor::{Editor, TextPoint, annotations, completion};
+use crate::editor::{Editor, TextPoint, annotations, completion, remove_tag_everywhere};
 use crate::window::WindowState;
 use gtk::prelude::*;
 use lemma_syntax::TokenKind;
@@ -274,8 +274,7 @@ pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     // The buffer can outlive the tab as a closed document's text.
     let buffer = editor.buffer();
     if let Some(tag) = buffer.tag_table().lookup(UNDEFINED_TAG) {
-        let (start, end) = buffer.bounds();
-        buffer.remove_tag(&tag, &start, &end);
+        remove_tag_everywhere(buffer, &tag);
     }
 }
 
@@ -403,8 +402,9 @@ fn underline(labels: &Labels, editor: &Editor) {
     let doc = editor.document();
     let buffer = editor.buffer();
     let tag = undefined_tag(buffer);
-    let (start, end) = buffer.bounds();
-    buffer.remove_tag(&tag, &start, &end);
+    // Where it is: an underline changes the text's size, and GTK lays out again all the text a
+    // removal spans.
+    remove_tag_everywhere(buffer, &tag);
     let findings = findings_for(labels, doc.path());
     if findings.is_empty() || !doc.has_line_states() {
         return;

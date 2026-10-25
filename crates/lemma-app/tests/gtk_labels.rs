@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         ("undefined_references_and_citations", undefined),
         (
             "undefined_follows_edits_saves_and_bibliographies",
@@ -53,7 +53,11 @@ fn main() -> ExitCode {
             "equation_numbers_from_aux_and_following_edits",
             equation_numbers,
         ),
-    ])
+    ];
+    if std::env::args().any(|a| a == "--ignored") {
+        tests.push(("perf_equation_numbers_large_tex", perf_equation_numbers));
+    }
+    common::run(&tests)
 }
 
 fn names(findings: &[Finding]) -> Vec<(String, u32, NameKind)> {
@@ -824,4 +828,105 @@ fn equation_numbers() {
     f.state.set_config(Rc::new(config));
     assert_eq!(annotations::shown(&editor).len(), 4);
     assert_eq!(annotations::shown(&chapter).len(), 1);
+}
+
+/// The inline equation numbers of `tests/fixtures/large.tex` (60k lines) with a label in each of
+/// its 2500 theorems besides the 2500 of its sections, a preamble defining the theorems, and an
+/// `.aux` that numbers all 5000: what one refresh costs when the numbers changed (the text read
+/// again, every label looked up and named), and the main loop's work after a new undefined
+/// reference is underlined.
+fn perf_equation_numbers() {
+    let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
+    let mut text = String::with_capacity(large.len() + (64 << 10));
+    let mut theorems = 0;
+    for line in large.split_inclusive('\n') {
+        text.push_str(line);
+        if line == "\\usepackage{amsmath}\n" {
+            text.push_str("\\newtheorem{theorem}{Theorem}[section]\n\\newtheorem{lemma}{Lemma}\n");
+        } else if line == "\\begin{theorem}\n" {
+            text.push_str(&format!("\\label{{thm:{theorems}}}\n"));
+            theorems += 1;
+        }
+    }
+    let mut aux = String::from("\\relax\n");
+    let mut numbered = 0;
+    for (at, _) in text.match_indices("\\label{") {
+        let name = &text[at + 7..at + 7 + text[at + 7..].find('}').unwrap()];
+        aux.push_str(&format!("\\newlabel{{{name}}}{{{{{numbered}}}{{1}}}}\n"));
+        numbered += 1;
+    }
+    let f = fixture("labels-perf-numbers");
+    std::fs::write(f.path("main.tex"), &text).unwrap();
+    std::fs::write(f.path("main.aux"), &aux).unwrap();
+    let editor = f.open("main.tex");
+    completion::refresh_project(&f.state);
+    let state = f.state.clone();
+    let main = f.path("main.tex");
+    common::pump_until(Duration::from_secs(60), || {
+        let index = state.workspace.index.borrow();
+        !completion::project_busy(&state)
+            && index.aux.labels.len() >= numbered
+            && index
+                .files
+                .iter()
+                .any(|(p, file)| normalize(p) == main && file.labels.len() >= numbered)
+    });
+    labels::check_now(&f.state);
+    assert_eq!(
+        annotations::shown(&editor).len(),
+        numbered,
+        "{theorems} theorems"
+    );
+    let mut times = Vec::new();
+    for i in 0..9 {
+        // A number that is new to the refresh: everything is computed again.
+        f.state
+            .workspace
+            .index
+            .borrow_mut()
+            .aux
+            .labels
+            .insert(format!("perf:{i}"), ("1".to_owned(), "1".to_owned()));
+        let started = Instant::now();
+        annotations::refresh(&f.state, &editor);
+        times.push(started.elapsed());
+    }
+    assert_eq!(annotations::shown(&editor).len(), numbered);
+    times.sort();
+    let median = times[times.len() / 2];
+    // A new undefined reference: the underlines are removed where they are, not from the whole
+    // text (an underline changes the text's size: GTK would lay all of it out again).
+    let context = glib::MainContext::default();
+    let drain = || {
+        let started = Instant::now();
+        while context.pending() {
+            context.iteration(false);
+        }
+        started.elapsed()
+    };
+    drain();
+    let at = offset_of(&editor, "\\end{document}", 0);
+    editor.buffer().insert(
+        &mut editor.iter_near(at).unwrap(),
+        "\\ref{perf:undefined}\n",
+    );
+    common::pump_until(Duration::from_secs(60), || {
+        labels::undefined(&state)
+            .iter()
+            .any(|u| u.name == "perf:undefined")
+    });
+    let underlined = drain();
+    assert_eq!(labels::underlined(&editor).len(), 1);
+    println!(
+        "    equation numbers of {numbered} labels on {} lines: refresh median {median:?}, max \
+         {:?}; a new undefined reference underlined, then the main loop {underlined:?}",
+        editor.buffer().line_count(),
+        times[times.len() - 1]
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(median <= Duration::from_millis(15), "{median:?}");
+        assert!(underlined <= Duration::from_millis(50), "{underlined:?}");
+    }
 }

@@ -10,6 +10,8 @@
 //! `\ProvideDocumentCommand`. (A definition that fails anyway only logs an error before the
 //! formula, which the preview ignores.)
 
+use std::ops::Range;
+
 /// The most text [`definitions`] returns.
 pub const MAX_DEFINITIONS: usize = 64 * 1024;
 /// Longer single definitions are skipped.
@@ -68,7 +70,27 @@ const VERBATIM_ENVS: &[&str] = &[
 /// `\makeatletter`…`\makeatother` (as most definitions that use `@` are written); empty when
 /// there are none. At most [`MAX_DEFINITIONS`] bytes.
 pub fn definitions(text: &str) -> String {
+    scan(text, None)
+}
+
+/// [`definitions`] of `text`, and the byte ranges of `text` they depend on besides its comments
+/// and control words: from the backslash of every definition command and `\begin` to the end of
+/// what the scan read of its arguments (to the end of the text when they did not parse) and of a
+/// verbatim environment, plus one byte (the scan may have looked at the byte after them). In
+/// text order; they can overlap.
+pub(crate) fn watched_definitions(text: &str) -> (String, Vec<Range<usize>>) {
+    let mut spans = Vec::new();
+    let found = scan(text, Some(&mut spans));
+    (found, spans)
+}
+
+fn scan(text: &str, mut spans: Option<&mut Vec<Range<usize>>>) -> String {
     let b = text.as_bytes();
+    let mut watch = |span: Range<usize>| {
+        if let Some(spans) = spans.as_deref_mut() {
+            spans.push(span.start..span.end + 1);
+        }
+    };
     let mut out = String::new();
     let mut i = 0;
     while i < b.len() {
@@ -80,19 +102,26 @@ pub fn definitions(text: &str) -> String {
                     i = (i + 2).min(b.len());
                     continue;
                 }
-                if name == "begin"
-                    && let Some((env, body)) = group(text, skip_space(b, after))
-                    && VERBATIM_ENVS.contains(&env.trim())
-                {
-                    let marker = format!("\\end{{{}}}", env.trim());
-                    i = text[body..]
-                        .find(&marker)
-                        .map_or(b.len(), |k| body + k + marker.len());
-                    continue;
+                if name == "begin" {
+                    let arg = group(text, skip_space(b, after));
+                    if let Some((env, body)) = arg
+                        && VERBATIM_ENVS.contains(&env.trim())
+                    {
+                        let marker = format!("\\end{{{}}}", env.trim());
+                        let end = text[body..]
+                            .find(&marker)
+                            .map_or(b.len(), |k| body + k + marker.len());
+                        watch(i..end);
+                        i = end;
+                        continue;
+                    }
+                    // Its argument could name a verbatim environment.
+                    watch(i..arg.map_or(b.len(), |(_, end)| end));
                 }
                 match COMMANDS.iter().find(|(n, _)| *n == name) {
                     Some((name, shape)) => match parse(text, after, *shape) {
                         Some(end) => {
+                            watch(i..end);
                             if end - i <= MAX_DEFINITION {
                                 let def = rewrite(name, &text[after..end]);
                                 if out.len() + def.len() + 1 > MAX_DEFINITIONS {
@@ -103,7 +132,10 @@ pub fn definitions(text: &str) -> String {
                             }
                             i = end;
                         }
-                        None => i = after,
+                        None => {
+                            watch(i..b.len());
+                            i = after;
+                        }
                     },
                     None => i = after,
                 }
@@ -181,8 +213,12 @@ fn parse(text: &str, i: usize, shape: Shape) -> Option<usize> {
             Some(at)
         }
         Shape::Def => {
+            // (A `\def` at the end of the text has no name.)
+            if b.get(i) != Some(&b'\\') {
+                return None;
+            }
             let (name, after) = control_word(text, i);
-            if b.get(i) != Some(&b'\\') || (name.is_empty() && after <= i + 1) {
+            if name.is_empty() && after <= i + 1 {
                 return None;
             }
             // Parameter text: anything up to the body's brace (not across a blank line).
@@ -408,6 +444,16 @@ mod tests {
         assert_eq!(defs(text), ["\\providecommand{\\b}{B}"]);
         let text = "\\newcommand{a}{A}\n\\newcommand{\\b}{B}\n";
         assert_eq!(defs(text), ["\\providecommand{\\b}{B}"]);
+        // The text ends in the middle of a definition (it is being typed).
+        for text in [
+            "\\def",
+            "x \\def  ",
+            "\\let",
+            "\\newcommand",
+            "\\newcommand{\\a}",
+        ] {
+            assert_eq!(definitions(text), "", "{text:?}");
+        }
     }
 
     #[test]

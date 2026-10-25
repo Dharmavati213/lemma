@@ -147,12 +147,33 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   kept the main thread busy for about 25 ms (over 50 ms at times), which made typing and
   scrolling stutter while the answer streamed; it now takes about 0.5 ms. A selection in the
   table is no longer lost while it streams.
+- The live math preview's card no longer makes GTK lay out the whole document again each time
+  it appears, moves or goes away, and neither do the underlines of undefined references, build
+  problems and chktex findings when they change, nor deciding a hunk. Each of these removed a
+  tag from the whole text, which on a 60k-line document kept the main thread busy for about
+  1.2 s afterwards (typing and scrolling stuttered meanwhile); it now takes under 1 ms.
+- Typing the name after `\end{` no longer copies the whole document on every key to find the
+  environment that is open: the proposals take 0.1 ms instead of 3.5 ms on a 60k-line
+  document.
+- The math hover and the live preview read a document's preamble and definitions again only
+  after an edit that could change them (in the preamble or a definition, or one that types or
+  deletes a backslash, a `%` or a line break), not after every edit: on a 60k-line document,
+  the preview after typing other text costs under 0.5 ms instead of 5 ms.
+- Inline equation numbers look each label up once: a refresh of a 60k-line document with 5000
+  labels takes 8 ms instead of 49 ms. The Unused dialog names its labels the same way.
+- With thousands of hunks in a file (a Format Document, a project-wide replace), the review
+  overlay re-tags only what moved: with 3000 hunks, its update after a recompute takes 10 ms
+  instead of 85 ms, and after a line break above them 36 ms instead of 0.34 s.
 
 ### Fixed
 
 - An editor that went away with its hover popover still on it no longer hangs Lemma in an
   endless loop of "GtkPopover is not a child of LemmaTexView" warnings (seen with GTK's own
   input method, when no IBus or Fcitx module is installed).
+- Hovering a formula, or the live preview, in a document whose text ends with `\def` (or
+  `\gdef`, `\edef`, `\xdef`), as while one is typed at the end of a file, made Lemma quit.
+- The math hover and the live preview of a file closed, changed on disk and opened again no
+  longer use the preamble and definitions of the text it had before.
 - With an input method that composes text (Japanese, Chinese or Korean input through IBus,
   Fcitx, macOS or Windows; dead keys), Enter in the agent's prompt box confirms the conversion
   instead of sending the prompt without the text being composed. Up, Down, Tab and Escape go to

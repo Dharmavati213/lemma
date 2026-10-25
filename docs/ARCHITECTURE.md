@@ -196,7 +196,7 @@ Rules:
 - **Painting.** `TexView::snapshot_layer(AboveText)` calls `review_overlay::paint`. For each visible hunk it paints an opaque base, then a red tint, then the layout.
   - Deleted words are drawn with a darker red `AttrList` background.
   - From M2 the layout also carries syntax colours from `lemma-syntax` tokens.
-  - Layouts are cached per (HunkId, width, scheme).
+  - Layouts are cached by content (the deleted text and words, the width, the scheme and the syntax context), not by `HunkId`: typing inside a hunk does not lay its deleted text out again.
 - **Action bars.** A pool of 8 `ReviewBar` overlays (`Accept ⌥Y · Reject ⌥N · 3/7`) is placed with `add_overlay`/`move_overlay` in the header band of hunks near `visible_rect`. Positions are recomputed in an idle callback after the vertical adjustment's `changed` or `value-changed`, after a recompute, and after a resize. **Buttons never cover text.**
 - **`ReviewGutter`** (subclass of `GutterRenderer`):
   - draws line numbers aligned to the text baseline (`iter_location().y` → `buffer_to_window_coords(Left)`); stock line numbers are turned off;

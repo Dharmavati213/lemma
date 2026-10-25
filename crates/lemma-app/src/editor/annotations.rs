@@ -28,8 +28,10 @@ use super::Editor;
 use crate::document::ObserverId;
 use crate::labels::scan;
 use crate::window::WindowState;
+use lemma_syntax::{FileIndex, Label, ProjectIndex};
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
@@ -238,20 +240,45 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
         }
         out
     });
+    let wanted = numbers_for(&index, file.as_deref(), labels);
+    drop(index);
+    show(&numbers, wanted);
+}
+
+/// The numbers shown for `labels`, the `\label`s of a file's live text ((0-based line, name) in
+/// line order), with `file` its entry in the project index: the annotation of each label that
+/// the `.aux` numbers, from what it labels (from `file`, else from wherever the project has it),
+/// those of one line joined with " · ". Each lookup goes through maps built once, so a file
+/// with thousands of labels costs no more per label than one with a few.
+pub fn numbers_for(
+    index: &ProjectIndex,
+    file: Option<&FileIndex>,
+    labels: Vec<(u32, String)>,
+) -> Vec<(u32, String)> {
+    // The file's labels by name (the first of a name, as a search finds it); the project's only
+    // for a label that is not in the file.
+    let mut own: HashMap<&str, &Label> = HashMap::new();
+    for label in file.iter().flat_map(|f| &f.labels) {
+        own.entry(label.name.as_str()).or_insert(label);
+    }
+    let mut project = None;
+    let namer = scan::LabelNamer::new(index);
     let mut wanted: Vec<(u32, String)> = Vec::new();
     for (line, name) in labels {
         if !index.aux.labels.contains_key(&name) {
             continue;
         }
-        // What it labels: from this file's index entry, else wherever the project has it.
-        let found = file
-            .as_ref()
-            .and_then(|f| f.labels.iter().find(|l| l.name == name).map(|l| (&**f, l)))
-            .or_else(|| scan::find_label(&index, &name).map(|(_, f, l)| (f, l)));
+        let found = match (file, own.get(name.as_str())) {
+            (Some(file), Some(label)) => Some((file, *label)),
+            _ => project
+                .get_or_insert_with(|| scan::labels_by_name(index))
+                .get(name.as_str())
+                .map(|&(_, file, label)| (file, label)),
+        };
         let Some((file_index, label)) = found else {
             continue;
         };
-        let Some(text) = scan::label_info(&index, file_index, label).annotation() else {
+        let Some(text) = namer.info(file_index, label).annotation() else {
             continue;
         };
         match wanted.last_mut() {
@@ -262,11 +289,59 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
             _ => wanted.push((line, text)),
         }
     }
-    drop(index);
-    show(&numbers, wanted);
+    wanted
 }
 
 /// The numbers `editor` shows: (0-based line, text) by line (tests).
 pub fn shown(editor: &Editor) -> Vec<(u32, String)> {
     lookup(editor).map_or_else(Vec::new, |n| n.shown.borrow().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lemma_syntax::index_file;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[test]
+    fn numbers_of_labels_by_line() {
+        let main = "\\documentclass{article}\n\\newtheorem{theorem}{Theorem}[section]\n\
+                    \\begin{document}\n\\section{Intro}\\label{sec:intro}\n\
+                    \\begin{theorem}\\label{thm:main}\nT\n\\end{theorem}\n\
+                    \\begin{align}\na \\label{eq:a}\\\\ b \\label{eq:b}\n\\end{align}\n\
+                    \\label{none}\n\\input{ch}\n\\end{document}\n";
+        let mut index = ProjectIndex::default();
+        index.update_file(PathBuf::from("/p/main.tex"), Arc::new(index_file(main)));
+        index.update_file(
+            PathBuf::from("/p/ch.tex"),
+            Arc::new(index_file("\\section{Chapter}\\label{sec:ch}\n")),
+        );
+        index.aux = lemma_syntax::parse_aux(
+            "\\newlabel{sec:intro}{{1}{1}}\n\\newlabel{thm:main}{{1.1}{1}}\n\
+             \\newlabel{eq:a}{{1}{1}}\n\\newlabel{eq:b}{{2}{1}}\n\\newlabel{sec:ch}{{2}{2}}\n",
+        );
+        let file = index.files[&PathBuf::from("/p/main.tex")].clone();
+        // The live text: the labels of the index plus one only the project knows (`sec:ch`
+        // moved here since the last indexing) and one the build did not number.
+        let labels = vec![
+            (3, "sec:intro".to_owned()),
+            (4, "thm:main".to_owned()),
+            (8, "eq:a".to_owned()),
+            (8, "eq:b".to_owned()),
+            (10, "none".to_owned()),
+            (11, "sec:ch".to_owned()),
+        ];
+        assert_eq!(
+            numbers_for(&index, Some(&file), labels.clone()),
+            vec![
+                (3, "§1".to_owned()),
+                (4, "1.1".to_owned()),
+                (8, "(1) · (2)".to_owned()),
+                (11, "§2".to_owned()),
+            ]
+        );
+        // Without the file's entry, everything comes from the project.
+        assert_eq!(numbers_for(&index, None, labels).len(), 4);
+    }
 }

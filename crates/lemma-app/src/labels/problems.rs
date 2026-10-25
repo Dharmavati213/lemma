@@ -332,6 +332,9 @@ fn present(state: &Rc<WindowState>, found: Vec<Finding>) {
     } else {
         let page = adw::PreferencesPage::new();
         let index = state.workspace.index.borrow();
+        // Looked up once for all the findings.
+        let defined = scan::labels_by_name(&index);
+        let namer = scan::LabelNamer::new(&index);
         for (title, items, description) in [
             (
                 "Labels",
@@ -353,8 +356,9 @@ fn present(state: &Rc<WindowState>, found: Vec<Finding>) {
                 .build();
             for finding in items.iter() {
                 let what = match finding.kind {
-                    NameKind::Label => scan::find_label(&index, &finding.name)
-                        .map(|(_, file, label)| scan::label_info(&index, file, label).title()),
+                    NameKind::Label => defined
+                        .get(finding.name.as_str())
+                        .map(|&(_, file, label)| namer.info(file, label).title()),
                     NameKind::Cite => {
                         scan::find_entry(&index, &finding.name).map(|(_, entry)| entry.kind.clone())
                     }

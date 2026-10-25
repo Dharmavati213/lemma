@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         ("golden_snapshots", golden_snapshots),
         ("accept_keeps_the_file_on_disk", accept_keeps_disk),
         ("reject_restores_the_baseline_and_saves", reject_restores),
@@ -62,9 +62,14 @@ fn main() -> ExitCode {
         ("banner_summary_and_changes_panel", banner_and_panel),
         ("reading_mode_shrinks_bands", reading_mode),
         ("gutter_numbers_follow_the_text", gutter_alignment),
+        ("a_pasted_anchor_line_reserves_nothing", pasted_anchor_line),
         ("emptied_file_draws_above_the_first_line", emptied_file),
         ("binary_apply_as_agent_and_demo", binary_runs),
-    ])
+    ];
+    if std::env::args().any(|a| a == "--ignored") {
+        tests.push(("perf_review_many_hunks", perf_many_hunks));
+    }
+    common::run(&tests)
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -1179,6 +1184,151 @@ fn gutter_alignment() {
     let (line_y, _) = view.line_yrange(&iter);
     let text_y = view.iter_location(&iter).y();
     assert_eq!(text_y - line_y, review.header_height() + block.deleted);
+}
+
+/// 3000 one-line hunks in a 9000-line file (an agent changed every third line, as a Format
+/// Document or a project-wide replace can): the overlay's sync after each recompute (the plan,
+/// the cached layouts of the deleted lines, the tags), after typing and after a line break that
+/// moves the hunks, the gutter's marks in a frame, and accepting a hunk.
+fn perf_many_hunks() {
+    let base = lines(9000);
+    let new: String = base
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i % 3 == 1 {
+                format!("{line} changed\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    let f = fixture("perf-hunks", &[("big.tex", &base)]);
+    let editor = f.open("big.tex");
+    let started = Instant::now();
+    f.write("big.tex", &new);
+    let first = started.elapsed();
+    assert_eq!(f.hunks("big.tex").len(), 3000);
+    let view = editor.view().clone();
+    let review = view.review_state().expect("review rendering is attached");
+    let doc = f.doc("big.tex");
+    f.frames(1);
+    let mut syncs = Vec::new();
+    for _ in 0..10 {
+        let started = Instant::now();
+        review.sync();
+        syncs.push(started.elapsed());
+    }
+    let mut recomputes = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        review_ui::recompute(&doc);
+        recomputes.push(started.elapsed());
+    }
+    // Typing outside the hunks, and the recompute after the pause (the hunks stay where they
+    // are); then a line break, which moves every hunk below it.
+    let buffer = editor.buffer();
+    let (mut typed, mut broken) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        buffer.insert(&mut buffer.iter_at_line(4500).unwrap(), "x");
+        let started = Instant::now();
+        review_ui::recompute(&doc);
+        typed.push(started.elapsed());
+    }
+    for _ in 0..3 {
+        buffer.insert(&mut buffer.iter_at_line(4500).unwrap(), "\n");
+        let started = Instant::now();
+        review_ui::recompute(&doc);
+        broken.push(started.elapsed());
+    }
+    assert_eq!(f.hunks("big.tex").len(), 3000);
+    // The middle of the file, where every drawn line looks up its marks.
+    let adjustment = view.vadjustment().unwrap();
+    adjustment.set_value((adjustment.upper() - adjustment.page_size()) / 2.0);
+    f.frames(2);
+    let gutter = sourceview5::prelude::ViewExt::gutter(&view, gtk::TextWindowType::Left);
+    let parent = gutter.parent().expect("the gutter is in the view");
+    let mut gutters = Vec::new();
+    for _ in 0..20 {
+        // Drawn again, not the nodes of the last frame: the gutter and its renderers.
+        gutter.queue_draw();
+        let mut child = gutter.first_child();
+        while let Some(renderer) = child {
+            renderer.queue_draw();
+            child = renderer.next_sibling();
+        }
+        let started = Instant::now();
+        let snapshot = gtk::Snapshot::new();
+        parent.snapshot_child(&gutter, &snapshot);
+        drop(snapshot.to_node());
+        gutters.push(started.elapsed());
+    }
+    let median = |mut times: Vec<Duration>| {
+        times.sort();
+        times[times.len() / 2]
+    };
+    let (sync, recompute, gutter) = (median(syncs), median(recomputes), median(gutters));
+    let (typed, broken) = (median(typed), median(broken));
+    // Accepting the last hunk: the plan has one anchor fewer, whose tag leaves the text.
+    let context = glib::MainContext::default();
+    let drain = || {
+        let started = Instant::now();
+        while context.pending() {
+            context.iteration(false);
+        }
+        started.elapsed()
+    };
+    drain();
+    let last = *f.ids("big.tex").last().unwrap();
+    let started = Instant::now();
+    review_ui::decide_hunks(&f.state, &doc, &[last], Decision::Accept);
+    let decided = started.elapsed();
+    let relaid = drain();
+    assert_eq!(f.hunks("big.tex").len(), 2999);
+    println!(
+        "    3000 hunks: the agent's write {first:?}; sync median {sync:?}; recompute (with the \
+         sync) median {recompute:?}, after typing {typed:?}, after a line break {broken:?}; \
+         gutter snapshot median {gutter:?}; accepting one {decided:?}, then the main loop \
+         {relaid:?}"
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(sync <= Duration::from_millis(15), "sync {sync:?}");
+        assert!(typed <= Duration::from_millis(40), "after typing {typed:?}");
+        assert!(gutter <= Duration::from_millis(1), "gutter {gutter:?}");
+    }
+}
+
+/// A paste copies the tags of the text it copies (GTK does, within a buffer): the copy of a
+/// hunk's anchor line must not reserve the hunk's space a second time once the overlay syncs.
+fn pasted_anchor_line() {
+    let f = fixture("paste", &[("main.tex", &lines(20))]);
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "line 5\n", "line five\n");
+    f.frames(2);
+    let view = editor.view().clone();
+    let buffer = editor.buffer();
+    let reserved = |line: i32| {
+        let iter = buffer.iter_at_line(line).unwrap();
+        view.iter_location(&iter).y() - view.line_yrange(&iter).0
+    };
+    let band = reserved(4);
+    assert!(band > 0, "the hunk's band and deleted line");
+    // As a paste of the anchor line below the hunk (typing there makes no hunk).
+    let start = buffer.iter_at_line(4).unwrap();
+    let mut end = start;
+    end.forward_line();
+    buffer.insert_range(&mut buffer.iter_at_line(15).unwrap(), &start, &end);
+    assert_eq!(f.hunks("main.tex").len(), 1);
+    review_ui::recompute(&f.doc("main.tex"));
+    f.frames(2);
+    assert_eq!(reserved(4), band, "the hunk keeps its space");
+    assert_eq!(reserved(15), 0, "the pasted line reserves none");
+    // Nor is it green.
+    let added = buffer.tag_table().lookup("lemma-review-added").unwrap();
+    assert!(buffer.iter_at_line(4).unwrap().has_tag(&added));
+    assert!(!buffer.iter_at_line(15).unwrap().has_tag(&added));
 }
 
 fn emptied_file() {

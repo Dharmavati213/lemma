@@ -365,6 +365,7 @@ check the budgets only in release builds:
 | `gtk_typing` `perf_typing_keys` | typing-helper keys on a 5k-line document ≤ 2 ms p99 |
 | `gtk_typing` `perf_typing_large_tex` | Enter and `\end` keys (which scan environments) on `large.tex` ≤ 2 ms p90 |
 | `gtk_completion` `perf_completion_keystroke` | keystroke to frame with completion, autosnippets and highlighting on a 5k-line document ≤ 8 ms p99 |
+| `gtk_completion` `perf_completion_end_large_tex` | the proposals after each key of `\end{equation` near the end of `large.tex` (they look for the open environment) ≤ 3 ms p90 (measured 0.1 ms; 3.7 ms when each key copied the document) |
 | `lemma-complete` `perf_complete` | completion ≤ 3 ms p99 with all tables and a 7k-line project index |
 | `lemma-complete` `perf_word_list_project` | the words of a generated 300-file project (120k lines, 26k words) added at once: linear, twice the files ≤ 2.5× the time (measured 0.16–0.19 s; 0.7–0.9 s when each file re-sorted and copied the list) |
 | `agent::markdown` `perf_render_long_message` | re-rendering a streaming 100 kB answer ≤ 2 ms per frame |
@@ -388,6 +389,9 @@ check the budgets only in release builds:
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 | `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
+| `gtk_math_preview` `perf_math_preview_large_tex` | on `large.tex` with the live preview (needs `pdflatex`): the main loop's work after the card appears or goes away ≤ 20 ms median (measured under 0.5 ms; 1.2 s while its tag was removed from the whole text, which GTK lays out again), and the hover of a rendered formula right after a one-character edit ≤ 2 ms median |
+| `gtk_labels` `perf_equation_numbers_large_tex` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`: a refresh ≤ 15 ms median (measured 8 ms; 49 ms with a search per label), and the main loop's work after a new undefined reference is underlined ≤ 50 ms |
+| `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms; prints a line break above the hunks and accepting one (with the main loop's work after it) |
 
 `perf_completion_keystroke` lays the document out before it measures and reports the window
 frames Broadway renders meanwhile separately (about 40–50 ms each in software, about once a

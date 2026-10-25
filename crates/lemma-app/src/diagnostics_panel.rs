@@ -30,7 +30,7 @@
 //! a quick fix applied as reviewable hunks.
 
 use crate::document::{DocRef, Document, ObserverId};
-use crate::editor::Editor;
+use crate::editor::{Editor, remove_tag_everywhere};
 use crate::window::{PAGE_PROBLEMS, WindowState};
 use crate::workspace::normalize;
 use adw::prelude::*;
@@ -1089,8 +1089,10 @@ impl Inner {
             WARNING_TAG,
             gtk::gdk::RGBA::new(0.90, 0.65, 0.04, 1.0),
         );
-        buffer.remove_tag(&error_tag, &start, &end);
-        buffer.remove_tag(&warning_tag, &start, &end);
+        // Where they are: an underline changes the text's size, and GTK lays out again all the
+        // text a removal spans.
+        remove_tag_everywhere(buffer, &error_tag);
+        remove_tag_everywhere(buffer, &warning_tag);
         let path = normalize(editor.document().path());
         let problems = self.problems.borrow();
         let lines = self.lines.borrow();
@@ -2314,8 +2316,7 @@ impl Inner {
                     tag
                 }
             };
-            let (start, end) = buffer.bounds();
-            buffer.remove_tag(&tag, &start, &end);
+            remove_tag_everywhere(buffer, &tag);
             let Some(file) = file else {
                 continue;
             };

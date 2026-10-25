@@ -84,6 +84,7 @@ fn main() -> ExitCode {
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_completion_keystroke", perf_keystroke));
+        tests.push(("perf_completion_end_large_tex", perf_end_large));
     }
     common::run(&tests)
 }
@@ -1398,6 +1399,63 @@ fn perf_keystroke() {
     } else {
         assert!(p99 <= Duration::from_millis(8), "p99 {p99:?} over 8 ms");
     }
+}
+
+/// `\end{equation` typed by hand near the end of `tests/fixtures/large.tex` (60k lines): the
+/// proposals after each key, which look for the environment open at the cursor.
+fn perf_end_large() {
+    let dir = project("perf-end");
+    std::fs::copy(common::fixtures().join("large.tex"), dir.join("large.tex")).unwrap();
+    let f = fixture_at(&dir, "large.tex", false);
+    let doc = f.editor.document().clone();
+    common::pump_until(TIMEOUT, || doc.has_line_states());
+    let buffer = f.buffer().clone();
+    let at = f.text().rfind("\\end{document}").unwrap();
+    buffer.place_cursor(&f.editor.iter_near(at).unwrap());
+    buffer.insert_at_cursor("\\begin{equation}\n  a = b\n\n");
+    let mut cursor = buffer.iter_at_mark(&buffer.get_insert());
+    cursor.backward_char();
+    buffer.place_cursor(&cursor);
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+        for c in "\\end{equation".chars() {
+            buffer.insert_at_cursor(&c.to_string());
+            let started = Instant::now();
+            let items = completion::items_at_cursor(&f.state, &f.editor);
+            let took = started.elapsed();
+            if c != '\\' && argument_typed(&buffer) {
+                times.push(took);
+                assert_eq!(items.first().map(|i| i.label.as_str()), Some("equation"));
+            }
+        }
+        let mut start = buffer.iter_at_line(line).unwrap();
+        let mut end = start;
+        end.forward_to_line_end();
+        buffer.delete(&mut start, &mut end);
+    }
+    times.sort();
+    let p = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    let (p50, p90) = (p(0.5), p(0.9));
+    println!(
+        "    proposals after `\\end{{` on {} lines ({} keys): p50 {p50:?}, p90 {p90:?}, max {:?}",
+        buffer.line_count(),
+        times.len(),
+        times[times.len() - 1]
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(p90 <= Duration::from_millis(3), "p90 {p90:?} over 3 ms");
+    }
+}
+
+/// True when the cursor is in the argument of `\end{`.
+fn argument_typed(buffer: &sourceview5::Buffer) -> bool {
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let mut start = cursor;
+    start.set_line_offset(0);
+    buffer.slice(&start, &cursor, true).contains("\\end{")
 }
 
 /// `\end{` closes whatever is open, also an environment that starts math, offered first; a name

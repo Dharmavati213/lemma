@@ -512,6 +512,42 @@ fn run_after_paint(widget: &gtk::Widget, run: Rc<dyn Fn()>) {
     widget.queue_draw();
 }
 
+/// Removes `tag` from the ranges it covers, found by walking its toggles. GTK lays out again
+/// all the text that a `remove_tag` spans when the tag changes the text's size (line spacing,
+/// underlines, fonts), whether or not the tag is there: one `remove_tag` over the whole buffer
+/// costs about a second of layout at 60k lines, this costs little for a tag on a few ranges.
+pub fn remove_tag_everywhere(buffer: &impl IsA<gtk::TextBuffer>, tag: &gtk::TextTag) {
+    let buffer = buffer.as_ref();
+    let mut ranges = Vec::new();
+    let mut iter = buffer.start_iter();
+    while iter.starts_tag(Some(tag)) || iter.forward_to_tag_toggle(Some(tag)) {
+        let start = iter.offset();
+        iter.forward_to_tag_toggle(Some(tag));
+        ranges.push((start, iter.offset()));
+        if iter.is_end() {
+            break;
+        }
+    }
+    // Removing a tag changes no offsets.
+    for (start, end) in ranges {
+        buffer.remove_tag(
+            tag,
+            &buffer.iter_at_offset(start),
+            &buffer.iter_at_offset(end),
+        );
+    }
+}
+
+/// Takes the line-spacing tag `tag` out of `buffer`'s text and tag table. GTK lays out the
+/// whole text again when a tag that changes the text's size leaves the table, even one that
+/// covers nothing (about half a second at 60k lines), so the tag's spacing is unset first.
+pub fn remove_spacing_tag(buffer: &impl IsA<gtk::TextBuffer>, tag: &gtk::TextTag) {
+    remove_tag_everywhere(buffer, tag);
+    tag.set_property("pixels-above-lines-set", false);
+    tag.set_property("pixels-below-lines-set", false);
+    buffer.as_ref().tag_table().remove(tag);
+}
+
 impl Drop for Editor {
     fn drop(&mut self) {
         // Detach Vim while the view is certainly alive: a VimIMContext finalized after its view
