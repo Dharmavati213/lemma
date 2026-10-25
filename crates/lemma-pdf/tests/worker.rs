@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use async_channel::{Receiver, TryRecvError};
 use lemma_pdf::{
     LinkDest, PageKey, PdfCmd, PdfEvent, PdfHandle, RenderReq, Rendered, page_pixels, tile_grid,
-    tile_rect,
+    tile_rect, tiles_covering,
 };
 
 const LETTER: (f64, f64) = (612.0, 792.0);
@@ -267,8 +267,10 @@ fn failed_open_keeps_the_current_document() {
 #[test]
 fn large_pages_are_rendered_as_tiles() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
-    // 3x letter is 17.4 MB, over the 16 MiB threshold: the whole-page request becomes 4x5 tiles.
+    // 3x letter is 17.4 MB, over the 16 MiB threshold: the whole-page request becomes 5
+    // full-width bands.
     let (cols, rows) = tile_grid(LETTER, 24).expect("3x letter is tiled");
+    assert_eq!((cols, rows), (1, 5));
     pdf.send(want([key(1, 2, 24)]));
     let (w, h) = page_pixels(LETTER, 24);
     let mut area = 0i64;
@@ -278,6 +280,7 @@ fn large_pages_are_rendered_as_tiles() {
             assert_eq!(r.key.tile, Some((col, row)));
             let (x, y, tw, th) = tile_rect(LETTER, 24, (col, row));
             assert_eq!((r.width, r.height), (tw, th));
+            assert_eq!(tw, w, "a full-width band");
             assert!(x + tw <= w && y + th <= h);
             assert_eq!(r.data.len(), r.stride as usize * r.height as usize);
             area += i64::from(r.width) * i64::from(r.height);
@@ -285,17 +288,18 @@ fn large_pages_are_rendered_as_tiles() {
     }
     assert_eq!(area, i64::from(w) * i64::from(h));
 
-    // An explicit tile matches the same region of the full-page bitmap.
+    // An explicit tile (the lower of 2x letter's two bands) matches the same region of the
+    // full-page bitmap.
     let tile = PageKey {
-        tile: Some((1, 1)),
+        tile: Some((0, 1)),
         ..key(1, 4, 16)
     };
     pdf.send(want([key(1, 4, 16), tile]));
     let full = rendered(&rx);
     let part = rendered(&rx);
     assert_eq!(part.key, tile);
-    assert_eq!((part.width, part.height), (512, 512));
-    let diff = tile_diff(&full, &part, 512, 512);
+    assert_eq!((part.width, part.height), (1224, 792));
+    let diff = tile_diff(&full, &part, 0, 792);
     assert!(
         diff < 0.5,
         "tile differs from the full page by {diff}/255 per byte"
@@ -485,4 +489,133 @@ fn perf_render() {
     eprintln!("perf_render: {per_page:.2} ms per stress page at 2x");
     assert!(per_page < 15.0, "{per_page:.2} ms per page");
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
+}
+
+/// Renders the regions `rects` (device pixels) of `page` at `scale` as the PDF thread renders a
+/// tile: each on a white surface of its own, through a translated and scaled context.
+fn render_regions(page: &poppler::Page, scale: f64, rects: &[(i32, i32, i32, i32)]) {
+    for &(x, y, w, h) in rects {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.paint().unwrap();
+        cr.translate(-f64::from(x), -f64::from(y));
+        cr.scale(scale, scale);
+        page.render(&cr);
+        cr.status().unwrap();
+    }
+}
+
+/// The 512² squares that tiled a `w × h` px page before, under the region `(x, y, width, height)`
+/// of it.
+fn squares_under(
+    w: i32,
+    h: i32,
+    (x, y, width, height): (i32, i32, i32, i32),
+) -> Vec<(i32, i32, i32, i32)> {
+    let (x0, y0) = (x / 512 * 512, y / 512 * 512);
+    (y0..(y + height).min(h))
+        .step_by(512)
+        .flat_map(|ty| {
+            (x0..(x + width).min(w))
+                .step_by(512)
+                .map(move |tx| (tx, ty, 512.min(w - tx), 512.min(h - ty)))
+        })
+        .collect()
+}
+
+/// A page too large for one bitmap costs a poppler pass over its whole content per tile, so its
+/// full-width bands must cost well under the 512² tiles that tiled it before. The stress pages at
+/// scale_q 26 (1989 × 2574 px, a fit-width page on a HiDPI pane about 1000 px wide), measured on
+/// a loaded machine: 5 bands 23–29 ms, 24 tiles 77–93 ms, the whole page 10–12 ms. Zoomed in far
+/// (scale_q 96, 7344 × 9504 px), the tiles of about 1024² under a 1800 × 2000 px view must cost
+/// well under the 512² ones too: 9 tiles (33 MiB) 31–34 ms, 25 tiles (25 MiB) 77–78 ms.
+#[test]
+#[ignore = "perf: run with cargo test --release -- --ignored perf"]
+fn perf_tiled_page() {
+    const Q: u16 = 26;
+    let (pdf, rx, sizes) = open("pdf/stress.pdf", 1);
+    let n = sizes.len() as u32;
+    let (cols, rows) = tile_grid(LETTER, Q).expect("tiled at scale_q 26");
+    let bands = usize::from(cols) * usize::from(rows);
+    // Warm up fonts and caches.
+    pdf.send(want([key(1, 0, Q)]));
+    for _ in 0..bands {
+        rendered(&rx);
+    }
+    // Through the PDF thread, which answers a whole-page request with the page's bands.
+    let t = Instant::now();
+    pdf.send(want((0..n).map(|p| key(1, p, Q))));
+    for _ in 0..n as usize * bands {
+        rendered(&rx);
+    }
+    let banded = t.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+    assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
+
+    // The same pages with poppler as the PDF thread calls it: whole, and in 512² tiles.
+    let bytes = glib::Bytes::from_owned(std::fs::read(fixture("pdf/stress.pdf")).unwrap());
+    let doc = poppler::Document::from_bytes(&bytes, None).unwrap();
+    let time = |q: u16, rects: &[(i32, i32, i32, i32)]| {
+        let t = Instant::now();
+        for p in 0..n as i32 {
+            render_regions(&doc.page(p).unwrap(), lemma_pdf::scale_of(q), rects);
+        }
+        t.elapsed().as_secs_f64() * 1e3 / f64::from(n)
+    };
+    let (w, h) = page_pixels(LETTER, Q);
+    let squares = squares_under(w, h, (0, 0, w, h));
+    render_regions(
+        &doc.page(0).unwrap(),
+        lemma_pdf::scale_of(Q),
+        &[(0, 0, w, h)],
+    );
+    let whole = time(Q, &[(0, 0, w, h)]);
+    let tiled = time(Q, &squares);
+    eprintln!(
+        "perf_tiled_page: a {w} × {h} px stress page in {bands} bands {banded:.1} ms, in {} tiles \
+         of 512² {tiled:.1} ms, whole {whole:.1} ms",
+        squares.len()
+    );
+    assert_eq!((bands, squares.len()), (5, 24));
+    assert!(
+        banded * 2.0 < tiled,
+        "{bands} bands {banded:.1} ms, {} tiles {tiled:.1} ms",
+        squares.len()
+    );
+
+    // Zoomed in far: a 900 × 1000 view at device scale 2 in the middle of the page, off the
+    // edges of tiles and squares.
+    const ZOOMED_Q: u16 = 96;
+    let (w, h) = page_pixels(LETTER, ZOOMED_Q);
+    let view = ((w - 1800) / 2 + 37, (h - 2000) / 2 + 41, 1800, 2000);
+    let tiles: Vec<(i32, i32, i32, i32)> = tiles_covering(LETTER, ZOOMED_Q, view)
+        .expect("tiled at scale_q 96")
+        .into_iter()
+        .map(|tile| tile_rect(LETTER, ZOOMED_Q, tile))
+        .collect();
+    let squares = squares_under(w, h, view);
+    let mib = |rects: &[(i32, i32, i32, i32)]| {
+        rects
+            .iter()
+            .map(|r| f64::from(r.2) * f64::from(r.3) * 4.0)
+            .sum::<f64>()
+            / f64::from(1 << 20)
+    };
+    let zoomed = time(ZOOMED_Q, &tiles);
+    let zoomed_squares = time(ZOOMED_Q, &squares);
+    eprintln!(
+        "perf_tiled_page: a 1800 × 2000 px view of a {w} × {h} px stress page in {} tiles \
+         ({:.0} MiB) {zoomed:.1} ms, in {} tiles of 512² ({:.0} MiB) {zoomed_squares:.1} ms",
+        tiles.len(),
+        mib(&tiles),
+        squares.len(),
+        mib(&squares)
+    );
+    assert_eq!((tiles.len(), squares.len()), (9, 25));
+    assert!(
+        zoomed * 1.5 < zoomed_squares,
+        "{} tiles {zoomed:.1} ms, {} tiles of 512² {zoomed_squares:.1} ms",
+        tiles.len(),
+        squares.len()
+    );
 }

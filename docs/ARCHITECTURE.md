@@ -319,7 +319,7 @@ Rules:
 - **PdfView** is one custom widget implementing `gtk::Scrollable`; there is no widget per page.
   - **Layout:** continuous scrolling, fit-width by default.
   - **Zoom:** Ctrl+wheel or `GestureZoom`, anchored at the pointer. Existing textures are stretched immediately and re-rendered after 120 ms idle at `scale_q = round(zoom × surface.scale() × 8)`. `Surface::scale()` (v4_12) exists [S]. The user's eDP-1 runs at scale 1; fractional scales are **[U]**.
-  - **Tiles:** pages larger than 16 MB are rendered as 512² tiles.
+  - **Tiles:** pages larger than 16 MB are rendered in tiles of at most 4 MiB: full-width bands, or squares of about 1024² on a page over 4096 px wide (§11, PDF view, 2026-10-25).
   - **Render queue:** visible pages from the centre outward, then ±1 page. Older generations are dropped.
   - **Textures:** `glib::Bytes::from_owned` → `MemoryTexture` (B8g8r8a8Premultiplied), with no copy [V].
   - **Cache:** a `ByteLru` capped at 48 MiB.
@@ -1388,6 +1388,24 @@ they conflict with the sections above, this section wins.
   - The view's own keys gain Ctrl+1 (100%), and Left and Right, `h` and `l` (sideways, taken
     also when there is nothing to scroll). They work only while the view has the focus, which no
     editor's Vim sees; Ctrl+1 is no accelerator (`gtk_shell_m3` checks it), like Ctrl+0.
+  - **Tiles** (§6): a page over the 16 MiB threshold (or cairo's 32 767 px) is rendered in
+    equally tall full-width bands of at most `TILE_BYTES` (4 MiB) instead of 512² tiles. Each
+    tile is a poppler pass over the page's whole content stream (cairo clips the drawing), so
+    fewer, larger tiles cost far less: a stress.pdf page at scale_q 26 (1989 × 2574 px, fit
+    width in a HiDPI pane about 1000 px wide) takes 23–29 ms in its 5 bands, 77–93 ms in 24
+    tiles of 512² and 10–12 ms whole (`lemma-pdf` `perf_tiled_page`, on a loaded machine). A
+    page wider than `MAX_TILE_WIDTH` (4096 px) is zoomed in far and shows only part of its
+    width, so it is cut into equal tiles of about 1024² (4 MiB) instead: a 1800 × 2000 px view
+    in the middle of a stress page at scale_q 96 (7344 × 9504 px) takes 9 of them (33 MiB) and
+    31–34 ms, where 25 tiles of 512² (25 MiB) took 77–78 ms and bands up to 4096 px wide 16
+    tiles (63 MiB, more than the default cache) and 52 ms.
+    `TILE_SIZE` is gone: `tile_size` gives a tiled page's tile size and `tiles_covering` the
+    tiles under a region of its bitmap (the hover crops use it); tiles keep that shape at every
+    scale, so an explicit tile of a page that is not tiled can still be rendered. The view asks
+    for the visible bands, then for the band that scrolling down shows next while it fits in
+    the cache (`geometry::tiles_below`: the next band of the last visible page or, once its last
+    band is in view, the first of the page after it), then for the whole pages ahead; tiled
+    pages were never rendered ahead before. Pages under the threshold are one bitmap as before.
 
 ## 12. macOS (2026-10-19)
 

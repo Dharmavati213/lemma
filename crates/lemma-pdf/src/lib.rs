@@ -19,7 +19,8 @@ pub use layout::{Anchor, PageLayout};
 pub use lemma_synctex::{SyncBox, SyncTarget};
 pub use lru::ByteLru;
 pub use render::{
-    TILE_SIZE, TILE_THRESHOLD_BYTES, page_pixels, scale_of, scale_q, tile_grid, tile_rect,
+    MAX_TILE_WIDTH, TILE_BYTES, TILE_THRESHOLD_BYTES, page_pixels, scale_of, scale_q, tile_grid,
+    tile_rect, tile_size, tiles_covering,
 };
 pub use worker::{PdfHandle, spawn};
 
@@ -37,8 +38,9 @@ pub struct PageKey {
     pub page: u32,
     /// Render scale in device pixels per bp, times 8 (see [`scale_q`]).
     pub scale_q: u16,
-    /// `(column, row)` of a [`TILE_SIZE`]² tile, used when a page bitmap would exceed
-    /// [`TILE_THRESHOLD_BYTES`] (see [`tile_grid`] and [`tile_rect`]); `None` for the whole page.
+    /// `(column, row)` of a tile (a full-width band unless the page is wider than
+    /// [`MAX_TILE_WIDTH`]), used when a page bitmap would exceed [`TILE_THRESHOLD_BYTES`] (see
+    /// [`tile_grid`] and [`tile_rect`]); `None` for the whole page.
     pub tile: Option<(u16, u16)>,
     /// True for the page in dark mode: the worker colours the bitmap with [`dark::darken_bgra`],
     /// so the view draws it without a colour matrix.

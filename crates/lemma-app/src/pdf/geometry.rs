@@ -2,7 +2,7 @@
 //! visibility and the dark-mode colour transforms. No GTK here, so everything is unit-tested.
 
 use lemma_pdf::dark::{HUE_180, INK as DARK_INK, PAPER as DARK_PAPER};
-use lemma_pdf::{PageLayout, TILE_SIZE, scale_of, tile_grid, tile_rect};
+use lemma_pdf::{PageLayout, scale_of, tile_grid, tile_rect, tile_size};
 use std::ops::Range;
 
 /// The smallest zoom the view allows (1.0 = 1 bp per logical pixel).
@@ -149,6 +149,39 @@ pub fn tile_view_rect(
     )
 }
 
+/// The tile grid of a page tiled at `scale_q` in logical pixels, for a page drawn at `page_rect`:
+/// `(columns, rows)` and the width and height of a tile (see `tile_view_rect`). `None` when the page
+/// is not tiled at this scale, or has no size.
+fn tile_edges(
+    size_bp: (f64, f64),
+    scale_q: u16,
+    page_rect: Rect,
+) -> Option<((u16, u16), (f64, f64))> {
+    let grid = tile_grid(size_bp, scale_q)?;
+    let (tile_w, tile_h) = tile_size(size_bp, scale_q)?;
+    // Logical pixels per device pixel of the bitmap.
+    let k = if size_bp.0 > 0.0 {
+        page_rect.width / size_bp.0 / scale_of(scale_q)
+    } else {
+        0.0
+    };
+    let edges = (f64::from(tile_w) * k, f64::from(tile_h) * k);
+    let valid = |edge: f64| edge.is_finite() && edge > 0.0;
+    (valid(edges.0) && valid(edges.1)).then_some((grid, edges))
+}
+
+/// The tiles from `origin` on (at most `count`, each `edge` long) that the span `from..to` can
+/// touch.
+fn tile_span(from: f64, to: f64, origin: f64, edge: f64, count: u16) -> Range<u16> {
+    let first = ((from - origin) / edge).floor().max(0.0);
+    let end = ((to - origin) / edge).ceil().min(f64::from(count));
+    if end > first {
+        first as u16..end as u16
+    } else {
+        0..0
+    }
+}
+
 /// The tiles of a page that must be tiled at `scale_q` and intersect `viewport`, nearest to the
 /// viewport's centre first. Empty when the page is not tiled at this scale.
 ///
@@ -160,35 +193,23 @@ pub fn visible_tiles(
     page_rect: Rect,
     viewport: Rect,
 ) -> Vec<(u16, u16)> {
-    let Some((columns, rows)) = tile_grid(size_bp, scale_q) else {
+    let Some(((columns, rows), (edge_x, edge_y))) = tile_edges(size_bp, scale_q, page_rect) else {
         return Vec::new();
     };
-    // The edge of a tile in logical pixels (see `tile_view_rect`).
-    let edge = if size_bp.0 > 0.0 {
-        f64::from(TILE_SIZE) * page_rect.width / size_bp.0 / scale_of(scale_q)
-    } else {
-        0.0
-    };
-    if !(edge.is_finite() && edge > 0.0) {
-        return Vec::new();
-    }
-    // The tiles from `origin` on (at most `count`) that the span `from..to` can touch.
-    let span = |from: f64, to: f64, origin: f64, count: u16| -> Range<u16> {
-        let first = ((from - origin) / edge).floor().max(0.0);
-        let end = ((to - origin) / edge).ceil().min(f64::from(count));
-        if end > first {
-            first as u16..end as u16
-        } else {
-            0..0
-        }
-    };
-    let column_span = span(
+    let column_span = tile_span(
         viewport.x,
         viewport.x + viewport.width,
         page_rect.x,
+        edge_x,
         columns,
     );
-    let row_span = span(viewport.y, viewport.y + viewport.height, page_rect.y, rows);
+    let row_span = tile_span(
+        viewport.y,
+        viewport.y + viewport.height,
+        page_rect.y,
+        edge_y,
+        rows,
+    );
     let (cx, cy) = viewport.center();
     let mut tiles: Vec<((u16, u16), f64)> = row_span
         .flat_map(|row| column_span.clone().map(move |column| (column, row)))
@@ -201,6 +222,43 @@ pub fn visible_tiles(
         .collect();
     tiles.sort_by(|a, b| a.1.total_cmp(&b.1));
     tiles.into_iter().map(|(tile, _)| tile).collect()
+}
+
+/// The row of tiles that scrolling down brings into view next, of a page that must be tiled at
+/// `scale_q`: the first row below `viewport` (its tiles under the viewport's columns; for a page
+/// tiled in full-width bands, one band). For a page below the viewport, that is its first row.
+/// Empty when the page's last row is in view or above it, or the page is not tiled at this scale.
+pub fn tiles_below(
+    size_bp: (f64, f64),
+    scale_q: u16,
+    page_rect: Rect,
+    viewport: Rect,
+) -> Vec<(u16, u16)> {
+    let Some(((columns, rows), (edge_x, edge_y))) = tile_edges(size_bp, scale_q, page_rect) else {
+        return Vec::new();
+    };
+    // The first row whose top edge is at or below the viewport's bottom edge (touching is not
+    // overlapping, see `Rect::intersects`).
+    let row = ((viewport.y + viewport.height - page_rect.y) / edge_y)
+        .ceil()
+        .max(0.0);
+    if row >= f64::from(rows) {
+        return Vec::new();
+    }
+    let row = row as u16;
+    tile_span(
+        viewport.x,
+        viewport.x + viewport.width,
+        page_rect.x,
+        edge_x,
+        columns,
+    )
+    .map(|column| (column, row))
+    .filter(|&tile| {
+        let rect = tile_view_rect(size_bp, scale_q, tile, page_rect);
+        rect.x < viewport.x + viewport.width && viewport.x < rect.x + rect.width
+    })
+    .collect()
 }
 
 /// The colour transform of dark mode ([`lemma_pdf::dark`]), as the `(matrix, offset)` arguments of
@@ -315,30 +373,38 @@ mod tests {
         );
     }
 
+    /// Scale 4 (zoom 2 at device scale 2): an A4 page is 2382×3368 px, 8 full-width bands of
+    /// 421 rows, 210.5 logical px each.
+    const BANDS_Q: u16 = 32;
+    fn banded_page() -> Rect {
+        Rect::new(100.0, 50.0, A4.0 * 2.0, A4.1 * 2.0)
+    }
+    /// Scale 15 (zoom 7.5 at device scale 2): 8930×12629 px, wider than a band can be, so 9 × 12
+    /// tiles of 993 × 1053 px, that is 496.5 × 526.5 logical px.
+    const COLUMNS_Q: u16 = 120;
+    fn wide_page() -> Rect {
+        Rect::new(12.0, 12.0, A4.0 * 7.5, A4.1 * 7.5)
+    }
+
     #[test]
-    fn tiles_cover_the_page_and_follow_the_viewport() {
-        // At scale 4 an A4 page is 2382×3368 px: 5×7 tiles of 512 px.
-        let q = 32;
-        let page = Rect::new(100.0, 50.0, A4.0 * 2.0, A4.1 * 2.0); // zoom 2, device scale 2
+    fn bands_cover_the_page_and_follow_the_viewport() {
+        let (q, page) = (BANDS_Q, banded_page());
         let all = visible_tiles(A4, q, page, page);
-        assert_eq!(all.len(), 35);
+        assert_eq!(all.len(), 8);
+        assert!(all.iter().all(|&(column, _)| column == 0), "{all:?}");
         let area: f64 = all
             .iter()
             .map(|&t| {
                 let r = tile_view_rect(A4, q, t, page);
+                assert!(close(r.width, page.width, 1.0), "full width: {r:?}");
                 r.width * r.height
             })
             .sum();
         assert!(close(area, page.width * page.height, page.width * 2.0));
 
-        // A viewport over the top-left corner sees only the first tiles, nearest first.
-        let viewport = Rect::new(100.0, 50.0, 300.0, 200.0);
-        let tiles = visible_tiles(A4, q, page, viewport);
-        assert_eq!(tiles.first(), Some(&(0, 0)));
-        assert!(tiles.iter().all(|&(c, r)| c <= 2 && r <= 1), "{tiles:?}");
-        for t in &tiles {
-            assert!(tile_view_rect(A4, q, *t, page).intersects(&viewport));
-        }
+        // A viewport over the top of the page sees the first two bands, nearest first.
+        let viewport = Rect::new(100.0, 50.0, 300.0, 300.0);
+        assert_eq!(visible_tiles(A4, q, page, viewport), vec![(0, 0), (0, 1)]);
         // Pages below the tiling threshold have no tiles.
         assert!(visible_tiles(A4, 8, page, page).is_empty());
     }
@@ -356,29 +422,75 @@ mod tests {
 
     #[test]
     fn visible_tiles_match_a_scan_of_the_whole_grid() {
-        let q = 32;
-        let page = Rect::new(100.0, 50.0, A4.0 * 2.0, A4.1 * 2.0);
-        let mut viewports = vec![page];
-        for (x, y) in [(0.0, 0.0), (100.0, 50.0), (356.0, 306.0), (900.0, 1500.0)] {
-            for (w, h) in [(300.0, 200.0), (256.0, 256.0), (1.0, 1.0), (2000.0, 4000.0)] {
-                viewports.push(Rect::new(x, y, w, h));
+        for (q, page) in [(BANDS_Q, banded_page()), (COLUMNS_Q, wide_page())] {
+            let mut viewports = vec![page];
+            for (x, y) in [(0.0, 0.0), (100.0, 50.0), (356.0, 306.0), (900.0, 1500.0)] {
+                for (w, h) in [(300.0, 200.0), (256.0, 256.0), (1.0, 1.0), (2000.0, 4000.0)] {
+                    viewports.push(Rect::new(x, y, w, h));
+                }
+            }
+            // Beside and below the page.
+            viewports.push(Rect::new(page.x + page.width, 0.0, 300.0, 300.0));
+            viewports.push(Rect::new(0.0, page.y + page.height, 300.0, 300.0));
+            // Edges exactly on tile boundaries only touch: bands 1 and 2, and on the wide page
+            // the columns 1 and 2 of rows 1 and 2.
+            viewports.push(Rect::new(100.0, 260.5, 300.0, 421.0));
+            viewports.push(Rect::new(508.5, 538.5, 993.0, 1053.0));
+            for viewport in viewports {
+                let mut tiles = visible_tiles(A4, q, page, viewport);
+                tiles.sort();
+                assert_eq!(tiles, scan_tiles(A4, q, page, viewport), "{viewport:?}");
             }
         }
-        // Edges exactly on tile boundaries (tiles are 256 logical px here) only touch.
-        viewports.push(Rect::new(356.0, 50.0, 256.0, 256.0));
-        // Beside and below the page.
-        viewports.push(Rect::new(2000.0, 0.0, 300.0, 300.0));
-        viewports.push(Rect::new(0.0, 4000.0, 300.0, 300.0));
-        for viewport in viewports {
+        let boundaries = |q, page, viewport| {
             let mut tiles = visible_tiles(A4, q, page, viewport);
             tiles.sort();
-            assert_eq!(tiles, scan_tiles(A4, q, page, viewport), "{viewport:?}");
-        }
+            tiles
+        };
+        assert_eq!(
+            boundaries(
+                BANDS_Q,
+                banded_page(),
+                Rect::new(100.0, 260.5, 300.0, 421.0)
+            ),
+            vec![(0, 1), (0, 2)]
+        );
+        let wide = boundaries(
+            COLUMNS_Q,
+            wide_page(),
+            Rect::new(508.5, 538.5, 993.0, 1053.0),
+        );
+        assert_eq!(wide, vec![(1, 1), (1, 2), (2, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn the_band_below_the_viewport_comes_next() {
+        let (q, page) = (BANDS_Q, banded_page());
+        let at = |y: f64, height: f64| Rect::new(0.0, y, 1400.0, height);
+        // Bands 0 to 2 in view: band 3 is next; a bottom edge on a boundary only touches.
+        assert_eq!(tiles_below(A4, q, page, at(0.0, 500.0)), vec![(0, 3)]);
+        assert_eq!(tiles_below(A4, q, page, at(0.0, 471.0)), vec![(0, 2)]);
+        // A page below the viewport: its first band.
+        assert_eq!(tiles_below(A4, q, page, at(-500.0, 400.0)), vec![(0, 0)]);
+        // Its last band in view, or the page above the viewport: nothing more on this page.
+        assert!(tiles_below(A4, q, page, at(1500.0, 400.0)).is_empty());
+        assert!(tiles_below(A4, q, page, at(5000.0, 400.0)).is_empty());
+        // Not tiled at this scale.
+        assert!(tiles_below(A4, 8, page, at(0.0, 500.0)).is_empty());
+        // Several columns: those under the viewport.
+        let viewport = Rect::new(1400.0, 1000.0, 900.0, 600.0);
+        assert_eq!(
+            tiles_below(A4, COLUMNS_Q, wide_page(), viewport),
+            vec![(2, 4), (3, 4), (4, 4)]
+        );
+        // Beside the page.
+        let beside = Rect::new(-1000.0, 0.0, 500.0, 500.0);
+        assert!(tiles_below(A4, q, page, beside).is_empty());
     }
 
     #[test]
     fn visible_tiles_of_a_huge_page_are_found_without_scanning_it() {
-        // A 2e7 bp page at the smallest zoom: 4883 × 4883 tiles, of which a 800 × 700 view
+        // A 2e7 bp page at the smallest zoom: 2442 × 2442 tiles, of which a 800 × 700 view
         // sees a few.
         let size = (2e7, 2e7);
         let q = 1;

@@ -87,6 +87,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - In dark mode the PDF strip's thumbnails (and link previews) are rendered dark by the PDF
   thread instead of being recoloured on every frame: drawing a 120 × 612 strip takes 0.3 ms
   instead of 2.1 ms with the cairo renderer, Lemma's default.
+- PDF pages too large for one bitmap (fit-width pages in a pane wider than about 900 px on a
+  HiDPI display, or any page zoomed in far enough) are rendered in a few full-width bands instead
+  of 512-pixel squares, each of which made poppler go through the whole page: such a page now
+  takes 23–29 ms to render instead of 77–93 ms (10–12 ms as one bitmap). Zoomed in so far that
+  a page is over 4096 pixels wide, it is rendered in squares of about 1024 pixels instead: a view
+  of it takes 31–34 ms instead of 77–78 ms. The band just below the view, on the same page or at
+  the top of the next, is rendered ahead, so scrolling down finds it ready; these pages were never
+  rendered ahead before.
 - Zooming the PDF out renders the pages that come into view at the new zoom right away, instead
   of at the old zoom and then again 120 ms later (over several Ctrl+wheel notches or a pinch,
   such a page then waits for the final zoom): zooming pdf50 out sixfold now renders 9 pages

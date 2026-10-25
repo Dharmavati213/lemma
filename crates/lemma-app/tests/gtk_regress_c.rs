@@ -316,8 +316,8 @@ fn prefetch_overflow_rerenders_on_every_scroll() {
     );
 }
 
-/// C2: zoomed into the tiled range (scale 3.5: an A4 page is 24.6 MB, so it is rendered as
-/// 512² tiles), a rebuild must keep the old tiles on screen until the new ones arrive
+/// C2: zoomed into the tiled range (scale 3.5: an A4 page is 24.6 MB, so it is rendered in
+/// tiles), a rebuild must keep the old tiles on screen until the new ones arrive
 /// (ARCHITECTURE §6 "Reload"). Only whole-page textures stand in, so the page turns blank.
 fn rebuild_blanks_tiled_pages() {
     let bench = Bench::new(48 << 20);

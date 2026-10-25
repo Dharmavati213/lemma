@@ -1,9 +1,11 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
 //! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
-//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale), Fit Page
-//! and 100%, handing the PDF to another application, dark mode, save → build → diagnostics (and
-//! a build with nothing to do), stopping a build, and SyncTeX in both directions; with a fake
-//! latexmk, the build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
+//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale), large
+//! pages in full-width bands (the band below the view rendered ahead, search highlights and dark
+//! mode over bands), Fit Page and 100%, handing the PDF to another application, dark mode, save
+//! → build → diagnostics (and a build with nothing to do), stopping a build, and SyncTeX in both
+//! directions; with a fake latexmk, the build toasts, a latexmk that is not installed, and Clean
+//! Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -39,6 +41,10 @@ fn main() -> ExitCode {
         (
             "zoom_out_renders_at_the_live_scale",
             zoom_out_renders_at_the_live_scale,
+        ),
+        (
+            "large_pages_are_drawn_from_full_width_bands",
+            large_pages_in_bands,
         ),
         ("fit_page_and_100_percent", fit_page_and_100_percent),
         ("the_pdf_is_handed_to_other_apps", pdf_handed_to_other_apps),
@@ -669,6 +675,114 @@ fn zoom_out_renders_at_the_live_scale() {
         "{renders} renders for {pages} pages"
     );
     assert!(view.cache_used() <= view.cache_cap());
+    state.window.destroy();
+}
+
+/// Pages too large for one bitmap (stress.pdf at zoom × scale 3.25 is 1989 × 2574 px, as a
+/// fit-width page on a HiDPI pane about 1000 px wide) are drawn from full-width bands: the ones
+/// in view, then the one that scrolling down shows next, so that a scroll by a band finds it
+/// rendered; once a page's last band is in view, that is the next page's first. Search
+/// highlights are drawn across bands, and the bands meet without a seam, in light and dark mode.
+fn large_pages_in_bands() {
+    let dir = common::temp_dir("bands");
+    let state = window(&dir, config());
+    let stress = common::fixtures().join("pdf/stress.pdf");
+    state
+        .pdf
+        .get()
+        .unwrap()
+        .open(&stress.canonicalize().unwrap());
+    wait_for_pages(&state);
+    let view = view(&state);
+    if view.is_dark() {
+        activate(&state, "win.pdf-invert");
+    }
+    let ds = view.device_scale();
+    view.set_zoom(3.25 / ds, None);
+    let q = lemma_pdf::scale_q(view.zoom(), ds);
+    common::pump_until(TIMEOUT, || view.render_scale_q() == q);
+    let size = view.page_size(5).unwrap();
+    let (columns, rows) = lemma_pdf::tile_grid(size, q).expect("tiled at zoom 3.25");
+    let (_, band_px) = lemma_pdf::tile_size(size, q).unwrap();
+    assert_eq!(columns, 1, "full-width bands");
+    // A band's height in logical pixels.
+    let band = f64::from(band_px) / ds;
+    let height = f64::from(view.height());
+    assert!(
+        height + band < band * f64::from(rows),
+        "the view shows part of a page"
+    );
+    let layout = view.layout().unwrap();
+    let rect = |page| layout.page_rect(page, view.zoom(), f64::from(view.width()));
+    let settle = || {
+        wait_for_pages(&state);
+        common::pump_until(TIMEOUT, || view.outstanding_requests() == 0);
+    };
+    // Scrolled down by one band from `y`, the view is complete at once (before the main loop
+    // runs again, so before any bitmap can arrive).
+    let scroll_by_a_band_from = |y: f64| {
+        view.set_scroll_position(0.0, y);
+        settle();
+        let received = view.bitmaps_received();
+        view.set_scroll_position(0.0, y + band);
+        let complete = view.visible_pages().all(|p| view.is_page_rendered(p));
+        println!(
+            "  from {y:.0} down by a band of {band:.0} px: pages {:?} complete {complete} \
+             ({received} bitmaps so far, cache {:.1} MiB)",
+            view.visible_pages(),
+            view.cache_used() as f64 / f64::from(1 << 20)
+        );
+        assert!(complete, "the band below the view was not rendered ahead");
+        assert!(view.cache_used() <= view.cache_cap());
+    };
+    // Within a page: the next band of the same page.
+    let (_, top, _, page_height) = rect(5);
+    scroll_by_a_band_from(top + band / 2.0);
+    assert_eq!(view.visible_pages(), 5..6);
+    // Its last band in view (the bottom of the view in the gap below it): the next page's first.
+    scroll_by_a_band_from(top + page_height + pdf_view::PAGE_GAP / 2.0 - height);
+    assert!(view.visible_pages().contains(&6));
+
+    // A match across the boundary of the first two bands (in the middle of the view), in the
+    // left margin.
+    view.set_scroll_position(0.0, top + band - height / 2.0);
+    settle();
+    let boundary_bp = f64::from(band_px) / lemma_pdf::scale_of(q);
+    let found = (20.0, boundary_bp - 10.0, 40.0, 20.0);
+    view.set_search_matches(5, vec![vec![found]]);
+    view.set_current_match(Some((5, 0)));
+    let check = |dark: bool| {
+        let (width, _, pixels) = render(&view);
+        let at = |x_bp: f64, y_bp: f64| {
+            let (x, y) = view.widget_point(5, x_bp, y_bp).unwrap();
+            let i = (y.floor() as usize * width as usize + x.floor() as usize) * 4;
+            // BGRA.
+            let p = &pixels[i..i + 4];
+            (f64::from(p[2]), f64::from(p[1]), f64::from(p[0]))
+        };
+        // Orange at 0.42 over grey changes red − green by +57 and green − blue by +50.
+        for y_bp in [boundary_bp - 5.0, boundary_bp + 5.0] {
+            let (r, g, b) = at(40.0, y_bp);
+            println!("  dark {dark}: the match at {y_bp:.1} bp is {r:.0},{g:.0},{b:.0}");
+            assert!((45.0..70.0).contains(&(r - g)) && (38.0..62.0).contains(&(g - b)));
+        }
+        // The paper on either side of the boundary, and on it.
+        let (x, boundary) = view.widget_point(5, 10.0, boundary_bp).unwrap();
+        let paper: Vec<f64> = [-1.0, 0.0, 1.0]
+            .iter()
+            .map(|dy| lightness(&pixels, width, x as i32, (boundary + dy).floor() as i32))
+            .collect();
+        println!("  dark {dark}: paper at the band boundary {paper:?}");
+        let expected = if dark { 0.0..60.0 } else { 250.0..256.0 };
+        assert!(paper.iter().all(|l| expected.contains(l)), "{paper:?}");
+        assert!(!has_color_matrix(&next_frame_node(&view)));
+    };
+    check(false);
+    activate(&state, "win.pdf-invert");
+    assert!(view.is_dark());
+    settle();
+    check(true);
+    activate(&state, "win.pdf-invert");
     state.window.destroy();
 }
 

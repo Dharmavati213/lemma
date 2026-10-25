@@ -411,17 +411,11 @@ async fn render_region(
         (px(region.0 + region.2) - rx).clamp(1, page_w - rx),
         (px(region.1 + region.3) - ry).clamp(1, page_h - ry),
     );
-    let tiles: Vec<Option<(u16, u16)>> = match lemma_pdf::tile_grid(size, scale_q) {
-        None => vec![None],
-        Some(_) => {
-            let size_px = lemma_pdf::TILE_SIZE;
-            let (c0, c1) = (rx / size_px, (rx + rw - 1) / size_px);
-            let (r0, r1) = (ry / size_px, (ry + rh - 1) / size_px);
-            (r0..=r1)
-                .flat_map(|r| (c0..=c1).map(move |c| Some((c as u16, r as u16))))
-                .collect()
-        }
-    };
+    let tiles: Vec<Option<(u16, u16)>> =
+        match lemma_pdf::tiles_covering(size, scale_q, (rx, ry, rw, rh)) {
+            None => vec![None],
+            Some(tiles) => tiles.into_iter().map(Some).collect(),
+        };
     let wants: Vec<RenderReq> = tiles
         .iter()
         .map(|tile| RenderReq {

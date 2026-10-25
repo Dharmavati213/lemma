@@ -12,8 +12,11 @@
 //! - **Render requests:** the visible pages from the centre outward, then the pages just before
 //!   and after (as far as their bitmaps fit in the cache beside the visible ones), are sent
 //!   through the request callback (the controller forwards them to the PDF thread as one
-//!   latest-wins `Want`). Pages too large for one bitmap are requested as the visible tiles
-//!   only. Nothing is requested while the view is not mapped (a hidden pane).
+//!   latest-wins `Want`). Pages too large for one bitmap are tiled in full-width bands (one
+//!   poppler pass each, so a few large bands cost far less than many small tiles; zoomed in
+//!   past 4096 px, in tiles of about 1024²) and requested as the visible bands, then the band
+//!   that scrolling down shows next, on the same page or the next one, if it fits in the cache.
+//!   Nothing is requested while the view is not mapped (a hidden pane).
 //! - **Textures** (`MemoryTexture` over the worker's pixel buffer, no copy) live in a byte-bounded
 //!   LRU, where the textures the view needs are never evicted for others. While a page has no
 //!   texture (or not all its visible tiles) of the current scale or generation, the best other
@@ -239,9 +242,9 @@ impl Model {
     }
 
     /// The bitmaps the current view needs, most urgent first: those of the visible pages (for a
-    /// tiled page, its visible tiles), then the whole pages just after and before them and the
-    /// pages `extra`, as long as all of these bitmaps fit in the cache. Each page is keyed at
-    /// [`Model::request_q`].
+    /// tiled page, its visible tiles), then the band of a tiled page that scrolling down shows
+    /// next, then the whole pages just after and before them and the pages `extra`, as long as
+    /// all of these bitmaps fit in the cache. Each page is keyed at [`Model::request_q`].
     fn working_set(&self, view: (f64, f64), scroll: (f64, f64), extra: Range<u32>) -> Vec<PageKey> {
         let Some(doc) = &self.doc else {
             return Vec::new();
@@ -263,38 +266,93 @@ impl Model {
         let cap = self.cache.cap();
         let mut bytes = 0usize;
         let mut keys = Vec::new();
-        for page in pages {
+        let key = |page, scale_q, tile| PageKey {
+            generation: doc.generation,
+            page,
+            scale_q,
+            tile,
+            dark: self.dark,
+        };
+        let add_page = |page: u32, bytes: &mut usize, keys: &mut Vec<PageKey>| {
             let Some(size) = doc.layout.page_size(page) else {
-                continue;
+                return;
             };
             let scale_q = self.request_q(page, doc.generation);
-            let key = |tile| PageKey {
-                generation: doc.generation,
-                page,
-                scale_q,
-                tile,
-                dark: self.dark,
-            };
             if tile_grid(size, scale_q).is_some() {
-                // Tiled pages: only the visible tiles of the visible pages.
+                // Tiled pages: the visible tiles of the visible pages.
                 if visible.contains(&page) {
                     let rect = page_rect(&doc.layout, page, self.zoom, width);
                     for tile in geometry::visible_tiles(size, scale_q, rect, viewport) {
-                        bytes += bitmap_bytes(size, scale_q, Some(tile));
-                        keys.push(key(Some(tile)));
+                        *bytes += bitmap_bytes(size, scale_q, Some(tile));
+                        keys.push(key(page, scale_q, Some(tile)));
                     }
                 }
             } else {
                 // The visible pages always; the others only while everything fits, so that a
                 // page ahead never pushes a page on screen out of the cache.
                 let page_bytes = bitmap_bytes(size, scale_q, None);
-                if visible.contains(&page) || bytes + page_bytes <= cap {
-                    bytes += page_bytes;
-                    keys.push(key(None));
+                if visible.contains(&page) || *bytes + page_bytes <= cap {
+                    *bytes += page_bytes;
+                    keys.push(key(page, scale_q, None));
                 }
             }
+        };
+        // The visible pages come first in `render_order`, then the pages beyond the view.
+        let ahead = pages
+            .iter()
+            .position(|p| !visible.contains(p))
+            .unwrap_or(pages.len());
+        for &page in &pages[..ahead] {
+            add_page(page, &mut bytes, &mut keys);
+        }
+        // Ahead of the view, the band below it first: on the last visible page, or the first of
+        // the page after it. Like a page ahead, only while it fits.
+        for (page, scale_q, tile) in self.next_band(doc, viewport, visible.clone()) {
+            let Some(size) = doc.layout.page_size(page) else {
+                continue;
+            };
+            let band_bytes = bitmap_bytes(size, scale_q, Some(tile));
+            if bytes + band_bytes <= cap {
+                bytes += band_bytes;
+                keys.push(key(page, scale_q, Some(tile)));
+            }
+        }
+        for &page in &pages[ahead..] {
+            add_page(page, &mut bytes, &mut keys);
         }
         keys
+    }
+
+    /// The tiles of the band that scrolling down shows next, with their page and scale, when it
+    /// is on a tiled page: the row below the view on the last visible page, or once that page's
+    /// last row is in view, the first row of the page after it. Empty when that page is not
+    /// tiled (it is asked for whole) or there is none.
+    fn next_band(
+        &self,
+        doc: &Doc,
+        viewport: Rect,
+        visible: Range<u32>,
+    ) -> Vec<(u32, u16, (u16, u16))> {
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        for page in [visible.end - 1, visible.end] {
+            let Some(size) = doc.layout.page_size(page) else {
+                continue;
+            };
+            let scale_q = self.request_q(page, doc.generation);
+            if tile_grid(size, scale_q).is_none() {
+                // A whole page; the page after it may still be tiled (pages of other sizes).
+                continue;
+            }
+            // The viewport is as wide as the view.
+            let rect = page_rect(&doc.layout, page, self.zoom, viewport.width);
+            let band = geometry::tiles_below(size, scale_q, rect, viewport);
+            if !band.is_empty() {
+                return band.into_iter().map(|tile| (page, scale_q, tile)).collect();
+            }
+        }
+        Vec::new()
     }
 
     /// The render requests for the current view, most urgent first, without cached bitmaps.
