@@ -367,3 +367,70 @@ fn other_agents_get_the_instructions_in_their_first_prompt() {
     assert_eq!(echoed["prompt"].as_array().unwrap().len(), 1, "{echoed}");
     shutdown(&handle);
 }
+
+/// Sends `text` to an `echo_prompt` agent; the prompt as the agent received it.
+fn echoed_prompt(handle: &lemma_agent::AgentHandle, text: &str) -> serde_json::Value {
+    prompt(handle, text);
+    let events = events_until(handle, SLOW, is_turn_end);
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    serde_json::from_str(&message_text(&events)).expect("the echoed prompt")
+}
+
+/// The first block of an echoed prompt opens with Lemma's instructions.
+fn has_instructions(echoed: &serde_json::Value) -> bool {
+    echoed["prompt"][0]["text"]
+        .as_str()
+        .is_some_and(|t| t.starts_with(lemma_agent::INSTRUCTIONS_TAG))
+}
+
+#[test]
+fn a_failed_first_prompt_gives_the_instructions_back() {
+    // The agent answers the first prompt with an error (a quota, an expired login): the next
+    // prompt carries the instructions again, and only that one.
+    let sb = Sandbox::new("instructions-error");
+    let cfg = generic(
+        &sb,
+        &json!({"_options": {"mcp": "skip",
+                             "prompt_error": {"code": -32603, "message": "quota exceeded"}},
+                "default": [{"echo_prompt": true}]}),
+    );
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    expect_ready(&handle);
+    prompt(&handle, "hello");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert!(
+        errors(&events).iter().any(|e| e.contains("quota exceeded")),
+        "{events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::TurnEnded(StopReason::EndTurn))
+    );
+    let echoed = echoed_prompt(&handle, "hello again");
+    assert!(has_instructions(&echoed), "{echoed}");
+    assert_eq!(echoed["prompt"][1]["text"], "hello again");
+    let echoed = echoed_prompt(&handle, "and again");
+    assert_eq!(echoed["prompt"].as_array().unwrap().len(), 1, "{echoed}");
+    shutdown(&handle);
+}
+
+#[test]
+fn a_loaded_session_gets_the_instructions_again() {
+    let sb = Sandbox::new("instructions-load");
+    let mut cfg = generic(
+        &sb,
+        &json!({"_options": {"mcp": "skip", "load_session": {}},
+                "default": [{"echo_prompt": true}]}),
+    );
+    cfg.load_session = Some("earlier-session".into());
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let AgentEvent::Ready { session, .. } = expect_ready(&handle) else {
+        unreachable!()
+    };
+    assert_eq!(session, "earlier-session");
+    let echoed = echoed_prompt(&handle, "hello");
+    assert!(has_instructions(&echoed), "{echoed}");
+    let echoed = echoed_prompt(&handle, "again");
+    assert_eq!(echoed["prompt"].as_array().unwrap().len(), 1, "{echoed}");
+    shutdown(&handle);
+}

@@ -47,6 +47,11 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   reached by F4. A build with 3000 warnings and bad boxes now keeps the main thread busy for
   about 20 ms instead of 0.35 s while the page is hidden, and 0.13 s instead of 0.7 s while it
   is shown.
+- The API backend appends each streamed piece of an answer or of its thinking in place instead
+  of copying everything received so far, which made a long answer cost time quadratic in its
+  length on the agent's thread (32,000 pieces: under 1 ms instead of 230 ms).
+- Of the last 64 tool calls, the editor keeps the first 2 KB of each reply instead of the whole
+  reply (often a whole file), and forgets them when the agent stops.
 
 ### Fixed
 
@@ -63,6 +68,16 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - `[typing] replacements` was accepted but did nothing. It now replaces `...` typed in text with
   `\dots` (not in math, comments or verbatim text, and not after `\.`); one undo gives back the
   dots. It stays off by default.
+- `[agent] idle_stop_min` was accepted but did nothing. Now an ACP agent idle for that many
+  minutes (10; 0 = never) is stopped to free its memory (about 360 MB for Claude Code), unless
+  the agent pane is open in the focused window, its prompt box has text or a permission
+  request waits; a note in the transcript says so. The next message (or opening the pane)
+  starts it again, and an agent that can resume conversations (ACP `session/load`, as Claude
+  Code's adapter can) continues this one, with the mode, model and effort it had, without
+  showing the conversation again. One that cannot is only stopped before the first message.
+- An ACP agent other than Claude Code (Pi, Codex, Gemini CLI, …) that answered the first
+  prompt with an error (a quota, an expired login) went without Lemma's instructions for the
+  rest of the session; the next prompt now carries them.
 
 ## epsilon (0.1.0), 2026-10-20
 

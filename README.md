@@ -349,6 +349,13 @@ through ACP's file methods (Pi, Gemini CLI) edit the live buffers; edits that an
 disk itself are picked up during the turn. Lemma never offers an agent's modes that skip its
 permission prompts (`bypassPermissions`, `yolo`, Codex's full access, …).
 
+An ACP agent that sits idle for 10 minutes is stopped to free its memory (Claude Code takes
+about 360 MB), unless the agent pane is open in the focused window, its prompt box has text or
+a permission request waits. Your next message (or opening the pane) starts it again, and it
+continues the conversation where it left off, in the mode and with the model you had chosen.
+An agent that cannot resume conversations is only stopped before your first message to it.
+`[agent] idle_stop_min` sets the minutes; 0 keeps the agent running.
+
 How each ACP agent starts can be changed in `config.toml`; every key is optional:
 
 ```toml

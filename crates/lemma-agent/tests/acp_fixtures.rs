@@ -245,6 +245,48 @@ fn long_streams_200_chunks_and_makes_30_edits() {
 }
 
 #[test]
+fn resume_edits_the_abstract_and_its_load_replays_nothing() {
+    let sb = Sandbox::new("fx-resume");
+    sb.copy_fixture_project();
+    let scenario = fixtures().join("agent").join("resume.json");
+    let mut handle = lemma_agent::spawn(sb.config(&scenario)).unwrap();
+    let tools = std::mem::replace(&mut handle.tools, async_channel::unbounded().1);
+    let answerer = ToolAnswerer::start(tools, simulated_editor(sb.project()));
+    let AgentEvent::Ready {
+        session, loadable, ..
+    } = expect_ready(&handle)
+    else {
+        unreachable!()
+    };
+    assert!(loadable);
+    prompt(&handle, "Polish the abstract");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    shutdown(&handle);
+    answerer.join();
+    assert!(read(&sb, "main.tex").contains("These notes are a test document."));
+    // A new process loads the session: the replayed conversation is not reported.
+    let mut cfg = sb.config(&scenario);
+    cfg.load_session = Some(session.clone());
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    assert!(matches!(expect_ready(&handle), AgentEvent::Ready { session: s, .. } if s == session));
+    prompt(&handle, "Are you still there?");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert_eq!(
+        message_text(&events),
+        "Still here, and I remember the abstract."
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ThoughtChunk(_) | AgentEvent::ToolCall { .. } | AgentEvent::Plan(_)
+        )),
+        "{events:#?}"
+    );
+    shutdown(&handle);
+}
+
+#[test]
 fn every_fixture_has_a_default_turn_that_starts() {
     // Each fixture file is a valid scenario and its session starts (cancel.json/permission.json
     // turns are exercised in acp_client.rs).
@@ -255,6 +297,7 @@ fn every_fixture_has_a_default_turn_that_starts() {
         "errors.json",
         "long.json",
         "cancel.json",
+        "resume.json",
     ] {
         let sb = Sandbox::new("fx-start");
         let handle = lemma_agent::spawn(sb.config(&fixtures().join("agent").join(name))).unwrap();

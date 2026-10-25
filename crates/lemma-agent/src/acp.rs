@@ -64,7 +64,22 @@
 //! `system_prompt_append` goes in `session/new`'s `_meta.systemPrompt.append` (Claude's adapter
 //! reads it; others ignore it). ACP itself has no system prompt, so for [`AcpFlavor::Generic`]
 //! it is also sent as the first text block of the session's first prompt, between
-//! [`INSTRUCTIONS_TAG`] and `</lemma_instructions>`.
+//! [`INSTRUCTIONS_TAG`] and `</lemma_instructions>`. When the agent answers that prompt with an
+//! error (a quota, an expired login, a network failure; not a cancel, and not the agent dying),
+//! the next prompt carries them again: the agent may never have seen them. A loaded session
+//! (below) gets them again with the first prompt after the load.
+//!
+//! # Loading a session
+//!
+//! With [`AgentConfig::load_session`], an agent that advertises `loadSession` in `initialize`
+//! gets `session/load` instead of `session/new`, with the same `cwd`, MCP server and `_meta`.
+//! The agent replays the conversation as `session/update`s before it answers; until the answer,
+//! the conversation's updates (user, agent and thought chunks, tool calls and their updates,
+//! plans) are dropped, since the client shows that conversation already, and nothing of it
+//! makes tool cards or reaches the editor. The other updates (modes, options, commands, usage,
+//! notices) count as usual. An agent that cannot load sessions, or answers `session/load` with
+//! an error, gets `session/new`, and a `Notice` after `Ready` says that the conversation was not
+//! resumed. `Ready.loadable` reports the capability.
 //!
 //! # Process lifecycle
 //!
@@ -517,6 +532,14 @@ struct Started {
     can_close: bool,
     /// The agent accepts `image` blocks in prompts (`promptCapabilities.image`).
     images: bool,
+    /// The agent can load sessions (`loadSession`).
+    loadable: bool,
+}
+
+/// A session that `session/new` or `session/load` opened.
+struct Opened {
+    session_id: s::SessionId,
+    modes: Option<s::SessionModeState>,
 }
 
 impl Session {
@@ -675,43 +698,36 @@ impl Session {
         );
         let can_close = init.agent_capabilities.session_capabilities.close.is_some();
         let images = init.agent_capabilities.prompt_capabilities.image;
+        let loadable = init.agent_capabilities.load_session;
 
-        let bridge = s::McpServerStdio::new("lemma", self.cfg.mcp_bridge.clone()).env(vec![
-            s::EnvVariable::new("LEMMA_MCP_SOCKET", self.socket.clone()),
-            s::EnvVariable::new("LEMMA_MCP_TOKEN", self.cfg.mcp_token.clone()),
-        ]);
-        // The response is recorded in an ordered callback, before the agent's next message is
-        // dispatched: updates the agent sends right after it (even in the same write) then apply
-        // on top of it instead of being overwritten when this task resumes.
-        let (new_tx, new_rx) = async_channel::bounded(1);
-        let shared = self.shared.clone();
-        cx.prepare_request(
-            s::NewSessionRequest::new(self.cfg.cwd.clone())
-                .mcp_servers(vec![s::McpServer::Stdio(bridge)])
-                .meta(session_meta(&self.cfg.system_prompt_append)),
-        )
-        .on_receiving_result(
-            move |result: Result<s::NewSessionResponse, agent_client_protocol::Error>| async move {
-                if let Ok(new) = &result {
-                    shared.begin_session(&agent, new);
+        let opened = match self.cfg.load_session.clone() {
+            Some(id) if loadable => match self.load_session(cx, &agent, id).await {
+                Ok(opened) => opened,
+                Err(StartError::Failed(why)) => {
+                    self.shared.emit(AgentEvent::Notice(format!(
+                        "The agent could not resume the conversation ({why}), so this is a new \
+                         conversation."
+                    )));
+                    self.new_session(cx, &agent).await?
                 }
-                let _ = new_tx.try_send(result);
-                Ok(())
+                Err(died) => return Err(died),
             },
-        )
-        .map_err(|e| StartError::from_acp("The agent could not start a session", &e))?;
-        let new = new_rx
-            .recv()
-            .await
-            .map_err(|_| StartError::Died)?
-            .map_err(|e| StartError::from_acp("The agent could not start a session", &e))?;
-        let session_id = new.session_id.clone();
-        let mode = new
+            Some(_) => {
+                self.shared.emit(AgentEvent::Notice(
+                    "The agent cannot resume conversations, so this is a new conversation."
+                        .to_owned(),
+                ));
+                self.new_session(cx, &agent).await?
+            }
+            None => self.new_session(cx, &agent).await?,
+        };
+        let session_id = opened.session_id;
+        let mode = opened
             .modes
             .as_ref()
             .map(|m| m.current_mode_id.0.to_string())
             .unwrap_or_default();
-        if new.modes.is_some() && !self.cfg.flavor.offers_mode(&mode) {
+        if opened.modes.is_some() && !self.cfg.flavor.offers_mode(&mode) {
             let Some(fallback) = self.shared.lock().fallback_mode.clone() else {
                 return Err(StartError::Failed(match self.cfg.flavor {
                     AcpFlavor::Claude => format!(
@@ -742,6 +758,117 @@ impl Session {
             session_id,
             can_close,
             images,
+            loadable,
+        })
+    }
+
+    /// Our MCP server, for `session/new` and `session/load` (§10.4).
+    fn mcp_servers(&self) -> Vec<s::McpServer> {
+        let bridge = s::McpServerStdio::new("lemma", self.cfg.mcp_bridge.clone()).env(vec![
+            s::EnvVariable::new("LEMMA_MCP_SOCKET", self.socket.clone()),
+            s::EnvVariable::new("LEMMA_MCP_TOKEN", self.cfg.mcp_token.clone()),
+        ]);
+        vec![s::McpServer::Stdio(bridge)]
+    }
+
+    async fn new_session(
+        &self,
+        cx: &ConnectionTo<Agent>,
+        agent: &str,
+    ) -> Result<Opened, StartError> {
+        // The response is recorded in an ordered callback, before the agent's next message is
+        // dispatched: updates the agent sends right after it (even in the same write) then apply
+        // on top of it instead of being overwritten when this task resumes.
+        let (new_tx, new_rx) = async_channel::bounded(1);
+        let shared = self.shared.clone();
+        let agent = agent.to_owned();
+        cx.prepare_request(
+            s::NewSessionRequest::new(self.cfg.cwd.clone())
+                .mcp_servers(self.mcp_servers())
+                .meta(session_meta(&self.cfg.system_prompt_append)),
+        )
+        .on_receiving_result(
+            move |result: Result<s::NewSessionResponse, agent_client_protocol::Error>| async move {
+                if let Ok(new) = &result {
+                    shared.begin_session(
+                        &agent,
+                        &new.session_id,
+                        new.modes.as_ref(),
+                        new.config_options.as_deref(),
+                    );
+                }
+                let _ = new_tx.try_send(result);
+                Ok(())
+            },
+        )
+        .map_err(|e| StartError::from_acp("The agent could not start a session", &e))?;
+        let new = new_rx
+            .recv()
+            .await
+            .map_err(|_| StartError::Died)?
+            .map_err(|e| StartError::from_acp("The agent could not start a session", &e))?;
+        Ok(Opened {
+            session_id: new.session_id,
+            modes: new.modes,
+        })
+    }
+
+    /// `session/load` of session `id` (see the module docs); `Failed` carries the agent's
+    /// answer.
+    async fn load_session(
+        &self,
+        cx: &ConnectionTo<Agent>,
+        agent: &str,
+        id: String,
+    ) -> Result<Opened, StartError> {
+        let session_id = s::SessionId::new(id);
+        {
+            // The updates of the replay name this session.
+            let mut st = self.shared.lock();
+            st.session = Some(session_id.clone());
+            st.replaying = true;
+        }
+        // As for `session/new`, the answer is recorded before the agent's next message.
+        let (load_tx, load_rx) = async_channel::bounded(1);
+        let shared = self.shared.clone();
+        let agent = agent.to_owned();
+        let sid = session_id.clone();
+        let failed = |e: &agent_client_protocol::Error| {
+            if agent_client_protocol::is_incoming_transport_closed(e) {
+                StartError::Died
+            } else {
+                StartError::Failed(describe(e))
+            }
+        };
+        cx.prepare_request(
+            s::LoadSessionRequest::new(session_id.clone(), self.cfg.cwd.clone())
+                .mcp_servers(self.mcp_servers())
+                .meta(session_meta(&self.cfg.system_prompt_append)),
+        )
+        .on_receiving_result(
+            move |result: Result<s::LoadSessionResponse, agent_client_protocol::Error>| async move {
+                match &result {
+                    Ok(loaded) => shared.begin_session(
+                        &agent,
+                        &sid,
+                        loaded.modes.as_ref(),
+                        loaded.config_options.as_deref(),
+                    ),
+                    Err(_) => shared.forget_session(),
+                }
+                let _ = load_tx.try_send(result);
+                Ok(())
+            },
+        )
+        .map_err(|e| failed(&e))?;
+        let loaded = load_rx
+            .recv()
+            .await
+            .map_err(|_| StartError::Died)?
+            .map_err(|e| failed(&e))?;
+        Ok(Opened {
+            session_id,
+            modes: loaded.modes,
         })
     }
 
@@ -768,7 +895,12 @@ impl Session {
                     shared.emit(AgentEvent::Notice(notice.into()));
                 }
                 // Lemma's instructions open the session's first prompt (see the module docs).
-                let instructions = shared.lock().instructions.take();
+                let instructions = {
+                    let mut st = shared.lock();
+                    let text = st.instructions.take();
+                    st.carried_instructions = text.clone().map(|text| (seq, text));
+                    text
+                };
                 let sent = cx.send_request(s::PromptRequest::new(
                     sid.clone(),
                     instructions
@@ -1109,6 +1241,12 @@ struct State {
     fallback_mode: Option<String>,
     /// Lemma's instructions, until the first prompt carries them ([`AcpFlavor::Generic`]).
     instructions: Option<String>,
+    /// The turn whose prompt carried them, with them, until it ends: a prompt the agent
+    /// answers with an error gives them back to `instructions` (see the module docs).
+    carried_instructions: Option<(u64, String)>,
+    /// `session/load` is replaying the conversation: its updates are dropped (see the module
+    /// docs).
+    replaying: bool,
     options: Vec<ConfigOpt>,
     boolean_options: HashSet<String>,
     agent: String,
@@ -1174,15 +1312,21 @@ impl Shared {
         }
     }
 
-    /// Records the `session/new` response. Runs in the response's ordered callback, so before
-    /// any later message from the agent is dispatched.
-    fn begin_session(&self, agent: &str, new: &s::NewSessionResponse) {
+    /// Records the `session/new` (or `session/load`) response: the session, its modes and
+    /// options; a replay is over. Runs in the response's ordered callback, so before any later
+    /// message from the agent is dispatched.
+    fn begin_session(
+        &self,
+        agent: &str,
+        session: &s::SessionId,
+        modes: Option<&s::SessionModeState>,
+        options: Option<&[s::SessionConfigOption]>,
+    ) {
         let mut st = self.lock();
-        st.session = Some(new.session_id.clone());
+        st.session = Some(session.clone());
+        st.replaying = false;
         agent.clone_into(&mut st.agent);
-        st.modes = new
-            .modes
-            .as_ref()
+        st.modes = modes
             .map(|m| {
                 m.available_modes
                     .iter()
@@ -1192,17 +1336,19 @@ impl Shared {
             })
             .unwrap_or_default();
         st.fallback_mode = fallback_mode(self.flavor, &st.modes);
-        st.mode = new
-            .modes
-            .as_ref()
+        st.mode = modes
             .map(|m| m.current_mode_id.0.to_string())
             .unwrap_or_default();
-        let (options, booleans) = convert_options(
-            new.config_options.as_deref().unwrap_or_default(),
-            self.flavor,
-        );
+        let (options, booleans) = convert_options(options.unwrap_or_default(), self.flavor);
         st.options = options;
         st.boolean_options = booleans;
+    }
+
+    /// `session/load` failed: no session yet, and no replay (`session/new` follows).
+    fn forget_session(&self) {
+        let mut st = self.lock();
+        st.session = None;
+        st.replaying = false;
     }
 
     fn become_ready(self: &Arc<Self>, started: &Started, cx: &ConnectionTo<Agent>) {
@@ -1213,6 +1359,7 @@ impl Shared {
             modes: st.modes.clone(),
             mode: st.mode.clone(),
             options: st.options.clone(),
+            loadable: started.loadable,
         };
         let _ = self.events.try_send(ready);
         st.ready = true;
@@ -1268,6 +1415,10 @@ impl Shared {
             return;
         };
         let cancel_requested = turn.cancel_requested;
+        let carried = st
+            .carried_instructions
+            .take_if(|(carrier, _)| *carrier == seq)
+            .map(|(_, text)| text);
         let reason = match result {
             Ok(response) => stop_reason(response.stop_reason),
             Err(e) => {
@@ -1278,6 +1429,11 @@ impl Shared {
                 if cancel_requested {
                     StopReason::Cancelled
                 } else {
+                    // The agent refused the prompt that carried Lemma's instructions: the next
+                    // one carries them (see the module docs).
+                    if carried.is_some() {
+                        st.instructions = carried;
+                    }
                     self.emit_locked(
                         &mut st,
                         AgentEvent::Error(format!("The agent failed: {}", describe(&e))),
@@ -1488,6 +1644,10 @@ impl Shared {
             tracing::debug!("update for another session ignored");
             return;
         }
+        if st.replaying && replays_conversation(&n.update) {
+            // The client shows the conversation `session/load` replays already.
+            return;
+        }
         let event = match n.update {
             s::SessionUpdate::AgentMessageChunk(c) => {
                 content_text(c.content).map(AgentEvent::MessageChunk)
@@ -1623,6 +1783,19 @@ impl Shared {
             tracing::warn!("cannot switch the agent back to an offered mode: {e}");
         }
     }
+}
+
+/// True for the updates by which `session/load` replays a conversation (see the module docs).
+fn replays_conversation(update: &s::SessionUpdate) -> bool {
+    matches!(
+        update,
+        s::SessionUpdate::UserMessageChunk(_)
+            | s::SessionUpdate::AgentMessageChunk(_)
+            | s::SessionUpdate::AgentThoughtChunk(_)
+            | s::SessionUpdate::ToolCall(_)
+            | s::SessionUpdate::ToolCallUpdate(_)
+            | s::SessionUpdate::Plan(_)
+    )
 }
 
 fn update_name(update: &s::SessionUpdate) -> &'static str {

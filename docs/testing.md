@@ -105,6 +105,7 @@ The scenarios in `tests/fixtures/agent/` work on a copy of `tests/fixtures/proj`
 | `errors.json` | three refused edits with the exact §4.2/§10.4 texts (not found, not unique, outside the root) |
 | `cancel.json` | streams, then sleeps 30 s until cancelled; `permission` leaves a request pending |
 | `long.json` | 200 message chunks and 30 edits of a new file, for performance |
+| `resume.json` | an agent that can load sessions (`_options.load_session`): `polish` edits the abstract; a load replays a conversation marked `REPLAYED` (a thought, a plan, an edit tool call, an answer) that the client must not show again |
 
 How Lemma runs it: `lemma FILE --agent-scenario SCENARIO.json` makes the window's agent the fake
 agent (found next to `lemma`, or through `LEMMA_FAKE_AGENT`). Cargo does not build other
@@ -115,12 +116,18 @@ test's target directory first (they fail, not skip, when that is impossible).
 Where the agent is tested:
 
 - `crates/lemma-agent/tests/acp_*.rs`: the ACP client against the fake agent (handshake,
-  streaming, permissions, cancel, process lifetime, threads); `mcp_*.rs`: the MCP server and the
+  streaming, permissions, cancel, process lifetime, threads, `session/load` with and without
+  the agent's `loadSession`: the replay is not reported); `mcp_*.rs`: the MCP server and the
   `lemma-mcp` bridge.
-- `tests/gtk_agent_tools.rs` (bridge, tools, watcher, history; e2e with `basic`, `bypass`,
-  `errors`, `long`) and `tests/gtk_agent_panel.rs` (panel, inline edit, quick actions, install
-  branches with a fake `npm`/`claude` on a temporary `PATH`; e2e with `basic`, `permission`,
-  `cancel`): in-process.
+- `tests/gtk_agent_tools.rs` (bridge, tools, watcher, history, the bounded text of the tool
+  records; e2e with `basic`, `bypass`, `errors`, `long`) and `tests/gtk_agent_panel.rs` (panel,
+  inline edit, quick actions, install branches with a fake `npm`/`claude` on a temporary
+  `PATH`; the idle stop on a command channel: what holds an idle agent, `idle_stop_min = 0`
+  (also set while the timer runs), a backend that `config.toml` replaced, the API backend; e2e
+  with `basic`, `permission`, `cancel`, and `resume`: an idle stop with the pane hidden ends the
+  fake agent's process, a start that fails keeps the conversation, and the next message loads
+  the same session in a new one, in the mode it had, without the replayed conversation):
+  in-process.
 - `tests/gtk_e2e_agent.rs`: the real `lemma` binary with `--demo agent` (below).
 - `scripts/e2e-agent.sh [case…]`: every scenario through the real binary, offscreen. Each case
   copies `proj` to `target/e2e-agent/<case>/`, runs the demo, checks the report line and the
@@ -167,7 +174,9 @@ No backend's real counterpart runs in a test: no request reaches the Anthropic A
   `acp_fs.rs` checks the generic mode policy against the fake agent's `_options.modes: "codex"`
   (Codex's modes, no `default`: the elevated `agent-full-access` is never offered and is
   switched back from) and that Lemma's instructions open only the first prompt (`echo_prompt`;
-  the fake agent leaves that block out of its keyword search). `install.rs`'s unit tests find
+  the fake agent leaves that block out of its keyword search), the next one again when the
+  agent answered the first with an error (`_options.prompt_error`), and the first after a
+  `session/load`. `install.rs`'s unit tests find
   each tool in a temporary home (`PATH`, `~/.local/bin`, `~/.<tool>/bin`, mise's `npm:`
   installs), a configured `command`, and Codex's node, `codex` and adapter. `gtk_agent_backends`
   runs a Grok turn end to end (instructions, a disk write that becomes a hunk, Codex's modes in
@@ -255,6 +264,7 @@ check the budgets only in release builds:
 | `gtk_completion` `perf_completion_keystroke` | keystroke to frame with completion, autosnippets and highlighting on a 5k-line document ≤ 8 ms p99 |
 | `lemma-complete` `perf_complete` | completion ≤ 3 ms p99 with all tables and a 7k-line project index |
 | `agent::markdown` `perf_render_long_message` | re-rendering a streaming 100 kB answer ≤ 2 ms per frame |
+| `lemma-agent` `perf_text_deltas_append_in_place` | the API backend's streamed deltas appended to their block: 32k deltas of 16 bytes ≤ 20 ms, and twice the deltas ≤ 3× the time (measured 0.8 ms; 230 ms when every delta copied the block) |
 | `lemma-syntax` `perf_index_pathological` | `index_file` on 14 pathological shapes (unclosed groups, stray `\end`, unterminated `\iffalse`, …) stays linear: twice the size ≤ 3× the time, ≤ 200 ms per MB |
 | `gtk_outline` `perf_outline_keystroke` | the outline's work per keystroke on the 7k-line corpus (first 7000 lines of `large.tex`) ≤ 1 ms (p99 and mean); `perf_outline_large_tex` prints the first outline and a patch on `large.tex` |
 | `gtk_pairs` `perf_pairs_cursor_moves_large_tex` | delimiter-pair highlight per cursor move on `large.tex` ≤ 0.5 ms p99 |

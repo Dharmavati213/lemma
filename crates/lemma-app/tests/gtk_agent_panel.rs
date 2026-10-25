@@ -22,11 +22,11 @@ mod common;
 use adw::prelude::*;
 use gtk::gdk::{Key, ModifierType};
 use lemma_agent::{
-    AgentEvent, ConfigOpt, EditorRequest, PermOption, PromptBlock, StopReason, ToolStatus,
+    AgentCmd, AgentEvent, ConfigOpt, EditorRequest, PermOption, PromptBlock, StopReason, ToolStatus,
 };
 use lemma_app::agent::panel::{self, Entry, PanelCommand, PermissionAnswer};
 use lemma_app::agent::{
-    AgentController, AgentState, PromptOrigin, SentPrompt, inline, install, quick,
+    AgentController, AgentState, PromptOrigin, SentPrompt, bridge, inline, install, quick,
 };
 use lemma_app::diagnostics_panel::Problem;
 use lemma_app::editor::Editor;
@@ -99,6 +99,11 @@ fn main() -> ExitCode {
         ("ask_agent_to_fix_sends_the_diagnostic", ask_agent_to_fix),
         ("lazy_start_and_retry", lazy_start),
         ("stop_agent_and_new_session", stop_and_new_session),
+        ("idle_stop_waits_for_the_user", idle_stop_waits),
+        (
+            "idle_stop_never_for_zero_minutes_or_the_api",
+            idle_stop_never,
+        ),
         ("install_adapter_with_fake_npm", install_success),
         ("install_failure_and_cancel", install_failure),
         ("diagnose_missing_node_and_claude", diagnose_missing),
@@ -110,6 +115,10 @@ fn main() -> ExitCode {
         ("e2e_pickers_switch_mode_and_model", e2e_pickers),
         ("e2e_inline_edit_hunks_only_in_region", e2e_inline),
         ("e2e_notification_when_unfocused", e2e_notification),
+        (
+            "e2e_idle_stop_resumes_the_conversation",
+            e2e_idle_stop_resumes,
+        ),
     ])
 }
 
@@ -891,6 +900,7 @@ fn ready_event() -> AgentEvent {
                 ],
             },
         ],
+        loadable: false,
     }
 }
 
@@ -2253,6 +2263,212 @@ fn stop_and_new_session() {
     panel.actions().activate_action("clear", None);
 }
 
+// ----- the idle stop -----
+
+/// How long the idle stop waits in these tests.
+const IDLE: Duration = Duration::from_millis(150);
+
+/// `ready_event` of session `session`, from an agent that can (or cannot) load sessions.
+fn ready_of(session: &str, loadable: bool) -> AgentEvent {
+    let AgentEvent::Ready {
+        agent,
+        modes,
+        mode,
+        options,
+        ..
+    } = ready_event()
+    else {
+        unreachable!()
+    };
+    AgentEvent::Ready {
+        session: session.into(),
+        agent,
+        modes,
+        mode,
+        options,
+        loadable,
+    }
+}
+
+/// A session on a command channel (no process), starting.
+fn channel_session(f: &Fixture) -> async_channel::Receiver<AgentCmd> {
+    let (tx, rx) = async_channel::unbounded();
+    bridge::attach_channel(&f.agent(), tx);
+    rx
+}
+
+/// A session on a command channel, `Ready` and idle.
+fn idle_session(f: &Fixture, session: &str, loadable: bool) -> async_channel::Receiver<AgentCmd> {
+    let rx = channel_session(f);
+    bridge::handle_event(&f.agent(), ready_of(session, loadable));
+    assert_eq!(f.agent().state(), AgentState::Idle);
+    rx
+}
+
+fn notices(panel: &panel::Panel) -> Vec<String> {
+    panel
+        .entries()
+        .into_iter()
+        .filter_map(|e| match e {
+            Entry::Notice(n) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+fn idle_stop_waits() {
+    let f = fixture("idle-stop", &[("main.tex", MAIN)], Hook::Forward);
+    let panel = f.panel();
+    let agent = f.agent();
+    let bridge = agent.bridge();
+    bridge.set_idle_stop(Some(IDLE));
+    let idle_for = |n: u32| common::pump_for(IDLE * n);
+
+    // The pane shown in the focused window holds the agent: the timer starts again. (Shown
+    // while the agent starts, so that showing it starts nothing; and beside the editor, as in
+    // a wide window, so that it stays shown wherever the focus goes.)
+    f.state.agent.split.set_collapsed(false);
+    let rx = channel_session(&f);
+    f.show_panel();
+    f.state.set_focus_override(Some(true));
+    bridge::handle_event(&agent, ready_of("s1", true));
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(bridge.idle_stop_pending());
+    idle_for(3);
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(bridge.idle_stop_pending());
+    // In a window without the focus it does not: stopped. Nothing went to this session, so
+    // there is nothing to resume, and the user did not stop it.
+    f.state.set_focus_override(Some(false));
+    common::pump_until(TIMEOUT, || agent.state() == AgentState::Stopped);
+    assert!(!bridge.has_session());
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|c| c == AgentCmd::Shutdown));
+    assert_eq!(bridge.resumable_session(), None);
+    assert_eq!(
+        notices(&panel),
+        [
+            "Claude was stopped after 1 idle minute to free memory; it starts again with your next \
+          message."
+        ]
+    );
+    assert_eq!(panel.setup(), None, "no \"Claude is stopped\" card");
+    f.state.agent.split.set_show_sidebar(false);
+
+    // Text in the prompt box holds it too (the window keeps without the focus from here on,
+    // wherever the permission card puts the pane).
+    let rx = idle_session(&f, "s2", true);
+    panel.prompt_view().buffer().set_text("a draft");
+    idle_for(3);
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(bridge.idle_stop_pending());
+    panel.prompt_view().buffer().set_text("");
+    // A permission request ends the timer, its answer starts it again.
+    bridge::handle_event(
+        &agent,
+        AgentEvent::Permission {
+            request: 7,
+            title: "Run ls".into(),
+            options: vec![perm("allow", "Allow", "allow_once")],
+        },
+    );
+    assert!(!bridge.idle_stop_pending());
+    idle_for(2);
+    assert_eq!(agent.state(), AgentState::Idle);
+    agent.permission(7, Some("allow".into()));
+    assert!(bridge.idle_stop_pending());
+    // A turn ends it; its end starts it again.
+    agent.prompt(vec![PromptBlock::Text("hi".into())], PromptOrigin::Panel);
+    assert!(!bridge.idle_stop_pending());
+    common::pump_until(TIMEOUT, || {
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, AgentCmd::Prompt(_)))
+    });
+    idle_for(3);
+    assert!(agent.is_running());
+    bridge::handle_event(&agent, AgentEvent::TurnEnded(StopReason::EndTurn));
+    assert!(bridge.idle_stop_pending());
+    // Stopped once idle long enough; this session's conversation is resumed with the next start.
+    common::pump_until(TIMEOUT, || agent.state() == AgentState::Stopped);
+    assert_eq!(bridge.resumable_session().as_deref(), Some("s2"));
+    assert_eq!(
+        notices(&panel).last().map(String::as_str),
+        Some(
+            "Claude was stopped after 1 idle minute to free memory; it resumes this \
+             conversation with your next message."
+        )
+    );
+
+    // An agent that cannot load sessions is stopped only before its first prompt.
+    let rx = idle_session(&f, "s3", false);
+    assert!(bridge.idle_stop_pending());
+    agent.prompt(vec![PromptBlock::Text("hi".into())], PromptOrigin::Panel);
+    common::pump_until(TIMEOUT, || {
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, AgentCmd::Prompt(_)))
+    });
+    bridge::handle_event(&agent, AgentEvent::TurnEnded(StopReason::EndTurn));
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(!bridge.idle_stop_pending());
+    idle_for(3);
+    assert!(bridge.has_session());
+    // A session that continues the last one keeps its context usage in the ring; a new one
+    // does not.
+    f.event(AgentEvent::Usage {
+        used: 1000,
+        size: 200_000,
+    });
+    bridge::handle_event(&agent, ready_of("s3", false));
+    assert_eq!(panel.usage(), Some((1000, 200_000)));
+    bridge::handle_event(&agent, ready_of("s4", false));
+    assert_eq!(panel.usage(), None);
+
+    // A conversation whose backend config.toml replaced while it ran (the switch waits for the
+    // session to end) is not stopped either: the next start would run the other backend.
+    let rx = idle_session(&f, "s5", true);
+    agent.prompt(vec![PromptBlock::Text("hi".into())], PromptOrigin::Panel);
+    common::pump_until(TIMEOUT, || {
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, AgentCmd::Prompt(_)))
+    });
+    bridge::handle_event(&agent, AgentEvent::TurnEnded(StopReason::EndTurn));
+    assert!(bridge.idle_stop_pending());
+    let mut config = (*f.state.config.get()).clone();
+    config.agent.backend = AgentBackend::Pi;
+    f.state.set_config(Rc::new(config));
+    idle_for(3);
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(bridge.has_session());
+    assert!(!bridge.idle_stop_pending());
+    bridge.set_idle_stop(None);
+    f.state.set_focus_override(None);
+    agent.stop();
+}
+
+fn idle_stop_never() {
+    // `agent.idle_stop_min = 0`: never.
+    let f = fixture_with("idle-never", &[("main.tex", MAIN)], Hook::Forward, |c| {
+        c.agent.idle_stop_min = 0;
+    });
+    let _rx = idle_session(&f, "s1", true);
+    assert!(!f.agent().bridge().idle_stop_pending());
+    f.agent().stop();
+    // Nor does a timer that started under another setting (a reload of config.toml).
+    let agent = f.agent();
+    agent.bridge().set_idle_stop(Some(IDLE));
+    let _rx = idle_session(&f, "s2", true);
+    assert!(agent.bridge().idle_stop_pending());
+    agent.bridge().set_idle_stop(None);
+    common::pump_for(IDLE * 3);
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert!(!agent.bridge().idle_stop_pending());
+    agent.stop();
+    // The API backend runs in Lemma's process: nothing to free.
+    let f = fixture_with("idle-api", &[("main.tex", MAIN)], Hook::Forward, |c| {
+        c.agent.backend = AgentBackend::Api;
+    });
+    f.agent().bridge().set_idle_stop(Some(IDLE));
+    let _rx = idle_session(&f, "api-1", false);
+    assert!(!f.agent().bridge().idle_stop_pending());
+    f.agent().stop();
+}
+
 const FAKE_NPM: &str = r#"echo "$@" > "$HOME/npm-args.txt"
 prefix=""; pkg=""
 while [ $# -gt 0 ]; do
@@ -2845,6 +3061,154 @@ fn e2e_notification() {
     assert_eq!(sent.borrow().len(), 1);
     f.state.set_notification_hook(None);
     f.agent().stop();
+}
+
+/// The fake agents playing `scenario` that run as children of this test.
+#[cfg(target_os = "linux")]
+fn agents_running(scenario: &std::path::Path) -> usize {
+    let me = std::process::id().to_string();
+    let needle = scenario.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let dir = entry.path();
+            let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
+            // `pid (comm) state ppid …`
+            let ppid = stat
+                .rfind(')')
+                .and_then(|end| stat[end + 1..].split_whitespace().nth(1));
+            ppid == Some(me.as_str())
+                && std::fs::read(dir.join("cmdline"))
+                    .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&needle))
+        })
+        .count()
+}
+
+fn e2e_idle_stop_resumes() {
+    let f = proj_fixture("e2e-idle");
+    f.open("main.tex");
+    let events: Rc<RefCell<Vec<AgentEvent>>> = Rc::default();
+    let sink = events.clone();
+    let id = f
+        .agent()
+        .connect_event(move |e| sink.borrow_mut().push(e.clone()));
+    if start_fake_agent(&f, "resume.json").is_none() {
+        return;
+    }
+    let agent = f.agent();
+    let bridge = agent.bridge();
+    let panel = f.panel();
+    let sessions = |events: &[AgentEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Ready { session, .. } => Some(session.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let in_plan = |events: &RefCell<Vec<AgentEvent>>| {
+        events
+            .borrow()
+            .iter()
+            .any(|e| *e == AgentEvent::ModeChanged("plan".into()))
+    };
+    let first = sessions(&events.borrow())[0].clone();
+    // The user chose plan mode in this conversation (the configured mode is `default`).
+    agent.set_mode("plan");
+    common::pump_until(TIMEOUT, || in_plan(&events));
+    // A turn that edits the abstract, with the pane hidden.
+    bridge.set_idle_stop(Some(IDLE));
+    assert!(panel::send_prompt(
+        &f.state,
+        vec![PromptBlock::Text("Polish the abstract".into())],
+        PromptOrigin::Panel
+    ));
+    assert_eq!(wait_turn_end(&f, TIMEOUT), Some(StopReason::EndTurn));
+    assert!(bridge.idle_stop_pending());
+    let hunks = lemma_app::review_ui::summary(&f.state.workspace).1;
+    assert_eq!(hunks, 1);
+    let scenario = common::fixtures()
+        .join("agent/resume.json")
+        .canonicalize()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(agents_running(&scenario), 1);
+    // Idle long enough: stopped and its process gone, the conversation kept to continue.
+    common::pump_until(TIMEOUT, || agent.state() == AgentState::Stopped);
+    assert_eq!(bridge.resumable_session(), Some(first.clone()));
+    #[cfg(target_os = "linux")]
+    common::pump_until(TIMEOUT, || agents_running(&scenario) == 0);
+    assert!(
+        notices(&panel).contains(
+            &"Claude was stopped after 1 idle minute to free memory; it resumes this conversation \
+          with your next message."
+                .to_owned()
+        )
+    );
+    assert_eq!(panel.setup(), None, "no \"Claude is stopped\" card");
+    // A start that fails (this agent exits at once) leaves the conversation to the next one.
+    let exits = common::temp_dir("e2e-idle-exits").join("exits.json");
+    std::fs::write(
+        &exits,
+        r#"{"_options": {"exit_on": "initialize"}, "default": [{"say": "never"}]}"#,
+    )
+    .unwrap();
+    agent.set_scenario(Some(exits));
+    let failed = block_on(async {
+        glib::future_with_timeout(Duration::from_secs(15), agent.ensure_started()).await
+    });
+    assert!(matches!(failed, Ok(Err(_))), "{failed:?}");
+    assert_eq!(bridge.resumable_session(), Some(first.clone()));
+    agent.set_scenario(Some(scenario));
+    // The next message starts the agent again, which loads the session: the same session,
+    // nothing of the conversation it replays, and plan mode again.
+    events.borrow_mut().clear();
+    assert!(panel::send_prompt(
+        &f.state,
+        vec![PromptBlock::Text("Are you still there?".into())],
+        PromptOrigin::Panel
+    ));
+    assert_eq!(wait_turn_end(&f, TIMEOUT), Some(StopReason::EndTurn));
+    common::pump_until(TIMEOUT, || in_plan(&events));
+    let seen = events.borrow().clone();
+    assert_eq!(sessions(&seen), [first]);
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::ThoughtChunk(_)
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::ToolUpdate { .. }
+                | AgentEvent::Plan(_)
+        )),
+        "{seen:#?}"
+    );
+    panel.flush();
+    let entries = panel.entries();
+    let count = |kind: &str| kinds(&entries).iter().filter(|k| **k == kind).count();
+    assert_eq!(
+        (
+            count("user"),
+            count("agent"),
+            count("tool"),
+            count("thought")
+        ),
+        (2, 2, 1, 0),
+        "{:?}",
+        kinds(&entries)
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| format!("{e:?}").contains("REPLAYED")),
+        "{entries:#?}"
+    );
+    assert_eq!(lemma_app::review_ui::summary(&f.state.workspace).1, hunks);
+    assert_eq!(panel.usage(), Some((53_000, 200_000)));
+    f.agent().disconnect(id);
+    bridge.set_idle_stop(None);
+    agent.stop();
 }
 
 fn descendants(widget: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {

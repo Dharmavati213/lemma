@@ -35,11 +35,16 @@ fn handshake_reports_ready_with_agent_modes_and_options() {
         modes,
         mode,
         options,
+        loadable,
     } = expect_ready(&handle)
     else {
         unreachable!()
     };
     assert!(session.starts_with("fake-session-"), "{session}");
+    assert!(
+        !loadable,
+        "the fake agent offers session/load only when asked"
+    );
     assert_eq!(
         agent,
         format!("lemma-fake-agent {}", env!("CARGO_PKG_VERSION"))
@@ -1151,6 +1156,121 @@ fn commands_sent_during_startup_run_after_ready() {
     assert!(events.contains(&AgentEvent::ModeChanged("plan".into())));
     assert_eq!(message_text(&events), "queued prompt ran");
     assert!(errors(&events).is_empty(), "{events:#?}");
+    shutdown(&handle);
+}
+
+/// The session id and `loadable` of a `Ready`.
+fn ready_session(ready: &AgentEvent) -> (String, bool) {
+    match ready {
+        AgentEvent::Ready {
+            session, loadable, ..
+        } => (session.clone(), *loadable),
+        other => panic!("not Ready: {other:?}"),
+    }
+}
+
+/// The conversation `session/load` replays (`_options.load_session.replay`).
+fn replay() -> serde_json::Value {
+    json!([
+        {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "Earlier question"}},
+        {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "REPLAYED thought"}},
+        {"sessionUpdate": "plan", "entries": [{"content": "REPLAYED plan", "priority": "medium", "status": "completed"}]},
+        {"sessionUpdate": "tool_call", "toolCallId": "old-1", "title": "mcp__lemma__edit", "kind": "other", "status": "pending"},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "old-1", "status": "completed"},
+        {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "REPLAYED answer"}},
+        {"sessionUpdate": "usage_update", "used": 52000, "size": 200000}
+    ])
+}
+
+#[test]
+fn a_loaded_session_continues_without_its_replay() {
+    let sb = Sandbox::new("load");
+    let scenario = sb.scenario(&json!({
+        "_options": {"load_session": {"replay": replay()}},
+        "default": [{"say": "fresh answer"}]
+    }));
+    // A first process: a new session that a later one can load.
+    let handle = lemma_agent::spawn(sb.config(&scenario)).unwrap();
+    let (first, loadable) = ready_session(&expect_ready(&handle));
+    assert!(loadable);
+    prompt(&handle, "hello");
+    events_until(&handle, SLOW, is_turn_end);
+    shutdown(&handle);
+    // A second one loads it: same id, and nothing of the replayed conversation is reported.
+    let mut cfg = sb.config(&scenario);
+    cfg.load_session = Some(first.clone());
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (session, loadable) = ready_session(&expect_ready(&handle));
+    assert_eq!(session, first);
+    assert!(loadable);
+    prompt(&handle, "and now?");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert_eq!(message_text(&events), "fresh answer");
+    let replayed: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ThoughtChunk(_)
+                    | AgentEvent::ToolCall { .. }
+                    | AgentEvent::ToolUpdate { .. }
+                    | AgentEvent::Plan(_)
+                    | AgentEvent::Notice(_)
+            )
+        })
+        .collect();
+    assert!(replayed.is_empty(), "{events:#?}");
+    // What is not the conversation still counts: the context usage, the commands.
+    assert!(events.contains(&AgentEvent::Usage {
+        used: 52000,
+        size: 200_000
+    }));
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Commands(_))),
+        "{events:#?}"
+    );
+    assert!(errors(&events).is_empty(), "{events:#?}");
+    shutdown(&handle);
+}
+
+#[test]
+fn a_session_that_cannot_be_loaded_is_a_new_one() {
+    // The agent refuses to load it.
+    let sb = Sandbox::new("load-error");
+    let scenario = sb.scenario(&json!({
+        "_options": {"load_session": {"error": {"code": -32603, "message": "no such session"}}},
+        "default": [{"say": "new answer"}]
+    }));
+    let mut cfg = sb.config(&scenario);
+    cfg.load_session = Some("gone-session".into());
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (session, _) = ready_session(&expect_ready(&handle));
+    assert_ne!(session, "gone-session");
+    prompt(&handle, "hello");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Notice(n)
+            if n.contains("could not resume the conversation") && n.contains("no such session"))),
+        "{events:#?}"
+    );
+    assert_eq!(message_text(&events), "new answer");
+    shutdown(&handle);
+    // The agent cannot load sessions at all.
+    let sb = Sandbox::new("load-unsupported");
+    let scenario = sb.scenario(&json!({"default": [{"say": "new answer"}]}));
+    let mut cfg = sb.config(&scenario);
+    cfg.load_session = Some("old-session".into());
+    let handle = lemma_agent::spawn(cfg).unwrap();
+    let (session, loadable) = ready_session(&expect_ready(&handle));
+    assert_ne!(session, "old-session");
+    assert!(!loadable);
+    prompt(&handle, "hello");
+    let events = events_until(&handle, SLOW, is_turn_end);
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Notice(n)
+            if n.contains("cannot resume conversations"))),
+        "{events:#?}"
+    );
     shutdown(&handle);
 }
 

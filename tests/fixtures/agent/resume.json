@@ -1,0 +1,31 @@
+{
+  "_description": "An agent that can load sessions (session/load), for the idle stop. A prompt with 'polish' edits the abstract of main.tex and answers; any other prompt just answers. Loading a session replays a conversation (a user message, a thought, a plan, an edit tool call and an answer, all marked REPLAYED) before the agent answers, as Claude's adapter does: the client must show none of it again.",
+  "_options": {
+    "load_session": {
+      "replay": [
+        {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "Polish the abstract"}},
+        {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "REPLAYED thought"}},
+        {"sessionUpdate": "plan", "entries": [{"content": "REPLAYED plan", "priority": "medium", "status": "completed"}]},
+        {"sessionUpdate": "tool_call", "toolCallId": "replayed-1", "title": "mcp__lemma__edit", "kind": "other", "status": "pending",
+         "rawInput": {"file_path": "main.tex", "old_string": "These notes are a test document.", "new_string": "REPLAYED"}},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "replayed-1", "status": "completed",
+         "content": [{"type": "content", "content": {"type": "text", "text": "Edited main.tex"}}]},
+        {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "REPLAYED answer"}},
+        {"sessionUpdate": "usage_update", "used": 52000, "size": 200000}
+      ]
+    }
+  },
+  "polish": [
+    {"tool": {"name": "edit", "args": {
+      "file_path": "main.tex",
+      "old_string": "These notes serve as a test document.",
+      "new_string": "These notes are a test document."
+    }}},
+    {"say": "I shortened the last sentence of the abstract."},
+    {"usage": {"used": 52000, "size": 200000}}
+  ],
+  "default": [
+    {"say": "Still here, and I remember the abstract."},
+    {"usage": {"used": 53000, "size": 200000}}
+  ]
+}

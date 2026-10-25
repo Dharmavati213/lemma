@@ -391,6 +391,7 @@ fn ready_event(mode: &str) -> AgentEvent {
                 values: vec![("low".into(), "Low".into()), ("high".into(), "High".into())],
             },
         ],
+        loadable: false,
     }
 }
 
@@ -865,6 +866,30 @@ fn tool_records() {
     agent.bridge().disconnect_tool_done(id);
     f.call_text(EditorRequest::ListFiles);
     assert_eq!(seen.borrow().len(), 2);
+    // A record keeps the start of a long reply (here a 2000-line read of a 300 KB file) and
+    // its length.
+    let line = format!("{}\n", "x".repeat(149));
+    f.external_write("big.tex", &line.repeat(2000));
+    let read = f.call_text(EditorRequest::ReadFile {
+        path: "big.tex".into(),
+        offset: None,
+        limit: None,
+    });
+    assert!(read.len() > 300_000, "{}", read.len());
+    let records = agent.bridge().tool_records();
+    let last = records.last().unwrap();
+    assert_eq!(last.tool, "read_file");
+    assert!(
+        last.text.len() <= bridge::TOOL_RECORD_TEXT,
+        "{}",
+        last.text.len()
+    );
+    assert!(read.starts_with(last.text.trim_end_matches('…')));
+    assert!(last.text.ends_with('…'));
+    assert_eq!(last.bytes, read.len());
+    // Stopping the agent forgets them.
+    agent.stop();
+    assert!(agent.bridge().tool_records().is_empty());
 }
 
 // ----- the bridge -----

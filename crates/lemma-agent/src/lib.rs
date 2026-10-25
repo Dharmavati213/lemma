@@ -38,6 +38,12 @@ pub struct AgentConfig {
     pub raw_log: Option<PathBuf>, // debug only; contains account info, never commit
     /// Which kind of ACP agent `program` is (WP5.2): see [`AcpFlavor`].
     pub flavor: AcpFlavor,
+    /// A session of an earlier process to continue (ACP `session/load`, with the same `cwd`,
+    /// MCP server and `_meta` as `session/new`), when the agent can load sessions (its `Ready`
+    /// said `loadable`). The conversation the agent replays while it loads is not reported:
+    /// the client shows it already. An agent that cannot load it starts a new session, with a
+    /// `Notice` that says so. `None`: a new session.
+    pub load_session: Option<String>,
 }
 /// The kind of ACP agent [`spawn`] runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,16 +199,20 @@ pub struct PermOption {
 /// start-up follow it), `Exited` comes last and the channel then closes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
-    /// The session exists. `agent` is the agent's `"name version"` from `initialize`; `modes` are
+    /// The session exists. `session` is its id (the one [`AgentConfig::load_session`] named
+    /// when it was loaded); `agent` is the agent's `"name version"` from `initialize`; `modes` are
     /// `(id, name)` limited to [`OFFERED_MODES`]; `mode` is the current one (a session that starts
     /// in another mode is switched to `default` first; if the agent switched to such a mode during
     /// start-up, `mode` says so, and a `Notice` and the switch back to `default` follow).
+    /// `loadable`: a later process can continue this session ([`AgentConfig::load_session`];
+    /// the agent advertised `loadSession`).
     Ready {
         session: String,
         agent: String,
         modes: Vec<(String, String)>,
         mode: String,
         options: Vec<ConfigOpt>,
+        loadable: bool,
     },
     MessageChunk(String),
     ThoughtChunk(String),

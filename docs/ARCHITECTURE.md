@@ -345,7 +345,7 @@ Rules:
 | Latexmk exit to first page on screen | ≤ 30 ms | 4–11 ms per page [V] |
 | SyncTeX query | ≤ 5 ms | About 50 µs [V] |
 | Agent inside the editor process | ≤ 3 MB | Threads and channels only |
-| Agent outside the editor | About 360 MB while running (node 123 MB + claude about 240 MB [V]) | Started when the panel first opens; Stop button; idle stop in M5 |
+| Agent outside the editor | About 360 MB while running (node 123 MB + claude about 240 MB [V]) | Started when the panel first opens; Stop button; stopped after `agent.idle_stop_min` idle minutes (§11) |
 
 **Techniques:**
 - System GTK, linked dynamically. No tokio, webview, JS engine or bundled C libraries.
@@ -368,7 +368,7 @@ Each milestone ends in a runnable app.
 | **M2 Agent + typing** | Claude over ACP edits through MCP tools; multi-file hunks, Changes panel, permission cards (y/Y/n), persistence, watcher, turn snapshots. Scanner highlighting (language None), L1+L3 completion, snippets and autosnippets, pairing, `\end` auto-close, spell check. Ends with **one paid prompt, only after the user approves it**, to check that edits go through `mcp__lemma__edit` and whether `render_page` images reach the model. | 2.1 ACP thread (`acp.rs`); 2.2 MCP server and bridge; 2.3 `lemma-fake-agent`; 2.4 agent bridge and tools (main-thread handlers, turn snapshot, watcher); 2.5 agent panel; 2.6 Changes panel and persistence; 2.7 highlighting switch; 2.8 L1 data (xtask) + `Completer`; 2.9 completion provider, snippet driver, typing helpers, spell; 2.10 key layer + Vim ex commands (verify `]h` before VimIMContext) |
 | **M3 Navigate & preview** | Outline, goto and hover for refs/cites, math hover preview, link hover, PDF search, word count, Annotations | — |
 | **M4 Typing depth** | L2 cwl (fetch TeXstudio `completion/`), quick fixes, symbol palette, Unicode → LaTeX (pdflatex documents only), live `\begin`/`\end` rename, VimTeX `cse`/`dse`/`tsf`/`ie`/`ae`/`i$`, list and align helpers | — |
-| **M5 Ecosystem & hardening** | Messages-API backend (API key; streaming design **[U]**), Codex/Gemini ACP presets with `fs/*` routing, idle stop + `session/load` **[U]**, `lemma-mcp` for Claude Code in a terminal, memory/performance CI gates, PKGBUILD | — |
+| **M5 Ecosystem & hardening** | Messages-API backend (API key; streaming design **[U]**), Codex/Gemini ACP presets with `fs/*` routing, idle stop + `session/load` (§11; tested against the fake agent), `lemma-mcp` for Claude Code in a terminal, memory/performance CI gates, PKGBUILD | — |
 
 ## 9. Top risks and mitigations
 1. **ACP SDK and adapter churn.** Three breaking major versions in 3.5 months; the adapter ships almost daily.
@@ -378,7 +378,7 @@ Each milestone ends in a runnable app.
 2. ~~**Edit routing has not been seen with a real model.**~~ **Verified 2026-10-11** (CLI 2.1.296, adapter 0.89.1). Claude used `ToolSearch` → `mcp__lemma__read_file` → `mcp__lemma__edit` → `mcp__lemma__compile` → `mcp__lemma__render_page`, with no built-in Edit/Write/Bash and no permission requests. The watcher plus turn snapshot remain the safety net.
 3. **Vim fidelity** for a Neovim/VimTeX user. VimIMContext has no macro recording [S], and it is unknown whether the key layer can run before it **[U]**. The fallback for after v1 is `nvim --embed`.
 4. **Inline diff polish.** Bar timing and soft-wrap heights. The prototype exists [V]; WP1.2 has snapshot and behaviour tests.
-5. **Agent memory** of about 360 MB. It is external and started only when the panel opens. Stop button; idle stop in M5; the API-key backend costs a few MB.
+5. **Agent memory** of about 360 MB. It is external and started only when the panel opens. Stop button; the idle stop after `agent.idle_stop_min` minutes, which continues the conversation with `session/load` (§11); the API-key backend costs a few MB.
 6. **Subscription policy.** Claude Code login reuse is for personal use; distributed builds should default to the API-key backend. The UI never offers the `bypassPermissions` or `auto` modes.
 7. **CLI version and PATH.**
    - Store absolute paths to `node` and `claude` (mise installs them under `~/.local/share/mise/installs/...`, which may not be on the PATH of a desktop launch).
@@ -1091,7 +1091,9 @@ they conflict with the sections above, this section wins.
       `acceptEdits`/`auto`), falling back to `default` or else their first offered mode.
     - Instructions: ACP has no system prompt and only Claude's adapter reads
       `_meta.systemPrompt.append`, so other agents get `GENERIC_APPEND` as the first block of the
-      session's first prompt, inside `<lemma_instructions>`.
+      session's first prompt, inside `<lemma_instructions>`. If the agent answers that prompt
+      with an error that is neither a cancel nor its death (a quota, an expired login), the
+      next prompt carries them again (2026-10-25).
     - Agents that write files themselves (Codex's `apply_patch`, …) are covered by the file
       monitor and the turn snapshot; the tool cards recognise Lemma's tools under other naming
       schemes (`mcp.lemma.edit`).
@@ -1131,6 +1133,40 @@ they conflict with the sections above, this section wins.
     first, then the files after (before) it, wrapping around, opening the file at the problem's
     mapped line as a click on its row does. Problems without a line, and findings, are skipped.
     Function keys are never typed, so the keys stay clear of Vim; Vim has no `]e` or `[e`.
+- **Idle stop and `session/load` (§7, §10.3, §10.4, 2026-10-25):**
+  - `AgentConfig` gains `load_session: Option<String>` and `AgentEvent::Ready` gains
+    `loadable: bool` (the agent advertised `loadSession` in `initialize`). With
+    `load_session` and a loadable agent, `session/load` replaces `session/new`, with the same
+    `cwd`, MCP server and `_meta`. Until its answer, the updates that replay the conversation
+    (user, agent and thought chunks, tool calls and their updates, plans) are dropped: the
+    transcript shows that conversation already, and nothing of it becomes a tool card or
+    reaches the editor. Modes, options, commands, usage and notices count. A refused load, or
+    an agent that cannot load, gets `session/new` and a `Notice`. A loaded generic agent gets
+    `GENERIC_APPEND` again with its first prompt. Claude's adapter 0.89.1 advertises
+    `loadSession: true` (and `sessionCapabilities` `close`, `delete`, `fork`, `list`,
+    `resume`, `subagents`); its `session/load` replays the history before it answers and
+    reads `_meta` as `session/new` does. ACP 3.3.0 has the `session/load` types (and
+    `session/resume`, which would replay nothing; not used).
+  - The bridge arms a timer of `agent.idle_stop_min` minutes (default 10, 0 = never) when an
+    ACP agent becomes `Idle` (its `Ready`, each turn's end) and ends it on a prompt, a
+    permission request, a start and a stop; never for the API backend, which has no process.
+    When it runs out with the agent still idle, nothing being prepared and no permission
+    request pending, the agent is stopped as Stop does, without the panel's "stopped by the
+    user" state, and a `Notice` says so, unless `panel::holds_agent` (text or attachments in
+    the prompt box, or the pane shown in the focused window) or `agent.idle_stop_min` changed
+    meanwhile, which start the timer again.
+  - A loadable session that had a prompt is kept (`Resume`: its id, `cwd`, backend, mode,
+    model and effort); each start in that root with that backend loads it, and the first
+    `Ready` takes it (a start that fails leaves it for the next). When that `Ready` names the
+    session, its mode, model and effort are chosen again instead of the configured ones. An
+    agent whose conversation the next start could not continue (it cannot load sessions, or
+    `config.toml` chose another backend while it ran) is stopped only while no prompt went to
+    it. Any other stop forgets the session. The pane keeps the context usage when `Ready`
+    names the session it showed last.
+  - Each `ToolRecord` keeps at most `TOOL_RECORD_TEXT` (2 KiB) of its reply's text, cut at a
+    character boundary with `…`, and the whole length in `bytes`; a stop clears the records.
+  - The API backend appends streamed text, thinking and signature deltas to their block in
+    place (a block of n bytes in k deltas cost O(n·k) bytes of copying).
 
 ## 12. macOS (2026-10-19)
 

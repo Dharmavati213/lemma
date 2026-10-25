@@ -92,10 +92,34 @@
 //! waits for writes to settle, so a change a program made just before the turn ended is often
 //! reported after it: it still gets the turn-end build ([`note_file_changed`],
 //! [`LATE_BUILD_DELAY`]).
+//!
+//! # Idle stop
+//!
+//! An ACP agent runs as processes of its own (Claude Code: about 360 MB, §7). Each time it
+//! becomes `Idle` (its `Ready`, the end of each turn) a timer of `agent.idle_stop_min` minutes
+//! starts (0: never); a prompt, a permission request, a start and a stop end it. The API
+//! backend runs in Lemma's process and is never stopped. When the timer runs out while the agent
+//! is still idle, nothing is being prepared and no permission request is pending, the agent is
+//! stopped as [`stop`] does, unless the pane holds it ([`super::panel::holds_agent`]: text or
+//! attachments in the prompt box, or the pane shown in the focused window), or
+//! `agent.idle_stop_min` changed meanwhile, which start the timer again. The user did not stop
+//! it, so the next prompt (or showing the pane) starts it again, and a `Notice` in the
+//! transcript says so.
+//!
+//! The conversation is kept when the agent can load sessions (`Ready.loadable`, ACP
+//! `loadSession`; Claude's adapter can): the stop keeps the session's id, directory, backend and
+//! its mode, model and effort, and each start in the same directory with the same backend gives
+//! the id to `lemma_agent` ([`AgentConfig::load_session`]), which loads the session instead of
+//! starting a new one, without reporting the conversation the agent replays. The first session
+//! that becomes ready takes it (a start that fails leaves it for the next); if it is the loaded
+//! one, the mode, model and effort it had are chosen again (not the configured ones). An agent
+//! whose conversation the next start could not continue (it cannot load sessions, or
+//! `config.toml` chose another backend while it ran) is stopped only while no prompt went to it,
+//! so that nothing is lost; otherwise it keeps running.
 
 use super::{
-    AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, history, install, tools,
-    watcher,
+    AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, history, install, panel,
+    tools, watcher,
 };
 use crate::build_ui::Reason;
 use crate::hooks::{HookId, Hooks};
@@ -108,7 +132,7 @@ use lemma_agent::mcp::{McpServer, Timeouts};
 use lemma_agent::{AgentCmd, AgentConfig, AgentEvent, ConfigOpt, StopReason, ToolCall};
 use lemma_config::{AgentBackend, AgentCfg, Paths};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
@@ -161,6 +185,9 @@ pub const NOTIFICATION_ID: &str = "lemma-agent-turn-ended";
 const MCP_BRIDGE: &str = "lemma-mcp";
 /// Tool calls remembered by [`Bridge::tool_records`].
 const TOOL_RECORDS_KEPT: usize = 64;
+/// At most this much of a reply's text is kept in its [`ToolRecord`], in bytes (the `…` that
+/// marks a cut included).
+pub const TOOL_RECORD_TEXT: usize = 2048;
 /// Event handling times remembered by [`Bridge::event_durations`].
 const EVENT_DURATIONS_KEPT: usize = 4096;
 /// Unix socket paths must be shorter than this (`sun_path`).
@@ -180,8 +207,12 @@ pub struct ToolRecord {
     /// The file the call named (as the agent wrote it), if any.
     pub path: Option<PathBuf>,
     pub is_error: bool,
-    /// The reply's text parts, joined by blank lines.
+    /// The start of the reply's text parts, joined by blank lines: all of it up to
+    /// [`TOOL_RECORD_TEXT`] bytes, else as much as fits with a `…` (a reply can be a whole
+    /// file, and 64 of them are kept).
     pub text: String,
+    /// The length of the whole joined text, in bytes.
+    pub bytes: usize,
     /// Number of images in the reply.
     pub images: usize,
     /// Time from the call's arrival on the main thread to its reply.
@@ -212,11 +243,83 @@ struct Session {
     mcp: Option<McpServer>,
     /// Which modes may be chosen ([`lemma_agent::AcpFlavor::offers_mode`]).
     flavor: lemma_agent::AcpFlavor,
+    /// The backend it runs (`agent.backend` may name another since: a switch in `config.toml`
+    /// waits for the session to end).
+    backend: AgentBackend,
+    /// The agent runs in processes of its own (not the API backend): the idle stop frees them.
+    process: bool,
+    /// The session's id, once `Ready` said that the agent can load it again.
+    loadable: Option<String>,
+    /// The session has a conversation: a prompt went to it, or it continues one.
+    conversation: bool,
+    /// Its mode, model and effort now (from `Ready` and the agent's updates).
+    preferences: Preferences,
+}
+
+/// The mode, model and effort of a session (see [`apply_preferences`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Preferences {
+    mode: String,
+    model: String,
+    effort: String,
+}
+
+impl Preferences {
+    /// The configured ones of `cfg`'s backend: `agent.default_mode` (`default` or `plan`),
+    /// `agent.model` and `agent.effort` (empty: the agent's own).
+    fn configured(cfg: &AgentCfg) -> Self {
+        let mode = if cfg.default_mode == "plan" {
+            "plan"
+        } else {
+            "default"
+        };
+        Self {
+            mode: mode.to_owned(),
+            model: cfg.model_for(cfg.backend).to_owned(),
+            effort: cfg.effort_for(cfg.backend).to_owned(),
+        }
+    }
+
+    /// The ones of a session in `mode` with `options`.
+    fn of(mode: &str, options: &[ConfigOpt]) -> Self {
+        let current = |ids: &[&str]| {
+            ids.iter()
+                .find_map(|id| options.iter().find(|o| o.id == *id))
+                .map(|o| o.current.clone())
+                .unwrap_or_default()
+        };
+        Self {
+            mode: mode.to_owned(),
+            model: current(&["model"]),
+            effort: current(EFFORT_OPTIONS),
+        }
+    }
+}
+
+/// A conversation that an idle stop left to continue (see the module docs).
+#[derive(Clone, Debug)]
+struct Resume {
+    /// The agent's id of the session.
+    session: String,
+    /// Where it ran, and which agent: a start elsewhere or with another backend is a new
+    /// conversation.
+    cwd: PathBuf,
+    backend: AgentBackend,
+    /// What the session had chosen, chosen again once it is loaded.
+    preferences: Preferences,
 }
 
 impl Session {
     fn send(&self, cmd: AgentCmd) -> bool {
         self.outbox.try_send(cmd).is_ok()
+    }
+
+    /// The id by which a later start continues this session's conversation (the agent can load
+    /// it), unless `configured` (`agent.backend`) is another backend: that one starts next.
+    fn continuable(&self, configured: AgentBackend) -> Option<&String> {
+        self.loadable
+            .as_ref()
+            .filter(|_| self.backend == configured)
     }
 
     /// Asks the agent thread to shut down (it closes the session, kills the agent's process
@@ -294,6 +397,15 @@ pub struct Bridge {
     config_hooked: Cell<bool>,
     /// The build for changes that arrived after the turn ended ([`note_file_changed`]).
     late_build: Rc<RefCell<Option<glib::SourceId>>>,
+    /// The idle stop's timer (see the module docs).
+    idle_timer: RefCell<Option<glib::SourceId>>,
+    /// Replaces `agent.idle_stop_min` (tests).
+    idle_after: Cell<Option<Duration>>,
+    /// The conversation the last idle stop left to continue, until a session is ready or a stop
+    /// (a start that fails leaves it for the next one).
+    resume: RefCell<Option<Resume>>,
+    /// Permission requests of the running session that are not settled.
+    pending_permissions: RefCell<HashSet<u64>>,
 }
 
 impl Default for Bridge {
@@ -324,6 +436,10 @@ impl Default for Bridge {
             builds_finished: RefCell::new(None),
             config_hooked: Cell::new(false),
             late_build: Rc::default(),
+            idle_timer: RefCell::new(None),
+            idle_after: Cell::new(None),
+            resume: RefCell::new(None),
+            pending_permissions: RefCell::new(HashSet::new()),
         }
     }
 }
@@ -350,7 +466,7 @@ impl Bridge {
         self.preparing.get().is_some()
     }
 
-    /// The last tool calls answered (at most 64), oldest first.
+    /// The last tool calls answered (at most 64) since the agent was last stopped, oldest first.
     pub fn tool_records(&self) -> Vec<ToolRecord> {
         self.records.borrow().iter().cloned().collect()
     }
@@ -375,6 +491,23 @@ impl Bridge {
     /// Changes [`AFTER_TURN_GRACE`] for this window (tests).
     pub fn set_after_turn_grace(&self, grace: Duration) {
         self.grace.set(grace);
+    }
+
+    /// Makes the idle stop wait `after` instead of `agent.idle_stop_min` minutes in this window
+    /// (tests; `None`: the configured time again). Takes effect the next time the agent
+    /// becomes idle; a timer that runs out under another setting starts again with this one.
+    pub fn set_idle_stop(&self, after: Option<Duration>) {
+        self.idle_after.set(after);
+    }
+
+    /// True while the idle stop's timer runs (see the module docs).
+    pub fn idle_stop_pending(&self) -> bool {
+        self.idle_timer.borrow().is_some()
+    }
+
+    /// The session id that the next start loads, left by an idle stop (see the module docs).
+    pub fn resumable_session(&self) -> Option<String> {
+        self.resume.borrow().as_ref().map(|r| r.session.clone())
     }
 
     /// The number of the running turn, if one runs.
@@ -501,6 +634,8 @@ fn begin_start(controller: &Rc<AgentController>) {
         session.shut_down();
     }
     let generation = bridge.next_generation();
+    Bridge::clear_timer(&bridge.idle_timer);
+    bridge.pending_permissions.borrow_mut().clear();
     controller.set_state(AgentState::Starting);
     // A callback may have stopped the agent already.
     if bridge.generation.get() != generation {
@@ -627,7 +762,7 @@ struct Resolved {
 }
 
 async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<(), String> {
-    let (scenario, agent_cfg, paths, runtime, build_timeout) = {
+    let (scenario, agent_cfg, paths, runtime, build_timeout, resume) = {
         let controller = weak.upgrade().ok_or(WINDOW_GONE)?;
         let state = controller.window().ok_or(WINDOW_GONE)?;
         (
@@ -636,6 +771,9 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
             state.paths.clone(),
             tools::runtime_dir(&state),
             Duration::from_secs(state.config.build.timeout_s),
+            // The conversation an idle stop left; the `Ready` of whichever start succeeds takes
+            // it.
+            controller.bridge().resume.borrow().clone(),
         )
     };
     let backend = agent_cfg.backend;
@@ -660,6 +798,16 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
         .root()
         .path()
         .to_path_buf();
+    // It continues only in its own directory and with its own agent (see the module docs).
+    let load_session = resume
+        .filter(|r| {
+            let same = r.cwd == root && r.backend == backend;
+            if !same {
+                tracing::info!("the agent starts elsewhere: a new conversation");
+            }
+            same
+        })
+        .map(|r| r.session);
     let (tool_tx, tool_rx) = async_channel::unbounded();
     // `compile` waits for the build: its timeout is the build's plus a grace period.
     let timeouts = Timeouts::for_build_timeout(build_timeout);
@@ -686,6 +834,7 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
         .to_owned(),
         raw_log: None,
         flavor,
+        load_session,
     };
     tracing::info!(
         "starting the agent: {} {}",
@@ -717,6 +866,7 @@ async fn start_session(weak: &Weak<AgentController>, generation: u64) -> Result<
         Some(mcp),
         Some(tool_rx),
         flavor,
+        backend,
     );
     Ok(())
 }
@@ -771,6 +921,7 @@ async fn start_api_session(
         None,
         None,
         lemma_agent::AcpFlavor::Claude,
+        AgentBackend::Api,
     );
     Ok(())
 }
@@ -780,7 +931,8 @@ fn stored_api_key() -> Option<lemma_agent::keys::ApiKey> {
     lemma_agent::keys::lookup().map(|(key, _source)| key)
 }
 
-/// Makes `handle` the running session and starts its pumps (the MCP server's tool calls too).
+/// Makes `handle` the running session of `backend` and starts its pumps (the MCP server's tool
+/// calls too).
 #[allow(clippy::too_many_arguments)]
 fn attach_session(
     controller: &Rc<AgentController>,
@@ -791,6 +943,7 @@ fn attach_session(
     mcp: Option<McpServer>,
     mcp_tools: Option<async_channel::Receiver<ToolCall>>,
     flavor: lemma_agent::AcpFlavor,
+    backend: AgentBackend,
 ) {
     let bridge = controller.bridge();
     let (outbox, queued) = async_channel::unbounded();
@@ -800,8 +953,15 @@ fn attach_session(
         cwd: root,
         cmd: handle.cmd,
         outbox,
+        // Only an agent process gets our MCP server (the API backend's tools come on
+        // `handle.tools`).
+        process: mcp.is_some(),
         mcp,
         flavor,
+        backend,
+        loadable: None,
+        conversation: false,
+        preferences: Preferences::default(),
     }));
     if !bridge.root_hooked.replace(true)
         && let Some(state) = controller.window()
@@ -832,30 +992,37 @@ fn attach_session(
 /// Attaches `cmd` as the agent's command channel without starting a process or an MCP server:
 /// the state becomes `Starting`, commands go to `cmd`, and whoever drives the session gives its
 /// events to [`handle_event`] (a `Ready` makes it `Idle`). For tests of the bookkeeping; a stop
-/// sends `Shutdown` and closes `cmd`.
+/// sends `Shutdown` and closes `cmd`. The session counts as an agent process (for the idle stop)
+/// unless the backend is `api`.
 pub fn attach_channel(controller: &Rc<AgentController>, cmd: async_channel::Sender<AgentCmd>) {
     let bridge = controller.bridge();
     if let Some(session) = bridge.session.take() {
         session.shut_down();
     }
     let generation = bridge.next_generation();
+    Bridge::clear_timer(&bridge.idle_timer);
+    bridge.pending_permissions.borrow_mut().clear();
     let (outbox, queued) = async_channel::unbounded();
     glib::spawn_future_local(forward(queued, cmd.clone()));
     let cwd = controller
         .window()
         .map(|s| s.workspace.root().path().to_path_buf())
         .unwrap_or_default();
+    let backend = controller
+        .window()
+        .map_or(AgentBackend::Claude, |s| s.config.agent.backend);
     bridge.session.replace(Some(Session {
         generation,
         cwd,
         cmd,
         outbox,
         mcp: None,
-        flavor: controller
-            .window()
-            .map_or(lemma_agent::AcpFlavor::Claude, |s| {
-                acp_flavor(s.config.agent.backend)
-            }),
+        flavor: acp_flavor(backend),
+        backend,
+        process: backend != AgentBackend::Api,
+        loadable: None,
+        conversation: false,
+        preferences: Preferences::default(),
     }));
     forget_held(controller);
     controller.set_state(AgentState::Starting);
@@ -1134,6 +1301,7 @@ fn fail_start(controller: &AgentController, message: String) {
     let bridge = controller.bridge();
     bridge.next_generation();
     Bridge::clear_timer(&bridge.start_timer);
+    Bridge::clear_timer(&bridge.idle_timer);
     if let Some(session) = bridge.session.take() {
         session.shut_down();
     }
@@ -1142,15 +1310,19 @@ fn fail_start(controller: &AgentController, message: String) {
 }
 
 /// See the module docs: stops the agent and its MCP server; `Stopped`. Safe in every state (also
-/// while the controller is being dropped).
+/// while the controller is being dropped). The next start is a new conversation, and the tool
+/// records are forgotten.
 pub fn stop(controller: &AgentController) {
     let bridge = controller.bridge();
     bridge.next_generation();
     Bridge::clear_timer(&bridge.start_timer);
     Bridge::clear_timer(&bridge.cancel_timer);
+    Bridge::clear_timer(&bridge.idle_timer);
     if let Some(session) = bridge.session.take() {
         session.shut_down();
     }
+    bridge.resume.replace(None);
+    bridge.pending_permissions.borrow_mut().clear();
     bridge.resolve_waiters(&Err(STOPPED.to_owned()));
     bridge.preparing.set(None);
     forget_held(controller);
@@ -1160,6 +1332,7 @@ pub fn stop(controller: &AgentController) {
     controller.set_state(AgentState::Stopped);
     // The agent that could look at them is gone.
     tools::remove_render_copies(&bridge.render_copies.take());
+    bridge.records.borrow_mut().clear();
 }
 
 /// Drops the held prompt (keeping its feedback for the next prompt) and forgets the `TurnEnded`
@@ -1189,19 +1362,58 @@ pub fn handle_event(controller: &Rc<AgentController>, event: AgentEvent) {
     let bridge = controller.bridge();
     match &event {
         AgentEvent::Ready {
+            session,
             agent,
             modes,
             mode,
             options,
-            ..
+            loadable,
         } => {
             tracing::info!("agent ready: {agent}");
             Bridge::clear_timer(&bridge.start_timer);
+            // A session that continues the conversation an idle stop left (it has its id)
+            // chooses again what it had chosen; any other forgets that conversation.
+            let resumed = bridge.resume.take().filter(|r| r.session == *session);
+            if let Some(s) = bridge.session.borrow_mut().as_mut() {
+                s.loadable = loadable.then(|| session.clone());
+                s.conversation |= resumed.is_some();
+                s.preferences = Preferences::of(mode, options);
+            }
+            if let Some(resumed) = &resumed {
+                tracing::info!("the agent continues session {}", resumed.session);
+            }
             if controller.state() == AgentState::Starting {
                 controller.set_state(AgentState::Idle);
             }
             bridge.resolve_waiters(&Ok(()));
-            apply_preferences(controller, modes, mode, options);
+            let wanted = match resumed {
+                Some(resumed) => Some(resumed.preferences),
+                None => controller
+                    .window()
+                    .map(|s| Preferences::configured(&s.config.agent)),
+            };
+            if let Some(wanted) = wanted {
+                apply_preferences(controller, modes, mode, options, &wanted);
+            }
+            arm_idle_stop(controller);
+        }
+        AgentEvent::ModeChanged(mode) => {
+            if let Some(s) = bridge.session.borrow_mut().as_mut() {
+                mode.clone_into(&mut s.preferences.mode);
+            }
+        }
+        AgentEvent::ConfigChanged(options) => {
+            if let Some(s) = bridge.session.borrow_mut().as_mut() {
+                s.preferences = Preferences::of(&s.preferences.mode, options);
+            }
+        }
+        AgentEvent::Permission { request, .. } => {
+            bridge.pending_permissions.borrow_mut().insert(*request);
+            Bridge::clear_timer(&bridge.idle_timer);
+        }
+        AgentEvent::PermissionWithdrawn { request } => {
+            bridge.pending_permissions.borrow_mut().remove(request);
+            arm_idle_stop(controller);
         }
         AgentEvent::TurnEnded(reason) => {
             let stale = bridge.stale_turn_ends.get();
@@ -1271,9 +1483,11 @@ fn agent_exited(controller: &AgentController, code: Option<i32>) {
     let bridge = controller.bridge();
     bridge.next_generation();
     Bridge::clear_timer(&bridge.cancel_timer);
+    Bridge::clear_timer(&bridge.idle_timer);
     if let Some(session) = bridge.session.take() {
         session.shut_down();
     }
+    bridge.pending_permissions.borrow_mut().clear();
     forget_held(controller);
     if close_turn(controller, StopReason::Cancelled) {
         controller.emit_event(&AgentEvent::TurnEnded(StopReason::Cancelled));
@@ -1284,33 +1498,28 @@ fn agent_exited(controller: &AgentController, code: Option<i32>) {
     )));
 }
 
-/// `agent.default_mode`, `agent.model` and `agent.effort`, applied when the agent is ready.
+/// The mode, model and effort `wanted` (`agent.default_mode`, `agent.model` and
+/// `agent.effort`, or what a continued conversation had), applied when the agent is ready.
 fn apply_preferences(
     controller: &AgentController,
     modes: &[(String, String)],
     mode: &str,
     options: &[ConfigOpt],
+    wanted: &Preferences,
 ) {
-    let Some(state) = controller.window() else {
-        return;
-    };
-    let cfg = state.config.agent.clone();
-    let backend = cfg.backend;
     let bridge = controller.bridge();
     // Only offered modes (risk §9.6): an agent that starts in a mode Lemma does not offer
-    // (`acceptEdits`, `bypassPermissions`, …) was switched by `lemma-agent`; here the configured
+    // (`acceptEdits`, `bypassPermissions`, …) was switched by `lemma-agent`; here the wanted
     // mode, when the agent has it.
-    let wanted = if cfg.default_mode == "plan" {
-        "plan"
-    } else {
-        "default"
-    };
-    if mode != wanted && modes.iter().any(|(id, _)| id == wanted) {
-        bridge.send(AgentCmd::SetMode(wanted.to_owned()));
+    if !wanted.mode.is_empty()
+        && mode != wanted.mode
+        && modes.iter().any(|(id, _)| *id == wanted.mode)
+    {
+        bridge.send(AgentCmd::SetMode(wanted.mode.clone()));
     }
     for (key, value) in [
-        ("model", cfg.model_for(backend)),
-        ("effort", cfg.effort_for(backend)),
+        ("model", wanted.model.as_str()),
+        ("effort", wanted.effort.as_str()),
     ] {
         if value.is_empty() {
             continue;
@@ -1362,6 +1571,7 @@ pub fn prompt(controller: &Rc<AgentController>, blocks: Vec<PromptBlock>, origin
     bridge.prepare_tokens.set(token);
     bridge.preparing.set(Some(token));
     bridge.cancel_requested.set(false);
+    Bridge::clear_timer(&bridge.idle_timer);
     let controller = controller.clone();
     glib::spawn_future_local(async move {
         let result = run_prompt(&controller, blocks, origin).await;
@@ -1374,6 +1584,9 @@ pub fn prompt(controller: &Rc<AgentController>, blocks: Vec<PromptBlock>, origin
         if let Err(message) = result {
             controller.emit_event(&AgentEvent::Error(message));
         }
+        // A prompt that never became a turn (cancelled while the agent started) leaves the agent
+        // idle.
+        arm_idle_stop(&controller);
     });
 }
 
@@ -1424,6 +1637,9 @@ fn send_prompt(
         keep_feedback(controller, feedback);
         end_turn_locally(controller, StopReason::Cancelled);
         return Err(format!("{} is not running", label_of(controller)));
+    }
+    if let Some(session) = bridge.session.borrow_mut().as_mut() {
+        session.conversation = true;
     }
     if let Some(mut open) = bridge.turn.get() {
         open.sent = true;
@@ -1649,10 +1865,13 @@ fn close_turn(controller: &AgentController, reason: StopReason) -> bool {
                 notify_turn_ended(&state, reason);
             }
         }
+        // The turn's permission cards cannot be answered any more.
+        bridge.pending_permissions.borrow_mut().clear();
     }
     if controller.is_running() {
         controller.set_state(AgentState::Idle);
     }
+    arm_idle_stop(controller);
     turn.is_some()
 }
 
@@ -1796,6 +2015,123 @@ pub fn turn_start_text(controller: &AgentController, path: &Path) -> Option<Stri
         .cloned()
 }
 
+// ----- idle stop -----
+
+/// How long an idle agent runs before the idle stop: `agent.idle_stop_min` minutes (`None` for
+/// 0: never), or what [`Bridge::set_idle_stop`] set.
+fn idle_stop_after(controller: &AgentController) -> Option<Duration> {
+    if let Some(after) = controller.bridge().idle_after.get() {
+        return Some(after);
+    }
+    let minutes = controller.window()?.config.agent.idle_stop_min;
+    (minutes > 0).then(|| Duration::from_secs(u64::from(minutes) * 60))
+}
+
+/// Starts the idle stop's timer again if the agent is idle (see the module docs); ends it
+/// otherwise.
+fn arm_idle_stop(controller: &AgentController) {
+    let bridge = controller.bridge();
+    Bridge::clear_timer(&bridge.idle_timer);
+    if controller.state() != AgentState::Idle
+        || bridge.preparing.get().is_some()
+        || !bridge.pending_permissions.borrow().is_empty()
+    {
+        return;
+    }
+    let (Some(after), Some(state)) = (idle_stop_after(controller), controller.window()) else {
+        return;
+    };
+    // A conversation the next start could not continue is worth more than the agent's memory.
+    let stoppable = bridge.session.borrow().as_ref().is_some_and(|s| {
+        s.process && (!s.conversation || s.continuable(state.config.agent.backend).is_some())
+    });
+    if !stoppable {
+        return;
+    }
+    // The timer finds the controller through the window, as the cancel watchdog does.
+    let window = Rc::downgrade(&state);
+    let generation = bridge.generation.get();
+    let id = glib::timeout_add_local_once(after, move || {
+        let Some(controller) = window.upgrade().and_then(|s| s.agent_controller().cloned()) else {
+            return;
+        };
+        let bridge = controller.bridge();
+        bridge.idle_timer.take();
+        if bridge.generation.get() == generation {
+            idle_stop(&controller, after);
+        }
+    });
+    bridge.idle_timer.replace(Some(id));
+}
+
+/// The idle stop's timer ran out after `after` (see the module docs): stops the agent, keeping
+/// its conversation to continue when it can, unless something holds it.
+fn idle_stop(controller: &AgentController, after: Duration) {
+    let bridge = controller.bridge();
+    let Some(state) = controller.window() else {
+        return;
+    };
+    if controller.state() != AgentState::Idle
+        || bridge.preparing.get().is_some()
+        || !bridge.pending_permissions.borrow().is_empty()
+    {
+        return;
+    }
+    // `agent.idle_stop_min` may have changed since the timer started (config.toml reloaded).
+    if idle_stop_after(controller) != Some(after) {
+        arm_idle_stop(controller);
+        return;
+    }
+    if panel::holds_agent(&state) {
+        arm_idle_stop(controller);
+        return;
+    }
+    let configured = state.config.agent.backend;
+    let session = bridge.session.borrow().as_ref().map(|s| {
+        (
+            s.continuable(configured).cloned(),
+            s.conversation,
+            s.cwd.clone(),
+            s.backend,
+            s.preferences.clone(),
+        )
+    });
+    let Some((continuable, conversation, cwd, backend, preferences)) = session else {
+        return;
+    };
+    let resume = match continuable {
+        Some(session) if conversation => Some(Resume {
+            session,
+            cwd,
+            backend,
+            preferences,
+        }),
+        None if conversation => return,
+        _ => None,
+    };
+    let name = agent_label(backend, &state.config.agent);
+    let minutes = after.as_secs().div_ceil(60).max(1);
+    let idle = if minutes == 1 {
+        "1 idle minute".to_owned()
+    } else {
+        format!("{minutes} idle minutes")
+    };
+    let next = if resume.is_some() {
+        "; it resumes this conversation with your next message"
+    } else if backend == configured {
+        "; it starts again with your next message"
+    } else {
+        // The pane says which backend starts instead.
+        ""
+    };
+    tracing::info!("stopping the agent after {idle}");
+    stop(controller);
+    bridge.resume.replace(resume);
+    controller.emit_event(&AgentEvent::Notice(format!(
+        "{name} was stopped after {idle} to free memory{next}."
+    )));
+}
+
 // ----- commands -----
 
 /// See the module docs: cancels the running turn. While the prompt is still being prepared, it
@@ -1850,12 +2186,13 @@ pub fn cancel(controller: &AgentController) {
 
 /// See the module docs: answers permission request `request` (`None` = cancelled).
 pub fn permission(controller: &AgentController, request: u64, option_id: Option<String>) {
-    if !controller
-        .bridge()
-        .send(AgentCmd::Permission { request, option_id })
-    {
+    let bridge = controller.bridge();
+    bridge.pending_permissions.borrow_mut().remove(&request);
+    if !bridge.send(AgentCmd::Permission { request, option_id }) {
         tracing::warn!("permission answer for request {request} dropped: no agent");
     }
+    // A request that came while the agent was idle held it.
+    arm_idle_stop(controller);
 }
 
 /// See the module docs: only `default` and `plan` are accepted (risk §9.6).

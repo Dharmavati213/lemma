@@ -11,7 +11,8 @@
 //! # Protocol (shapes mirror `@agentclientprotocol/claude-agent-acp` 0.89.1)
 //!
 //! - `initialize` → protocol version 1, `agentInfo {name: "lemma-fake-agent", version}`,
-//!   `sessionCapabilities.close`, no auth methods. A client that advertises
+//!   `sessionCapabilities.close`, `loadSession` only with `_options.load_session`, no auth
+//!   methods. A client that advertises
 //!   `clientCapabilities.session.notices` gets `notice` updates; others get the adapter's
 //!   transcript fallback (an `agent_message_chunk` reading `**title:** description`).
 //! - `session/new` checks that `_meta.claudeCode.options.disallowedTools` contains `Edit`,
@@ -21,6 +22,10 @@
 //!   `notifications/initialized`, `tools/list`. It answers with modes `default`/`plan` and the
 //!   config options `mode`, `model` (default/opus/sonnet/haiku) and `effort` (default, low…max),
 //!   then sends `available_commands_update` with `compact` and `init`.
+//! - `session/load` (with `_options.load_session`; otherwise "method not found") makes the same
+//!   checks and launches the MCP server for the session id it names, replays the scenario's
+//!   history (`load_session.replay`, each a `session/update` of that session), then answers with
+//!   the modes and config options and sends `available_commands_update`, like the adapter.
 //! - `session/set_mode` sends `config_option_update` and answers `{}` (no `current_mode_update`,
 //!   like the adapter); `session/set_config_option` answers `{configOptions}` (for `mode` it first
 //!   sends `current_mode_update`).
@@ -52,6 +57,8 @@
 //! | `agent_name` | the `agentInfo.name` to report (default `lemma-fake-agent`), e.g. to play Pi's adapter |
 //! | `no_images` | `true`: advertise `promptCapabilities.image: false` (an agent that takes no images) |
 //! | `session_new_error` | `{"code": n, "message": "…"}`: answer `session/new` with this error (e.g. -32000, Pi's "authentication required") |
+//! | `load_session` | `{"replay": [update, …], "error": {"code": n, "message": "…"}}`, both optional: advertise `loadSession` and answer `session/load`, replaying these `session/update` objects first (or answer with `error`) |
+//! | `prompt_error` | `{"code": n, "message": "…"}`: answer the first `session/prompt` with this error (a quota, an expired login) |
 //!
 //! Steps (each an object with one key; strings may contain `{{i}}` inside `repeat`):
 //!
@@ -178,9 +185,21 @@ struct Options {
     agent_name: Option<String>,
     session_new_error: Option<RpcErrorSpec>,
     no_images: bool,
+    load_session: Option<LoadSessionSpec>,
+    prompt_error: Option<RpcErrorSpec>,
 }
 
-/// `_options.session_new_error`.
+/// `_options.load_session`: `session/load` is offered.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LoadSessionSpec {
+    /// The `session/update` objects replayed before the answer (the loaded conversation).
+    replay: Vec<Value>,
+    /// Answer `session/load` with this error instead.
+    error: Option<RpcErrorSpec>,
+}
+
+/// `_options.session_new_error`, `load_session.error` and `prompt_error`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RpcErrorSpec {
@@ -261,6 +280,21 @@ impl Scenario {
             && !modes_for(&options).iter().any(|m| m.id == mode)
         {
             return Err(format!("_options.initial_mode: \"{mode}\" is not offered"));
+        }
+        if let Some(load) = &options.load_session {
+            for (i, update) in load.replay.iter().enumerate() {
+                if update
+                    .get("sessionUpdate")
+                    .and_then(Value::as_str)
+                    .is_none()
+                {
+                    return Err(format!(
+                        "_options.load_session.replay {}: expected an update object with a \
+                         \"sessionUpdate\" string",
+                        i + 1
+                    ));
+                }
+            }
         }
         if turns.is_empty() {
             return Err("no turns: add at least a \"default\" list of steps".into());
@@ -925,6 +959,8 @@ struct Agent {
     next_request: AtomicU64,
     next_session: AtomicU64,
     tool_seq: AtomicU64,
+    /// `session/prompt` requests so far (`_options.prompt_error` answers the first).
+    prompts: AtomicU64,
 }
 
 /// The MCP server process, killed on every exit path.
@@ -957,6 +993,7 @@ fn serve(scenario: Scenario) -> ExitCode {
         next_request: AtomicU64::new(0),
         next_session: AtomicU64::new(1),
         tool_seq: AtomicU64::new(1),
+        prompts: AtomicU64::new(0),
     });
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -1030,6 +1067,14 @@ fn handle_request(agent: &Arc<Agent>, method: &str, id: Value, params: Value) {
             }
             Err(e) => Err(e),
         },
+        "session/load" => match session_load(agent, &params) {
+            Ok(result) => {
+                agent.out.respond(&id, result);
+                send_available_commands(agent);
+                return;
+            }
+            Err(e) => Err(e),
+        },
         "session/prompt" => match prompt(agent, &params, id.clone()) {
             // Answered by the turn thread.
             Ok(()) => return,
@@ -1094,7 +1139,7 @@ fn initialize(agent: &Agent, params: &Value) -> RpcResult {
     Ok(json!({
         "protocolVersion": 1,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": agent.scenario.options.load_session.is_some(),
             "promptCapabilities": {
                 "image": !agent.scenario.options.no_images,
                 "embeddedContext": true
@@ -1116,39 +1161,96 @@ fn session_new(agent: &Agent, params: &Value) -> RpcResult {
     if options.exit_on.as_deref() == Some("session/new") {
         shutdown(options.exit_code.unwrap_or(1));
     }
-    let cwd = params
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or_else(|| invalid("session/new: cwd must be an absolute path"))?;
-    check_meta(params.get("_meta"))?;
+    let cwd = session_cwd(params, "session/new")?;
+    check_meta(params.get("_meta"), "session/new")?;
     if let Some(e) = &options.session_new_error {
         return Err((e.code, e.message.clone()));
     }
     if options.session_new_delay_ms > 0 {
         thread::sleep(Duration::from_millis(options.session_new_delay_ms));
     }
-    if options.mcp.as_deref() != Some("skip") {
-        let servers = params
-            .get("mcpServers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let server = servers
-            .iter()
-            .find(|s| s.get("name").and_then(Value::as_str) == Some("lemma"))
-            .ok_or_else(|| invalid("session/new: no MCP server named \"lemma\" in mcpServers"))?;
-        if let Some(old) = lock(&MCP).take() {
-            old.close();
-        }
-        let mcp =
-            Mcp::launch(server, &cwd).map_err(|e| (-32603, format!("MCP server lemma: {e}")))?;
-        *lock(&MCP) = Some(mcp);
-    }
+    launch_mcp(agent, params, &cwd, "session/new")?;
     let n = agent.next_session.fetch_add(1, Ordering::SeqCst);
+    let id = format!("fake-session-{}-{n}", std::process::id());
+    let mut result = open_session(agent, id.clone(), cwd);
+    result.insert("sessionId".into(), json!(id));
+    Ok(Value::Object(result))
+}
+
+/// `session/load` (only with `_options.load_session`): sets up like `session/new` for the
+/// session it names, replays `load_session.replay` and then answers, as the adapter does.
+fn session_load(agent: &Agent, params: &Value) -> RpcResult {
+    let Some(load) = &agent.scenario.options.load_session else {
+        return Err((-32601, "Method not found: session/load".to_owned()));
+    };
+    let id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("session/load: sessionId missing"))?
+        .to_owned();
+    let cwd = session_cwd(params, "session/load")?;
+    check_meta(params.get("_meta"), "session/load")?;
+    if let Some(e) = &load.error {
+        return Err((e.code, e.message.clone()));
+    }
+    launch_mcp(agent, params, &cwd, "session/load")?;
+    for update in &load.replay {
+        agent
+            .out
+            .notify("session/update", json!({"sessionId": id, "update": update}));
+    }
+    Ok(Value::Object(open_session(agent, id, cwd)))
+}
+
+/// The `cwd` of a `method` request, which must be an absolute path.
+fn session_cwd(params: &Value, method: &str) -> Result<PathBuf, (i64, String)> {
+    params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| invalid(format!("{method}: cwd must be an absolute path")))
+}
+
+/// Launches the stdio MCP server named `lemma` of a `method` request in `cwd` (replacing the
+/// one before), unless `_options.mcp` is `"skip"`.
+fn launch_mcp(
+    agent: &Agent,
+    params: &Value,
+    cwd: &Path,
+    method: &str,
+) -> Result<(), (i64, String)> {
+    if agent.scenario.options.mcp.as_deref() == Some("skip") {
+        return Ok(());
+    }
+    let servers = params
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let server = servers
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("lemma"))
+        .ok_or_else(|| {
+            invalid(format!(
+                "{method}: no MCP server named \"lemma\" in mcpServers"
+            ))
+        })?;
+    if let Some(old) = lock(&MCP).take() {
+        old.close();
+    }
+    let mcp = Mcp::launch(server, cwd).map_err(|e| (-32603, format!("MCP server lemma: {e}")))?;
+    *lock(&MCP) = Some(mcp);
+    Ok(())
+}
+
+/// Makes session `id` in `cwd` the agent's session (a turn of the one before is cancelled);
+/// returns the answer's `modes` and `configOptions`.
+fn open_session(agent: &Agent, id: String, cwd: PathBuf) -> Map<String, Value> {
+    let options = &agent.scenario.options;
     let session = Session {
-        id: format!("fake-session-{}-{n}", std::process::id()),
+        id,
         cwd,
         mode: options
             .initial_mode
@@ -1157,20 +1259,22 @@ fn session_new(agent: &Agent, params: &Value) -> RpcResult {
         model: "default".into(),
         effort: "default".into(),
     };
-    let result = json!({
-        "sessionId": session.id,
-        "modes": modes_json(options, &session.mode),
-        "configOptions": config_options_json(options, &session),
-    });
+    let mut result = Map::new();
+    result.insert("modes".into(), modes_json(options, &session.mode));
+    result.insert(
+        "configOptions".into(),
+        config_options_json(options, &session),
+    );
     if let Some(turn) = lock(&agent.turn).as_ref() {
         turn.cancel();
     }
     *lock(&agent.session) = Some(session);
-    Ok(result)
+    result
 }
 
-/// `_meta.claudeCode.options.disallowedTools` must route all edits through Lemma's tools.
-fn check_meta(meta: Option<&Value>) -> Result<(), (i64, String)> {
+/// `_meta.claudeCode.options.disallowedTools` must route all edits through Lemma's tools
+/// (`method`: `session/new` or `session/load`, for the message).
+fn check_meta(meta: Option<&Value>, method: &str) -> Result<(), (i64, String)> {
     let disallowed: Vec<&str> = meta
         .and_then(|m| m.pointer("/claudeCode/options/disallowedTools"))
         .and_then(Value::as_array)
@@ -1182,7 +1286,7 @@ fn check_meta(meta: Option<&Value>) -> Result<(), (i64, String)> {
         .collect();
     if !missing.is_empty() {
         return Err(invalid(format!(
-            "session/new: _meta.claudeCode.options.disallowedTools must contain Edit, Write and \
+            "{method}: _meta.claudeCode.options.disallowedTools must contain Edit, Write and \
              NotebookEdit (missing: {})",
             missing.join(", ")
         )));
@@ -1342,6 +1446,11 @@ fn close_session(agent: &Agent, params: &Value) -> RpcResult {
 
 fn prompt(agent: &Arc<Agent>, params: &Value, id: Value) -> Result<(), (i64, String)> {
     let (session_id, cwd) = with_session(agent, params, |s| Ok((s.id.clone(), s.cwd.clone())))?;
+    if agent.prompts.fetch_add(1, Ordering::SeqCst) == 0
+        && let Some(e) = &agent.scenario.options.prompt_error
+    {
+        return Err((e.code, e.message.clone()));
+    }
     let blocks = params
         .get("prompt")
         .and_then(Value::as_array)
@@ -2358,6 +2467,14 @@ mod tests {
             ),
             (r#"{"_description": "x"}"#, "no turns"),
             (r#"[1]"#, "object"),
+            (
+                r#"{"_options": {"load_session": {"replay": [{"text": "x"}]}}, "default": []}"#,
+                "load_session.replay 1",
+            ),
+            (
+                r#"{"_options": {"load_session": {"history": []}}, "default": []}"#,
+                "unknown field",
+            ),
         ];
         for (text, want) in bad {
             let err = Scenario::parse(text).unwrap_err();
@@ -2381,7 +2498,17 @@ mod tests {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "json") {
-                Scenario::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let scenario =
+                    Scenario::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                // What a load replays must be ACP updates.
+                let replay = scenario.options.load_session.map(|l| l.replay);
+                for update in replay.unwrap_or_default() {
+                    let n = json!({"sessionId": "fake", "update": update});
+                    serde_json::from_value::<agent_client_protocol_schema::v1::SessionNotification>(
+                        n.clone(),
+                    )
+                    .unwrap_or_else(|e| panic!("{}: {n}: {e}", path.display()));
+                }
                 count += 1;
             }
         }
@@ -2405,12 +2532,19 @@ mod tests {
         let parsed: s::NewSessionResponse = serde_json::from_value(new).unwrap();
         assert_eq!(parsed.config_options.unwrap().len(), 3);
         assert_eq!(parsed.modes.unwrap().available_modes.len(), 2);
+        let load = json!({"modes": modes_json(&options, "default"),
+                           "configOptions": config_options_json(&options, &session)});
+        let parsed: s::LoadSessionResponse = serde_json::from_value(load).unwrap();
+        assert_eq!(parsed.config_options.unwrap().len(), 3);
         let perm = json!({"sessionId": "fake", "toolCall": {"toolCallId": "t", "title": "x", "kind": "execute", "status": "pending"},
                           "options": bash_options().iter().map(PermOption::to_json).collect::<Vec<_>>()});
         let parsed: s::RequestPermissionRequest = serde_json::from_value(perm).unwrap();
         assert_eq!(parsed.options.len(), 3);
         for update in [
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x"}}),
+            // As `load_session.replay` has them (`tests/fixtures/agent/resume.json`).
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "x"}}),
+            json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "x"}}),
             json!({"sessionUpdate": "plan", "entries": [{"content": "c", "priority": "medium", "status": "pending"}]}),
             json!({"sessionUpdate": "tool_call", "toolCallId": "t", "title": "mcp__lemma__edit", "kind": "other", "status": "pending", "rawInput": {}}),
             json!({"sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed",

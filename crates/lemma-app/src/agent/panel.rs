@@ -27,6 +27,10 @@
 //!   with `win.toggle-agent`
 //!   (F10); each time it is shown while the agent is stopped (and the user did not stop it from
 //!   the menu) it calls `AgentController::ensure_started` and shows "Starting Claude…".
+//! - The bridge's idle stop does not stop an agent the pane holds ([`holds_agent`]: text or
+//!   attachments in the prompt box, or the pane shown in the focused window); its `Notice`
+//!   shows in the transcript. A session that continues the last one (the same id in `Ready`)
+//!   keeps the usage ring.
 //! - The transcript follows `AgentController::connect_prompt`, `connect_event` and
 //!   `connect_state_changed`, so prompts from inline edits, quick actions and the Problems list
 //!   show up too. Every prompt Lemma sends goes through [`send_prompt`].
@@ -329,6 +333,18 @@ pub fn send_prompt(
 /// other prompt may overtake.
 pub fn is_busy(controller: &AgentController) -> bool {
     controller.is_running() || controller.bridge().is_preparing()
+}
+
+/// True while the pane holds an idle agent that the bridge's idle stop would stop: the user is
+/// writing to it (text or attachments in the prompt box), or may be reading it (the pane is
+/// shown in the focused window).
+pub fn holds_agent(state: &WindowState) -> bool {
+    if state.agent.split.shows_sidebar() && state.window_focused() {
+        return true;
+    }
+    get(state).is_some_and(|panel| {
+        !panel.inner.prompt_text().trim().is_empty() || !panel.inner.attachments.borrow().is_empty()
+    })
 }
 
 /// Shows every [`PanelCommand`] to `hook` first (tests; see [`CommandHook`]); `None` removes
@@ -1870,6 +1886,8 @@ pub(crate) struct Inner {
     quick_menu: gio::Menu,
     // agent data
     agent_name: RefCell<String>,
+    /// The id of the agent's last session (a continued one keeps its context usage).
+    session: RefCell<String>,
     modes: RefCell<Vec<(String, String)>>,
     mode: RefCell<String>,
     options: RefCell<Vec<ConfigOpt>>,
@@ -2219,6 +2237,7 @@ impl Inner {
             attach_button,
             quick_menu,
             agent_name: RefCell::new(String::new()),
+            session: RefCell::new(String::new()),
             modes: RefCell::new(Vec::new()),
             mode: RefCell::new(String::new()),
             options: RefCell::new(Vec::new()),
@@ -3101,6 +3120,7 @@ impl Inner {
     fn on_event(self: &Rc<Self>, event: &AgentEvent) {
         match event {
             AgentEvent::Ready {
+                session,
                 agent,
                 modes,
                 mode,
@@ -3111,8 +3131,11 @@ impl Inner {
                 self.modes.replace(modes.clone());
                 self.mode.replace(mode.clone());
                 self.options.replace(options.clone());
-                // A new session: nothing of its context is used yet.
-                self.reset_usage();
+                // A new session: nothing of its context is used yet. (One that continues the
+                // last, after an idle stop, still has its context.)
+                if self.session.replace(session.clone()) != *session {
+                    self.reset_usage();
+                }
                 self.sync_mode_option();
                 self.refresh_pickers();
                 self.refresh_header();

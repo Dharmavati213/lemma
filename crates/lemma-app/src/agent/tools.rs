@@ -141,12 +141,14 @@ pub async fn handle(state: Rc<WindowState>, call: ToolCall) {
             "\nThe user has not accepted, rejected or edited anything since the last report.\n",
         );
     }
+    let (text, bytes) = reply_text_prefix(&answer, bridge::TOOL_RECORD_TEXT);
     let record = ToolRecord {
         call,
         tool,
         path,
         is_error: answer.is_error,
-        text: reply_text(&answer),
+        text,
+        bytes,
         images: answer
             .content
             .iter()
@@ -203,6 +205,47 @@ pub fn reply_text(reply: &ToolReply) -> String {
         })
         .collect();
     texts.join("\n\n")
+}
+
+/// The start of [`reply_text`] of `reply`, at most `limit` bytes: the whole text when it fits,
+/// else as much as fits before a `…` (cut at a character boundary); and the length of the whole
+/// text. The whole text is never built.
+pub fn reply_text_prefix(reply: &ToolReply, limit: usize) -> (String, usize) {
+    const MARK: &str = "…";
+    let texts = reply.content.iter().filter_map(|c| match c {
+        ToolContent::Text(t) => Some(t.as_str()),
+        ToolContent::Png(_) => None,
+    });
+    let mut pieces = Vec::new();
+    let mut bytes = 0;
+    for (i, text) in texts.enumerate() {
+        if i > 0 {
+            pieces.push("\n\n");
+            bytes += 2;
+        }
+        pieces.push(text);
+        bytes += text.len();
+    }
+    if bytes <= limit {
+        return (pieces.concat(), bytes);
+    }
+    let room = limit.saturating_sub(MARK.len());
+    let mut prefix = String::with_capacity(limit);
+    for piece in pieces {
+        let left = room - prefix.len();
+        if piece.len() <= left {
+            prefix.push_str(piece);
+            continue;
+        }
+        let mut end = left;
+        while !piece.is_char_boundary(end) {
+            end -= 1;
+        }
+        prefix.push_str(&piece[..end]);
+        break;
+    }
+    prefix.push_str(MARK);
+    (prefix, bytes)
 }
 
 fn request_path(req: &EditorRequest) -> Option<PathBuf> {
@@ -1481,6 +1524,40 @@ fn review_state(state: &WindowState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_keep_the_start_of_a_reply() {
+        let reply = |parts: &[&str]| ToolReply {
+            content: parts
+                .iter()
+                .map(|p| ToolContent::Text((*p).to_owned()))
+                .chain([ToolContent::Png(vec![0; 64])])
+                .collect(),
+            is_error: false,
+        };
+        // Short replies are kept whole, joined as `reply_text` joins them.
+        let short = reply(&["Edited main.tex", "<review_feedback>\n</review_feedback>"]);
+        let whole = reply_text(&short);
+        assert_eq!(
+            reply_text_prefix(&short, 2048),
+            (whole.clone(), whole.len())
+        );
+        assert_eq!(
+            reply_text_prefix(&short, whole.len()),
+            (whole.clone(), whole.len())
+        );
+        // A long one is cut, at a character boundary, and marked; its length is the whole one.
+        let long = reply(&["ab", &"é".repeat(2000)]);
+        let (text, bytes) = reply_text_prefix(&long, 11);
+        assert_eq!(text, "ab\n\néé…");
+        assert_eq!(bytes, 2 + 2 + 4000);
+        let (text, bytes) = reply_text_prefix(&long, 2048);
+        assert!(text.len() <= 2048 && text.len() >= 2045, "{}", text.len());
+        assert!(text.starts_with("ab\n\né") && text.ends_with("é…"));
+        assert_eq!(bytes, reply_text(&long).len());
+        // The cut can fall into the separator.
+        assert_eq!(reply_text_prefix(&long, 6), ("ab\n…".to_owned(), 4004));
+    }
 
     #[test]
     fn outlines_list_sections_theorems_labels_and_includes() {

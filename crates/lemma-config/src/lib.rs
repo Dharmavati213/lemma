@@ -249,7 +249,13 @@ pub struct AgentCfg {
     pub save_before_prompt: bool,
     /// Cap of the per-turn snapshot of closed project files, in MiB.
     pub snapshot_cap_mib: u32,
-    /// Stop an idle agent after this many minutes (M5).
+    /// Stop an ACP agent's processes after this many idle minutes, to free their memory (M5;
+    /// 0: never; the API backend runs inside Lemma and is never stopped). The agent is idle
+    /// between turns; it is kept while a permission request waits, the prompt box has text, or
+    /// the agent pane is shown in the focused window. The next prompt (or showing the pane)
+    /// starts it again: an agent that can load sessions (ACP `session/load`, as Claude Code's
+    /// adapter can) continues the conversation, with the mode, model and effort it had; one
+    /// that cannot is stopped only while no prompt went to it.
     pub idle_stop_min: u32,
     /// Send a desktop notification when a turn ends while the window is not focused.
     pub notify_on_turn_end: bool,

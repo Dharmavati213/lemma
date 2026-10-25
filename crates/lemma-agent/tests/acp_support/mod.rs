@@ -190,6 +190,7 @@ impl Sandbox {
             system_prompt_append: "You are working inside Lemma (test).".into(),
             raw_log: None,
             flavor: lemma_agent::AcpFlavor::Claude,
+            load_session: None,
         }
     }
 }

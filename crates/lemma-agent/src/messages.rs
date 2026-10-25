@@ -554,6 +554,8 @@ impl Agent {
             modes: Vec::new(),
             mode: String::new(),
             options: self.options(),
+            // The history lives in this thread only.
+            loadable: false,
         });
         for note in notes {
             self.emit(AgentEvent::Notice(note));
@@ -1303,10 +1305,13 @@ fn refusal_notice(details: &Value) -> String {
     text
 }
 
+/// Appends a streamed delta to the block's `key` where it is (a block of n bytes in k deltas
+/// costs O(n), not O(n·k)); a key that is missing or not a string starts with `text`.
 fn append(block: &mut Value, key: &str, text: &str) {
-    let mut s = block[key].as_str().unwrap_or_default().to_owned();
-    s.push_str(text);
-    block[key] = Value::String(s);
+    match block.get_mut(key) {
+        Some(Value::String(s)) => s.push_str(text),
+        _ => block[key] = Value::String(text.to_owned()),
+    }
 }
 
 /// Parses a `tool_use`'s accumulated input strictly; no input at all is `{}`.
@@ -1792,6 +1797,53 @@ mod tests {
         assert_eq!(retry_after(&h), Some(Duration::from_millis(250)));
         h.insert("retry-after-ms", "9999999".parse().unwrap());
         assert_eq!(retry_after(&h), Some(MAX_RETRY_WAIT));
+    }
+
+    #[test]
+    fn deltas_append_to_their_block() {
+        let mut block = json!({"type": "text", "text": ""});
+        append(&mut block, "text", "Hello");
+        append(&mut block, "text", ", world");
+        assert_eq!(block["text"], "Hello, world");
+        // A key the block does not have yet (a thinking block's first signature delta), and
+        // one that is not a string, start with the delta.
+        append(&mut block, "signature", "sig");
+        assert_eq!(block["signature"], "sig");
+        block["text"] = json!(3);
+        append(&mut block, "text", "x");
+        assert_eq!(block["text"], "x");
+    }
+
+    /// The deltas of a long streamed block are appended where they are, not copied with
+    /// everything before them: twice the deltas take about twice the time, not four times.
+    /// Run with `cargo test --release -p lemma-agent --lib -- --ignored perf_text_deltas`.
+    #[test]
+    #[ignore = "release timing test"]
+    fn perf_text_deltas_append_in_place() {
+        let delta = "sixteen bytes.. ";
+        let time = |n: usize| {
+            (0..3)
+                .map(|_| {
+                    let mut block = json!({"type": "text", "text": ""});
+                    let started = std::time::Instant::now();
+                    for _ in 0..n {
+                        append(&mut block, "text", std::hint::black_box(delta));
+                    }
+                    let elapsed = started.elapsed();
+                    assert_eq!(block["text"].as_str().map(str::len), Some(n * delta.len()));
+                    elapsed
+                })
+                .min()
+                .unwrap()
+        };
+        // 16k and 32k deltas: 256 KB and 512 KB of text (`MAX_TOKENS` is about 250 KB).
+        let (t1, t2) = (time(16_384), time(32_768));
+        eprintln!("perf_text_deltas_append_in_place: 16k deltas {t1:?}, 32k deltas {t2:?}");
+        assert!(t2 < Duration::from_millis(20), "{t2:?} for 32k deltas");
+        assert!(
+            t2 < t1 * 3 + Duration::from_millis(1),
+            "not linear ({t1:?} → {t2:?})"
+        );
     }
 
     #[test]

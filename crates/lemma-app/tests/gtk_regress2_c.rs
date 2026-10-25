@@ -401,6 +401,7 @@ fn ready_event() -> AgentEvent {
                 ("sonnet".into(), "Sonnet".into()),
             ],
         }],
+        loadable: false,
     }
 }
 

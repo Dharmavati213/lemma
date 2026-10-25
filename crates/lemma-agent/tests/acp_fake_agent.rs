@@ -327,7 +327,7 @@ fn check_mode_validates_scenario_files() {
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     files.sort();
-    assert_eq!(files.len(), 6, "{files:?}");
+    assert_eq!(files.len(), 7, "{files:?}");
     let out = Command::new(&bins().fake_agent)
         .arg("--check")
         .args(&files)
