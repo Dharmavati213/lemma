@@ -1,5 +1,5 @@
 //! The `adw::Application`: settings (and their live reload), application actions and
-//! accelerators, windows, and the start-up sequence (open the FILE argument, or without one the
+//! accelerators, windows, and the start-up sequence (open the FILE arguments, or without any the
 //! project and file of the last session, restore the session, then the scripted steps of
 //! [`crate::testmode`]).
 //!
@@ -8,9 +8,10 @@
 //! the command palette and the shortcuts window are generated from them and from the
 //! accelerators ([`default_accels`], `accels_for_action` after `[keys]` overrides).
 
-use crate::cli::Options;
+use crate::cli::{FileArg, Options};
+use crate::editor::Editor;
 use crate::settings::{self, ConfigFile, Reloaded, Settings, SettingsFiles};
-use crate::window::WindowState;
+use crate::window::{self, WindowState};
 use crate::workspace::{Workspace, normalize};
 use crate::{APP_ID, editor, perf, review_ui, session, testmode};
 use adw::prelude::*;
@@ -530,6 +531,32 @@ fn trim_heap_later() {
     glib::timeout_add_local_once(TRIM_AFTER, crate::heap::trim);
 }
 
+/// How long after the document is open the sessions directory is swept: well after the start-up
+/// work (and the heap trim) is done.
+const PRUNE_AFTER: Duration = Duration::from_secs(10);
+
+/// Removes the session files of projects that are gone or were not opened for months, once per
+/// process ([`session::prune_once`], on the jobs thread). The projects of the open windows keep
+/// theirs.
+fn prune_sessions_later(shared: &Rc<Shared>) {
+    let weak = Rc::downgrade(shared);
+    glib::timeout_add_local_once(PRUNE_AFTER, move || {
+        let Some(shared) = weak.upgrade() else {
+            return;
+        };
+        let Some(paths) = shared.paths.as_ref() else {
+            return;
+        };
+        let roots: Vec<PathBuf> = shared
+            .windows
+            .borrow()
+            .iter()
+            .map(|s| s.workspace.root().path().to_path_buf())
+            .collect();
+        session::prune_once(paths, &roots);
+    });
+}
+
 fn startup(app: &adw::Application, shared: &Rc<Shared>) {
     perf::mark("gtk_init", shared.started);
     sourceview5::init();
@@ -581,16 +608,16 @@ fn open_window(app: &adw::Application, shared: &Rc<Shared>, reopen_last: bool) {
         state.window.present();
         return;
     }
-    let reopen = if reopen_last {
-        last_session(shared)
-    } else {
-        None
-    };
+    let last = last_session(shared);
+    let reopen = last
+        .as_ref()
+        .filter(|_| reopen_last && shared.options.files.is_empty())
+        .and_then(session::reopen_of);
     // The last session's root is chosen as `lemma DIR` would choose it.
     let wanted = shared
         .options
-        .file
-        .clone()
+        .first_file()
+        .map(Path::to_path_buf)
         .or_else(|| reopen.as_ref().map(|r| r.root.clone()));
     let root = match project_root(wanted.as_deref()) {
         Ok(root) => root,
@@ -629,6 +656,21 @@ fn open_window(app: &adw::Application, shared: &Rc<Shared>, reopen_last: bool) {
         // document does not move it.
         state.pin_root();
     }
+    // An interactive window gets the size the last session left and records its own; the size
+    // of a scripted run's window, or one from `LEMMA_WINDOW_SIZE`, is not the user's.
+    let size = last.and_then(|l| l.window);
+    if shared.options.is_scripted() || window::size_overridden() {
+        session::keep_window_size(&state, size);
+    } else {
+        session::remember_window_size(&state, size);
+    }
+    let documents = startup_documents(&shared.options, reopen.and_then(|r| r.file));
+    // The first frame has the panes the user left; the tabs follow in `start`.
+    let session_tabs = restores_session(shared) && session::restore_panes_early(&state);
+    if !documents.is_empty() || session_tabs {
+        // A blank editor area until they are open, not "No Document Open".
+        state.set_opening(true);
+    }
     perf::mark("window", shared.started);
     shared.windows.borrow_mut().push(state.clone());
     // Runs after GtkWindow's own realize, which creates the renderer.
@@ -636,20 +678,38 @@ fn open_window(app: &adw::Application, shared: &Rc<Shared>, reopen_last: bool) {
     state.window.present();
     perf::mark("presented", shared.started);
     perf::watch_first_frame(&state.window, shared.started);
-    glib::spawn_future_local(start(state, shared.clone(), reopen.and_then(|r| r.file)));
+    glib::spawn_future_local(start(state, shared.clone(), documents));
 }
 
-/// The project and file `lemma` without a FILE reopens (`session::reopen`): only when the run
-/// restores sessions (`[session] restore`, and a scripted run only with `--restore-session`).
-fn last_session(shared: &Shared) -> Option<session::Reopen> {
-    let opts = &shared.options;
-    if opts.file.is_some()
-        || (opts.is_scripted() && !opts.restore_session)
-        || !shared.settings.borrow().config.session.restore
-    {
+/// What the last session left (`last.json`, read once before the window is built): the project
+/// and file `lemma` without a FILE reopens, and the window's size. Only when the run restores
+/// sessions (`[session] restore`, and a scripted run only with `--restore-session`).
+fn last_session(shared: &Shared) -> Option<session::LastSession> {
+    if !restores_session(shared) {
         return None;
     }
-    session::reopen(shared.paths.as_ref()?)
+    session::read_last(shared.paths.as_ref()?)
+}
+
+/// True when the run restores the project's session (M3): `[session] restore`, and in a scripted
+/// run only with `--restore-session`.
+fn restores_session(shared: &Shared) -> bool {
+    let opts = &shared.options;
+    (!opts.is_scripted() || opts.restore_session) && shared.settings.borrow().config.session.restore
+}
+
+/// The documents the window opens at start: the FILE arguments that are not a directory (the
+/// first may be the project itself, `lemma .`), or without any `reopened`, the last session's
+/// file.
+fn startup_documents(opts: &Options, reopened: Option<PathBuf>) -> Vec<FileArg> {
+    if opts.files.is_empty() {
+        return reopened.map(FileArg::new).into_iter().collect();
+    }
+    opts.files
+        .iter()
+        .filter(|f| !is_directory(&f.path))
+        .cloned()
+        .collect()
 }
 
 /// True when the FILE argument names an existing directory (`lemma .`, as with `nvim .`).
@@ -693,9 +753,9 @@ fn no_project_dir() -> PathBuf {
     glib::user_runtime_dir().join(format!("lemma-{}-no-project", std::process::id()))
 }
 
-/// Opens the FILE argument (or `reopened`, the last session's file) and runs the scripted
-/// steps.
-async fn start(state: Rc<WindowState>, shared: Rc<Shared>, reopened: Option<PathBuf>) {
+/// Opens `documents` (the FILE arguments, or the last session's file), restores the session and
+/// runs the scripted steps.
+async fn start(state: Rc<WindowState>, shared: Rc<Shared>, documents: Vec<FileArg>) {
     let opts = &shared.options;
     let scripted = opts.is_scripted();
     let report = |message: &str| {
@@ -712,14 +772,7 @@ async fn start(state: Rc<WindowState>, shared: Rc<Shared>, reopened: Option<Path
     for e in key_problems(config, &state.config.keys) {
         report(&e);
     }
-    // A directory (`lemma .`) is the project root (see `project_root`): nothing to open.
-    let file = match opts.file.as_deref() {
-        Some(file) => Some(file).filter(|f| !is_directory(f)),
-        None => reopened.as_deref(),
-    };
-    if let Some(file) = file
-        && let Err(e) = state.open_file(file).await
-    {
+    for e in open_documents(&state, &documents).await {
         report(&e);
         if scripted {
             shared.failed.set(true);
@@ -727,13 +780,17 @@ async fn start(state: Rc<WindowState>, shared: Rc<Shared>, reopened: Option<Path
     }
     perf::mark("opened", shared.started);
     // The session of the project (M3): not in scripted runs unless asked for.
-    if (!scripted || opts.restore_session)
-        && state.config.session.restore
+    if restores_session(&shared)
         && let Err(e) = session::restore(&state).await
     {
         report(&e);
     }
+    // Every tab of the start is open, or failed to: "No Document Open" when there is none.
+    state.set_opening(false);
     trim_heap_later();
+    if !scripted && state.session_saves_enabled() {
+        prune_sessions_later(&shared);
+    }
     if let Err(e) = perf::run(&state, shared.started).await {
         eprintln!("lemma: {e}");
         shared.failed.set(true);
@@ -742,6 +799,75 @@ async fn start(state: Rc<WindowState>, shared: Rc<Shared>, reopened: Option<Path
         eprintln!("lemma: {e}");
         shared.failed.set(true);
     }
+}
+
+/// Opens the documents of the command line in order (see [`crate::cli::USAGE`]): the first in a
+/// tab that is shown and focused at once, the others behind it, as a restored session's tabs
+/// are (`WindowState::open_file_in_background`). A document with a line gets its cursor there,
+/// which the session restore then leaves alone. When the first does not open, the project root
+/// stays where the first FILE put it. Returns the errors, one per document that did not open.
+pub async fn open_documents(state: &Rc<WindowState>, documents: &[FileArg]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (i, file) in documents.iter().enumerate() {
+        let opened = if i == 0 {
+            state.open_file(&file.path).await
+        } else {
+            state.open_file_in_background(&file.path).await
+        };
+        match opened {
+            Ok(editor) => {
+                if let Some(line) = file.line {
+                    place_cursor(&editor, line, file.column);
+                    session::keep_position(state, &editor);
+                }
+            }
+            Err(e) => {
+                if i == 0 && documents.len() > 1 {
+                    // The workspace is still empty: the next document would move the root to
+                    // its own directory.
+                    state.pin_root();
+                }
+                errors.push(e);
+            }
+        }
+    }
+    errors
+}
+
+/// Puts `editor`'s cursor on the 1-based `line` (on its 1-based character `column`, else on its
+/// first non-blank character), both clamped to the text, and scrolls it into view, again once the
+/// view has drawn (a tab that is not shown yet when it is first selected).
+fn place_cursor(editor: &Rc<Editor>, line: u32, column: Option<u32>) {
+    let buffer = editor.buffer();
+    let last = buffer.line_count().saturating_sub(1);
+    let line = i32::try_from(line.saturating_sub(1)).map_or(last, |l| l.min(last));
+    let Some(mut iter) = buffer.iter_at_line(line) else {
+        return;
+    };
+    match column {
+        Some(column) => {
+            let mut end = iter;
+            if !end.ends_line() {
+                end.forward_to_line_end();
+            }
+            let wanted = i32::try_from(column.saturating_sub(1)).unwrap_or(i32::MAX);
+            iter.set_line_offset(wanted.min(end.line_offset()));
+        }
+        None => {
+            while !iter.ends_line() && iter.char().is_whitespace() {
+                iter.forward_char();
+            }
+        }
+    }
+    buffer.place_cursor(&iter);
+    let scroll = |editor: &Editor| {
+        let buffer = editor.buffer();
+        editor
+            .view()
+            .scroll_to_mark(&buffer.get_insert(), 0.0, true, 0.0, 0.3);
+    };
+    scroll(editor);
+    editor.after_first_frame(move |editor| scroll(editor));
 }
 
 fn install_actions(app: &adw::Application, shared: &Rc<Shared>) {
@@ -790,12 +916,23 @@ fn open_handed_files(app: &adw::Application, shared: &Rc<Shared>, files: &[gio::
     state.window.present();
     let paths: Vec<PathBuf> = files.iter().filter_map(gio::File::path).collect();
     glib::spawn_future_local(async move {
+        let mut documents = Vec::new();
         for path in paths {
             if is_directory(&path) {
                 state.toast("A folder opens as a project from the command line: lemma DIR");
-                continue;
+            } else {
+                documents.push(path);
             }
-            if let Err(e) = state.open_file(&path).await {
+        }
+        // The last one is shown; the others open behind it.
+        let shown = documents.len().saturating_sub(1);
+        for (i, path) in documents.iter().enumerate() {
+            let opened = if i == shown {
+                state.open_file(path).await
+            } else {
+                state.open_file_in_background(path).await
+            };
+            if let Err(e) = opened {
                 state.toast(&e);
             }
         }

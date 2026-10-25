@@ -1,4 +1,6 @@
-//! WP3.8: session restore (`session.rs`) and the local-history timeline (`history_ui.rs`).
+//! WP3.8: session restore (`session.rs`) and the local-history timeline (`history_ui.rs`),
+//! with the start-up around them: the command line's FILEs (`app::open_documents`), the blank
+//! editor area while they open, the window size `last.json` remembers.
 //!
 //! Every window gets `Paths` in a temporary directory, and `XDG_DATA_HOME` (the trash) points
 //! into this test's temporary directory too: nothing reads or writes the user's state. The
@@ -14,19 +16,22 @@ mod common;
 use adw::prelude::*;
 use lemma_app::agent::history::{self, HistoryReason};
 use lemma_app::agent::panel::{self, PanelCommand};
-use lemma_app::editor::Editor;
+use lemma_app::app;
+use lemma_app::cli::FileArg;
+use lemma_app::editor::{Editor, spell};
 use lemma_app::history_ui;
 use lemma_app::pdf::pdf_view;
 use lemma_app::review_ui::{self, Decision};
 use lemma_app::session::{
     self, LastSession, PaneState, PdfState, Reopen, SessionFile, SidebarState, TabState,
+    WindowGeometry,
 };
 use lemma_app::testmode;
 use lemma_app::window::{PAGE_PROBLEMS, PAGE_SEARCH, WindowState};
 use lemma_app::workspace::{Workspace, normalize};
 use lemma_config::{Config, Paths};
 use lemma_core::ProjectRoot;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -47,6 +52,11 @@ fn main() -> ExitCode {
             "session_missing_files_and_clamped_positions",
             missing_and_clamped,
         ),
+        ("session_restores_tabs_in_the_background", background_tabs),
+        ("startup_opens_several_files_and_a_line", several_files),
+        ("startup_shows_a_blank_page_while_opening", opening_page),
+        ("session_panes_before_the_first_frame", early_panes),
+        ("session_remembers_the_window_size", window_size),
         ("session_saves_debounced_and_on_close", saves),
         ("session_agent_pane_only_when_safe", agent_pane),
         ("session_bad_files_are_ignored_or_reported", bad_files),
@@ -472,6 +482,431 @@ fn missing_and_clamped() {
     close(w);
 }
 
+/// The restored tabs open in the background: the FILE stays selected and focused throughout,
+/// and a tab that has not been shown loads nothing that waits for its first frame (spell
+/// checking, completion's popup) until it is selected.
+fn background_tabs() {
+    let base = common::temp_dir("background");
+    let dir = base.join("proj");
+    let long: String = (0..300).map(|i| format!("Line {i} of b.\n")).collect();
+    write(
+        &dir,
+        &[
+            ("main.tex", "Main text.\n"),
+            ("a.tex", "First.\n"),
+            ("b.tex", &long),
+            ("c.tex", "Third.\n"),
+        ],
+    );
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let tab = |path: &str, line, top| TabState {
+        path: path.into(),
+        line,
+        column: 0,
+        top,
+    };
+    let session = SessionFile {
+        version: session::VERSION,
+        root: dir.to_string_lossy().into_owned(),
+        tabs: vec![
+            tab("main.tex", 0, 0),
+            tab("a.tex", 0, 0),
+            tab("b.tex", 210, 200),
+            tab("c.tex", 0, 0),
+        ],
+        active: Some(3),
+        ..SessionFile::default()
+    };
+    write_session(&paths, &dir, &session);
+    let w = window(&dir, &paths, |c| {
+        c.spell.enabled = true;
+        c.spell.language = "en_US".into();
+    });
+    let main = open(&w, &dir, "main.tex");
+    common::pump_until(TIMEOUT, || spell::is_checking(&main));
+    let selections = Rc::new(Cell::new(0));
+    let counter = selections.clone();
+    w.tab_view
+        .connect_selected_page_notify(move |_| counter.set(counter.get() + 1));
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex", "a.tex", "b.tex", "c.tex"]);
+    assert_eq!(selections.get(), 0, "no tab but the FILE was ever selected");
+    assert!(Rc::ptr_eq(&w.active_editor().unwrap(), &main));
+    for _ in 0..3 {
+        assert!(block_on(testmode::wait_for_frames(&w.window, 1)));
+    }
+    assert!(main.view().is_focus(), "the FILE keeps the focus");
+    for file in ["a.tex", "b.tex", "c.tex"] {
+        let editor = editor_of(&w, &dir, file);
+        assert!(!editor.view().is_mapped(), "{file} was never shown");
+        assert!(
+            spell::adapter(&editor).is_none(),
+            "{file} is not checked yet"
+        );
+    }
+    // Shown, a tab loads them and scrolls to its saved place.
+    let b = editor_of(&w, &dir, "b.tex");
+    w.select_editor(&b);
+    common::pump_until(TIMEOUT, || spell::is_checking(&b));
+    let deadline = Instant::now() + TIMEOUT;
+    while top_line(&b) != 200 {
+        assert!(block_on(testmode::wait_for_frames(&w.window, 1)));
+        assert!(Instant::now() < deadline, "top line {}", top_line(&b));
+    }
+    assert_eq!(cursor(&b), (210, 0));
+    assert!(spell::adapter(&editor_of(&w, &dir, "a.tex")).is_none());
+    drop((main, b));
+    close(w);
+
+    // Without a FILE (`lemma DIR`): the saved active tab is the only one ever shown.
+    write_session(&paths, &dir, &session);
+    let w = window(&dir, &paths, |c| {
+        c.spell.enabled = true;
+        c.spell.language = "en_US".into();
+    });
+    let selections = Rc::new(Cell::new(0));
+    let counter = selections.clone();
+    w.tab_view
+        .connect_selected_page_notify(move |_| counter.set(counter.get() + 1));
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex", "a.tex", "b.tex", "c.tex"]);
+    let c = editor_of(&w, &dir, "c.tex");
+    assert!(Rc::ptr_eq(&w.active_editor().unwrap(), &c));
+    assert_eq!(
+        selections.get(),
+        1,
+        "only the saved active tab was selected"
+    );
+    common::pump_until(TIMEOUT, || spell::is_checking(&c));
+    for file in ["main.tex", "a.tex", "b.tex"] {
+        let editor = editor_of(&w, &dir, file);
+        assert!(
+            spell::adapter(&editor).is_none(),
+            "{file} is not checked yet"
+        );
+    }
+    drop(c);
+    close(w);
+}
+
+/// True when document line `line` (0-based) of `editor` is in its view.
+fn line_in_view(editor: &Editor, line: u32) -> bool {
+    let view = editor.view();
+    let Some(iter) = editor.buffer().iter_at_line(line as i32) else {
+        return false;
+    };
+    let (y, height) = view.line_yrange(&iter);
+    let rect = view.visible_rect();
+    view.height() > 0 && y >= rect.y() && y + height <= rect.y() + rect.height()
+}
+
+/// The command line's documents (`app::open_documents`): the first is shown and focused at
+/// once, the others open behind it in order; a line puts the cursor there, in view once the
+/// tab is shown, and wins over the place the session saved.
+fn several_files() {
+    let base = common::temp_dir("several");
+    let dir = base.join("proj");
+    let long: String = (1..=300).map(|i| format!("    line {i}\n")).collect();
+    write(
+        &dir,
+        &[("main.tex", &long), ("b.tex", &long), ("c.tex", "c\n")],
+    );
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let tab = |path: &str, line, top| TabState {
+        path: path.into(),
+        line,
+        column: 0,
+        top,
+    };
+    write_session(
+        &paths,
+        &dir,
+        &SessionFile {
+            version: session::VERSION,
+            root: dir.to_string_lossy().into_owned(),
+            tabs: vec![tab("b.tex", 20, 10), tab("c.tex", 0, 0)],
+            active: Some(1),
+            ..SessionFile::default()
+        },
+    );
+    let w = window(&dir, &paths, |_| {});
+    let selections = Rc::new(Cell::new(0));
+    let counter = selections.clone();
+    w.tab_view
+        .connect_selected_page_notify(move |_| counter.set(counter.get() + 1));
+    let documents = [
+        FileArg {
+            line: Some(120),
+            ..FileArg::new(dir.join("main.tex"))
+        },
+        FileArg {
+            line: Some(250),
+            column: Some(7),
+            ..FileArg::new(dir.join("b.tex"))
+        },
+    ];
+    let errors = block_on(app::open_documents(&w, &documents));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(tab_paths(&w, &dir), ["main.tex", "b.tex"]);
+    let main = editor_of(&w, &dir, "main.tex");
+    let b = editor_of(&w, &dir, "b.tex");
+    assert!(Rc::ptr_eq(&w.active_editor().unwrap(), &main));
+    assert_eq!(selections.get(), 1, "only the first document was selected");
+    assert_eq!(cursor(&main), (119, 4), "line 120, on its text");
+    assert_eq!(cursor(&b), (249, 6), "line 250, character 7");
+    common::pump_until(TIMEOUT, || {
+        main.view().is_focus() && line_in_view(&main, 119)
+    });
+    assert!(!b.view().is_mapped(), "b.tex opened behind");
+    // The session's tabs follow; b.tex keeps the command line's place.
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex", "b.tex", "c.tex"]);
+    assert!(Rc::ptr_eq(&w.active_editor().unwrap(), &main));
+    assert_eq!(cursor(&b), (249, 6), "not the session's place");
+    w.select_editor(&b);
+    common::pump_until(TIMEOUT, || b.view().is_mapped() && line_in_view(&b, 249));
+    for _ in 0..2 {
+        assert!(block_on(testmode::wait_for_frames(&w.window, 1)));
+    }
+    assert!(
+        line_in_view(&b, 249),
+        "the session's scroll does not follow"
+    );
+    // A document that does not open is reported; the others open all the same.
+    write(&dir, &[("binary.tex", "a\0b\n")]);
+    let errors = block_on(app::open_documents(
+        &w,
+        &[
+            FileArg::new(dir.join("binary.tex")),
+            FileArg::new(dir.join("c.tex")),
+        ],
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("binary.tex"), "{errors:?}");
+    drop((main, b));
+    close(w);
+
+    // The first document decides the project root even when it does not open: the next one,
+    // elsewhere, opens without moving the root to its directory.
+    write(&base, &[("elsewhere/x.tex", "x\n")]);
+    let w = window(&dir, &paths, |_| {});
+    let errors = block_on(app::open_documents(
+        &w,
+        &[
+            FileArg::new(dir.join("binary.tex")),
+            FileArg::new(base.join("elsewhere/x.tex")),
+        ],
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(w.tab_view.n_pages(), 1);
+    assert_eq!(w.workspace.root().path(), dir);
+    close(w);
+}
+
+/// While the documents of the start open, the editor area is blank instead of "No Document
+/// Open"; once they are open it shows them, and when none opened after all, the empty page.
+fn opening_page() {
+    let base = common::temp_dir("opening");
+    let dir = base.join("proj");
+    write(&dir, &[("main.tex", "x\n"), ("binary.tex", "a\0b\n")]);
+    let dir = dir.canonicalize().unwrap();
+    let mut config = Config::default();
+    config.spell.enabled = false;
+    let w = WindowState::new(
+        &common::application(),
+        Rc::new(config),
+        None,
+        Workspace::new(ProjectRoot::new(&dir).unwrap()),
+        true,
+    );
+    assert_eq!(w.editor_page().as_deref(), Some("empty"));
+    // As the app does before the window is shown.
+    w.set_opening(true);
+    w.window.set_default_size(1024, 740);
+    w.window.present();
+    common::pump_until(TIMEOUT, || w.window.is_mapped());
+    assert!(block_on(testmode::wait_for_frames(&w.window, 1)));
+    assert_eq!(w.editor_page().as_deref(), Some("opening"));
+    let main = block_on(w.open_file(&dir.join("main.tex"))).unwrap();
+    assert_eq!(w.editor_page().as_deref(), Some("tabs"));
+    w.set_opening(false);
+    assert_eq!(w.editor_page().as_deref(), Some("tabs"));
+    w.close_editor(&main, true);
+    common::pump_until(TIMEOUT, || w.tab_view.n_pages() == 0);
+    assert_eq!(w.editor_page().as_deref(), Some("empty"));
+    // Nothing opened: the empty page once the start is done.
+    w.set_opening(true);
+    assert_eq!(w.editor_page().as_deref(), Some("opening"));
+    assert!(block_on(w.open_file(&dir.join("binary.tex"))).is_err());
+    assert_eq!(w.editor_page().as_deref(), Some("opening"));
+    w.set_opening(false);
+    assert_eq!(w.editor_page().as_deref(), Some("empty"));
+    drop(main);
+    close(w);
+}
+
+/// `session::restore_panes_early`, before the window is shown: its first frame has the saved
+/// panes (here the PDF pane hidden, the Search page and the PDF strip), and the restore then
+/// opens the tabs from what it read.
+fn early_panes() {
+    let (dir, paths) = project("early-panes");
+    let file = write_session(
+        &paths,
+        &dir,
+        &SessionFile {
+            version: session::VERSION,
+            root: dir.to_string_lossy().into_owned(),
+            tabs: vec![TabState {
+                path: "main.tex".into(),
+                ..TabState::default()
+            }],
+            active: Some(0),
+            sidebar: SidebarState {
+                visible: Some(true),
+                page: Some(PAGE_SEARCH.into()),
+                width: Some(0.25),
+            },
+            pdf: PdfState {
+                visible: Some(false),
+                strip: Some(true),
+                ..PdfState::default()
+            },
+            ..SessionFile::default()
+        },
+    );
+    let mut config = Config::default();
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    let w = WindowState::new(
+        &common::application(),
+        Rc::new(config),
+        Some(paths.clone()),
+        Workspace::new(ProjectRoot::new(&dir).unwrap()),
+        true,
+    );
+    assert!(w.pdf_pane.get_visible(), "shown by default");
+    assert!(session::restore_panes_early(&w), "the session has a tab");
+    // What the first frame shows.
+    let first: Rc<RefCell<Option<String>>> = Rc::default();
+    let seen = first.clone();
+    let (pdf_pane, stack, strip) = (
+        w.pdf_pane.clone(),
+        w.sidebar.stack.clone(),
+        w.pdf_sidebar.split.clone(),
+    );
+    w.window.connect_realize(move |window| {
+        let clock = window.frame_clock().unwrap();
+        let (seen, pdf_pane, stack, strip) =
+            (seen.clone(), pdf_pane.clone(), stack.clone(), strip.clone());
+        clock.connect_after_paint(move |_| {
+            if seen.borrow().is_none() {
+                let page = stack.visible_child_name().unwrap_or_default();
+                let (pdf, strip) = (pdf_pane.is_visible(), strip.shows_sidebar());
+                seen.replace(Some(format!("pdf={pdf} page={page} strip={strip}")));
+            }
+        });
+    });
+    w.window.set_default_size(1024, 740);
+    w.window.present();
+    common::pump_until(TIMEOUT, || first.borrow().is_some());
+    assert_eq!(
+        first.borrow().as_deref(),
+        Some("pdf=false page=search strip=true")
+    );
+    assert!((w.sidebar.split.sidebar_width_fraction() - 0.25).abs() < 1e-9);
+    // The restore uses what was read: the file is not read again.
+    std::fs::remove_file(&file).unwrap();
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex"]);
+    assert!(!w.pdf_pane.is_visible());
+    close(w);
+}
+
+/// `last.json` records the size and maximized state of a window that remembers its size, and
+/// the next window starts with them; a window that keeps the remembered size writes it unchanged.
+fn window_size() {
+    let base = common::temp_dir("window-size");
+    let dir = base.join("proj");
+    write(&dir, &[("main.tex", "x\n")]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let unpresented = || {
+        let mut config = Config::default();
+        config.build.on_save = false;
+        config.spell.enabled = false;
+        config.history.enabled = false;
+        let w = WindowState::new(
+            &common::application(),
+            Rc::new(config),
+            Some(paths.clone()),
+            Workspace::new(ProjectRoot::new(&dir).unwrap()),
+            true,
+        );
+        w.set_session_autosave(Some(true));
+        w.set_session_debounce(Duration::from_millis(60));
+        w
+    };
+    let show = |w: &Rc<WindowState>| {
+        w.window.present();
+        common::pump_until(TIMEOUT, || w.window.is_mapped());
+        assert!(block_on(testmode::wait_for_frames(&w.window, 1)));
+        block_on(session::restore(w)).unwrap();
+        open(w, &dir, "main.tex")
+    };
+    let remembered = || session::read_last(&paths).and_then(|l| l.window);
+    let a = unpresented();
+    session::remember_window_size(&a, None);
+    a.window.set_default_size(900, 650);
+    let main = show(&a);
+    let expected = WindowGeometry {
+        width: 900,
+        height: 650,
+        maximized: false,
+    };
+    common::pump_until(TIMEOUT, || remembered() == Some(expected));
+    a.window.maximize();
+    common::pump_until(TIMEOUT, || a.window.is_maximized());
+    let maximized = WindowGeometry {
+        maximized: true,
+        ..expected
+    };
+    common::pump_until(TIMEOUT, || remembered() == Some(maximized));
+    drop(main);
+    close(a);
+    assert_eq!(remembered(), Some(maximized), "closing keeps it");
+
+    // The next window starts with them.
+    let b = unpresented();
+    session::remember_window_size(&b, remembered());
+    assert_eq!(b.window.default_size(), (900, 650));
+    let main = show(&b);
+    common::pump_until(TIMEOUT, || b.window.is_maximized());
+    b.window.unmaximize();
+    common::pump_until(TIMEOUT, || remembered() == Some(expected));
+    drop(main);
+    close(b);
+
+    // A window whose size is not the user's writes the remembered one as it is.
+    let c = unpresented();
+    session::keep_window_size(&c, remembered());
+    c.window.set_default_size(700, 500);
+    let main = show(&c);
+    place(&main, 0, 1);
+    c.save_session_now();
+    session::flush(&c);
+    common::pump_for(Duration::from_millis(200));
+    drop(main);
+    close(c);
+    assert_eq!(remembered(), Some(expected));
+    let last = session::read_last(&paths).unwrap();
+    assert_eq!(
+        last.file,
+        Some(dir.join("main.tex").to_string_lossy().into())
+    );
+}
+
 fn saves() {
     let (dir, paths) = project("saves");
     let w = window(&dir, &paths, |_| {});
@@ -777,6 +1212,7 @@ fn reopen_runs() {
         version: session::VERSION,
         root: dir.to_string_lossy().into_owned(),
         file: Some(dir.join("b.tex").to_string_lossy().into_owned()),
+        window: None,
     };
     std::fs::write(
         paths.last_session_file(),

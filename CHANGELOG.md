@@ -25,6 +25,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   Save As, refusing a file that exists unless `:sav!`. `:w other.tex` used to say that writing
   to another file is not supported. `:w !cmd`, `:w >> file` and the `%` and `#` file names are
   not supported (a toast says so).
+- Several FILEs on the command line (`lemma *.tex`, `lemma main.tex refs.bib`) open in tabs of
+  one window; the first decides the project and is shown. `+LINE FILE`, `FILE:LINE` and
+  `FILE:LINE:COLUMN` put the cursor there, as other editors take them. Several `.tex` files
+  opened together from a Linux file manager open in one window too (the desktop entry passes
+  them all).
+- The main window opens at the size it had when it was last closed, and maximized if it was.
 - Find and replace in the current file: Ctrl+F opens a find bar above the editor (Ctrl+H with
   its replace row) that highlights every match and counts them ("3 of 17"), with Match Case,
   Whole Word and Regular Expression, F3 / Shift+F3 (or Enter / Shift+Enter) for the next and
@@ -54,6 +60,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Changed
 
+- A restored session opens its tabs in the background: the focus no longer passes through every
+  tab while it restores, and only the tab that is shown loads spell checking and completion at
+  start-up, the others when they are first selected.
+- Start-up no longer shows "No Document Open" before the document appears, and the sidebar, the
+  PDF pane and its strip are as the session left them from the first frame instead of moving
+  there once the document is open.
+- The sessions of projects whose directory is gone, or that were not opened for 180 days, are
+  removed, and so are temporary files a crash left in the sessions directory.
 - A build's toast replaces the previous build's instead of queueing behind it, and a build that
   succeeds or is stopped withdraws it: repeated saves or the agent's `compile` calls no longer
   leave a train of stale "Build failed" toasts.

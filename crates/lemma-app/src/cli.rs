@@ -2,15 +2,18 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Printed for `--help` and after a usage error.
 pub const USAGE: &str = "\
-Usage: lemma [FILE] [OPTIONS]
+Usage: lemma [[+LINE] FILE[:LINE[:COLUMN]]]... [OPTIONS]
 
 FILE is a document or a project directory (`.` for the current one). Without it, Lemma
-reopens the project and file it had open last.
+reopens the project and file it had open last. The first FILE decides the project (its
+directory, or the directory itself); only the first can be a directory. The others open in
+tabs after it, and the first document is shown. +LINE before a FILE, or :LINE after it, puts
+the cursor on that line (:LINE:COLUMN, on that character), counted from 1.
 
 Options:
   --snapshot PNG          render the window to PNG once the first frame is drawn
@@ -124,11 +127,34 @@ impl SidebarPage {
     }
 }
 
+/// A FILE argument: the path, and the place to put the cursor (`+LINE FILE`, `FILE:LINE`,
+/// `FILE:LINE:COLUMN`; counted from 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileArg {
+    /// Relative to the current directory.
+    pub path: PathBuf,
+    pub line: Option<u32>,
+    /// A character of `line`.
+    pub column: Option<u32>,
+}
+
+impl FileArg {
+    /// `path` without a place.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            line: None,
+            column: None,
+        }
+    }
+}
+
 /// Everything the command line can ask for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
-    /// The document to open (relative to the current directory).
-    pub file: Option<PathBuf>,
+    /// The documents to open, in order. The first decides the project root, and it alone may
+    /// be a directory (the project itself).
+    pub files: Vec<FileArg>,
     pub snapshot: Option<PathBuf>,
     /// Measured from process start.
     pub quit_after: Option<Duration>,
@@ -148,6 +174,11 @@ pub struct Options {
 }
 
 impl Options {
+    /// The first FILE, which decides the project root.
+    pub fn first_file(&self) -> Option<&Path> {
+        self.files.first().map(|f| f.path.as_path())
+    }
+
     /// True when the run is scripted (tests, screenshots, measurements): the scripted steps run,
     /// animations are off and errors go to stderr. Prompts are suppressed only when the run also
     /// quits by itself (see [`Options::quits_by_itself`]).
@@ -168,7 +199,10 @@ impl Options {
     }
 
     /// Parses the arguments after the program name. Options take their value either as the next
-    /// argument or after `=`; `--` ends option parsing.
+    /// argument or after `=`; `--` ends option parsing (and `+LINE`: what follows is a FILE).
+    ///
+    /// It looks at the FILEs on disk: `FILE:LINE` is a place only when no file has that very
+    /// name, and a FILE after the first must not be a directory.
     pub fn parse<I>(args: I) -> Result<Parsed, CliError>
     where
         I: IntoIterator<Item = OsString>,
@@ -176,14 +210,27 @@ impl Options {
         let mut opts = Options::default();
         let mut args = args.into_iter();
         let mut only_files = false;
+        // A `+LINE` waiting for its FILE.
+        let mut line: Option<(u32, String)> = None;
         while let Some(arg) = args.next() {
             let text = arg.to_str();
             let is_option = !only_files && text.is_some_and(|t| t.starts_with('-') && t != "-");
             if !is_option {
-                if opts.file.is_some() {
-                    return Err(CliError::ExtraArgument(arg.to_string_lossy().into_owned()));
+                if let Some(n) = text.filter(|_| !only_files).and_then(plus_line) {
+                    line = Some((n, arg.to_string_lossy().into_owned()));
+                    continue;
                 }
-                opts.file = Some(PathBuf::from(arg));
+                let mut file = file_arg(arg);
+                if let Some((n, _)) = line.take() {
+                    // `+LINE` wins over the FILE's own `:LINE`.
+                    file.line = Some(n);
+                    file.column = None;
+                }
+                if !opts.files.is_empty() && file.path.is_dir() {
+                    let shown = file.path.to_string_lossy().into_owned();
+                    return Err(CliError::DirectoryNotFirst(shown));
+                }
+                opts.files.push(file);
                 continue;
             }
             let text = text.unwrap_or_default();
@@ -234,8 +281,55 @@ impl Options {
                 _ => return Err(CliError::UnknownOption(text.to_owned())),
             }
         }
+        if let Some((_, text)) = line {
+            return Err(CliError::LineWithoutFile(text));
+        }
         Ok(Parsed::Run(opts))
     }
+}
+
+/// The line of a `+LINE` argument (`+42`).
+fn plus_line(text: &str) -> Option<u32> {
+    number(text.strip_prefix('+')?)
+}
+
+/// A line or column number: digits only. Counting starts at 1 (0 is taken as 1), and a number
+/// too large for a `u32` is the end.
+fn number(digits: &str) -> Option<u32> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.parse::<u32>().unwrap_or(u32::MAX).max(1))
+}
+
+/// A FILE argument: `FILE`, or `FILE:LINE` / `FILE:LINE:COLUMN` when no file has that very name
+/// (a colon is legal in a file name on Unix).
+fn file_arg(arg: OsString) -> FileArg {
+    let place = arg
+        .to_str()
+        .filter(|_| !Path::new(&arg).exists())
+        .and_then(split_place);
+    match place {
+        Some((path, line, column)) => FileArg {
+            path: PathBuf::from(path),
+            line: Some(line),
+            column,
+        },
+        None => FileArg::new(arg),
+    }
+}
+
+/// `FILE:LINE` or `FILE:LINE:COLUMN` split into its parts; `None` for anything else.
+fn split_place(text: &str) -> Option<(&str, u32, Option<u32>)> {
+    let (rest, last) = text.rsplit_once(':')?;
+    let last = number(last)?;
+    if let Some((path, line)) = rest.rsplit_once(':')
+        && let Some(line) = number(line)
+        && !path.is_empty()
+    {
+        return Some((path, line, Some(last)));
+    }
+    (!rest.is_empty()).then_some((rest, last, None))
 }
 
 fn bad_value(option: &'static str, value: &OsString) -> CliError {
@@ -258,8 +352,14 @@ pub enum Parsed {
 pub enum CliError {
     UnknownOption(String),
     MissingValue(&'static str),
-    BadValue { option: &'static str, value: String },
-    ExtraArgument(String),
+    BadValue {
+        option: &'static str,
+        value: String,
+    },
+    /// A `+LINE` with no FILE after it.
+    LineWithoutFile(String),
+    /// A directory as a FILE other than the first.
+    DirectoryNotFirst(String),
 }
 
 impl fmt::Display for CliError {
@@ -268,7 +368,13 @@ impl fmt::Display for CliError {
             Self::UnknownOption(o) => write!(f, "unknown option {o}"),
             Self::MissingValue(o) => write!(f, "{o} needs a value"),
             Self::BadValue { option, value } => write!(f, "invalid value {value:?} for {option}"),
-            Self::ExtraArgument(a) => write!(f, "only one FILE can be given (extra: {a})"),
+            Self::LineWithoutFile(a) => write!(f, "{a} must come before a FILE"),
+            Self::DirectoryNotFirst(a) => {
+                write!(
+                    f,
+                    "only the first FILE can be a directory (the project): {a}"
+                )
+            }
         }
     }
 }
@@ -320,7 +426,7 @@ mod tests {
             "basic.json",
             "--restore-session",
         ]);
-        assert_eq!(o.file, Some(PathBuf::from("main.tex")));
+        assert_eq!(o.files, [FileArg::new("main.tex")]);
         assert_eq!(o.agent_scenario, Some(PathBuf::from("basic.json")));
         assert_eq!(o.snapshot, Some(PathBuf::from("out.png")));
         assert_eq!(o.quit_after, Some(Duration::from_millis(1500)));
@@ -339,7 +445,122 @@ mod tests {
         let o = run(&["--quit-after-ms=10", "--snapshot=a b.png", "x.tex"]);
         assert_eq!(o.quit_after, Some(Duration::from_millis(10)));
         assert_eq!(o.snapshot, Some(PathBuf::from("a b.png")));
-        assert_eq!(o.file, Some(PathBuf::from("x.tex")));
+        assert_eq!(o.files, [FileArg::new("x.tex")]);
+    }
+
+    #[test]
+    fn several_files_in_order() {
+        let o = run(&["b.tex", "a.tex", "--build", "chapters/c.tex"]);
+        let files: Vec<&Path> = o.files.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(files, ["b.tex", "a.tex", "chapters/c.tex"].map(Path::new));
+        assert_eq!(o.first_file(), Some(Path::new("b.tex")));
+        assert!(o.build);
+        assert_eq!(run(&[]).first_file(), None);
+        // The same file twice is opened once (by the app), not refused.
+        assert_eq!(run(&["a.tex", "a.tex"]).files.len(), 2);
+    }
+
+    #[test]
+    fn plus_line_goes_with_the_next_file() {
+        let at = |path: &str, line: u32| FileArg {
+            line: Some(line),
+            ..FileArg::new(path)
+        };
+        assert_eq!(run(&["+12", "a.tex"]).files, [at("a.tex", 12)]);
+        assert_eq!(
+            run(&["a.tex", "+3", "b.tex", "c.tex"]).files,
+            [FileArg::new("a.tex"), at("b.tex", 3), FileArg::new("c.tex")]
+        );
+        // Options may come between; the later `+LINE` wins; lines count from 1.
+        assert_eq!(
+            run(&["+1", "+7", "--build", "a.tex"]).files,
+            [at("a.tex", 7)]
+        );
+        assert_eq!(run(&["+0", "a.tex"]).files, [at("a.tex", 1)]);
+        assert_eq!(
+            run(&["+99999999999", "a.tex"]).files,
+            [at("a.tex", u32::MAX)]
+        );
+        // Not a line: a file whose name starts with `+`; after `--`, a file.
+        assert_eq!(run(&["+notes.tex"]).files, [FileArg::new("+notes.tex")]);
+        assert_eq!(run(&["+"]).files, [FileArg::new("+")]);
+        assert_eq!(
+            run(&["--", "+5", "a.tex"]).files,
+            [FileArg::new("+5"), FileArg::new("a.tex")]
+        );
+        // `+LINE` wins over the FILE's own place.
+        assert_eq!(run(&["+5", "a.tex:7:2"]).files, [at("a.tex", 5)]);
+        assert_eq!(
+            parse(&["a.tex", "+5"]),
+            Err(CliError::LineWithoutFile("+5".into()))
+        );
+        assert_eq!(
+            parse(&["+5", "--build"]),
+            Err(CliError::LineWithoutFile("+5".into()))
+        );
+        assert_eq!(
+            CliError::LineWithoutFile("+5".into()).to_string(),
+            "+5 must come before a FILE"
+        );
+    }
+
+    #[test]
+    fn line_and_column_after_a_file() {
+        let place = |path: &str, line: u32, column: Option<u32>| FileArg {
+            line: Some(line),
+            column,
+            ..FileArg::new(path)
+        };
+        let missing = "lemma-cli-test-missing.tex";
+        assert_eq!(
+            run(&[&format!("{missing}:12")]).files,
+            [place(missing, 12, None)]
+        );
+        assert_eq!(
+            run(&[&format!("{missing}:12:5")]).files,
+            [place(missing, 12, Some(5))]
+        );
+        assert_eq!(
+            run(&["dir/a:b.tex:3"]).files,
+            [place("dir/a:b.tex", 3, None)]
+        );
+        // Anything else is a file name.
+        for name in [
+            "a.tex:", "a.tex:x", "a.tex:1x", ":12", "a.tex:-3", "a.tex:+3",
+        ] {
+            assert_eq!(run(&["--", name]).files, [FileArg::new(name)], "{name}");
+        }
+    }
+
+    /// A file whose name ends in `:12` (a colon cannot be in a Windows file name) is opened as
+    /// it is; a directory may only be the first FILE.
+    #[cfg(unix)]
+    #[test]
+    fn files_on_disk() {
+        let dir = std::env::temp_dir().join(format!("lemma-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let odd = dir.join("notes.tex:12");
+        std::fs::write(&odd, "x\n").unwrap();
+        let odd = odd.to_str().unwrap();
+        assert_eq!(run(&[odd]).files, [FileArg::new(odd)]);
+        let main = dir.join("main.tex");
+        let main = main.to_str().unwrap();
+        let sub = dir.join("sub");
+        let sub = sub.to_str().unwrap();
+        let o = run(&[sub, main]);
+        assert_eq!(o.first_file(), Some(Path::new(sub)));
+        assert_eq!(o.files.len(), 2);
+        assert_eq!(
+            parse(&[main, sub]),
+            Err(CliError::DirectoryNotFirst(sub.into()))
+        );
+        assert!(
+            CliError::DirectoryNotFirst(sub.into())
+                .to_string()
+                .starts_with("only the first FILE can be a directory")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -416,11 +637,8 @@ mod tests {
 
     #[test]
     fn double_dash_allows_files_starting_with_a_dash() {
-        assert_eq!(
-            run(&["--", "-odd.tex"]).file,
-            Some(PathBuf::from("-odd.tex"))
-        );
-        assert_eq!(run(&["-"]).file, Some(PathBuf::from("-")));
+        assert_eq!(run(&["--", "-odd.tex"]).files, [FileArg::new("-odd.tex")]);
+        assert_eq!(run(&["-"]).files, [FileArg::new("-")]);
     }
 
     #[test]
@@ -453,10 +671,6 @@ mod tests {
                 option: "--demo",
                 value: "everything".into()
             })
-        );
-        assert_eq!(
-            parse(&["a.tex", "b.tex"]),
-            Err(CliError::ExtraArgument("b.tex".into()))
         );
         assert_eq!(
             parse(&["--mem-report=yes"]),

@@ -206,6 +206,8 @@ pub struct WindowState {
     pub editor_menu: gio::Menu,
     editors: RefCell<Vec<Rc<Editor>>>,
     editor_stack: gtk::Stack,
+    /// Documents are opening (see [`WindowState::set_opening`]).
+    opening: Cell<bool>,
     vim_enabled: Cell<bool>,
     /// The keyboard focus is in an editor or the find bar (see [`WindowState::focus_moved`]).
     editor_focused: Cell<bool>,
@@ -345,6 +347,7 @@ impl WindowState {
             editor_menu: gio::Menu::new(),
             editors: RefCell::new(Vec::new()),
             editor_stack,
+            opening: Cell::new(false),
             editor_focused: Cell::new(false),
             close_confirmed: Cell::new(false),
             snippets: RefCell::new(settings.map(|s| s.snippets.clone())),
@@ -468,6 +471,33 @@ impl WindowState {
     /// empty workspace moves the project root to its directory (unless that is `/`, or the root
     /// is pinned, see [`WindowState::pin_root`]).
     pub async fn open_file(self: &Rc<Self>, path: &Path) -> Result<Rc<Editor>, String> {
+        let doc = self.open_document(path).await?;
+        self.show_document(&doc)
+            .ok_or_else(|| format!("cannot show {}", path.display()))
+    }
+
+    /// [`WindowState::open_file`] without selecting the tab or moving the focus (the first tab
+    /// of an empty window is selected all the same). The session's tabs and the command line's
+    /// further FILEs open this way: a tab that is not shown is not drawn, so what waits for an
+    /// editor's first frame (spell checking, completion's popup) waits until it is selected.
+    pub async fn open_file_in_background(
+        self: &Rc<Self>,
+        path: &Path,
+    ) -> Result<Rc<Editor>, String> {
+        let doc = self.open_document(path).await?;
+        let editor = self
+            .tab_for(&doc)
+            .ok_or_else(|| format!("cannot show {}", path.display()))?;
+        // The first tab: its status (Vim's mode among it) once its hooks are attached.
+        if self.is_active(&editor) {
+            self.refresh_status();
+        }
+        Ok(editor)
+    }
+
+    /// Loads `path` into the workspace for [`WindowState::open_file`], moving the root first
+    /// when it is the first document.
+    async fn open_document(self: &Rc<Self>, path: &Path) -> Result<DocRef, String> {
         if !self.root_pinned.get()
             && self.workspace.is_empty()
             && let Some(dir) = normalize(path).parent()
@@ -483,16 +513,22 @@ impl WindowState {
                 }
             }
         }
-        let doc = self.workspace.open(path).await?;
-        self.show_document(&doc)
-            .ok_or_else(|| format!("cannot show {}", path.display()))
+        self.workspace.open(path).await
     }
 
     /// Shows an open document: selects its tab, creating it first if needed. `None` when the
     /// document is closed (see `Workspace::open`).
     pub fn show_document(self: &Rc<Self>, doc: &DocRef) -> Option<Rc<Editor>> {
+        let editor = self.tab_for(doc)?;
+        self.select_editor(&editor);
+        self.refresh_status();
+        Some(editor)
+    }
+
+    /// The editor tab of an open document, created (at the end, not selected) if it has none.
+    /// `None` when the document is closed.
+    fn tab_for(self: &Rc<Self>, doc: &DocRef) -> Option<Rc<Editor>> {
         if let Some(editor) = self.editor_for(doc) {
-            self.select_editor(&editor);
             return Some(editor);
         }
         let editor = Editor::new(doc, &self.config.editor)?;
@@ -525,8 +561,6 @@ impl WindowState {
                 spell::attach_after_first_frame(&state, editor);
             }
         });
-        self.select_editor(&editor);
-        self.refresh_status();
         Some(editor)
     }
 
@@ -565,6 +599,34 @@ impl WindowState {
         };
         self.tab_view.set_selected_page(&page);
         editor.view().grab_focus();
+    }
+
+    /// Shows a blank editor area instead of "No Document Open" while no tab is open and
+    /// `opening` is set. The app sets it before the window is first shown when it is about to
+    /// open documents (a FILE, the last session's file, or the tabs of the project's session),
+    /// and clears it once they are open or have failed to, so the first frames do not flash the
+    /// empty page.
+    pub fn set_opening(&self, opening: bool) {
+        self.opening.set(opening);
+        self.show_editor_page();
+    }
+
+    /// The editor area's page: `tabs`, `opening` (blank, see [`WindowState::set_opening`]) or
+    /// `empty` ("No Document Open").
+    pub fn editor_page(&self) -> Option<glib::GString> {
+        self.editor_stack.visible_child_name()
+    }
+
+    /// Shows the tabs; without any, the blank page while documents open and else the empty page.
+    fn show_editor_page(&self) {
+        let page = if self.tab_view.n_pages() > 0 {
+            "tabs"
+        } else if self.opening.get() {
+            "opening"
+        } else {
+            "empty"
+        };
+        self.editor_stack.set_visible_child_name(page);
     }
 
     /// The tab page showing `editor`; `None` once its tab is closed (an `Editor` can outlive its
@@ -1862,10 +1924,9 @@ impl WindowState {
             }
         });
         let state = Rc::downgrade(self);
-        self.tab_view.connect_n_pages_notify(move |view| {
+        self.tab_view.connect_n_pages_notify(move |_| {
             if let Some(state) = state.upgrade() {
-                let page = if view.n_pages() > 0 { "tabs" } else { "empty" };
-                state.editor_stack.set_visible_child_name(page);
+                state.show_editor_page();
             }
         });
         let state = Rc::downgrade(self);
@@ -2071,6 +2132,12 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// True when `LEMMA_WINDOW_SIZE` sets the size of new windows (a testing aid): the app then
+/// leaves the size the last session remembered alone (`session::keep_window_size`).
+pub fn size_overridden() -> bool {
+    layout::size_from_env().is_some()
 }
 
 /// True when GTK draws offscreen (Broadway, as every test and scripted snapshot does).

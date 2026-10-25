@@ -11,7 +11,7 @@
 //!   (`exec_first_frame_ms`, `exec_ready_ms`), which adds loading the shared libraries. The
 //!   first-frame line also has the milestones of [`mark`]: GTK initialised (`gtk_init_ms`), the
 //!   window built (`window_ms`), presented (`presented_ms`, which includes creating the renderer)
-//!   and, when it came first, the document open (`opened_ms`).
+//!   and, when it came first, the documents of the start open (`opened_ms`).
 //! - `typing`: types LaTeX into a new paragraph in the middle of the open document, one
 //!   character every 35–65 ms, through the text view's `insert-at-cursor` (the path of an input
 //!   method's commit, so buffer handlers, highlighting, completion, spell checking, the outline,

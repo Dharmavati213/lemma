@@ -317,13 +317,20 @@ cargo run --release -p lemma-app -- path/to/main.tex
 
 ```sh
 lemma path/to/main.tex     # open a document; its directory is the project
+lemma main.tex ch/*.tex    # open several documents in tabs; the first is shown
+lemma +120 main.tex        # open a document with the cursor on line 120 (or main.tex:120)
 lemma path/to/project/     # open a project directory
 lemma                      # reopen the file you had open last (with its project's tabs)
 lemma .                    # open the current directory as the project
 ```
 
-The first `lemma` without a file (or after turning `[session] restore` off) shows an empty
-window; open a file with Ctrl+O, or make a new one with Ctrl+N.
+The first FILE decides the project, and only the first can be a directory (`lemma . *.tex`).
+`FILE:LINE:COLUMN` puts the cursor on a character of the line. The first `lemma` without a file
+(or after turning `[session] restore` off) shows an empty window; open a file with Ctrl+O, or
+make a new one with Ctrl+N.
+
+Lemma reopens a project's tabs, panes and PDF place, and the window at the size you left it
+(maximized, if it was).
 
 Saving builds the document; Ctrl+Shift+S saves it under another name. F8 toggles the PDF pane,
 F9 the sidebar and F10 the agent pane. Ctrl+? lists every shortcut, and Ctrl+, opens
@@ -398,7 +405,8 @@ For example, to never flag the words in your own word lists:
 word_lists = ["~/.config/nvim/dictionaries/my-field.txt"]
 ```
 
-Sessions, review state and local history are stored under `~/.local/state/lemma/`. Set
+Sessions, review state and local history are stored under `~/.local/state/lemma/`; the
+sessions of projects that are gone, or were not opened for 180 days, are removed. Set
 `LEMMA_LOG=lemma_app=info` to turn on logging.
 
 ## Development

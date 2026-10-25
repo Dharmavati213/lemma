@@ -1204,6 +1204,38 @@ they conflict with the sections above, this section wins.
     agent's. `:wq path` writes the copy, then closes as `:q` (`:wq!` as `:q!`). GtkSourceView
     passes `:w`'s name on as typed, so `:w !cmd`, `:w >> file` and names with `%` or `#` are
     refused with a toast (`vim::unsupported_file_name`) rather than written as files of that name.
+- **Start-up and sessions (§10, 2026-10-25):**
+  - The command line is `lemma [[+LINE] FILE[:LINE[:COLUMN]]]... [OPTIONS]` (`cli::FileArg`).
+    The first FILE decides the project root as before (also when it does not open: the root is
+    then pinned, so the next document does not move it); only the first can be a directory (a
+    directory later is a usage error, exit 2). `FILE:LINE` is a place only when no file has that
+    very name; `+LINE` goes with the next FILE and wins over its `:LINE`. The first document is
+    opened with `open_file`, the others with `WindowState::open_file_in_background` (a tab that
+    is not selected, focused or drawn); a document with a line gets its cursor there, which the
+    session restore then leaves alone (`session::keep_position`). The desktop entry passes `%F`.
+  - The session restore opens its tabs in the background too, the saved active tab first (in a
+    window without tabs the first tab opened is the one shown), so a tab not shown runs nothing
+    that waits for its first frame (spell checking, completion's popup; §7) and the focus stays
+    where it is. macOS's handed files: all but the last in the background.
+  - While the start's documents open (the FILEs, the last session's file, or the tabs of the
+    session that `restore_panes_early` read), the editor area shows a blank `opening` page
+    instead of "No Document Open" (`WindowState::set_opening`).
+  - Before the window is presented, `session::restore_panes_early` reads the project's session
+    file synchronously (a few hundred bytes; an exception to §3 rule 2, as `last.json`, read at
+    the same moment, and the settings files, read before the main loop, are) and applies the
+    sidebar, its page and width, the PDF pane, its strip and the split, so the first frame has
+    them; `restore` then uses what it read. The agent pane waits for `restore` (showing it
+    starts the agent, and whether it is an overlay is known only after the first allocation).
+  - `LastSession` gains `window` (`WindowGeometry`: GTK's default size, which a resize changes,
+    and whether the window is maximized). Interactive windows apply it before they are shown
+    (shrunk to the largest monitor) and record their own (`session::remember_window_size`); a
+    window sized by `LEMMA_WINDOW_SIZE`, or a scripted run's, writes the remembered one
+    unchanged (`keep_window_size`).
+  - `session::prune_once`, 10 s after an interactive start, once per process, on the jobs
+    thread: removes `*.tmp` files older than 10 minutes and `<hash>.json` sessions not written
+    for 180 days or whose root is missing from a parent directory that still exists (a project
+    whose parent is gone too, as on a removable drive that is not mounted, keeps its session);
+    never `last.json` or the sessions of the open windows' roots.
 
 ## 12. macOS (2026-10-19)
 
@@ -1232,7 +1264,7 @@ its behaviour is unchanged. The differences:
   its own GLib) is loaded. PATH gets the login shell's PATH (when not started from a terminal)
   and Homebrew's, MacTeX's and MacPorts' directories.
 - **Finder**: on macOS the application has `HANDLES_OPEN`; files from Finder, the Dock or
-  `open -a Lemma` open in the active window.
+  `open -a Lemma` open in the active window (the last one shown, the others in tabs behind it).
 - **Not ported**: shortcuts stay on Ctrl (not Cmd); `--mem-report` reads `/proc` and reports
   that it cannot on macOS. The tests run on Linux only (`scripts/ci.sh`); some of them read
   `/proc`.

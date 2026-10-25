@@ -238,6 +238,15 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `gtk_palette`, `gtk_pairs`, `gtk_outline`, `gtk_pdf_m3` and `gtk_agent_panel` (the prompt
   box); pointer hovers through the modules' `pointer_moved` functions (GTK cannot inject
   pointer events).
+- **Start-up and sessions:** `gtk_session`'s `session_restores_tabs_in_the_background` (no tab
+  but the shown one is selected, focused or spell-checked during a restore),
+  `startup_opens_several_files_and_a_line` (`app::open_documents`: the first FILE shown, the
+  others behind it, `+LINE` and `FILE:LINE:COLUMN` winning over the session's place, the root
+  kept when the first does not open), `startup_shows_a_blank_page_while_opening`,
+  `session_panes_before_the_first_frame` and `session_remembers_the_window_size` (`last.json`'s
+  window size, maximized under Broadway too); `gtk_app`'s `several_files_and_lines` and
+  `usage_errors_and_help` run the binary. The command line's parsing (with files on disk) and
+  the sweep of old session files are unit tests in `cli.rs` and `session.rs`.
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
   `find_bar_*` tests (counts and wrapping, the options and invalid expressions, the actions
   following the focus and Vim, the prefill and the query a match keeps, Replace and Replace All

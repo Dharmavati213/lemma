@@ -1,5 +1,5 @@
 //! The `lemma` binary end to end (WP0.2 acceptance 1 and 4): `--snapshot`, `--quit-after-ms`,
-//! `--mem-report`, `--build`, `--sidebar` and usage errors.
+//! `--mem-report`, `--build`, `--sidebar`, several FILEs with lines, and usage errors.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_app`. The binary
 //! inherits the Broadway environment; `LEMMA_CONFIG=/dev/null` keeps the user's config out.
@@ -26,6 +26,7 @@ fn main() -> ExitCode {
             build_without_root,
         ),
         ("usage_errors_and_help", usage),
+        ("several_files_and_lines", several_files),
         // M5 (WP5.4)
         ("perf_mode_prints_startup_and_typing", perf_mode),
         ("perf_mode_rejects_unknown_scenarios", perf_unknown),
@@ -221,11 +222,45 @@ fn usage() {
     let out = lemma(&["--frobnicate"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option --frobnicate"));
+    let out = lemma(&["main.tex", "+5"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("+5 must come before a FILE"));
+    let fixtures = common::fixtures();
+    let main = fixture_main();
+    let out = lemma(&[&main, fixtures.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only the first FILE can be a directory")
+    );
     let out = lemma(&["--help"]);
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("--snapshot PNG"));
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--snapshot PNG"));
+    assert!(help.contains("[+LINE] FILE[:LINE[:COLUMN]]"), "{help}");
     let out = lemma(&["--version"]);
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("lemma "));
+}
+
+/// Several FILEs (as `lemma *.tex` gives them), with `+LINE` and `FILE:LINE`, open without
+/// complaint (they used to be a usage error); `gtk_session`'s
+/// `startup_opens_several_files_and_a_line` checks the tabs and cursors.
+fn several_files() {
+    let dir = copy_project(&common::fixtures().join("proj"), PROJECT_FILES, "several");
+    let png = dir.join("several.png");
+    let out = lemma(&[
+        dir.join("main.tex").to_str().unwrap(),
+        "+3",
+        dir.join("chapters/yoneda.tex").to_str().unwrap(),
+        &format!("{}:2:5", dir.join("refs.bib").display()),
+        "--snapshot",
+        png.to_str().unwrap(),
+        "--quit-after-ms",
+        "1500",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "lemma failed: {stderr}");
+    assert!(!stderr.contains("lemma:"), "{stderr}");
+    assert!(png.is_file());
 }
 
 /// Runs lemma with `envs` (and `GSK_RENDERER` removed unless given) and private state and data

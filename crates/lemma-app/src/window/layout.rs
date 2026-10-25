@@ -32,7 +32,8 @@ pub(super) struct Layout {
     pub tab_bar: adw::TabBar,
     /// Between the tab bar and the tab view; holds the find bar.
     pub find_slot: adw::Bin,
-    /// "empty" (a status page) or "tabs" (tab bar, find bar and tab view).
+    /// "empty" (a status page), "opening" (blank, while the first documents open) or "tabs"
+    /// (tab bar, find bar and tab view).
     pub editor_stack: gtk::Stack,
     pub status: StatusBar,
 }
@@ -73,6 +74,7 @@ pub(super) fn build(app: &adw::Application) -> Layout {
         .width_request(320)
         .build();
     editor_stack.add_named(&empty, Some("empty"));
+    editor_stack.add_named(&adw::Bin::new(), Some("opening"));
     editor_stack.add_named(&tabs, Some("tabs"));
 
     let pdf_pane = adw::Bin::builder()
@@ -409,12 +411,17 @@ fn placeholder(icon: &str, title: &str, description: &str) -> adw::StatusPage {
 }
 
 /// The initial window size: `LEMMA_WINDOW_SIZE=WxH` (a testing aid, e.g. for narrow-window
-/// snapshots), else the default.
+/// snapshots), else the default (the app may then set the last session's, see
+/// `session::remember_window_size`).
 fn initial_size() -> (i32, i32) {
+    size_from_env().unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT))
+}
+
+/// The size `LEMMA_WINDOW_SIZE` asks for, if it is valid.
+pub(super) fn size_from_env() -> Option<(i32, i32)> {
     std::env::var("LEMMA_WINDOW_SIZE")
         .ok()
         .and_then(|v| parse_size(&v))
-        .unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT))
 }
 
 fn parse_size(text: &str) -> Option<(i32, i32)> {

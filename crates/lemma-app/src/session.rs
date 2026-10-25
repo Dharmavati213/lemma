@@ -10,43 +10,57 @@
 //!
 //! **Saving.** The shell calls [`save`] when the window is about to close, and 2 s
 //! (`window::SESSION_DEBOUNCE`) after the last change it sees (tabs, cursor moves, scrolling,
-//! panes, the split, the sidebar page, the PDF view); only while
+//! panes, the split, the sidebar page, the PDF view, the window's size); only while
 //! `state.session_saves_enabled()` (windows with `paths` that do not quit by themselves, while
 //! `[session] restore` is on). The snapshot is taken on the main thread (a few hundred bytes of
 //! JSON) and written atomically on the jobs thread; an unchanged snapshot is not written again.
 //! When the window closes, the write queued by the close-time save is done synchronously (in a
 //! close-request handler after the shell's, and again when the window is destroyed), so closing
 //! never loses the last state. Nothing is written before the window's session was restored
-//! ([`restore`] runs right after the FILE argument opened), so a save can never overwrite the
-//! session that is about to be restored. What the window cannot see at the moment of a save is carried over
-//! from the session it restored (or saved last): the place of a PDF that is not shown (no build
-//! yet, or a pane never laid out), the visibility of a pane while it is an overlay (a narrow
-//! window), the first line of a restored tab that has not been drawn yet. The restored state
-//! is saved once the restore is done.
+//! ([`restore`] runs right after the FILE arguments opened), so a save can never overwrite the
+//! session that is about to be restored. What the window cannot see at the moment of a save is
+//! carried over from the session it restored (or saved last): the place of a PDF that is not
+//! shown (no build yet, or a pane never laid out), the visibility of a pane while it is an
+//! overlay (a narrow window), the first line of a restored tab that has not been drawn yet. The
+//! restored state is saved once the restore is done.
 //!
 //! **The last session.** `Paths::last_session_file()` (`sessions/last.json`, a [`LastSession`])
-//! names the project root and the selected file of the window that saved last: a save that
-//! changes them writes it (with the session), and closing a window writes it again, so the window
-//! closed last wins. A window without tabs leaves it alone. `lemma` without a FILE reopens it
-//! ([`reopen`]): the app opens that root (pinned, as `lemma DIR` does) and the file, then
-//! restores the root's session as usual.
+//! names the project root and the selected file of the window that saved last, and the size of
+//! the main window (its default size, which a resize changes, and whether it is maximized): a
+//! save that changes them writes it (with the session), and closing a window writes it again, so
+//! the window closed last wins. A window without tabs leaves it alone. `lemma` without a FILE
+//! reopens it ([`reopen`]): the app opens that root (pinned, as `lemma DIR` does) and the file,
+//! then restores the root's session as usual. Every interactive window starts at the size
+//! `last.json` gives, shrunk to fit the largest monitor, and records its own
+//! ([`remember_window_size`]); a window sized by `LEMMA_WINDOW_SIZE`, and a scripted run's, keep
+//! the remembered size as it is ([`keep_window_size`]).
 //!
-//! **Restoring.** The app calls [`restore`] once, after the FILE argument was handled and
+//! **Restoring.** The app calls [`restore`] once, after the FILE arguments were handled and
 //! before the scripted steps (not in scripted runs unless `--restore-session`, and not while
-//! `[session] restore` is false). Tabs whose files are gone are skipped; the others open in
-//! their saved order (a tab the window already has, such as the FILE argument, moves to its
-//! saved place; one the session does not know stays first); cursors are clamped to the text
-//! and each view scrolls to its first line once it has drawn. The FILE given on the command line
+//! `[session] restore` is false). Tabs whose files are gone are skipped; the others open in the
+//! background, the saved active tab first, and take their saved order (a tab the window already
+//! has, such as a FILE argument, moves to its saved place; one the session does not know stays
+//! first). No other tab is selected or drawn on the way, so a tab that is not shown loads its
+//! spell checking and completion only when it is first selected. Cursors are clamped to the text
+//! and each view scrolls to its first line once it has drawn, except in a tab whose cursor the
+//! command line put on a line ([`keep_position`]). The first FILE given on the command line
 //! stays the active tab; otherwise the saved active tab is selected. Panes: the sidebar (and its
 //! page and width), the PDF pane (and the editor/PDF split, as a share of the width), the PDF
 //! strip and the agent pane are restored; a pane that is an overlay in a narrow window is left
-//! closed. Showing the agent pane starts the agent (as F10 does), so a run that quits by itself
-//! never restores it unless it plays a `--agent-scenario`. The PDF's place, zoom and dark mode
-//! are applied the first time the same PDF is shown and laid out in the window (also later,
-//! after the first build, or when a hidden PDF pane is shown); another PDF drops them.
+//! closed. All but the agent pane are applied before the window is first shown
+//! ([`restore_panes_early`]). Showing the agent pane starts the agent (as F10 does), so a run
+//! that quits by itself never restores it unless it plays a `--agent-scenario`. The PDF's place,
+//! zoom and dark mode are applied the first time the same PDF is shown and laid out in the
+//! window (also later, after the first build, or when a hidden PDF pane is shown); another PDF
+//! drops them.
+//!
+//! **Pruning.** Once per process, 10 s after an interactive start, the jobs thread removes the
+//! session files of projects that are gone or whose session was not saved for 180 days, and the
+//! temporary files of writes a crash interrupted ([`prune_once`]).
 //!
 //! Tests: [`file_for_root`], [`parse`], [`state_file`], [`is_restoring`],
-//! [`pdf_place_pending`], [`flush`], [`reopen`]; with temporary XDG directories only.
+//! [`pdf_place_pending`], [`flush`], [`reopen`], [`remember_window_size`]; with temporary XDG
+//! directories only.
 
 use crate::editor::Editor;
 use crate::pdf::pdf_view;
@@ -60,7 +74,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 /// The format of [`SessionFile`].
 pub const VERSION: u32 = 1;
@@ -145,7 +161,7 @@ pub struct PdfPlace {
 }
 
 /// What `lemma` without a FILE reopens (see the module docs): the project and file of the
-/// window that saved or closed last.
+/// window that saved or closed last, and the size of the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LastSession {
@@ -154,6 +170,18 @@ pub struct LastSession {
     pub root: String,
     /// The selected tab's file (absolute).
     pub file: Option<String>,
+    /// The main window's size and maximized state (see [`remember_window_size`]).
+    pub window: Option<WindowGeometry>,
+}
+
+/// The size of a main window when it is not maximized (GTK's default size, which a resize
+/// changes), and whether it is maximized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowGeometry {
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
 }
 
 /// Where `lemma` without a FILE starts: [`LastSession`] with what is still there.
@@ -171,18 +199,27 @@ pub fn parse_last(bytes: &[u8]) -> Result<LastSession, String> {
 }
 
 /// The project and file that `lemma` without a FILE reopens; `None` when nothing was saved, the
-/// file does not parse, or its root is no longer a directory. It reads the disk: the app calls it
-/// once, before the window is built.
+/// file does not parse, or its root is no longer a directory. It reads the disk.
 pub fn reopen(paths: &Paths) -> Option<Reopen> {
+    reopen_of(&read_last(paths)?)
+}
+
+/// Reads `last.json` ([`LastSession`]); `None` when nothing was saved or the file does not
+/// parse. It reads the disk: the app calls it once, before the window is built.
+pub fn read_last(paths: &Paths) -> Option<LastSession> {
     let file = paths.last_session_file();
     let bytes = std::fs::read(&file).ok()?;
-    let last = match parse_last(&bytes) {
-        Ok(last) => last,
+    match parse_last(&bytes) {
+        Ok(last) => Some(last),
         Err(e) => {
             tracing::warn!("ignoring {} that does not parse: {e}", file.display());
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// The project and file of `last` that `lemma` without a FILE reopens (see [`reopen`]).
+pub fn reopen_of(last: &LastSession) -> Option<Reopen> {
     let root = PathBuf::from(&last.root);
     if !root.is_absolute() || root.parent().is_none() || !root.is_dir() {
         tracing::info!("session: the last project {} is gone", last.root);
@@ -190,6 +227,7 @@ pub fn reopen(paths: &Paths) -> Option<Reopen> {
     }
     let file = last
         .file
+        .as_deref()
         .map(PathBuf::from)
         .filter(|f| f.is_absolute() && f.is_file());
     tracing::info!("session: reopening the last project {}", root.display());
@@ -211,6 +249,7 @@ fn last_session_of(snapshot: &SessionFile, root: &Path) -> Option<LastSession> {
         version: VERSION,
         root: root.to_str()?.to_owned(),
         file: file.to_str().map(str::to_owned),
+        window: None,
     })
 }
 
@@ -244,6 +283,72 @@ pub fn pdf_place_pending(state: &WindowState) -> bool {
     session_of(state).is_some_and(|s| s.pending_pdf.borrow().is_some())
 }
 
+/// Gives `state`'s window, before it is first shown, the size and maximized state of `saved`
+/// (the last session's: [`LastSession::window`], at most as large as the largest monitor), and
+/// from now on records its own in `last.json`. The app calls it for interactive windows only;
+/// the others write what [`keep_window_size`] gives them.
+pub fn remember_window_size(state: &Rc<WindowState>, saved: Option<WindowGeometry>) {
+    if let Some(saved) = saved.filter(|g| g.width > 0 && g.height > 0) {
+        let (width, height) = fit_monitors((saved.width, saved.height), &monitor_sizes());
+        state.window.set_default_size(width, height);
+        if saved.maximized {
+            state.window.maximize();
+        }
+    }
+    session_for(state).window_size.replace(WindowSize::Recorded);
+    for property in ["default-width", "default-height", "maximized"] {
+        let weak = Rc::downgrade(state);
+        state
+            .window
+            .connect_notify_local(Some(property), move |_, _| {
+                if let Some(state) = weak.upgrade() {
+                    state.session_changed();
+                }
+            });
+    }
+}
+
+/// Makes the `last.json` that `state`'s window writes carry `saved` (the last session's window
+/// size) unchanged: a window whose size is not the user's (`LEMMA_WINDOW_SIZE`, a scripted run)
+/// neither applies nor records one. A window the app tells neither (a test's) records none.
+pub fn keep_window_size(state: &Rc<WindowState>, saved: Option<WindowGeometry>) {
+    session_for(state)
+        .window_size
+        .replace(WindowSize::Kept(saved));
+}
+
+/// `size`, shrunk to fit the largest of the monitors' `(width, height)` in each direction; as
+/// it is without monitors.
+fn fit_monitors(size: (i32, i32), monitors: &[(i32, i32)]) -> (i32, i32) {
+    let widest = monitors.iter().map(|m| m.0).max();
+    let tallest = monitors.iter().map(|m| m.1).max();
+    match (widest, tallest) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (size.0.min(w), size.1.min(h)),
+        _ => size,
+    }
+}
+
+/// The sizes of the display's monitors (logical pixels).
+fn monitor_sizes() -> Vec<(i32, i32)> {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return Vec::new();
+    };
+    let monitors = display.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i).and_downcast::<gtk::gdk::Monitor>())
+        .map(|m| (m.geometry().width(), m.geometry().height()))
+        .collect()
+}
+
+/// Leaves the cursor and the scroll position of `editor` alone when [`restore`] runs: the command
+/// line put the cursor on a line (`lemma +42 main.tex`), which wins over the session's place.
+pub fn keep_position(state: &Rc<WindowState>, editor: &Editor) {
+    session_for(state)
+        .kept_positions
+        .borrow_mut()
+        .push(editor.document().path().to_path_buf());
+}
+
 /// Writes a save still queued for `state`'s window now (what closing the window does).
 pub fn flush(state: &WindowState) {
     if let Some(s) = session_of(state) {
@@ -267,7 +372,8 @@ pub fn save(state: &Rc<WindowState>) {
     let root = state.workspace.root().path().to_path_buf();
     let file = file_for_root(&paths.sessions_dir(), &root);
     let snapshot = s.capture(state, &root);
-    if let Some(last) = last_session_of(&snapshot, &root) {
+    if let Some(mut last) = last_session_of(&snapshot, &root) {
+        last.window = s.window_geometry(state);
         s.remember_last(paths.last_session_file(), &last);
     }
     let unchanged = s
@@ -287,6 +393,35 @@ pub fn save(state: &Rc<WindowState>) {
     };
     s.last.replace(Some((root, snapshot)));
     s.write(file, bytes);
+}
+
+/// Applies the panes of the project's saved session to `state`'s window before the window is
+/// first shown, so that its first frame has the layout the user left: the sidebar, its page and
+/// width, the PDF pane, its strip and the split. The agent pane waits for [`restore`]: showing it
+/// starts the agent, and whether it fits beside the editor is known only once the window has its
+/// size. It reads the session file synchronously (a few hundred bytes, as [`read_last`] reads
+/// `last.json`); [`restore`] then uses what it read. The app calls it right before presenting
+/// the window, when the run restores sessions. True when the session has tabs for [`restore`]
+/// to open.
+pub fn restore_panes_early(state: &Rc<WindowState>) -> bool {
+    let Some(file) = state_file(state) else {
+        return false;
+    };
+    let s = session_for(state);
+    if s.phase.get() != Phase::Fresh {
+        return false;
+    }
+    let Some(saved) = std::fs::read(&file).ok().and_then(|b| parse(&b).ok()) else {
+        return false;
+    };
+    let root = state.workspace.root().path().to_path_buf();
+    if !saved.root.is_empty() && Path::new(&saved.root) != root {
+        return false;
+    }
+    s.restore_panes(state, &saved);
+    let tabs = !saved.tabs.is_empty();
+    s.preloaded.replace(Some((root, saved)));
+    tabs
 }
 
 /// Restores the session of `state`'s project (see the module docs). Runs once per window; a
@@ -311,6 +446,98 @@ pub async fn restore(state: &Rc<WindowState>) -> Result<(), String> {
     result
 }
 
+// ----- pruning -----
+
+/// A session file not written for this long is removed by [`prune_once`]: its project has not
+/// been open for half a year.
+const PRUNE_AGE: Duration = Duration::from_secs(180 * 24 * 60 * 60);
+
+/// A [`Writer`]'s temporary file this old was left by a process that died while writing.
+const STALE_TMP_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Sweeps the sessions directory once per process, on the jobs thread (see [`prune_dir`]);
+/// the sessions of `roots` (the projects open now) stay. The app calls it once start-up has
+/// settled, in interactive runs only.
+pub fn prune_once(paths: &Paths, roots: &[PathBuf]) {
+    static PRUNED: AtomicBool = AtomicBool::new(false);
+    if PRUNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let dir = paths.sessions_dir();
+    let keep: Vec<PathBuf> = roots.iter().map(|r| file_for_root(&dir, r)).collect();
+    glib::spawn_future_local(async move {
+        let now = SystemTime::now();
+        match gio::spawn_blocking(move || prune_dir(&dir, &keep, now)).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("session: removed {n} old session files"),
+            Err(_) => tracing::warn!("session: removing old session files panicked"),
+        }
+    });
+}
+
+/// Removes from the sessions directory `dir`, as of `now`: temporary files older than
+/// [`STALE_TMP_AGE`], and the session files (`<hash>.json`, never `last.json` or one of `keep`)
+/// not written for [`PRUNE_AGE`] or whose project directory is gone. A project counts as gone
+/// only when its directory is missing from a parent directory that is still there, so a project
+/// whose parent is gone too (on a removable drive that is not mounted, whose mount directory
+/// goes with it) keeps its session. Returns how many files were removed. Blocking: for the jobs
+/// thread.
+fn prune_dir(dir: &Path, keep: &[PathBuf], now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !meta.is_file() || keep.contains(&path) {
+            continue;
+        }
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default();
+        let stale = if name.ends_with(".tmp") {
+            age > STALE_TMP_AGE
+        } else if is_session_name(name) {
+            age > PRUNE_AGE || project_is_gone(&path)
+        } else {
+            false
+        };
+        if stale {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::info!("session: cannot remove {}: {e}", path.display()),
+            }
+        }
+    }
+    removed
+}
+
+/// True for the name of a project's session file ([`file_for_root`]).
+fn is_session_name(name: &str) -> bool {
+    name.strip_suffix(".json")
+        .is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// True when the session file `file` names a project whose directory is gone (see
+/// [`prune_dir`]); false when it cannot be read or does not say.
+fn project_is_gone(file: &Path) -> bool {
+    let Some(saved) = std::fs::read(file).ok().and_then(|b| parse(&b).ok()) else {
+        return false;
+    };
+    let root = Path::new(&saved.root);
+    root.is_absolute()
+        && root.parent().is_some_and(Path::is_dir)
+        && std::fs::symlink_metadata(root).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 // ----- the per-window state -----
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +548,15 @@ enum Phase {
     Ready,
     /// The window is gone.
     Closed,
+}
+
+/// What a window's `last.json` says about its size (see [`remember_window_size`]).
+#[derive(Clone, Copy, Debug)]
+enum WindowSize {
+    /// The window's own, as it is at each save.
+    Recorded,
+    /// The last session's, unchanged.
+    Kept(Option<WindowGeometry>),
 }
 
 /// The session of one window.
@@ -346,6 +582,11 @@ struct Session {
     last_writer: Arc<Writer>,
     /// This window's [`LastSession`] as last handed to `last_writer`: closing writes it again.
     last_queued: RefCell<Option<Queued>>,
+    window_size: Cell<WindowSize>,
+    /// The documents whose place [`restore`] leaves alone ([`keep_position`]).
+    kept_positions: RefCell<Vec<PathBuf>>,
+    /// The session [`restore_panes_early`] read, with its root, for [`restore`].
+    preloaded: RefCell<Option<(PathBuf, SessionFile)>>,
 }
 
 /// A snapshot handed to a writer.
@@ -387,6 +628,9 @@ fn session_for(state: &Rc<WindowState>) -> Rc<Session> {
         reported: Cell::new(false),
         last_writer: Arc::new(Writer::default()),
         last_queued: RefCell::new(None),
+        window_size: Cell::new(WindowSize::Kept(None)),
+        kept_positions: RefCell::new(Vec::new()),
+        preloaded: RefCell::new(None),
     });
     SESSIONS.with(|list| list.borrow_mut().push(s.clone()));
     // The shell saves in its close-request handler (connected before this one), so the write
@@ -522,6 +766,21 @@ impl Session {
             column,
             top,
         })
+    }
+
+    /// The window size `last.json` gets (see [`WindowSize`]).
+    fn window_geometry(&self, state: &WindowState) -> Option<WindowGeometry> {
+        match self.window_size.get() {
+            WindowSize::Kept(saved) => saved,
+            WindowSize::Recorded => {
+                let (width, height) = state.window.default_size();
+                (width > 0 && height > 0).then(|| WindowGeometry {
+                    width,
+                    height,
+                    maximized: state.window.is_maximized(),
+                })
+            }
+        }
     }
 
     /// The PDF shown and its place; while none is shown or laid out (or a restored place still
@@ -695,26 +954,13 @@ impl Session {
         root: &Path,
         file: &Path,
     ) -> Result<(), String> {
-        let saved = match gio::File::for_path(file).load_contents_future().await {
-            Ok((bytes, _)) if bytes.trim_ascii().is_empty() => return Ok(()),
-            Ok((bytes, _)) => match parse(&bytes) {
-                Ok(saved) => saved,
-                Err(e) => {
-                    tracing::warn!(
-                        "ignoring the session {} that does not parse: {e}",
-                        file.display()
-                    );
-                    return Ok(());
-                }
+        let preloaded = self.preloaded.take().filter(|(r, _)| r == root);
+        let saved = match preloaded {
+            Some((_, saved)) => saved,
+            None => match read_session(file).await? {
+                Some(saved) => saved,
+                None => return Ok(()),
             },
-            Err(e) if e.matches(gio::IOErrorEnum::NotFound) => return Ok(()),
-            Err(e) => {
-                return Err(format!(
-                    "Could not read the saved session {}: {}",
-                    file.display(),
-                    e.message()
-                ));
-            }
         };
         if !saved.root.is_empty() && Path::new(&saved.root) != root {
             tracing::warn!(
@@ -728,6 +974,7 @@ impl Session {
         self.last.replace(Some((root.to_path_buf(), saved.clone())));
         // The panes first: the tabs then open into the final layout.
         self.restore_panes(state, &saved);
+        self.restore_agent_pane(state, &saved);
         let opened = self.restore_tabs(state, root, &saved).await;
         if let Some(place) = saved.pdf.place {
             let pdf = saved.pdf.file.as_deref().map(|f| absolute(root, f));
@@ -763,9 +1010,17 @@ impl Session {
         .await
         .unwrap_or_default();
         let first_active = state.active_editor();
-        let mut restored: Vec<(Rc<Editor>, &TabState)> = Vec::new();
+        // The saved active tab opens first: in a window without tabs, the first tab opened is
+        // the one shown (and drawn), so no other is shown on the way.
+        let active = saved.active.filter(|&i| i < wanted.len());
+        let opening_order = active
+            .into_iter()
+            .chain((0..wanted.len()).filter(|&i| Some(i) != active));
+        // With their index in `wanted`.
+        let mut restored: Vec<(usize, Rc<Editor>, &TabState)> = Vec::new();
         let mut saved_active = None;
-        for (i, (path, tab)) in wanted.iter().enumerate() {
+        for i in opening_order {
+            let (path, tab) = &wanted[i];
             let open = state
                 .workspace
                 .get(path)
@@ -778,7 +1033,7 @@ impl Session {
                         // subdirectory) must not move it.
                         state.pin_root();
                     }
-                    match state.open_file(path).await {
+                    match state.open_file_in_background(path).await {
                         Ok(editor) => editor,
                         Err(e) => {
                             tracing::info!("session: not restoring {}: {e}", path.display());
@@ -791,14 +1046,15 @@ impl Session {
                     continue;
                 }
             };
-            if restored.iter().any(|(e, _)| Rc::ptr_eq(e, &editor)) {
+            if restored.iter().any(|(_, e, _)| Rc::ptr_eq(e, &editor)) {
                 continue;
             }
-            if saved.active == Some(i) {
+            if active == Some(i) {
                 saved_active = Some(editor.clone());
             }
-            restored.push((editor, tab));
+            restored.push((i, editor, *tab));
         }
+        restored.sort_by_key(|(i, _, _)| *i);
         // Tabs the session does not know (a FILE argument it does not list) stay first; the
         // others follow in their saved order.
         let editors = state.editors();
@@ -808,12 +1064,12 @@ impl Session {
             if let Some(e) = editors
                 .iter()
                 .find(|e| e.widget().upcast_ref::<gtk::Widget>() == &child)
-                && !restored.iter().any(|(r, _)| Rc::ptr_eq(r, e))
+                && !restored.iter().any(|(_, r, _)| Rc::ptr_eq(r, e))
             {
                 order.push(e.clone());
             }
         }
-        order.extend(restored.iter().map(|(e, _)| e.clone()));
+        order.extend(restored.iter().map(|(_, e, _)| e.clone()));
         for (position, editor) in order.iter().enumerate() {
             if let Some(page) = page_of(state, editor)
                 && let Ok(position) = i32::try_from(position)
@@ -822,16 +1078,20 @@ impl Session {
                 state.tab_view.reorder_page(&page, position);
             }
         }
-        for (editor, tab) in &restored {
-            self.restore_position(editor, tab);
+        for (_, editor, tab) in &restored {
+            let path = editor.document().path();
+            if !self.kept_positions.borrow().iter().any(|p| p == path) {
+                self.restore_position(editor, tab);
+            }
         }
         let select = first_active
             .filter(|e| page_of(state, e).is_some())
             .or(saved_active)
-            .or_else(|| restored.first().map(|(e, _)| e.clone()));
+            .or_else(|| restored.first().map(|(_, e, _)| e.clone()));
         if let Some(editor) = select {
             state.select_editor(&editor);
         }
+        state.refresh_status();
         restored.len()
     }
 
@@ -872,8 +1132,9 @@ impl Session {
         });
     }
 
+    /// The sidebar and the PDF pane of `saved` (also before the window is shown, see
+    /// [`restore_panes_early`]).
     fn restore_panes(&self, state: &Rc<WindowState>, saved: &SessionFile) {
-        let fraction = |w: Option<f64>| w.filter(|w| (0.05..=0.95).contains(w));
         let sidebar = &state.sidebar;
         if let Some(width) = fraction(saved.sidebar.width) {
             sidebar.split.set_sidebar_width_fraction(width);
@@ -888,6 +1149,19 @@ impl Session {
         {
             sidebar.split.set_show_sidebar(visible);
         }
+        if let Some(visible) = saved.pdf.visible {
+            state.pdf_pane.set_visible(visible);
+        }
+        if let Some(strip) = saved.pdf.strip {
+            state.pdf_sidebar.split.set_show_sidebar(strip);
+        }
+        if let Some(split) = fraction(saved.pdf.split) {
+            set_split(state, split);
+        }
+    }
+
+    /// The agent pane of `saved`, shown only when it fits beside the editor.
+    fn restore_agent_pane(&self, state: &Rc<WindowState>, saved: &SessionFile) {
         let agent = &state.agent.split;
         if let Some(width) = fraction(saved.agent.width) {
             agent.set_sidebar_width_fraction(width);
@@ -903,15 +1177,6 @@ impl Session {
             if !visible || !(state.scripted && real_agent) {
                 agent.set_show_sidebar(visible);
             }
-        }
-        if let Some(visible) = saved.pdf.visible {
-            state.pdf_pane.set_visible(visible);
-        }
-        if let Some(strip) = saved.pdf.strip {
-            state.pdf_sidebar.split.set_show_sidebar(strip);
-        }
-        if let Some(split) = fraction(saved.pdf.split) {
-            set_split(state, split);
         }
     }
 
@@ -1038,6 +1303,35 @@ impl Session {
 }
 
 // ----- helpers -----
+
+/// A saved share of the window's width, if it is a sensible one.
+fn fraction(width: Option<f64>) -> Option<f64> {
+    width.filter(|w| (0.05..=0.95).contains(w))
+}
+
+/// Reads and parses the session file `file`: `None` when there is none, it is empty, or it does
+/// not parse; an error when it cannot be read.
+async fn read_session(file: &Path) -> Result<Option<SessionFile>, String> {
+    match gio::File::for_path(file).load_contents_future().await {
+        Ok((bytes, _)) if bytes.trim_ascii().is_empty() => Ok(None),
+        Ok((bytes, _)) => match parse(&bytes) {
+            Ok(saved) => Ok(Some(saved)),
+            Err(e) => {
+                tracing::warn!(
+                    "ignoring the session {} that does not parse: {e}",
+                    file.display()
+                );
+                Ok(None)
+            }
+        },
+        Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Ok(None),
+        Err(e) => Err(format!(
+            "Could not read the saved session {}: {}",
+            file.display(),
+            e.message()
+        )),
+    }
+}
 
 /// How a session stores `path`: relative to `root` when inside it, else absolute; `None` when
 /// it is not UTF-8.
@@ -1393,6 +1687,7 @@ mod tests {
                 version: VERSION,
                 root: root.to_str().unwrap().into(),
                 file: Some(main.to_str().unwrap().into()),
+                window: None,
             };
             std::fs::write(&file, serde_json::to_vec(&last).unwrap()).unwrap();
         };
@@ -1422,6 +1717,124 @@ mod tests {
         assert_eq!(reopen(&paths), None);
         std::fs::write(&file, "{oops").unwrap();
         assert_eq!(reopen(&paths), None);
+        assert_eq!(read_last(&paths), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_window_size_round_trips_and_is_optional() {
+        let last = LastSession {
+            version: VERSION,
+            root: "/p".into(),
+            file: Some("/p/main.tex".into()),
+            window: Some(WindowGeometry {
+                width: 1200,
+                height: 800,
+                maximized: true,
+            }),
+        };
+        let json = serde_json::to_vec(&last).unwrap();
+        assert_eq!(parse_last(&json).unwrap(), last);
+        // A `last.json` from before the size was recorded.
+        let old = parse_last(br#"{"version":1,"root":"/p","file":"/p/main.tex"}"#).unwrap();
+        assert_eq!(old.window, None);
+        assert_eq!(old.root, "/p");
+        let partial = parse_last(br#"{"root":"/p","window":{"width":900}}"#).unwrap();
+        assert_eq!(
+            partial.window,
+            Some(WindowGeometry {
+                width: 900,
+                height: 0,
+                maximized: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_remembered_size_fits_the_largest_monitor() {
+        let monitors = [(1920, 1080), (1280, 1440)];
+        assert_eq!(fit_monitors((1360, 860), &monitors), (1360, 860));
+        assert_eq!(fit_monitors((3840, 2160), &monitors), (1920, 1440));
+        assert_eq!(fit_monitors((1500, 1300), &[(1280, 800)]), (1280, 800));
+        // Without monitors (or with nonsense) the size stays.
+        assert_eq!(fit_monitors((3840, 2160), &[]), (3840, 2160));
+        assert_eq!(fit_monitors((3840, 2160), &[(0, 0)]), (3840, 2160));
+    }
+
+    #[test]
+    fn pruning_removes_stale_sessions_only() {
+        let base = std::env::temp_dir().join(format!("lemma-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = |name: &str| {
+            let root = base.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        };
+        let (here, open, old, gone) = (
+            project("here"),
+            project("open"),
+            project("old"),
+            base.join("gone"),
+        );
+        let unmounted = base.join("unmounted-drive/thesis");
+        let now = SystemTime::now();
+        let write = |root: &Path, age: Duration| {
+            let file = file_for_root(&dir, root);
+            let session = SessionFile {
+                version: VERSION,
+                root: root.to_string_lossy().into_owned(),
+                ..SessionFile::default()
+            };
+            std::fs::write(&file, serde_json::to_vec(&session).unwrap()).unwrap();
+            let f = std::fs::File::options().write(true).open(&file).unwrap();
+            f.set_modified(now - age).unwrap();
+            file
+        };
+        let day = Duration::from_secs(24 * 60 * 60);
+        let other = |name: &str, age: Duration| {
+            let file = dir.join(name);
+            std::fs::write(&file, b"{}").unwrap();
+            let f = std::fs::File::options().write(true).open(&file).unwrap();
+            f.set_modified(now - age).unwrap();
+            file
+        };
+        let kept = [
+            write(&here, day),
+            // Open in a window, though old and gone.
+            write(&open, 400 * day),
+            // On a removable drive that is not mounted: its parent directory is missing too.
+            write(&unmounted, day),
+            other("last.json", 400 * day),
+            other("notes.txt", 400 * day),
+            other("0123456789abcdef.json.42.0.tmp", Duration::from_secs(60)),
+            // Not a session (the name is not a hash), and one that does not parse.
+            other("abc.json", 400 * day),
+            other("fedcba9876543210.json", day),
+        ];
+        std::fs::write(kept.last().unwrap(), "{oops").unwrap();
+        let removed = [
+            write(&old, 181 * day),
+            write(&gone, day),
+            other(
+                "0123456789abcdef.json.42.1.tmp",
+                Duration::from_secs(11 * 60),
+            ),
+            other("last.json.42.2.tmp", 2 * day),
+        ];
+        std::fs::remove_dir_all(&open).unwrap();
+        let keep = [file_for_root(&dir, &open)];
+        assert_eq!(prune_dir(&dir, &keep, now), removed.len());
+        for file in &kept {
+            assert!(file.exists(), "{} is kept", file.display());
+        }
+        for file in &removed {
+            assert!(!file.exists(), "{} is removed", file.display());
+        }
+        // Nothing more the second time; a missing directory is no error.
+        assert_eq!(prune_dir(&dir, &keep, now), 0);
+        assert_eq!(prune_dir(&base.join("nonexistent"), &[], now), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
