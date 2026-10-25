@@ -40,6 +40,26 @@ pub(crate) struct LineHunk {
     ops: Range<usize>,
 }
 
+impl LineHunk {
+    /// A hunk of these lines and bytes that comes from no [`LineDiff`] (a review's own hunk), so
+    /// it has no ops and no word spans: [`LineDiff::refine_words`] must not be given it.
+    pub(crate) fn of_ranges(
+        old_lines: Range<u32>,
+        new_lines: Range<u32>,
+        old_bytes: Range<usize>,
+        new_bytes: Range<usize>,
+    ) -> Self {
+        Self {
+            old_lines,
+            new_lines,
+            old_bytes,
+            new_bytes,
+            words: Vec::new(),
+            ops: 0..0,
+        }
+    }
+}
+
 /// The lines of one side's differing middle part.
 struct Lines<'a> {
     lines: Vec<&'a str>,

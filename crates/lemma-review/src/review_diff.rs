@@ -51,12 +51,13 @@ pub fn review_diff(
     let line_hunks: Vec<LineHunk> = if fits {
         hunks
             .iter()
-            .map(|h| LineHunk {
-                old_lines: h.base_lines.clone(),
-                new_lines: h.cur_lines.clone(),
-                old_bytes: h.base_bytes.clone(),
-                new_bytes: h.cur_bytes.clone(),
-                words: Vec::new(),
+            .map(|h| {
+                LineHunk::of_ranges(
+                    h.base_lines.clone(),
+                    h.cur_lines.clone(),
+                    h.base_bytes.clone(),
+                    h.cur_bytes.clone(),
+                )
             })
             .collect()
     } else {
