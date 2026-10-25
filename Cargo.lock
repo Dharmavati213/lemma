@@ -1286,6 +1286,7 @@ dependencies = [
  "glib",
  "lemma-core",
  "lemma-synctex",
+ "libc",
  "poppler-rs",
  "proptest",
  "tracing",

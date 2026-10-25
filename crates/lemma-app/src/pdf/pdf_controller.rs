@@ -6,10 +6,12 @@
 //! [`PdfView`]. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
 //! new generation; the view keeps showing the previous generation until the new one has opened,
 //! and a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the
-//! scroll position; another PDF starts at the top. A build whose PDF has not changed since the
-//! last open (the same size and modification time) opens nothing
-//! ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the links, a search
-//! and a SyncTeX highlight stay as they are.
+//! scroll position; another PDF starts at the top. A rebuild of the file asked for last is a
+//! `PdfCmd::Reload`: with as many pages it shows with the old page sizes at once, and the view
+//! and the strip follow the sizes the PDF thread reads afterwards (`PdfEvent::PageSizes`). A
+//! build whose PDF has not changed since the last open (the same size and modification time)
+//! opens nothing ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the
+//! links, a search and a SyncTeX highlight stay as they are.
 //!
 //! M3 (WP3.4): the controller also dispatches the PDF thread's answers to the [`links`],
 //! [`search`] and [`sidebar`] modules (each registers itself here when it installs), sends their
@@ -218,6 +220,14 @@ impl PdfController {
         self.inner.view.is_dark()
     }
 
+    /// Lets the PDF thread free what it keeps beside the document (`PdfCmd::Trim`): the SyncTeX
+    /// scanner (about 85 KiB per page; the next sync parses the file again) and the heap's free
+    /// pages; and forget that SyncTeX was used, so rebuilds parse nothing ahead. Nothing before
+    /// the thread has started. ARCHITECTURE §7: a window in the background, a hidden pane.
+    pub fn trim(&self) {
+        self.inner.trim_worker();
+    }
+
     // ----- M3 (WP3.4) -----
 
     /// Sends `cmd` to the PDF thread (starting it if needed).
@@ -342,9 +352,23 @@ impl Inner {
         }
     }
 
+    /// Sends `PdfCmd::Trim` to the PDF thread if it runs (see [`PdfController::trim`]).
+    fn trim_worker(&self) {
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.send(PdfCmd::Trim);
+        }
+    }
+
     fn open(&self, pdf: &Path, stamp: Option<PdfStamp>) {
         let generation = self.last_generation.get() + 1;
         self.last_generation.set(generation);
+        // A rebuild of the file asked for last shows with its page sizes until the PDF thread has
+        // read the new ones (`PdfEvent::PageSizes`), instead of after reading every page.
+        let rebuild = self
+            .requested
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, requested)| requested == pdf);
         self.requested
             .replace(Some((generation, pdf.to_path_buf())));
         self.requested_stamp.set(stamp);
@@ -355,9 +379,11 @@ impl Inner {
             self.placeholder.set_title("Loading PDF…");
             self.placeholder.set_description(None);
         }
-        self.send(PdfCmd::Open {
-            generation,
-            pdf: pdf.to_path_buf(),
+        let pdf = pdf.to_path_buf();
+        self.send(if rebuild {
+            PdfCmd::Reload { generation, pdf }
+        } else {
+            PdfCmd::Open { generation, pdf }
         });
     }
 
@@ -407,6 +433,10 @@ impl Inner {
                 generation,
                 page_sizes,
             } => self.opened(generation, page_sizes),
+            PdfEvent::PageSizes {
+                generation,
+                page_sizes,
+            } => self.page_sizes(generation, page_sizes),
             PdfEvent::OpenFailed { generation, error } => self.open_failed(generation, &error),
             PdfEvent::Rendered(rendered) => self.view.add_rendered(rendered),
             PdfEvent::Forward { boxes, .. } => self.forward_answer(&boxes),
@@ -533,6 +563,19 @@ impl Inner {
         }
         if let Some(s) = self.search.get() {
             s.document_changed(generation, rebuilt);
+        }
+    }
+
+    /// The page sizes of `generation` as the PDF thread read them, after a reload that showed with
+    /// those of the generation before: the view lays the pages out again (keeping its place) and
+    /// the strip sizes its thumbnails.
+    fn page_sizes(&self, generation: u64, page_sizes: Vec<(f64, f64)>) {
+        if self.shown.borrow().as_ref().map(|(g, _)| *g) != Some(generation) {
+            return;
+        }
+        self.view.set_page_sizes(generation, page_sizes);
+        if let Some(s) = self.strip.get() {
+            s.page_sizes_changed();
         }
     }
 
@@ -1005,7 +1048,8 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
             inner.follow_cursor(editor.buffer());
         }
     });
-    // A hidden pane gives its textures back (ARCHITECTURE §7).
+    // A hidden pane gives its textures back, and the PDF thread its SyncTeX scanner (ARCHITECTURE
+    // §7).
     let weak = Rc::downgrade(&inner);
     state.pdf_pane.connect_visible_notify(move |pane| {
         if !pane.is_visible()
@@ -1013,6 +1057,18 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         {
             inner.view.trim_cache();
             crate::heap::trim();
+            // Unless the PDF went to a window of its own, which hides the pane too (the window
+            // is recorded after that).
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(inner) = weak.upgrade()
+                    && let Some(state) = inner.state.upgrade()
+                    && !state.pdf_pane.is_visible()
+                    && !detach::is_detached(&state)
+                {
+                    inner.trim_worker();
+                }
+            });
         }
     });
     inner.refresh_toolbar();

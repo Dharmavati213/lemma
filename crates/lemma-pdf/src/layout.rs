@@ -67,6 +67,11 @@ impl PageLayout {
         self.sizes.get(page as usize).copied()
     }
 
+    /// The sizes of every page in bp.
+    pub fn sizes(&self) -> &[(f64, f64)] {
+        &self.sizes
+    }
+
     /// Width and height of the whole document in logical px, margins included.
     pub fn content_size(&self, zoom: f64) -> (f64, f64) {
         let n = self.sizes.len();

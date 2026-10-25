@@ -1075,12 +1075,18 @@ impl WindowState {
     // ----- memory -----
 
     /// Gives memory back (ARCHITECTURE §7): the PDF view keeps only the textures of the pages on
-    /// screen, and the allocator returns its free pages to the system. Runs by itself once the
-    /// window has been in the background for [`INACTIVE_TRIM_DELAY`]; hiding the PDF pane trims
-    /// its cache too.
+    /// screen, the PDF thread frees its SyncTeX scanner (and trims its own heap after that), and
+    /// the allocator returns its free pages to the system. Runs by itself once the window has been
+    /// in the background for [`INACTIVE_TRIM_DELAY`]; hiding the PDF pane trims both PDF caches
+    /// too. A PDF in a window of its own that is active (read while this one is in the
+    /// background) keeps them.
     pub fn trim_memory(&self) {
-        if let Some(pdf) = self.pdf.get() {
+        let pdf_in_use = crate::pdf::detach::window(self).is_some_and(|w| w.is_active());
+        if let Some(pdf) = self.pdf.get()
+            && !pdf_in_use
+        {
             pdf.view().trim_cache();
+            pdf.trim();
         }
         crate::heap::trim();
     }

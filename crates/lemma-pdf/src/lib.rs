@@ -6,6 +6,7 @@
 //! the origin at the page's top-left corner and y growing downward.
 
 pub mod dark;
+mod heap;
 mod layout;
 mod links;
 mod lru;
@@ -165,8 +166,18 @@ impl std::fmt::Debug for Rendered {
 /// Events from the PDF thread to the main thread.
 #[derive(Debug)]
 pub enum PdfEvent {
-    /// The document of `generation` is now current; page sizes in bp.
+    /// The document of `generation` is now current; page sizes in bp. After a
+    /// [`PdfCmd::Reload`] they can be the previous generation's, which [`PdfEvent::PageSizes`]
+    /// corrects.
     Opened {
+        generation: u64,
+        page_sizes: Vec<(f64, f64)>, /*bp*/
+    },
+    /// The page sizes of the document of `generation`, as read from it, when some differ from
+    /// those reported before (by [`PdfEvent::Opened`] after a [`PdfCmd::Reload`], or by an
+    /// earlier `PageSizes`): all of them, as displayed. It comes before any event that depends
+    /// on the sizes of those pages (their bitmaps, their SyncTeX boxes).
+    PageSizes {
         generation: u64,
         page_sizes: Vec<(f64, f64)>, /*bp*/
     },
@@ -237,8 +248,16 @@ pub enum PdfCmd {
     /// Answered with [`PdfEvent::Opened`] or [`PdfEvent::OpenFailed`]. Once a newer generation is open,
     /// queued requests for older generations are dropped. The SyncTeX file next to the PDF
     /// (`<stem>.synctex.gz` or `<stem>.synctex`) is parsed on the first Forward or Inverse and reparsed
-    /// whenever it changes.
+    /// whenever it changes, on a helper thread, so pages are rendered meanwhile; when SyncTeX was
+    /// used since the previous Open or in the last few minutes, the new file is parsed right away.
     Open { generation: u64, pdf: PathBuf },
+    /// Opens `pdf` as [`PdfCmd::Open`] does, for a rebuild of the current document. When the
+    /// current document is the same file with as many pages, [`PdfEvent::Opened`] reports its
+    /// page sizes instead of reading every page first (about 0.1 ms each); the pages are read
+    /// afterwards, a few at a time once no page waits to be rendered, and
+    /// [`PdfEvent::PageSizes`] reports the sizes again when one differs. A page is always read
+    /// before it (or its thumbnail) is rendered or mapped for SyncTeX.
+    Reload { generation: u64, pdf: PathBuf },
     /// Replaces the whole pending render queue (latest wins). Requests for older generations are dropped.
     ///
     /// Requests are rendered in the given order, one [`PdfEvent::Rendered`] each; a page being rendered
@@ -274,6 +293,10 @@ pub enum PdfCmd {
     Outline,
     /// The page labels of the current document; answered with [`PdfEvent::PageLabels`].
     PageLabels,
+    /// Frees the SyncTeX scanner (about 85 KiB per page; the next sync parses the file again),
+    /// gives the heap's free pages back to the system, and forgets that SyncTeX was used, so the
+    /// next Open parses nothing ahead. For a window in the background or a hidden PDF pane.
+    Trim,
     /// Stops the thread; pending requests are dropped. See also [`PdfHandle::shutdown_and_join`].
     Shutdown,
 }

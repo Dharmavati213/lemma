@@ -36,8 +36,11 @@ pub fn darken_rgb(rgb: [f32; 3]) -> [f32; 3] {
 /// Colours a bitmap of BGRA premultiplied pixels (cairo's ARGB32 on little-endian, as rendered)
 /// in dark mode, in place; alpha is unchanged. A trailing partial pixel is left alone.
 ///
-/// Opaque pixels (every pixel of a rendered page) go through integer lookup tables, about as fast
-/// as copying the bitmap; the others are unpremultiplied, transformed and premultiplied again.
+/// Opaque pixels (every pixel of a rendered page) go through integer lookup tables; the others are
+/// unpremultiplied, transformed and premultiplied again. Most of a page is white paper and the rest
+/// mostly grey ink (r = g = b), whose pixels are looked up whole in tables made with the same
+/// arithmetic, so the result is the same to the bit: a 1563 × 2210 page (fit width on a HiDPI
+/// screen) takes about 2.5 ms instead of 12 ms with three table lookups per channel.
 pub fn darken_bgra(data: &mut [u8]) {
     let contrast = INK - PAPER;
     // lut[c][j][v]: the share of input channel j at level v in output channel c (R, G, B), in
@@ -55,9 +58,20 @@ pub fn darken_bgra(data: &mut [u8]) {
         let sum = lut[c][0][usize::from(r)] + lut[c][1][usize::from(g)] + lut[c][2][usize::from(b)];
         ((base - sum + 128) >> 8).clamp(0, 255) as u8
     };
+    // greys[v]: the opaque grey pixel of level v, coloured (BGRA, as below).
+    let greys: [[u8; 4]; 256] = std::array::from_fn(|v| {
+        let v = v as u8;
+        [level(2, v, v, v), level(1, v, v, v), level(0, v, v, v), 255]
+    });
+    let paper = greys[255];
     for pixel in data.as_chunks_mut::<4>().0 {
+        if *pixel == [255; 4] {
+            *pixel = paper;
+            continue;
+        }
         let (b, g, r, a) = (pixel[0], pixel[1], pixel[2], pixel[3]);
         match a {
+            255 if b == g && g == r => *pixel = greys[usize::from(b)],
             255 => {
                 pixel[2] = level(0, r, g, b);
                 pixel[1] = level(1, r, g, b);

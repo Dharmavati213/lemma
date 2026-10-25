@@ -121,6 +121,28 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   of it takes 31–34 ms instead of 77–78 ms. The band just below the view, on the same page or at
   the top of the next, is rendered ahead, so scrolling down finds it ready; these pages were never
   rendered ahead before.
+- Dark PDF pages are coloured about five times as fast, to the same pixels: a dark page at fit
+  width on a HiDPI screen renders in about 8–9 ms instead of 17–22 ms (6–7 ms light), and at
+  scale 1 a dark page costs no more than a light one. Dark pages are the default with a dark
+  system style.
+- The first SyncTeX search after a build (Ctrl+click, Ctrl+Alt+J or follow-cursor) no longer
+  holds up the PDF while the SyncTeX file is read, which takes about 130 ms for a 500-page
+  document: it is read in the background and the pages appear meanwhile (after 14–25 ms instead
+  of 170–230 ms when the click comes as the PDF reloads). If you used SyncTeX since the build
+  before, or in the last five minutes, a build's SyncTeX file is read as soon as its PDF
+  reloads, so the search is answered at once (under 1 ms instead of 130–190 ms); otherwise it is
+  never read ahead. When the window has been in the background for a minute, or the PDF pane is
+  hidden, the SyncTeX data is freed (47 MiB for 500 pages). A PDF in a window of its own that
+  you are reading keeps it, and the pages it rendered ahead, while the main window is in the
+  background.
+- A rebuilt PDF with as many pages as before shows without reading every page's size first: on
+  the PDF thread a 500-page document shows after 6 ms instead of 24 ms (about 0.6 s sooner for
+  6000 pages). The sizes are read afterwards, and a page whose size changed is laid out again
+  with the view keeping its place.
+- With the PDF strip on Bookmarks, a build that leaves the outline's titles as they were updates
+  the rows where the entries now point instead of building every row again: with 500 bookmarks
+  the window no longer stalls for about 60 ms after each build (about 1 ms now). The expanded
+  entries and the selected row stay as they were.
 - Zooming the PDF out renders the pages that come into view at the new zoom right away, instead
   of at the old zoom and then again 120 ms later (over several Ctrl+wheel notches or a pinch,
   such a page then waits for the final zoom, and a page in bands gets the bands it lacks at the

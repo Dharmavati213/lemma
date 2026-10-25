@@ -26,7 +26,8 @@
 //! - **Bookmarks:** the PDF's outline (hyperref's bookmarks) as a tree (`gtk::TreeListModel`),
 //!   with each entry's page label. It is read when the strip is first shown and after each
 //!   rebuild; the entries that were expanded stay expanded (otherwise the PDF's own `/Count`
-//!   decides).
+//!   decides). A rebuild whose outline has the same titles keeps the rows, and its entries take
+//!   their new destinations in place.
 //!
 //! The row of the page shown (or of the section the top of the view is in) is selected and kept
 //! in view while the PDF scrolls. Selecting a row (click or arrow keys) goes there; a bookmark
@@ -137,11 +138,12 @@ type Chosen = (u32, Option<(f64, f64)>);
 /// A bookmark row as tests see it: depth, title and 0-based page.
 pub type BookmarkRow = (u32, String, Option<u32>);
 
-/// An outline entry in the bookmark tree.
+/// An outline entry in the bookmark tree. The rows of the tree and the child lists that expanding
+/// creates share it, so a rebuild that moves only the destinations updates them all in place.
 struct Node {
     title: String,
-    dest: LinkDest,
-    open: bool,
+    dest: RefCell<LinkDest>,
+    open: Cell<bool>,
     /// The titles from the root to this entry (identifies it across rebuilds).
     path: Vec<String>,
     children: Vec<Rc<Node>>,
@@ -190,10 +192,14 @@ pub struct Strip {
     bookmarks_selection: gtk::SingleSelection,
     outline_generation: Cell<u64>,
     outline_requested: Cell<u64>,
+    /// The outline the tree shows, as the PDF thread read it.
+    outline_items: RefCell<Vec<OutlineItem>>,
+    /// How many times the tree was built (tests check that rebuilds keep it).
+    outline_builds: Cell<usize>,
     /// The paths of the expanded entries, kept across rebuilds.
     expanded: RefCell<HashSet<Vec<String>>>,
-    /// The page labels of the bound bookmark rows, with their pages.
-    bookmark_pages: RefCell<Vec<(glib::WeakRef<gtk::Label>, u32)>>,
+    /// The page labels of the bound bookmark rows, with their entries.
+    bookmark_pages: RefCell<Vec<(glib::WeakRef<gtk::Label>, Rc<Node>)>>,
     /// The outline has been shown once (later loads keep the user's expansions).
     outline_seen: Cell<bool>,
     /// Some entry has children (rows then leave room for the expander arrow).
@@ -297,33 +303,44 @@ impl Strip {
     /// A new generation (or, unless `rebuilt`, another PDF) is shown.
     pub(super) fn document_changed(&self, generation: u64, rebuilt: bool) {
         self.generation.set(generation);
-        let sizes: Vec<(f64, f64)> = self.view.layout().map_or(Vec::new(), |layout| {
-            (0..layout.page_count())
-                .filter_map(|p| layout.page_size(p))
-                .collect()
-        });
         if !rebuilt {
             self.cache.borrow_mut().retain(|_| false);
             self.expanded.borrow_mut().clear();
             self.outline_seen.set(false);
             self.labels.borrow_mut().clear();
         }
-        let n = sizes.len();
+        let n = self.take_sizes();
         self.cache.borrow_mut().retain(|page| (*page as usize) < n);
-        self.sizes.replace(sizes);
         // Until the page labels come: the old ones where they still fit, else numbers.
         let labels: Vec<String> = (0..n as u32).map(|p| self.page_label(p)).collect();
         self.set_labels(labels);
-        for (page, row) in self.bound.borrow().iter() {
-            if let Some(size) = self.sizes.borrow().get(*page as usize) {
-                row.picture.set_page_size(*size);
-            }
-        }
         self.labels_generation.set(0);
         self.outline_requested.set(0);
         if self.active.get() {
             self.refresh_page();
         }
+    }
+
+    /// The generation shown has other page sizes than it showed with (a rebuild with as many
+    /// pages, `PdfEvent::PageSizes`): the thumbnail rows take them.
+    pub(super) fn page_sizes_changed(&self) {
+        self.take_sizes();
+    }
+
+    /// Takes the view's page sizes for the thumbnail rows; returns how many pages there are.
+    fn take_sizes(&self) -> usize {
+        let sizes = self
+            .view
+            .layout()
+            .map_or(Vec::new(), |layout| layout.sizes().to_vec());
+        for (page, row) in self.bound.borrow().iter() {
+            if let Some(size) = sizes.get(*page as usize) {
+                row.picture.set_page_size(*size);
+            }
+        }
+        let n = sizes.len();
+        self.sizes.replace(sizes);
+        n
     }
 
     /// Replaces the page labels shown (and the thumbnail rows, when the count changed).
@@ -531,8 +548,23 @@ impl Strip {
     // ----- bookmarks -----
 
     /// The outline of `generation` (`PdfEvent::Outline`).
+    ///
+    /// A rebuild usually leaves the titles as they are, and at most moves where the entries point
+    /// (text added on a page moves the sections after it): then the rows stay, with their
+    /// expansion and selection, and their entries take the new destinations. Replacing every row
+    /// cost 50–80 ms of the main thread for 500 entries. Other outlines are built anew.
     pub(super) fn outline(&self, generation: u64, items: Vec<OutlineItem>) {
         if generation != self.generation.get() {
+            return;
+        }
+        if self.outline_seen.get() && same_titles(&self.outline_items.borrow(), &items) {
+            self.outline_generation.set(generation);
+            if *self.outline_items.borrow() != items {
+                set_destinations(&self.root_nodes(), &items);
+                self.outline_items.replace(items);
+                self.refresh_bookmark_rows();
+            }
+            self.follow_view();
             return;
         }
         // Remember what is expanded now.
@@ -551,14 +583,17 @@ impl Strip {
         let first = !self.outline_seen.replace(true);
         self.outline_generation.set(generation);
         let nodes = build_nodes(&items, &[]);
+        self.outline_items.replace(items);
+        self.outline_builds.set(self.outline_builds.get() + 1);
         self.nested
             .set(nodes.iter().any(|n| !n.children.is_empty()));
         self.syncing.set(true);
-        self.outline_root.remove_all();
-        for node in &nodes {
-            self.outline_root
-                .append(&glib::BoxedAnyObject::new(node.clone()));
-        }
+        let rows: Vec<glib::BoxedAnyObject> = nodes
+            .iter()
+            .map(|node| glib::BoxedAnyObject::new(node.clone()))
+            .collect();
+        self.outline_root
+            .splice(0, self.outline_root.n_items(), &rows);
         // Expand top-down (expanding inserts the children after the row).
         let expanded = self.expanded.borrow().clone();
         let mut i = 0;
@@ -568,7 +603,7 @@ impl Strip {
                 && !node.children.is_empty()
             {
                 let open = if first {
-                    node.open
+                    node.open.get()
                 } else {
                     expanded.contains(&node.path)
                 };
@@ -589,11 +624,34 @@ impl Strip {
     fn refresh_bookmark_rows(&self) {
         let mut rows = self.bookmark_pages.borrow_mut();
         rows.retain(|(label, _)| label.upgrade().is_some());
-        for (label, page) in rows.iter() {
+        for (label, node) in rows.iter() {
             if let Some(label) = label.upgrade() {
-                label.set_text(&self.page_label(*page));
+                label.set_text(&self.bookmark_page(&node.dest.borrow()));
             }
         }
+    }
+
+    /// The page label a bookmark row shows for `dest` (none for a link elsewhere).
+    fn bookmark_page(&self, dest: &LinkDest) -> String {
+        match dest {
+            LinkDest::Page { page, .. } => self.page_label(*page),
+            _ => String::new(),
+        }
+    }
+
+    /// The entries of the tree's top level.
+    fn root_nodes(&self) -> Vec<Rc<Node>> {
+        (0..self.outline_root.n_items())
+            .filter_map(|i| {
+                let item = self
+                    .outline_root
+                    .item(i)?
+                    .downcast::<glib::BoxedAnyObject>()
+                    .ok()?;
+                let node = item.try_borrow::<Rc<Node>>().ok()?.clone();
+                Some(node)
+            })
+            .collect()
     }
 
     // ----- following the view -----
@@ -651,7 +709,7 @@ impl Strip {
             let Some(node) = self.tree.row(i).and_then(|r| row_node(&r)) else {
                 continue;
             };
-            let LinkDest::Page { page, y_bp } = node.dest else {
+            let LinkDest::Page { page, y_bp } = *node.dest.borrow() else {
                 continue;
             };
             let at = (page, y_bp.unwrap_or(0.0));
@@ -684,7 +742,7 @@ impl Strip {
         let Some(node) = self.tree.row(row).and_then(|r| row_node(&r)) else {
             return;
         };
-        let LinkDest::Page { page, y_bp } = node.dest else {
+        let LinkDest::Page { page, y_bp } = *node.dest.borrow() else {
             return;
         };
         if let Some(state) = self.state.upgrade()
@@ -717,13 +775,31 @@ fn build_nodes(items: &[OutlineItem], parent: &[String]) -> Vec<Rc<Node>> {
             let children = build_nodes(&item.children, &path);
             Rc::new(Node {
                 title: item.title.clone(),
-                dest: item.dest.clone(),
-                open: item.open,
+                dest: RefCell::new(item.dest.clone()),
+                open: Cell::new(item.open),
                 path,
                 children,
             })
         })
         .collect()
+}
+
+/// True when `a` and `b` are trees of the same titles (whatever their destinations).
+fn same_titles(a: &[OutlineItem], b: &[OutlineItem]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.title == b.title && same_titles(&a.children, &b.children))
+}
+
+/// Gives `nodes`, built from an outline with the same titles as `items`, the destinations and
+/// `/Count` signs of `items`.
+fn set_destinations(nodes: &[Rc<Node>], items: &[OutlineItem]) {
+    for (node, item) in nodes.iter().zip(items) {
+        node.dest.replace(item.dest.clone());
+        node.open.set(item.open);
+        set_destinations(&node.children, &item.children);
+    }
 }
 
 fn row_node(row: &gtk::TreeListRow) -> Option<Rc<Node>> {
@@ -902,15 +978,18 @@ fn bookmarks_list(
         };
         title.set_text(&node.title);
         title.set_tooltip_text(Some(&node.title));
-        let label = match (&node.dest, weak.upgrade()) {
-            (LinkDest::Page { page: p, .. }, Some(strip)) => {
+        let label = match weak.upgrade() {
+            Some(strip) => {
+                // Its page label follows the page labels and the entry's destination.
                 let mut rows = strip.bookmark_pages.borrow_mut();
                 rows.retain(|(l, _)| l.upgrade().is_some_and(|l| l != page));
-                rows.push((page.downgrade(), *p));
-                strip.page_label(*p)
+                rows.push((page.downgrade(), node.clone()));
+                strip.bookmark_page(&node.dest.borrow())
             }
-            (LinkDest::Page { page, .. }, None) => (page + 1).to_string(),
-            _ => String::new(),
+            None => match *node.dest.borrow() {
+                LinkDest::Page { page, .. } => (page + 1).to_string(),
+                _ => String::new(),
+            },
         };
         page.set_text(&label);
     });
@@ -1022,6 +1101,8 @@ pub fn install(state: &Rc<WindowState>) {
             bookmarks_selection,
             outline_generation: Cell::new(0),
             outline_requested: Cell::new(0),
+            outline_items: RefCell::new(Vec::new()),
+            outline_builds: Cell::new(0),
             expanded: RefCell::new(HashSet::new()),
             bookmark_pages: RefCell::new(Vec::new()),
             outline_seen: Cell::new(false),
@@ -1158,6 +1239,21 @@ pub fn thumbnail_rows(state: &WindowState) -> Vec<(u32, bool)> {
     rows
 }
 
+/// The page size (bp) each bound thumbnail row is laid out for.
+pub fn thumbnail_page_sizes(state: &WindowState) -> Vec<(u32, (f64, f64))> {
+    let Some(strip) = strip_of(state) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(u32, (f64, f64))> = strip
+        .bound
+        .borrow()
+        .iter()
+        .map(|(&page, row)| (page, row.picture.page_size()))
+        .collect();
+    rows.sort_by_key(|(page, _)| *page);
+    rows
+}
+
 /// The thumbnail list (tests select rows and scroll it).
 pub fn thumbnail_list(state: &WindowState) -> Option<(gtk::ListView, gtk::SingleSelection)> {
     strip_of(state).map(|s| (s.thumbs.clone(), s.thumbs_selection.clone()))
@@ -1178,7 +1274,7 @@ pub fn bookmark_rows(state: &WindowState) -> (Vec<BookmarkRow>, Option<u32>) {
         .filter_map(|i| {
             let row = strip.tree.row(i)?;
             let node = row_node(&row)?;
-            let page = match node.dest {
+            let page = match *node.dest.borrow() {
                 LinkDest::Page { page, .. } => Some(page),
                 _ => None,
             };
@@ -1206,6 +1302,25 @@ pub fn select_bookmark(state: &WindowState, row: u32) {
     if let Some(strip) = strip_of(state) {
         strip.bookmarks_selection.select_item(row, true);
     }
+}
+
+/// How many times the bookmark tree was built since the window opened (a rebuild whose outline
+/// has the same titles keeps the tree).
+pub fn bookmark_builds(state: &WindowState) -> usize {
+    strip_of(state).map_or(0, |s| s.outline_builds.get())
+}
+
+/// The page label each bookmark row shows (empty for a row whose entry points elsewhere), for
+/// the rows that are bound.
+pub fn bookmark_page_labels(state: &WindowState) -> Vec<(String, String)> {
+    let Some(strip) = strip_of(state) else {
+        return Vec::new();
+    };
+    let mut rows = strip.bookmark_pages.borrow_mut();
+    rows.retain(|(label, _)| label.upgrade().is_some());
+    rows.iter()
+        .filter_map(|(label, node)| Some((node.title.clone(), label.upgrade()?.text().into())))
+        .collect()
 }
 
 /// True when the outline of the shown generation has been loaded.

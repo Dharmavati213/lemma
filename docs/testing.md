@@ -289,6 +289,18 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   a line that reserves its space (it failed when a deletion joined two anchor lines that share
   a tag: both bands were drawn on that line). The text has no `\r`: GTK breaks lines at a lone
   one, where `LineIndex` does not.
+- **The PDF thread** (`lemma-pdf`): its SyncTeX parses on helper threads are tested white-box in
+  `worker::tests`, which drive a worker on the test's thread and hand it each parse that ends
+  (queries that wait while pages render, parsing ahead only after a recent sync, a file changed
+  during its parse, an Open that replaces a running parse, `Trim`, a restart with queries
+  waiting), as are a Reload's pages read before they (or their thumbnails) are rendered, the
+  others once no page waits to be rendered, and its sizes reported after a restart. `tests/worker.rs` checks them through the thread on hand-written PDFs (a Reload's
+  `Opened` with the old sizes and its `PageSizes`, SyncTeX on a page that a rebuild turned) and
+  that `dark::darken_bgra` gives exactly what it gave before its fast paths
+  (`dark_pages_come_out_as_before`: a copy of the old transform, on every opaque colour and on
+  stress pages, light and dark). `gtk_pdf` `pages_resized_by_a_rebuild_keep_the_anchor` and
+  `gtk_pdf_m3` `bookmarks_follow_a_rebuild_in_place` check the view and the strip; both write
+  their PDFs with `common::write_pdf` (blank pages of given sizes, with an outline).
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -470,6 +482,10 @@ check the budgets only in release builds:
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 | `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
+| `lemma-pdf` `perf_dark_pages` | colouring a page for dark mode (stress and pdf50 pages at scale_q 10 and 21) takes under 1/2.5 of the time of the transform without its fast paths for white and grey pixels (measured 0.6 against 3.4 ms, and 2.7–2.9 against 15.5–16.2 ms), with the same bytes; through the PDF thread a dark stress page at scale_q 21 costs under 1.5 times a light one (measured 12.6 and 10.7 ms; 18.6 and 7.9 before) |
+| `lemma-pdf` `perf_first_sync_after_a_rebuild` | on pdf50 (or `LEMMA_PERF_PDF`, a PDF of your own with its SyncTeX file): after a rebuild, a Ctrl+click sent before the Want of the first three pages holds the first page back at most to 1.5 times its time without the click plus 5 ms, while the file is parsed on a helper thread, and the first Forward after a rebuild parsed ahead takes ≤ 5 ms median (§7); on a 500-page build measured 25 against 17 ms (169–230 ms before), and 0.8 ms (126–190 ms before) |
+| `lemma-pdf` `perf_reload_of_a_long_pdf` | a Reload of a generated 3000-page PDF reports `Opened` in under half the time of an Open, which reads every page first, and its first page comes no later; pdf50 and `LEMMA_PERF_PDF` are printed too (a 500-page build: 5.8 against 24 ms, the first page after 23 against 40 ms) |
+| `gtk_pdf_m3` `perf_bookmarks_after_rebuilds` | with the strip's 500 bookmarks shown, the longest main-loop iteration after a rebuild (the window's frames left out and printed: Broadway renders them in software), when the outline is the same or only its destinations moved: ≤ 5 ms median (measured about 1 ms; 57–73 ms before, when every row was replaced); with other titles, printed (46–50 ms) |
 | `gtk_math_preview` `perf_math_preview_large_tex` | on `large.tex` with the live preview (needs `pdflatex`): the main loop's work after the card appears or goes away ≤ 20 ms median (measured under 0.5 ms; 1.2 s while its tag was removed from the whole text, which GTK lays out again), and the hover of a rendered formula right after a one-character edit ≤ 2 ms median |
 | `gtk_labels` `perf_equation_numbers_large_tex` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`: a refresh ≤ 15 ms median (measured 8 ms; 49 ms with a search per label), and the main loop's work after a new undefined reference is underlined ≤ 50 ms |
 | `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms, Alt+Y and Alt+N on the middle hunk (`decide_and_advance`) ≤ 50 ms median and the recompute after typing in a hunk ≤ 40 ms (measured 20 ms and 18 ms; 0.43 s and 0.37 s while the overlay re-tagged every added line and changed word, with a tag per hunk that moved for every hunk after a decided one); prints a line break above the hunks and accepting the last one (with the main loop's work after it) |

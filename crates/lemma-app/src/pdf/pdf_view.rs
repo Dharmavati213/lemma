@@ -22,7 +22,9 @@
 //!   texture (or not all its visible tiles) of the current scale or generation, the best other
 //!   ones are stretched in its place, so zooming and rebuilding never flash white pages.
 //! - **Reload:** a new generation of the same PDF keeps the scroll [`Anchor`] (page and
-//!   fraction), clamped when the page count changes; another PDF starts at the top.
+//!   fraction), clamped when the page count changes; another PDF starts at the top. A rebuild with
+//!   as many pages shows with the old page sizes until the PDF thread has read its own, and keeps
+//!   the anchor when they differ ([`PdfView::set_page_sizes`]).
 //! - **Dark mode:** the pages are requested dark ([`PageKey::dark`]) and the PDF thread colours
 //!   the bitmaps (invert, then hue-rotate 180°, [`lemma_pdf::dark`]), so they are drawn as they
 //!   are. (A colour matrix over the view would cost GTK's cairo renderer, the default, a per-pixel
@@ -152,6 +154,9 @@ struct Model {
     /// The bitmaps of the shown generation that arrived from the PDF thread (tests count the
     /// renders a zoom costs).
     received: usize,
+    /// The times the page sizes read after a reload laid the document out again (tests check
+    /// that a rebuild showed before they came).
+    resized: usize,
     /// Search matches per 0-based page (M3).
     search: HashMap<u32, Vec<SearchMatch>>,
     /// The emphasised match: page and index in its page's list.
@@ -178,6 +183,7 @@ impl Default for Model {
             gesture_start_zoom: 1.0,
             max_snapshot: Duration::ZERO,
             received: 0,
+            resized: 0,
             search: HashMap::new(),
             current_match: None,
             held: None,
@@ -1174,6 +1180,32 @@ impl PdfView {
     /// textures stay on screen until the new ones arrive. Otherwise the view starts at the top,
     /// fitted to its width. (For another PDF, use [`PdfView::open_document`].)
     pub fn set_document(&self, generation: u64, page_sizes: Vec<(f64, f64)>) {
+        self.lay_out(generation, page_sizes, true);
+    }
+
+    /// The document shown, of `generation`, has other page sizes than it is laid out with
+    /// (`PdfEvent::PageSizes`: a reload showed with the sizes of the generation before, and the
+    /// PDF thread has read its pages since). It is laid out again with them, keeping the scroll
+    /// anchor as a rebuild does; the textures stay. Sizes of another generation, or the same
+    /// ones, change nothing.
+    pub fn set_page_sizes(&self, generation: u64, page_sizes: Vec<(f64, f64)>) {
+        let changed = self
+            .imp()
+            .model
+            .borrow()
+            .doc
+            .as_ref()
+            .is_some_and(|d| d.generation == generation && d.layout.sizes() != page_sizes);
+        if changed {
+            self.imp().model.borrow_mut().resized += 1;
+            self.lay_out(generation, page_sizes, false);
+        }
+    }
+
+    /// Lays out the document of `generation` with `page_sizes`, keeping the scroll anchor of the
+    /// document shown (see [`PdfView::set_document`]). A new generation also forgets the requests
+    /// outstanding (the PDF thread drops those of older generations) and the SyncTeX highlight.
+    fn lay_out(&self, generation: u64, page_sizes: Vec<(f64, f64)>, new_generation: bool) {
         let imp = self.imp();
         let size = imp.view_size();
         let (sx, sy) = imp.scroll();
@@ -1204,9 +1236,11 @@ impl PdfView {
             }
             let position = anchor.map_or((0.0, 0.0), |a| (a.x, layout.y_for_anchor(a, model.zoom)));
             model.doc = Some(Doc { generation, layout });
-            // The PDF thread drops requests of older generations.
-            model.outstanding.clear();
-            model.flash = None;
+            if new_generation {
+                // The PDF thread drops requests of older generations.
+                model.outstanding.clear();
+                model.flash = None;
+            }
             position
         };
         imp.configure_adjustments(x, y);
@@ -1610,6 +1644,12 @@ impl PdfView {
     /// was created.
     pub fn bitmaps_received(&self) -> usize {
         self.imp().model.borrow().received
+    }
+
+    /// How many times [`PdfView::set_page_sizes`] laid the document out again since the view
+    /// was created.
+    pub fn page_size_updates(&self) -> usize {
+        self.imp().model.borrow().resized
     }
 
     /// The keys of the cached textures of the 0-based `page`, in no particular order.

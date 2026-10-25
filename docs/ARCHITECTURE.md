@@ -123,6 +123,7 @@ Data and test directories:
 |---|---|---|---|
 | GTK main | always | All widgets and buffers, `Document`s, `FileReview`s, `LineStates`, `ProjectIndex`, completion and snippet matching | One `glib::spawn_future_local` receive loop per `async_channel` |
 | `pdf` | from the first PDF | poppler `Document` (!Send), synctex `Scanner`, render queue | `PdfCmd` over `std::mpsc` (Want = latest wins) in; `PdfEvent` over async_channel out |
+| `synctex` | one per SyncTeX parse (§11, PDF view) | `Scanner::open`, after freeing the scanner it replaces | The scanner back on the `pdf` thread's channel |
 | build | one per build | latexmk (`process_group(0)`), blocking `wait`, log parsing | `BuildOutcome` over async_channel |
 | jobs | on demand | `gio::spawn_blocking`: `index_file`, `scan_bib`, cwl decode, turn snapshots, math-preview TeX runs | Awaited handle |
 | `agent` | from the first panel open until Stop or quit | `block_on(Client.builder()…connect_with(AcpAgent))` | `AgentCmd` in; `AgentEvent` out |
@@ -329,7 +330,7 @@ Rules:
 - **SyncTeX:**
   - **Forward** (Ctrl+Alt+J, optional follow-cursor debounced 200 ms) draws `(h, v−H, W, H)` in bp scaled by zoom × scale, scrolled to one third of the view and faded over 600 ms.
   - **Inverse** (Ctrl+click on the PDF) calls `to_page`, then `Scanner::inverse`, then opens the file at that line. Sync is per line only, because pdfTeX records column −1.
-  - The scanner opens on the first sync and is reopened when the `.synctex.gz` modification time changes.
+  - The scanner opens on the first sync and is reopened when the `.synctex.gz` modification time changes, on a helper thread of the PDF thread, so pages render meanwhile (§11, PDF view, 2026-10-25).
 - **Link hover (M3)** works like sioyek: `link_mapping` gives the destination, and a popover renders that region of the target page.
 
 ## 7. Memory and performance budget
@@ -350,8 +351,8 @@ Rules:
 
 **Techniques:**
 - System GTK, linked dynamically. No tokio, webview, JS engine or bundled C libraries.
-- Lazy loading: spell check after the first frame, cwl per package, SyncTeX on the first sync, the preview format on the first hover, the agent when its panel opens.
-- `mallopt(M_MMAP_THRESHOLD, 1 MiB)` and `mallopt(M_ARENA_MAX, 2)` at startup. When the PDF pane is hidden, or the window has been inactive for 60 s, shrink the cache to the visible pages and call `malloc_trim(0)`. (`lemma-app/src/heap.rs`: glibc only; on macOS `heap::trim` is `malloc_zone_pressure_relief`, see §12.)
+- Lazy loading: spell check after the first frame, cwl per package, SyncTeX on the first sync (after a rebuild, parsed ahead only when SyncTeX was used since the build before or in the last five minutes), the preview format on the first hover, the agent when its panel opens.
+- `mallopt(M_MMAP_THRESHOLD, 1 MiB)` and `mallopt(M_ARENA_MAX, 2)` at startup. When the PDF pane is hidden, or the window has been inactive for 60 s (unless the PDF is in a window of its own that is active), shrink the cache to the visible pages, free the SyncTeX scanner (`PdfCmd::Trim`, about 85 KiB per page) and call `malloc_trim(0)`, on the PDF thread too after the scanner is freed. (`lemma-app/src/heap.rs` and `lemma-pdf/src/heap.rs`: glibc only; on macOS `heap::trim` is `malloc_zone_pressure_relief`, see §12.)
 - Keep GTK's default Vulkan renderer: `GSK_RENDERER=gl` measured about +75 MB [V]. `cairo` measured −30 MB and is documented as a low-memory option. M5: `[editor] renderer = "auto"|"cairo"|"vulkan"|"gl"` sets `GSK_RENDERER` at start-up unless the environment has it; `auto` (the default) is cairo: measured on the user's machine it saves about 27 MB and 140 ms to the first frame, types as fast, and still scrolls the PDF at 60 fps (docs/STATUS.md, "M5 performance").
 - Closed documents are kept as `String`s; baselines exist only while hunks exist.
 - **Measurement:**
@@ -1568,6 +1569,67 @@ they conflict with the sections above, this section wins.
     the cache (`geometry::tiles_below`: the next band of the last visible page or, once its last
     band is in view, the first of the page after it), then for the whole pages ahead; tiled
     pages were never rendered ahead before. Pages under the threshold are one bitmap as before.
+  - **Dark pages** (§6): `dark::darken_bgra` looks up the output of white paper and of opaque
+    grey (r = g = b) pixels whole, in tables built with the same integer arithmetic as every
+    other opaque pixel's (three table lookups per channel), so the output is the same to the bit:
+    `lemma-pdf` `dark_pages_come_out_as_before` compares it with the transform as it was, on
+    every opaque colour and on rendered pages, light and dark. Text pages are 95–98% white and
+    the rest grey: colouring a page takes 0.6 ms instead of 3.4–3.8 ms at scale_q 10 and
+    2.7–2.9 ms instead of 15.5–16.2 ms at 21 (fit width on a HiDPI screen; `perf_dark_pages`),
+    and through the PDF thread a dark pdf50 page at 21 renders in 7.5–9.3 ms instead of
+    17.1–21.8 ms (5.7–7.5 ms light), at 10 as fast as a light one (load 5).
+  - **SyncTeX** (§6, §7): the `.synctex.gz` is parsed on a helper thread (`synctex`, §3; about
+    0.25 ms per page, 125–200 ms for 500 pages under load), which first frees the scanner it
+    replaces, so memory never holds two (about 85 KiB per page: 47 MiB for 500). The PDF thread
+    serves its commands and renders meanwhile. A Forward or Inverse that finds no scanner for the
+    file as it is now (its stamp, compared on each query) waits, with the queries after it, and
+    they are answered in order when the parse ends; a parse whose file changed meanwhile, or that
+    a newer Open replaced, is dropped (its scanner freed on a thread of its own: freeing takes
+    libsynctex's lock, which another parse may hold). After an Open whose SyncTeX file changed,
+    the file is parsed right away only when a sync came since the previous Open or in the last
+    five minutes (`RECENT_SYNC`); otherwise only the old scanner goes. A parse holds the lock
+    throughout, so the label preview's PDF thread waits for it with its Forward queries. With a
+    Ctrl+click sent before the Want of the visible pages of a 500-page rebuild, the first page
+    came after 169–230 ms, now after 14–25 ms (13–17 ms without the click, load 5–9); the first
+    Forward after a rebuild parsed ahead takes 0.8 ms instead of 126–190 ms
+    (`perf_first_sync_after_a_rebuild`). Waiting queries survive a restart after a panic (they get
+    a parse of their own; parses are numbered across restarts, so one left running is never
+    taken for a newer one), and a parse that ends after the thread stopped frees its scanner
+    itself.
+  - `PdfCmd::Trim` (§10.3 addition) frees the scanner (and a parse ahead that no query waits
+    for), runs the PDF thread's own `heap::trim`, and forgets the recent use, so the next rebuild
+    parses nothing ahead. `WindowState::trim_memory` and hiding the PDF pane send it (not when the
+    pane hides because the PDF moved to a window of its own; and `trim_memory`, which runs while
+    the main window is in the background, leaves the PDF's textures and scanner alone while the
+    PDF's own window is active). A process showing a 500-page PDF goes back from 74 MiB to
+    27 MiB RSS after its first sync and a trim.
+  - **Reloads** (§6, §10.3 addition): `PdfCmd::Reload` opens a rebuild of the current document.
+    With as many pages, `PdfEvent::Opened` reports the current document's page sizes instead of
+    reading every page first, which takes 0.03–0.1 ms a page (24 ms for 500 pages at load 7,
+    0.6 s for 5892 at load 11–15). The pages are read afterwards, once no page waits to be
+    rendered, 32 at a time in a unit of work that takes its turn with searches and thumbnails: a
+    unit between the bands of the pages in view held them back (two pages at scale_q 26 in 12
+    bands, pdf500, load 12–15: 145–160 ms to the last band after a Reload, 119–128 ms with the
+    renders first). A page is always read before it is rendered (its tile grid) or its
+    thumbnail is, mapped for SyncTeX (`box_to_display`, `point_from_display`) or its rotation
+    used. When a page read has another size, `PdfEvent::PageSizes { generation,
+    page_sizes }` (§10.3 addition: all of them) comes before any event that depends on it; a
+    restart after a panic reads every page and reports them once. Another page count, another
+    file, or `PdfCmd::Open` read every page first as before; the label preview's worker uses
+    `Open`, as its crops take the sizes of `Opened`. The controller sends `Reload` for the file
+    the latest open asked for; the view lays out the new sizes keeping its anchor
+    (`PdfView::set_page_sizes`), and the strip's thumbnail rows take them. A 500-page build shows
+    5.8 ms after its Reload instead of 24 ms, its first page after 23 ms instead of 40 ms
+    (`perf_reload_of_a_long_pdf`).
+  - **Bookmarks** (§6): a rebuild whose outline has the same titles in the same tree keeps the
+    strip's rows; when only destinations (or `/Count` signs) changed, the entries take them in
+    place. An entry is shared by the root list, the child lists the tree has made and its
+    parent's children, from which a collapsed entry's list is made later. The rows' page labels
+    follow (`refresh_bookmark_rows`), and so do the row the view selects and the jumps. Other
+    outlines are built again, in one splice. With 500 bookmarks, the longest main-loop iteration
+    after a rebuild took 57–73 ms (median) at load 9–11, now about 1 ms, the same outline or with
+    moved destinations (`gtk_pdf_m3` `perf_bookmarks_after_rebuilds`, ≤ 5 ms; 46–50 ms when the
+    titles changed).
 - **Recovery of unsaved changes (§3, §7, 2026-10-25):** auto-save is off by default, and a
   crash, `SIGTERM`, `SIGHUP` or a logout used to end the process without the "Save changes?"
   dialog, losing every unsaved change (`recovery.rs`, `[editor] recovery`, default true).

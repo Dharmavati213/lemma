@@ -2,13 +2,15 @@
 //! confirmation), search (counts against `pdftotext`, navigation, case and whole words,
 //! cancellation and latest wins, highlights, a rebuilt PDF that keeps the reading place), the
 //! strip (lazy thumbnails within their budget, bound rows that need more than it, dark
-//! thumbnails rendered dark, the current page, the bookmark tree), detaching the PDF into its
-//! own window and back (anchor, search, SyncTeX, dark pages, reloads), `--demo pdf-search`, and
-//! the view's keys on real key events.
+//! thumbnails rendered dark, the current page, the bookmark tree, and a rebuild that moves its
+//! destinations in place), detaching the PDF into its own window and back (anchor, search,
+//! SyncTeX, dark pages, reloads), `--demo pdf-search`, and the view's keys on real key events.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf_m3`. The pdf50
 //! tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`) and print `SKIP`
-//! without it. `LEMMA_TEST_SNAPSHOTS=dir` saves review snapshots there.
+//! without it. `LEMMA_TEST_SNAPSHOTS=dir` saves review snapshots there. The ignored
+//! `perf_bookmarks_after_rebuilds` times the main loop after rebuilds with 500 bookmarks
+//! (release: `cargo test --release -p lemma-app --test gtk_pdf_m3 -- --ignored perf`).
 
 mod broadway_input;
 mod common;
@@ -33,7 +35,8 @@ fn main() -> ExitCode {
     if broadway_input::is_child() {
         return common::run(&[("pdf_m3_real_keys_child", real_keys::child)]);
     }
-    common::run(&[
+    let ignored = std::env::args().any(|a| a == "--ignored" || a == "--include-ignored");
+    let mut tests: Vec<common::Test> = vec![
         ("links_geometry_hover_preview_and_jump_back", links_and_back),
         ("web_links_ask_before_opening", web_links),
         ("search_counts_match_pdftotext_and_navigate", search_counts),
@@ -49,10 +52,21 @@ fn main() -> ExitCode {
         ),
         ("dark_thumbnails_are_rendered_dark", dark_thumbnails),
         ("bookmark_tree_matches_the_golden_tree", bookmarks),
+        (
+            "bookmarks_follow_a_rebuild_in_place",
+            bookmarks_follow_a_rebuild,
+        ),
         ("detach_and_reattach_keep_the_anchor", detach_reattach),
         ("demo_pdf_search_snapshot", demo_pdf_search),
         ("pdf_keys_on_real_key_events", real_keys::parent),
-    ])
+    ];
+    if ignored {
+        tests.push((
+            "perf_bookmarks_after_rebuilds",
+            perf_bookmarks_after_rebuilds,
+        ));
+    }
+    common::run(&tests)
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -1100,6 +1114,91 @@ fn bookmarks() {
     state.window.destroy();
 }
 
+/// A rebuild whose outline keeps its titles keeps the bookmark tree (its rows and expansion) and
+/// moves the entries' destinations: the rows' pages and page labels, the row the view selects, a
+/// jump, and the children of an entry that was collapsed, made when it is expanded. The same
+/// outline changes nothing; other titles build the tree again, keeping the expansion.
+fn bookmarks_follow_a_rebuild() {
+    let dir = common::temp_dir("bookmarks-rebuild");
+    let pdf = dir.join("main.pdf");
+    let sizes = vec![(595.0, 842.0); 8];
+    // "2.2" on 0-based page `maps`, "3.1" on `examples`.
+    let outline = |maps: u32, examples: u32, title: &str| -> Vec<common::OutlineEntry> {
+        vec![
+            (0, "1. Intro".into(), 0, 72.0),
+            (0, "2. Theory".into(), 1, 72.0),
+            (1, "2.1. Sets".into(), 1, 400.0),
+            (1, format!("2.2. {title}"), maps, 72.0),
+            (0, "3. Applications".into(), 4, 72.0),
+            (1, "3.1. Examples".into(), examples, 72.0),
+            (0, "References".into(), 7, 72.0),
+        ]
+    };
+    common::write_pdf(&pdf, &sizes, &outline(2, 5, "Maps"));
+    let state = window(&dir);
+    let view = show_pdf(&state, &pdf);
+    state.pdf_sidebar.split.set_show_sidebar(true);
+    sidebar::show_page(&state, sidebar::Page::Bookmarks);
+    common::pump_until(TIMEOUT, || sidebar::bookmarks_loaded(&state));
+    let row_of = |title: &str| {
+        sidebar::bookmark_rows(&state)
+            .0
+            .iter()
+            .position(|r| r.1 == title)
+            .unwrap_or_else(|| panic!("no row {title}")) as u32
+    };
+    sidebar::set_bookmark_expanded(&state, row_of("2. Theory"), true);
+    let controller = state.pdf.get().unwrap();
+    let rebuild = |outline: &[common::OutlineEntry]| {
+        common::write_pdf(&pdf, &sizes, outline);
+        let generation = controller.generation();
+        controller.open(&pdf);
+        common::pump_until(TIMEOUT, || {
+            controller.generation() > generation && sidebar::bookmarks_loaded(&state)
+        });
+    };
+    let builds = sidebar::bookmark_builds(&state);
+    let rows = sidebar::bookmark_rows(&state).0;
+    rebuild(&outline(2, 5, "Maps"));
+    assert_eq!(sidebar::bookmark_builds(&state), builds, "the same outline");
+    assert_eq!(sidebar::bookmark_rows(&state).0, rows);
+
+    // "2.2" moves to the fourth page and "3.1" (collapsed) to the seventh.
+    rebuild(&outline(3, 6, "Maps"));
+    assert_eq!(sidebar::bookmark_builds(&state), builds, "the tree stays");
+    assert_eq!(
+        bookmark_text(&sidebar::bookmark_rows(&state).0),
+        "1. Intro → 1\n2. Theory → 2\n  2.1. Sets → 2\n  2.2. Maps → 4\n3. Applications → 5\n\
+         References → 8\n"
+    );
+    common::pump_until(TIMEOUT, || {
+        sidebar::bookmark_page_labels(&state).contains(&("2.2. Maps".into(), "4".into()))
+    });
+    // On the third page the view is in 2.1 now, no longer in 2.2.
+    view.goto_page(2);
+    wait_for_pages(&state);
+    common::pump_until(TIMEOUT, || {
+        sidebar::bookmark_rows(&state).1 == Some(row_of("2.1. Sets"))
+    });
+    sidebar::select_bookmark(&state, row_of("2.2. Maps"));
+    common::pump_until(TIMEOUT, || view.anchor().is_some_and(|a| a.page == 3));
+    sidebar::set_bookmark_expanded(&state, row_of("3. Applications"), true);
+    assert!(
+        bookmark_text(&sidebar::bookmark_rows(&state).0).contains("  3.1. Examples → 7\n"),
+        "the children of a collapsed entry take the new destinations"
+    );
+
+    // Other titles: the tree is built again, as expanded as it was.
+    rebuild(&outline(3, 6, "Functors"));
+    assert_eq!(sidebar::bookmark_builds(&state), builds + 1);
+    assert_eq!(
+        bookmark_text(&sidebar::bookmark_rows(&state).0),
+        "1. Intro → 1\n2. Theory → 2\n  2.1. Sets → 2\n  2.2. Functors → 4\n\
+         3. Applications → 5\n  3.1. Examples → 7\nReferences → 8\n"
+    );
+    state.window.destroy();
+}
+
 /// Acceptance: detaching moves the view into its own window and back, keeping the anchor; in
 /// the PDF window search, SyncTeX, dark pages and reloads (with their anchor) keep working;
 /// closing it re-attaches; showing the pane meanwhile brings it forward.
@@ -1215,6 +1314,14 @@ fn detach_reattach() {
     common::pump_for(Duration::from_millis(50));
     assert!(close(before_reload, view.anchor().unwrap()));
     wait_for_pages(&state);
+    // The main window's memory trim (it is in the background) leaves the PDF alone while its
+    // window is in use: the pages off screen stay cached.
+    view.prefetch(0..2);
+    common::pump_until(TIMEOUT, || !view.cached_keys(1).is_empty());
+    common::pump_until(TIMEOUT, || window.is_active());
+    let cached = view.cache_used();
+    state.trim_memory();
+    assert_eq!(view.cache_used(), cached, "the PDF window is active");
 
     // Showing the pane brings the PDF window forward and keeps the pane hidden.
     state.pdf_pane.set_visible(true);
@@ -1484,5 +1591,127 @@ mod real_keys {
         assert!(state.editors()[0].document().path() == editor.document().path());
         state.window.destroy();
         common::pump_until(TIMEOUT, || !window.is_visible());
+    }
+}
+
+/// The outline of [`perf_bookmarks_after_rebuilds`]: `count` top-level entries titled
+/// `"{title} {k}"`, one per page, `y` bp from its top.
+fn flat_outline(count: u32, title: &str, y: f64) -> Vec<common::OutlineEntry> {
+    (0..count)
+        .map(|k| (0, format!("{title} {k}"), k, y))
+        .collect()
+}
+
+/// The median and the largest of `times`.
+fn median_max(times: &mut [Duration]) -> (Duration, Duration) {
+    times.sort_unstable();
+    (times[times.len() / 2], times[times.len() - 1])
+}
+
+/// Rebuilds while the strip shows 500 bookmarks (one top-level entry per page): the longest
+/// main-loop iteration (`common::timed_iteration`) from the reload until the outline of the new
+/// generation is shown, and 150 ms after, when the outline is the same (most builds), when only
+/// its destinations moved (text added on a page moves the sections after it), and when its
+/// titles changed (the tree is built again, printed only). The window's frames are left out
+/// and printed apart: Broadway renders a whole frame in software (20–70 ms) about once a second,
+/// whatever changed, while replacing the rows costs the main thread when the outline arrives.
+fn perf_bookmarks_after_rebuilds() {
+    const ENTRIES: u32 = 500;
+    let dir = common::temp_dir("perf-bookmarks");
+    let pdf = dir.join("main.pdf");
+    let sizes = vec![(595.0, 842.0); ENTRIES as usize];
+    common::write_pdf(&pdf, &sizes, &flat_outline(ENTRIES, "Section", 100.0));
+    let state = window(&dir);
+    show_pdf(&state, &pdf);
+    state.pdf_sidebar.split.set_show_sidebar(true);
+    sidebar::show_page(&state, sidebar::Page::Bookmarks);
+    common::pump_until(TIMEOUT, || sidebar::bookmarks_loaded(&state));
+    assert_eq!(sidebar::bookmark_rows(&state).0.len(), ENTRIES as usize);
+    let frame_start: Rc<std::cell::Cell<Option<std::time::Instant>>> = Rc::default();
+    let painted: Rc<std::cell::Cell<Duration>> = Rc::default();
+    let frames: Rc<RefCell<Vec<Duration>>> = Rc::default();
+    let clock = state.window.frame_clock().expect("a frame clock");
+    let start = frame_start.clone();
+    let before_paint =
+        clock.connect_before_paint(move |_| start.set(Some(std::time::Instant::now())));
+    let (start, sum, all) = (frame_start.clone(), painted.clone(), frames.clone());
+    let after_paint = clock.connect_after_paint(move |_| {
+        if let Some(t) = start.take() {
+            sum.set(sum.get() + t.elapsed());
+            all.borrow_mut().push(t.elapsed());
+        }
+    });
+    let controller = state.pdf.get().unwrap();
+    let rebuild = |outline: &[common::OutlineEntry]| -> Duration {
+        common::write_pdf(&pdf, &sizes, outline);
+        let generation = controller.generation();
+        controller.open(&pdf);
+        let mut longest = Duration::ZERO;
+        let mut iterate = || {
+            painted.set(Duration::ZERO);
+            let took = common::timed_iteration();
+            longest = longest.max(took.saturating_sub(painted.get()));
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while controller.generation() <= generation || !sidebar::bookmarks_loaded(&state) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rebuild timed out"
+            );
+            iterate();
+        }
+        let after = std::time::Instant::now() + Duration::from_millis(150);
+        while std::time::Instant::now() < after {
+            iterate();
+        }
+        longest
+    };
+    let (mut same, mut moved, mut retitled) = (Vec::new(), Vec::new(), Vec::new());
+    for run in 0..7 {
+        same.push(rebuild(&flat_outline(ENTRIES, "Section", 100.0)));
+        moved.push(rebuild(&flat_outline(
+            ENTRIES,
+            "Section",
+            100.0 + 3.0 * f64::from(run + 1),
+        )));
+        retitled.push(rebuild(&flat_outline(
+            ENTRIES,
+            &format!("Part {run}"),
+            100.0,
+        )));
+        rebuild(&flat_outline(ENTRIES, "Section", 100.0));
+    }
+    clock.disconnect(before_paint);
+    clock.disconnect(after_paint);
+    let frames = frames.take();
+    println!(
+        "  runs: the same {same:.1?}, moved {moved:.1?}, titles changed {retitled:.1?}; {} \
+         window frames, the longest {:.1?} (not counted)",
+        frames.len(),
+        frames.iter().max()
+    );
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let ((same_median, same_max), (moved_median, moved_max), (retitled_median, retitled_max)) = (
+        median_max(&mut same),
+        median_max(&mut moved),
+        median_max(&mut retitled),
+    );
+    println!(
+        "  {ENTRIES} bookmarks, longest iteration after a rebuild (median / max): the same \
+         outline {same_median:.1?} / {same_max:.1?}, destinations moved {moved_median:.1?} / \
+         {moved_max:.1?}, titles changed {retitled_median:.1?} / {retitled_max:.1?} (load {})",
+        load.split_whitespace().next().unwrap_or("?")
+    );
+    state.window.destroy();
+    if cfg!(debug_assertions) {
+        println!("    (debug build: budgets not checked)");
+        return;
+    }
+    for (what, median) in [("the same outline", same_median), ("moved", moved_median)] {
+        assert!(
+            median <= Duration::from_millis(5),
+            "{what}: {median:?} (titles changed: {retitled_median:?})"
+        );
     }
 }

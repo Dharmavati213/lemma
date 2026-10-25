@@ -207,6 +207,113 @@ pub fn application() -> adw::Application {
     APP.with(Clone::clone)
 }
 
+/// One entry of the outline [`write_pdf`] writes: its depth (0 at the top), its title, and its
+/// destination: a 0-based page and a y in bp from the top of that page.
+pub type OutlineEntry = (u32, String, u32, f64);
+
+/// Writes a PDF of blank pages of `sizes` (bp) with `outline` (bookmarks) in document order, as
+/// a build would: an entry's parent is the last entry before it one level up, and the entries
+/// with children are closed.
+pub fn write_pdf(path: &Path, sizes: &[(f64, f64)], outline: &[OutlineEntry]) {
+    use std::fmt::Write;
+    // Objects: 1 the catalog, 2 the page tree, then the pages, the outline and its entries.
+    let page_object = |page: usize| page + 3;
+    let root = sizes.len() + 3;
+    let entry_object = |i: usize| root + 1 + i;
+    let mut parents = Vec::with_capacity(outline.len());
+    let mut ancestors: Vec<usize> = Vec::new();
+    for (i, (depth, ..)) in outline.iter().enumerate() {
+        ancestors.truncate(*depth as usize);
+        parents.push(ancestors.last().copied());
+        ancestors.push(i);
+    }
+    let children = |parent: Option<usize>| -> Vec<usize> {
+        (0..outline.len())
+            .filter(|&i| parents[i] == parent)
+            .collect()
+    };
+    let mut objects = Vec::new();
+    objects.push(if outline.is_empty() {
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string()
+    } else {
+        format!("<< /Type /Catalog /Pages 2 0 R /Outlines {root} 0 R /PageMode /UseOutlines >>")
+    });
+    let kids: Vec<String> = (0..sizes.len())
+        .map(|p| format!("{} 0 R", page_object(p)))
+        .collect();
+    objects.push(format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        sizes.len()
+    ));
+    for (w, h) in sizes {
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << >> >>"
+        ));
+    }
+    let top = children(None);
+    objects.push(match (top.first(), top.last()) {
+        (Some(first), Some(last)) => format!(
+            "<< /Type /Outlines /First {} 0 R /Last {} 0 R /Count {} >>",
+            entry_object(*first),
+            entry_object(*last),
+            top.len()
+        ),
+        _ => "<< /Type /Outlines /Count 0 >>".to_string(),
+    });
+    for (i, (_, title, page, y)) in outline.iter().enumerate() {
+        let siblings = children(parents[i]);
+        let at = siblings.iter().position(|&s| s == i).unwrap();
+        let mut entry = format!(
+            "<< /Title ({}) /Parent {} 0 R /Dest [{} 0 R /XYZ 0 {} null]",
+            title
+                .replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)"),
+            parents[i].map_or(root, entry_object),
+            page_object(*page as usize),
+            sizes[*page as usize].1 - y
+        );
+        if at > 0 {
+            write!(entry, " /Prev {} 0 R", entry_object(siblings[at - 1])).unwrap();
+        }
+        if let Some(next) = siblings.get(at + 1) {
+            write!(entry, " /Next {} 0 R", entry_object(*next)).unwrap();
+        }
+        let own = children(Some(i));
+        if let (Some(first), Some(last)) = (own.first(), own.last()) {
+            write!(
+                entry,
+                " /First {} 0 R /Last {} 0 R /Count -{}",
+                entry_object(*first),
+                entry_object(*last),
+                own.len()
+            )
+            .unwrap();
+        }
+        entry.push_str(" >>");
+        objects.push(entry);
+    }
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        write!(pdf, "{} 0 obj\n{body}\nendobj\n", i + 1).unwrap();
+    }
+    let xref = pdf.len();
+    writeln!(pdf, "xref\n0 {}\n0000000000 65535 f ", objects.len() + 1).unwrap();
+    for offset in offsets {
+        writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        pdf,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    )
+    .unwrap();
+    std::fs::write(path, pdf).expect("write the PDF");
+}
+
 /// A small deterministic PRNG (xorshift64*), so failures are reproducible from the seed.
 pub struct Rng(u64);
 

@@ -1,12 +1,13 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
-//! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
-//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale; pages in
-//! bands or tiles are rendered whole once they are one bitmap, and over several notches keep the
-//! scale of their first bands, which are all drawn), large pages in full-width bands (the band
-//! below the view rendered ahead, search highlights and dark mode over bands), Fit Page and
-//! 100%, handing the PDF to another application, dark mode, save → build → diagnostics (and a
-//! build with nothing to do), stopping a build, and SyncTeX in both directions; with a fake
-//! latexmk, the build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
+//! `--demo pdf`, scrolling cost and the cache cap, reload anchors (also when the page sizes of a
+//! rebuild come after it showed), an unchanged PDF that is not reloaded, anchored zoom (zooming
+//! out renders the new pages once, at the new scale; pages in bands or tiles are rendered whole
+//! once they are one bitmap, and over several notches keep the scale of their first bands, which
+//! are all drawn), large pages in full-width bands (the band below the view rendered ahead,
+//! search highlights and dark mode over bands), Fit Page and 100%, handing the PDF to another
+//! application, dark mode, save → build → diagnostics (and a build with nothing to do), stopping
+//! a build, and SyncTeX in both directions (also after a memory trim); with a fake latexmk, the
+//! build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -39,6 +40,10 @@ fn main() -> ExitCode {
         ("demo_snapshot_shows_three_pages", demo_snapshot),
         ("scrolling_pdf50_is_fast_and_bounded", scrolling_pdf50),
         ("reload_keeps_the_scroll_anchor", reload_keeps_anchor),
+        (
+            "pages_resized_by_a_rebuild_keep_the_anchor",
+            resized_pages_keep_the_anchor,
+        ),
         ("an_unchanged_pdf_is_not_reloaded", unchanged_pdf),
         ("ctrl_wheel_zoom_is_anchored_at_the_pointer", anchored_zoom),
         (
@@ -382,6 +387,71 @@ fn reload_keeps_anchor() {
     let anchor = pdf_view::anchor_of(&view).unwrap();
     assert_eq!(anchor.page, 4);
     wait_for_pages(&state);
+    state.window.destroy();
+}
+
+/// A rebuild with as many pages shows at once with the page sizes of the generation before;
+/// once the PDF thread has read the new ones, the view lays them out keeping its anchor (a page
+/// above it that grew moves nothing in view), and the strip's thumbnail rows take them.
+fn resized_pages_keep_the_anchor() {
+    let dir = common::temp_dir("resized");
+    let pdf = dir.join("doc.pdf");
+    let mut sizes = vec![(595.0, 842.0); 30];
+    common::write_pdf(&pdf, &sizes, &[]);
+    let state = window(&dir, config());
+    state.pdf_sidebar.split.set_show_sidebar(true);
+    let controller = state.pdf.get().unwrap();
+    controller.open(&pdf);
+    wait_for_pages(&state);
+    let view = view(&state);
+    view.goto_page(12);
+    wait_for_pages(&state);
+    let (x, y) = view.scroll_position();
+    view.set_scroll_position(x, y + 123.0);
+    common::pump_until(TIMEOUT, || {
+        lemma_app::pdf::sidebar::thumbnail_page_sizes(&state)
+            .iter()
+            .any(|(page, _)| *page == 13)
+    });
+    let anchor = pdf_view::anchor_of(&view).unwrap();
+    // The page above the anchor's grows, the one below it shrinks.
+    sizes[11] = (595.0, 1400.0);
+    sizes[13] = (420.0, 600.0);
+    common::write_pdf(&pdf, &sizes, &[]);
+    let generation = controller.generation();
+    let updates = view.page_size_updates();
+    controller.open(&pdf);
+    common::pump_until(TIMEOUT, || {
+        controller.generation() > generation
+            && view.layout().is_some_and(|layout| layout.sizes() == sizes)
+    });
+    assert!(
+        view.page_size_updates() > updates,
+        "the rebuild showed with the old sizes, which the new ones replaced"
+    );
+    let after = pdf_view::anchor_of(&view).unwrap();
+    println!("  {anchor:?} -> {after:?}");
+    assert_eq!(after.page, anchor.page);
+    assert!(
+        (after.frac - anchor.frac).abs() < 1e-6,
+        "{anchor:?} -> {after:?}"
+    );
+    common::pump_until(TIMEOUT, || {
+        lemma_app::pdf::sidebar::thumbnail_page_sizes(&state)
+            .iter()
+            .all(|(page, size)| *size == sizes[*page as usize])
+    });
+    // The pages are drawn at their new sizes.
+    view.goto_page(13);
+    wait_for_pages(&state);
+    let rect = pdf_view::view_point_of(&view, 13, 420.0, 600.0)
+        .zip(pdf_view::view_point_of(&view, 13, 0.0, 0.0))
+        .map(|((x1, y1), (x0, y0))| (x1 - x0, y1 - y0))
+        .unwrap();
+    assert!(
+        (rect.0 / rect.1 - 420.0 / 600.0).abs() < 1e-3,
+        "page 14 laid out at {rect:?}"
+    );
     state.window.destroy();
 }
 
@@ -1200,6 +1270,14 @@ fn forward_search() {
     let third = f64::from(view.height()) / 3.0;
     assert!((y - third).abs() <= 1.0, "the box is at {y}, not {third}");
     review_snapshot(&state, "forward-search");
+    // After the window's memory trim, which frees the SyncTeX scanner, the next search parses
+    // the file again.
+    state.trim_memory();
+    controller.forward_search(&dir.join("chapters/yoneda.tex"), 26);
+    common::pump_until(TIMEOUT, || {
+        view.highlight()
+            .is_some_and(|(page, b)| page == 1 && b[0].1 != boxes[0].1)
+    });
     state.window.destroy();
 }
 

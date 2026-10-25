@@ -17,6 +17,8 @@ cairo = { workspace = true }
 glib = { workspace = true }
 async-channel = { workspace = true }
 tracing = { workspace = true }
+# malloc_trim after a Trim (heap.rs)
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

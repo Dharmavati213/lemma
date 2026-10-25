@@ -14,7 +14,9 @@ use crate::{SyncBox, SyncTarget, ffi};
 ///
 /// The library is not documented as thread-safe and writes node descriptions into static
 /// buffers, so two scanners on different threads must never run library code at the same time.
-/// The lock is uncontended in practice (one PDF thread) and is held only around FFI calls.
+/// It is held only around FFI calls, but [`Scanner::open`] is one: parsing a file holds it for
+/// the whole parse (about 0.25 ms per page). Lemma's PDF thread parses on a helper thread, so
+/// another thread's queries (the label preview's PDF thread) wait for that parse.
 static LIBRARY: Mutex<()> = Mutex::new(());
 
 fn with_library<R>(f: impl FnOnce() -> R) -> R {
@@ -24,8 +26,9 @@ fn with_library<R>(f: impl FnOnce() -> R) -> R {
 
 /// A parsed synctex file: forward (source → PDF) and inverse (PDF → source) search.
 ///
-/// Opening parses the whole file (about 8 ms for 5 pages, 15 ms for 23); a query then takes
-/// tens of microseconds. Reopen the scanner whenever the `.synctex.gz` changes.
+/// Opening parses the whole file (about 8 ms for 5 pages, 15 ms for 23, 120–130 ms for 500)
+/// and keeps it in memory (about 85 KiB per page); a query then takes tens of microseconds.
+/// Reopen the scanner whenever the `.synctex.gz` changes.
 pub struct Scanner {
     raw: NonNull<ffi::synctex_scanner_s>,
     /// The directory of the PDF, canonical when the PDF exists.
