@@ -12,6 +12,14 @@
 //! finishes, and the panel then follows every later change. Marks, underlines and Problems-list
 //! navigation all use the mapped line.
 //!
+//! The list's rows are built when the page first shows them, and it lists at most
+//! [`MAX_SECTION_ROWS`] problems, the most severe ones, then a line saying how many more there
+//! are: a long thesis's thousands of bad boxes would otherwise cost tens of thousands of widgets
+//! on every build. The problems it leaves out still get their gutter marks, and
+//! `win.problem-next` / `win.problem-prev` (F4 / Shift+F4, `]e` / `[e` in Vim) go from the
+//! cursor to the next or previous problem in the list's order, listed or not, opening its file as
+//! a click on its row does ([`DiagnosticsPanel::goto_problem`]).
+//!
 //! **M3 (WP3.7, additive):** problems of other sources than the build — chktex warnings
 //! (`DiagSource::Lint`, [`crate::lint`]) and, for WP3.2, undefined references
 //! (`DiagSource::Labels`) — are [`Finding`]s in their own section below the build's problems,
@@ -58,6 +66,7 @@ pub(crate) const CSS: &str = "
 .lemma-problem-details { margin: 4px 0 2px 24px; }
 .lemma-problem-details button { padding: 2px 10px; min-height: 24px; }
 .lemma-problem-toggle { min-width: 22px; min-height: 22px; padding: 0; margin: -2px 0; }
+.lemma-problems-more { margin: 4px 2px; }
 ";
 
 /// Extensions of files TeX writes itself; diagnostics while reading them belong to the root.
@@ -344,6 +353,15 @@ struct Inner {
     refreshing: Cell<bool>,
     /// The error kinds whose first row was expanded (the others start collapsed).
     expanded_kinds: RefCell<std::collections::HashSet<lemma_build::explain::ErrorKind>>,
+    /// `list` holds the rows of `problems` (they are built when the page is shown).
+    rows_built: Cell<bool>,
+    /// The problem each row of `list` shows, by row index ([`listed_problems`]).
+    listed: Rc<RefCell<Vec<usize>>>,
+    /// The problem gone to last (a row's click, next or previous problem): the next step goes
+    /// on from it while the cursor is still on its line.
+    at: Cell<Option<usize>>,
+    /// True while the file of the problem gone to last is being opened.
+    opening: Cell<bool>,
 }
 
 impl DiagnosticsPanel {
@@ -447,6 +465,10 @@ impl DiagnosticsPanel {
             details: RefCell::new(HashMap::new()),
             refreshing: Cell::new(false),
             expanded_kinds: RefCell::new(std::collections::HashSet::new()),
+            rows_built: Cell::new(false),
+            listed: Rc::new(RefCell::new(Vec::new())),
+            at: Cell::new(None),
+            opening: Cell::new(false),
         });
         inner.connect_list();
         inner.connect_context_menu();
@@ -480,9 +502,12 @@ impl DiagnosticsPanel {
         inner.built.set(true);
         inner.details.borrow_mut().clear();
         inner.expanded_kinds.borrow_mut().clear();
+        inner.at.set(None);
+        inner.opening.set(false);
         // Empty the list while there are no problems: each removed row makes the list rerun the
         // header function on the next one, which must not look at the new problems.
         inner.problems.replace(Vec::new());
+        inner.listed.replace(Vec::new());
         inner.list.remove_all();
         inner.trackers.borrow_mut().clear();
         inner.mark_names.borrow_mut().clear();
@@ -516,14 +541,21 @@ impl DiagnosticsPanel {
         counts(&self.inner.problems.borrow())
     }
 
-    /// Activates the row of problem `index` (as a click does): opens its file at its line.
+    /// Opens problem `index` at its line, as a click on its row does (also for the problems the
+    /// list does not show).
     pub fn activate(&self, index: usize) {
-        if let Some(row) = i32::try_from(index)
-            .ok()
-            .and_then(|i| self.inner.list.row_at_index(i))
-        {
-            row.emit_activate();
-        }
+        self.inner.open_problem(index);
+    }
+
+    /// Goes to the next problem after the active editor's cursor (`forward`), or the previous
+    /// one before it, in the list's order: `win.problem-next` / `win.problem-prev`. The same file
+    /// comes first, then the files after (before) it, wrapping around; repeated steps go on from
+    /// the problem gone to last while the cursor stays on its line. The problem's file is opened
+    /// at the problem's current line, as a click on its row does. Problems without a line are
+    /// skipped, and so are the findings (lint warnings, references). Toasts "No problems" when
+    /// the build has none.
+    pub fn goto_problem(&self, forward: bool) {
+        self.inner.goto_problem(forward);
     }
 
     /// Problem `index` as "Ask agent to fix" sends it: with its line in the current text (the
@@ -538,12 +570,14 @@ impl DiagnosticsPanel {
         self.inner.ask_agent(index);
     }
 
-    /// The context menu of row `index` (what a right click on it shows); `None` past the
-    /// last row.
+    /// The context menu of problem `index` (what a right click on its row shows); `None` past
+    /// the last problem.
     pub fn context_menu(&self, index: usize) -> Option<gio::Menu> {
-        let row = self.inner.list.row_at_index(i32::try_from(index).ok()?)?;
-        let menu = u32::try_from(row.index()).ok().map(context_menu)?;
-        self.inner.add_fix_item(&menu, index as u32);
+        let index = u32::try_from(index)
+            .ok()
+            .filter(|&i| (i as usize) < self.inner.problems.borrow().len())?;
+        let menu = context_menu(index);
+        self.inner.add_fix_item(&menu, index);
         Some(menu)
     }
 
@@ -693,16 +727,18 @@ impl Inner {
 
     fn connect_list(self: &Rc<Self>) {
         let problems = self.problems.clone();
+        let listed = self.listed.clone();
         let file_counts = self.file_counts.clone();
         let root = self.root.clone();
         self.list.set_header_func(move |row, before| {
             let problems = problems.borrow();
-            let index = |r: &gtk::ListBoxRow| usize::try_from(r.index()).ok();
-            let Some(current) = index(row).and_then(|i| problems.get(i)) else {
+            let listed = listed.borrow();
+            let shown = |r: &gtk::ListBoxRow| row_problem(&listed, r).and_then(|i| problems.get(i));
+            let Some(current) = shown(row) else {
                 row.set_header(None::<&gtk::Widget>);
                 return;
             };
-            let previous = before.and_then(index).and_then(|i| problems.get(i));
+            let previous = before.and_then(shown);
             if previous.is_some_and(|p| p.path == current.path) {
                 row.set_header(None::<&gtk::Widget>);
             } else {
@@ -719,33 +755,103 @@ impl Inner {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            let Some(state) = inner.state.upgrade() else {
-                return;
-            };
-            let Ok(index) = usize::try_from(row.index()) else {
-                return;
-            };
-            let Some(problem) = inner.problems.borrow().get(index).cloned() else {
-                return;
-            };
-            state.sidebar.dismiss_overlay();
-            let weak = Rc::downgrade(&inner);
-            glib::spawn_future_local(async move {
-                // The line is looked up once the file is open, so it is the marked line.
-                match state.open_file(&problem.path).await {
-                    Ok(editor) => {
-                        let line = weak.upgrade().map_or(problem.line, |inner| {
-                            inner.current_line(index, &problem, &editor)
-                        });
-                        if let Some(line) = line {
-                            goto_line(&editor, line);
-                            scroll_again_after_first_frame(&editor);
-                        }
-                    }
-                    Err(e) => state.toast(&e),
-                }
-            });
+            let index = row_problem(&inner.listed.borrow(), row);
+            if let Some(index) = index {
+                inner.open_problem(index);
+            }
         });
+        // The rows are built when the page first shows them (see `fill_list`).
+        let weak = Rc::downgrade(self);
+        self.list.connect_map(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.build_rows();
+            }
+        });
+    }
+
+    /// Opens the file of problem `index` and puts the cursor on the problem's current line (a
+    /// click on its row, next or previous problem).
+    fn open_problem(self: &Rc<Self>, index: usize) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(problem) = self.problems.borrow().get(index).cloned() else {
+            return;
+        };
+        self.at.set(Some(index));
+        self.opening.set(true);
+        state.sidebar.dismiss_overlay();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // The line is looked up once the file is open, so it is the marked line.
+            let opened = state.open_file(&problem.path).await;
+            let inner = weak.upgrade();
+            if let Some(inner) = &inner
+                && inner.at.get() == Some(index)
+            {
+                inner.opening.set(false);
+            }
+            match opened {
+                Ok(editor) => {
+                    let line = inner.map_or(problem.line, |inner| {
+                        inner.current_line(index, &problem, &editor)
+                    });
+                    if let Some(line) = line {
+                        goto_line(&editor, line);
+                        scroll_again_after_first_frame(&editor);
+                    }
+                }
+                Err(e) => state.toast(&e),
+            }
+        });
+    }
+
+    fn goto_problem(self: &Rc<Self>, forward: bool) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let target = {
+            let problems = self.problems.borrow();
+            if problems.is_empty() {
+                // Lint warnings and references have rows of their own, but are no build problems.
+                let findings = self.sections.borrow().iter().any(|s| s.total() > 0);
+                state.toast(if findings {
+                    "No build problems"
+                } else {
+                    "No problems"
+                });
+                return;
+            }
+            let editor = state.active_editor();
+            let cursor = editor
+                .as_ref()
+                .map(|e| (normalize(e.document().path()), e.cursor_position().0));
+            // Lines past the end are the last line, where `goto_line` put the cursor (a bad box
+            // has no mark to keep it in the text).
+            let line = |i: usize| match &editor {
+                Some(editor) => {
+                    let last = u32::try_from(editor.buffer().line_count()).unwrap_or(u32::MAX);
+                    self.current_line(i, &problems[i], editor)
+                        .map(|l| l.min(last))
+                }
+                None => problems[i].line,
+            };
+            // Going on from the problem gone to last while its file opens or the cursor is
+            // still on its line; otherwise from the cursor.
+            let from = self.at.get().filter(|&i| {
+                self.opening.get()
+                    || cursor.as_ref().is_some_and(|(path, cursor_line)| {
+                        problems.get(i).is_some_and(|p| p.path == *path)
+                            && line(i) == Some(*cursor_line)
+                    })
+            });
+            let cursor = cursor.as_ref().map(|(path, line)| (path.as_path(), *line));
+            step_target(&problems, from, cursor, line, forward)
+        };
+        match target {
+            Some(index) => self.open_problem(index),
+            None => state.toast("No problem has a line to go to"),
+        }
     }
 
     fn problem_for_agent(&self, index: usize) -> Option<Problem> {
@@ -849,7 +955,8 @@ impl Inner {
 
     /// Shows the context menu of `row`, at `at` (list coordinates) or below the row.
     fn show_context_menu(&self, row: &gtk::ListBoxRow, at: Option<(f64, f64)>) {
-        let Ok(index) = u32::try_from(row.index()) else {
+        let index = row_problem(&self.listed.borrow(), row);
+        let Some(index) = index.and_then(|i| u32::try_from(i).ok()) else {
             return;
         };
         let menu = context_menu(index);
@@ -893,18 +1000,37 @@ impl Inner {
         popover.popup();
     }
 
-    /// Appends a row for every problem (the list is empty) and updates the summary.
+    /// Fills the list (it is empty) and updates the summary. The rows are widgets (several per
+    /// problem): they are built when the page shows them, so the problems of a build nobody
+    /// looks at in the list cost no widgets.
     fn fill_list(self: &Rc<Self>) {
-        let problems = self.problems.borrow();
-        for (index, problem) in problems.iter().enumerate() {
-            self.list.append(&self.build_row(index, problem));
+        self.rows_built.set(false);
+        if self.list.is_mapped() {
+            self.build_rows();
         }
-        let (errors, _, _) = counts(&problems);
-        drop(problems);
+        let (errors, _, _) = counts(&self.problems.borrow());
         self.refresh_page();
         if let Some(state) = self.state.upgrade() {
             let page = state.sidebar.stack.page(&state.sidebar.problems);
             page.set_needs_attention(errors > 0);
+        }
+    }
+
+    /// Fills the list with the rows of at most [`MAX_SECTION_ROWS`] problems, the most severe
+    /// ones ([`listed_problems`]), and a line counting the others, unless it holds them.
+    fn build_rows(self: &Rc<Self>) {
+        if self.rows_built.replace(true) {
+            return;
+        }
+        let problems = self.problems.borrow();
+        let listed = listed_problems(&problems, MAX_SECTION_ROWS);
+        // Before the rows: appending one runs the header function, which looks it up.
+        self.listed.replace(listed.clone());
+        for &index in &listed {
+            self.list.append(&self.build_row(index, &problems[index]));
+        }
+        if problems.len() > listed.len() {
+            self.list.append(&more_row(problems.len() - listed.len()));
         }
     }
 
@@ -977,6 +1103,99 @@ impl Inner {
         drop((problems, lines, tooltips, mark_names));
         self.apply_findings(editor);
     }
+}
+
+/// The problem a row of the build's list shows (`listed` is [`Inner::listed`]): its index,
+/// `None` for the line after the last one the list holds.
+fn row_problem(listed: &[usize], row: &gtk::ListBoxRow) -> Option<usize> {
+    usize::try_from(row.index())
+        .ok()
+        .and_then(|i| listed.get(i).copied())
+}
+
+/// The problems the build's list shows, in its order: all of them, or when there are more than
+/// `max`, the `max` most severe ones (errors, then warnings, then bad boxes, each in the list's
+/// order). Its first `max` rows would not do: a file's errors come before its bad boxes, but the
+/// errors and warnings of the files after it come after them.
+fn listed_problems(problems: &[Problem], max: usize) -> Vec<usize> {
+    let mut listed: Vec<usize> = (0..problems.len()).collect();
+    if listed.len() > max {
+        listed.sort_by_key(|&i| (severity_rank(problems[i].severity), i));
+        listed.truncate(max);
+        listed.sort_unstable();
+    }
+    listed
+}
+
+/// The last row of a list cut at [`MAX_SECTION_ROWS`]: how many problems it leaves out.
+fn more_row(left_out: usize) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .label(format!("{left_out} more not listed"))
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label", "lemma-problems-more"])
+        .build();
+    gtk::ListBoxRow::builder()
+        .child(&label)
+        .activatable(false)
+        .selectable(false)
+        .build()
+}
+
+/// The problem that next problem (`forward`) or previous problem goes to: an index into
+/// `problems`, which are in the Problems page's order. Problems without a line are skipped;
+/// `None` when no problem has one.
+///
+/// With `from` (the problem gone to last, while the cursor is still on its line) it is the
+/// problem after (before) it. Otherwise it is found from the `cursor` (the active editor's file
+/// and 1-based line; `line(i)` is the current line of problem `i` of that file): going forward,
+/// the first of that file's problems whose line is after the cursor, else the first problem of
+/// the files after it; going back, the last one whose line is before the cursor, else the last
+/// problem of the files before it. Both wrap around. From a file without problems (or no file)
+/// they go to the first and the last problem.
+fn step_target(
+    problems: &[Problem],
+    from: Option<usize>,
+    cursor: Option<(&Path, u32)>,
+    line: impl Fn(usize) -> Option<u32>,
+    forward: bool,
+) -> Option<usize> {
+    let order: Vec<usize> = (0..problems.len())
+        .filter(|&i| problems[i].line.is_some())
+        .collect();
+    let n = order.len();
+    if n == 0 {
+        return None;
+    }
+    let after = |k: usize| order[(k + 1) % n];
+    let before = |k: usize| order[(k + n - 1) % n];
+    if let Some(k) = from.and_then(|i| order.iter().position(|&j| j == i)) {
+        return Some(if forward { after(k) } else { before(k) });
+    }
+    let ends = || Some(if forward { order[0] } else { order[n - 1] });
+    let Some((path, cursor_line)) = cursor else {
+        return ends();
+    };
+    // The file's problems are one run of the list: after its last come the next files'.
+    let here: Vec<usize> = (0..n)
+        .filter(|&k| problems[order[k]].path == path)
+        .collect();
+    let (Some(&first), Some(&last)) = (here.first(), here.last()) else {
+        return ends();
+    };
+    let found = if forward {
+        here.iter()
+            .find(|&&k| line(order[k]).is_some_and(|l| l > cursor_line))
+    } else {
+        here.iter()
+            .rev()
+            .find(|&&k| line(order[k]).is_some_and(|l| l < cursor_line))
+    };
+    Some(match found {
+        Some(&k) => order[k],
+        None if forward => after(last),
+        None => before(first),
+    })
 }
 
 /// The context menu of the problem row `index`: "Ask Agent to Fix".
@@ -1128,7 +1347,15 @@ pub fn reveal(state: &WindowState) {
     state.sidebar.show_page(PAGE_PROBLEMS);
 }
 
-/// Called once per window; fills `state.sidebar.problems` with the build controller's panel.
+/// The default keys of next and previous problem (`[keys]` overrides them). F8, the usual key
+/// for this, shows the PDF.
+const ACCELS: &[(&str, &[&str])] = &[
+    ("win.problem-next", &["F4"]),
+    ("win.problem-prev", &["<Shift>F4"]),
+];
+
+/// Called once per window; fills `state.sidebar.problems` with the build controller's panel and
+/// adds `win.problem-next` / `win.problem-prev` ([`DiagnosticsPanel::goto_problem`]).
 pub fn install(state: &Rc<WindowState>) {
     if let Some(build) = state.build.get() {
         state
@@ -1136,6 +1363,19 @@ pub fn install(state: &Rc<WindowState>) {
             .problems
             .set_child(Some(&build.diagnostics().widget()));
     }
+    for (name, forward) in [("problem-next", true), ("problem-prev", false)] {
+        let action = gio::SimpleAction::new(name, None);
+        let weak = Rc::downgrade(state);
+        action.connect_activate(move |_, _| {
+            if let Some(state) = weak.upgrade()
+                && let Some(build) = state.build.get()
+            {
+                build.diagnostics().goto_problem(forward);
+            }
+        });
+        state.window.add_action(&action);
+    }
+    crate::app::set_default_accels(state, ACCELS);
 }
 
 /// Called after an editor tab is created: applies the current diagnostics to its buffer, and
@@ -1262,7 +1502,6 @@ impl Section {
 #[derive(Clone)]
 struct RowDetails {
     toggle: gtk::ToggleButton,
-    explanation: Option<String>,
     /// The label of the quick fix, once [`crate::quickfix::proposal`] found one (the details
     /// were shown).
     fix: Rc<RefCell<Option<String>>>,
@@ -1427,14 +1666,12 @@ impl DiagnosticsPanel {
 
     /// The plain-English explanation of build problem `index`, if the table knows its error.
     pub fn explanation(&self, index: usize) -> Option<String> {
-        self.inner
-            .details
-            .borrow()
-            .get(&index)
-            .and_then(|d| d.explanation.clone())
+        let problems = self.inner.problems.borrow();
+        crate::quickfix::explanation(problems.get(index)?).map(|e| e.text)
     }
 
-    /// The label of the quick fix offered for build problem `index`, once it is known.
+    /// The label of the quick fix offered for build problem `index`, once it is known (its row
+    /// computes it when its details are first shown; rows exist once the page showed the list).
     pub fn fix_label(&self, index: usize) -> Option<String> {
         self.inner
             .details
@@ -1448,7 +1685,8 @@ impl DiagnosticsPanel {
         self.inner.apply_fix(index);
     }
 
-    /// Whether the details (explanation and actions) of build problem `index` are shown.
+    /// Whether the details (explanation and actions) of build problem `index` are shown (false
+    /// while its row does not exist).
     pub fn is_expanded(&self, index: usize) -> bool {
         self.inner
             .details
@@ -1457,7 +1695,7 @@ impl DiagnosticsPanel {
             .is_some_and(|d| d.toggle.is_active())
     }
 
-    /// Shows or hides the details of build problem `index`.
+    /// Shows or hides the details of build problem `index`, if the list holds its row.
     pub fn set_expanded(&self, index: usize, expanded: bool) {
         if let Some(d) = self.inner.details.borrow().get(&index) {
             d.toggle.set_active(expanded);
@@ -2230,14 +2468,9 @@ impl Inner {
             }
             details
         });
-        self.details.borrow_mut().insert(
-            index,
-            RowDetails {
-                toggle,
-                explanation: Some(explanation.text),
-                fix,
-            },
-        );
+        self.details
+            .borrow_mut()
+            .insert(index, RowDetails { toggle, fix });
         row
     }
 
@@ -2674,6 +2907,87 @@ mod tests {
         assert_eq!(moved_line(20, (4, 5, 1)), 16);
         assert_eq!(moved_line(7, (4, 5, 1)), 5);
         assert_eq!(moved_line(4, (4, 5, 1)), 4);
+    }
+
+    #[test]
+    fn next_and_previous_problem_follow_the_list() {
+        let (a, b, c) = (
+            Path::new("/p/a.tex"),
+            Path::new("/p/b.tex"),
+            Path::new("/p/c.tex"),
+        );
+        let problem = |path: &Path, line| Problem {
+            path: path.to_path_buf(),
+            line,
+            severity: Severity::Error,
+            message: "e".into(),
+            context: None,
+            source: DiagSource::Tex,
+        };
+        // The list's order: a.tex's problems (lines 8, none, 3), then b.tex's (5, 2).
+        let problems = vec![
+            problem(a, Some(8)),
+            problem(a, None),
+            problem(a, Some(3)),
+            problem(b, Some(5)),
+            problem(b, Some(2)),
+        ];
+        let step = |from, cursor, forward| {
+            step_target(&problems, from, cursor, |i| problems[i].line, forward)
+        };
+        // On from the problem gone to last, past the one without a line, around the ends.
+        assert_eq!(step(Some(0), None, true), Some(2));
+        assert_eq!(step(Some(2), None, true), Some(3));
+        assert_eq!(step(Some(4), None, true), Some(0));
+        assert_eq!(step(Some(0), None, false), Some(4));
+        assert_eq!(step(Some(3), None, false), Some(2));
+        // From the cursor: the first (last) of its file's problems in the list after (before)
+        // it, else the first problem of the next file (the last of the previous one).
+        assert_eq!(step(None, Some((a, 1)), true), Some(0));
+        assert_eq!(step(None, Some((a, 5)), true), Some(0));
+        assert_eq!(step(None, Some((a, 5)), false), Some(2));
+        assert_eq!(step(None, Some((a, 8)), true), Some(3));
+        assert_eq!(step(None, Some((a, 8)), false), Some(2));
+        assert_eq!(step(None, Some((a, 1)), false), Some(4));
+        assert_eq!(step(None, Some((b, 3)), true), Some(3));
+        assert_eq!(step(None, Some((b, 6)), true), Some(0));
+        assert_eq!(step(None, Some((b, 1)), false), Some(2));
+        // A file without problems, no editor, or a last problem without a line: the ends.
+        assert_eq!(step(None, Some((c, 4)), true), Some(0));
+        assert_eq!(step(None, Some((c, 4)), false), Some(4));
+        assert_eq!(step(None, None, true), Some(0));
+        assert_eq!(step(Some(1), Some((b, 3)), false), Some(4));
+        // Nothing to go to.
+        let lineless = vec![problem(a, None)];
+        assert_eq!(step_target(&lineless, None, None, |_| None, true), None);
+        assert_eq!(step_target(&[], Some(0), None, |_| None, false), None);
+    }
+
+    #[test]
+    fn a_long_list_shows_the_most_severe_problems() {
+        let problem = |path: &str, severity| Problem {
+            path: PathBuf::from(path),
+            line: Some(1),
+            severity,
+            message: "m".into(),
+            context: None,
+            source: DiagSource::Tex,
+        };
+        use Severity::{BadBox, Error, Warning};
+        // As `problems_from` sorts them: a.tex's error and bad boxes come before b.tex's error.
+        let problems = vec![
+            problem("/p/a.tex", Error),
+            problem("/p/a.tex", BadBox),
+            problem("/p/a.tex", BadBox),
+            problem("/p/b.tex", Error),
+            problem("/p/c.tex", Warning),
+            problem("/p/c.tex", BadBox),
+        ];
+        assert_eq!(listed_problems(&problems, 6), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(listed_problems(&problems, 4), [0, 1, 3, 4]);
+        assert_eq!(listed_problems(&problems, 3), [0, 3, 4]);
+        assert_eq!(listed_problems(&problems, 1), [0]);
+        assert!(listed_problems(&[], 2).is_empty());
     }
 
     #[test]

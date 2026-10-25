@@ -534,12 +534,15 @@ fn regress_saving_the_bib_builds_its_document() {
 ///
 /// The cost of replacing n rows by n rows, minus the cost of filling an empty list, is the
 /// removal cost. It must grow about linearly (×6 from 1500 to 9000 rows) or stay below half the
-/// fill cost; quadratic removal grows about ×20.
+/// fill cost; quadratic removal grows about ×20. (The list now holds at most
+/// `MAX_SECTION_ROWS` rows, built while the page is shown, as it is here: both sizes fill it to
+/// that cap, which bounds the removal by itself, so this no longer measures growth in rows.)
 fn regress_refilling_the_problems_list_is_not_quadratic() {
     let dir = common::temp_dir("list-perf");
     let root = dir.join("main.tex");
     std::fs::write(&root, "x\n").unwrap();
     let state = window(&dir, config(false));
+    lemma_app::diagnostics_panel::reveal(&state);
     let panel = state.build.get().unwrap().diagnostics();
     let problems = |n: usize| -> Vec<Problem> {
         (0..n)

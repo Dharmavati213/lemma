@@ -1103,6 +1103,16 @@ they conflict with the sections above, this section wins.
     what to install, `[build] latexmk`): F5 every time, the other triggers once per window
     until a latexmk starts; the status bar says "Not built: latexmk not found".
   - Auto-save saves its documents together and then requests one `Save` build.
+- **Problems (§5, 2026-10-25):**
+  - The Problems page builds a build's rows when it is shown, and lists at most
+    `MAX_SECTION_ROWS` (500) of its problems, the most severe ones (errors, then warnings, then
+    bad boxes, each in the list's order), then a line "N more not listed". The ones left out
+    keep their gutter marks and underlines.
+  - `win.problem-next` / `win.problem-prev` (F4 / Shift+F4; `]e` / `[e` in `[vim.normal]`) go
+    from the cursor to the next or previous build problem in the list's order: the cursor's file
+    first, then the files after (before) it, wrapping around, opening the file at the problem's
+    mapped line as a click on its row does. Problems without a line, and findings, are skipped.
+    Function keys are never typed, so the keys stay clear of Vim; Vim has no `]e` or `[e`.
 
 ## 12. macOS (2026-10-19)
 

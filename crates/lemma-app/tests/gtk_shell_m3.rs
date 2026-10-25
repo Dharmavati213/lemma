@@ -1711,6 +1711,8 @@ mod real_keys {
             "goto-forward",
             "show-hover",
             "agent-inline-edit",
+            "problem-next",
+            "problem-prev",
         ] {
             let log = activated.clone();
             let action = f.state.window.lookup_action(name).unwrap();
@@ -1752,6 +1754,8 @@ mod real_keys {
             (gdk::Key::F12, 0, "goto-definition"),
             (gdk::Key::F12, SHIFT, "find-references"),
             (gdk::Key::F2, 0, "rename-label"),
+            (gdk::Key::F4, 0, "problem-next"),
+            (gdk::Key::F4, SHIFT, "problem-prev"),
             (gdk::Key::percent, CONTROL, "jump-pair"),
             (gdk::Key::Right, ALT, "goto-forward"),
             (gdk::Key::Left, ALT, "goto-back"),

@@ -252,6 +252,7 @@ check the budgets only in release builds:
 | `gtk_pairs` `perf_pairs_cursor_moves_large_tex` | delimiter-pair highlight per cursor move on `large.tex` ≤ 0.5 ms p99 |
 | `gtk_git_gutter` `perf_git_gutter_keystrokes_large_tex` | the git gutter's main-thread cost per keystroke on `large.tex` (with against without the gutter) and per diff |
 | `gtk_search` `perf_search_10k_frame_budget` | the Search page's work per main-loop step while 10 000 matches stream in ≤ 4 ms |
+| `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 
 `perf_completion_keystroke` lays the document out before it measures and reports the window

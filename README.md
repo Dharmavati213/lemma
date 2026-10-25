@@ -29,7 +29,8 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   **Clean Build Files and Rebuild** in the command palette runs `latexmk -c` (the PDF stays) and
   builds again.
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
-  explanations and quick fixes for common errors, plus optional `chktex` lint.
+  explanations and quick fixes for common errors, plus optional `chktex` lint. F4 and Shift+F4
+  (`]e` and `[e` in Vim) go to the next and previous build problem, across files.
 - **Writing help.** Completion for commands, environments, labels, citations and Unicode math
   glyphs from per-package word lists. Snippets and autosnippets, bracket pairing, spell
   checking, hover previews of `\ref`, `\cite` and rendered math, and label rename/references.

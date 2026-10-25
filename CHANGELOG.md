@@ -14,6 +14,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   Live and MiKTeX are found in their usual folders.
 - Clean Build Files and Rebuild (command palette): stops the build, runs `latexmk -c`, which
   keeps the PDF, and builds again, for a build that a damaged `.aux` or `.bbl` keeps failing.
+- F4 and Shift+F4 go to the next and previous build problem from the cursor, in the Problems
+  page's order and across files, opening them at their current line; `]e` and `[e` in Vim
+  normal mode. Both are in the command palette and the shortcuts window.
 
 ### Changed
 
@@ -25,6 +28,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   per window; the status bar says "latexmk not found".
 - Auto-saving several documents requests one build once they are all written, not one per
   document, which ran latexmk a second time for nothing and wrote the documents twice.
+- The Problems page builds its rows only when it is shown, and lists at most 500 of a build's
+  problems, the most severe ones (errors, then warnings, then bad boxes), followed by a line
+  saying how many more there are. The ones left out keep their gutter marks and are still
+  reached by F4. A build with 3000 warnings and bad boxes now keeps the main thread busy for
+  about 20 ms instead of 0.35 s while the page is hidden, and 0.13 s instead of 0.7 s while it
+  is shown.
 
 ### Fixed
 

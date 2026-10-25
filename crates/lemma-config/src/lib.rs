@@ -517,7 +517,8 @@ impl Default for CompletionCfg {
 /// The Vim normal-mode key sequences of [`VimCfg::normal`] and the actions they run.
 ///
 /// `gd` (go to the definition of the reference, citation, file or macro under the cursor) and
-/// `K` (its hover popover at the cursor) are M3's.
+/// `K` (its hover popover at the cursor) are M3's; `]e` / `[e` go to the next / previous build
+/// problem (Vim itself has no `]e`).
 pub const DEFAULT_VIM_NORMAL: &[(&str, &str)] = &[
     ("]h", "win.review-next"),
     ("[h", "win.review-prev"),
@@ -526,6 +527,8 @@ pub const DEFAULT_VIM_NORMAL: &[(&str, &str)] = &[
     ("<Space>a", "win.agent-focus"),
     ("gd", "win.goto-definition"),
     ("K", "win.show-hover"),
+    ("]e", "win.problem-next"),
+    ("[e", "win.problem-prev"),
 ];
 
 /// `[vim]`: Lemma's own Vim normal-mode mappings, on top of GtkSourceView's Vim emulation.
@@ -851,6 +854,8 @@ mod tests {
         let vim = c.vim.normal_bindings();
         assert_eq!(vim["gd"], "win.goto-definition");
         assert_eq!(vim["K"], "win.show-hover");
+        assert_eq!(vim["]e"], "win.problem-next");
+        assert_eq!(vim["[e"], "win.problem-prev");
     }
 
     #[test]

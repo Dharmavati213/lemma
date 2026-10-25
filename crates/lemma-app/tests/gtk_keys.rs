@@ -26,12 +26,13 @@ use gtk::gdk;
 use lemma_agent::{AgentEvent, EditorRequest, ToolReply};
 use lemma_app::agent::{AgentState, SentPrompt};
 use lemma_app::agent_edits;
+use lemma_app::diagnostics_panel::Problem;
 use lemma_app::editor::keys::{self, KeyEvent};
 use lemma_app::editor::{Editor, TexView, VimMode, vim};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
-use lemma_core::ProjectRoot;
+use lemma_core::{DiagSource, ProjectRoot, Severity};
 use std::cell::RefCell;
 use std::future::Future;
 use std::path::PathBuf;
@@ -58,6 +59,10 @@ fn main() -> ExitCode {
         (
             "bracket_h_in_insert_mode_types_the_characters",
             bracket_h_in_insert_mode_types,
+        ),
+        (
+            "bracket_e_goes_to_the_next_and_previous_problem",
+            bracket_e_goes_to_problems,
         ),
         (
             "tab_in_insert_mode_reaches_the_snippet_handler_before_vim",
@@ -507,6 +512,46 @@ fn bracket_h_in_insert_mode_types() {
         gdk::ModifierType::empty(),
     );
     assert_eq!(keys::dispatch(f.view(), &event), glib::Propagation::Proceed);
+}
+
+/// `]e` / `[e` (`[vim.normal]` defaults: next and previous build problem) go from the cursor to
+/// the problems in the Problems page's order, around the end. Vim has no `]e` or `[e`
+/// (GtkSourceView's Vim drops the bracket and moves to the end of the word, as `e` alone does),
+/// so the bindings take no Vim command.
+fn bracket_e_goes_to_problems() {
+    let f = fixture("bracket-e", &main_files());
+    for keys in ["]e", "[e"] {
+        f.set_cursor(4, 2);
+        f.vim_alone(keys);
+        let alone = (f.text(), f.cursor(), f.mode(), f.vim_command());
+        f.set_cursor(4, 2);
+        f.vim_alone("e");
+        assert_eq!(
+            (f.text(), f.cursor(), f.mode(), f.vim_command()),
+            alone,
+            "{keys}"
+        );
+    }
+    let path = lemma_app::workspace::normalize(&f.dir.join("main.tex"));
+    let problem = |line| Problem {
+        path: path.clone(),
+        line: Some(line),
+        severity: Severity::Error,
+        message: "Undefined control sequence.".into(),
+        context: None,
+        source: DiagSource::Tex,
+    };
+    let panel = f.state.build.get().unwrap().diagnostics();
+    // 1-based lines: the cursor goes to the 0-based lines 3 and 9.
+    panel.set(vec![problem(4), problem(10)], &path);
+    f.set_cursor(0, 0);
+    for (keys, line) in [("]e", 3), ("]e", 9), ("]e", 3), ("[e", 9), ("[e", 3)] {
+        f.keys(keys);
+        f.wait_cursor_line(line);
+    }
+    assert_eq!(f.mode(), VimMode::Normal);
+    assert_eq!(f.vim_command(), "");
+    assert_eq!(f.text(), MAIN, "navigation changes no text");
 }
 
 fn tab_reaches_snippet_handler_first() {

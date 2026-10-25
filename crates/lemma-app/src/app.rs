@@ -177,6 +177,8 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.build", "Build", BuildPdf),
         info("win.stop-build", "Stop Build", BuildPdf),
         info("win.clean-build", "Clean Build Files and Rebuild", BuildPdf),
+        info("win.problem-next", "Next Problem", BuildPdf),
+        info("win.problem-prev", "Previous Problem", BuildPdf),
         info("win.sync-forward", "Show Cursor in PDF", BuildPdf),
         info("win.pdf-invert", "Dark PDF Pages", BuildPdf),
         info("win.pdf-zoom-in", "Zoom In PDF", BuildPdf),
@@ -991,7 +993,7 @@ mod tests {
                 panic!("{accel} is bound to both {other} and {action}");
             }
         }
-        // Ones the other modules set (agent panel, inline edit, build, PDF).
+        // Ones the other modules set (agent panel, inline edit, build, PDF, Problems).
         for accel in [
             "<control>l",
             "<control><shift>backspace",
@@ -999,6 +1001,8 @@ mod tests {
             "<shift>f5",
             "<control><alt>j",
             "<control><shift>i",
+            "f4",
+            "<shift>f4",
         ] {
             assert!(!seen.contains_key(accel), "{accel} is taken");
         }
