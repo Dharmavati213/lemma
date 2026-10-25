@@ -38,6 +38,10 @@ fn main() -> ExitCode {
             "nested_apply_edits_reach_the_review_with_their_origin",
             nested_apply_edits_keep_their_origin,
         ),
+        (
+            "edits_move_past_what_closing_the_user_action_changed",
+            edits_move_past_closing_changes,
+        ),
         ("observers_and_disconnect", observers_and_disconnect),
         ("save_round_trip_is_byte_identical", save_round_trip),
         ("saves_are_coalesced", saves_are_coalesced),
@@ -521,6 +525,101 @@ fn nested_apply_edits_keep_their_origin() {
         .map(|h| (h.cur_bytes.start, h.cur_bytes.end))
         .collect();
     assert_eq!(hunks, [(0, 6)]);
+}
+
+/// Agent edits that close the user action left open (Vim's insert mode) after an
+/// `end-user-action` handler changed the text before them, as the environment rename does:
+/// they move past that change, so they still replace the text they were computed for, and the
+/// apply observers see them so; the review takes the user's change into the baseline and the
+/// agent's as hunks. An edit whose text the handler changed is refused with nothing of it
+/// applied, and the user action is open again either way.
+fn edits_move_past_closing_changes() {
+    let text = "alpha\nbeta\ngamma\n";
+    let doc = open_doc(text);
+    doc.review
+        .replace(Some(lemma_review::FileReview::new(text.to_owned())));
+    let buffer = buffer_of(&doc);
+    // The handler's next change, made once when the user action closes.
+    let pending = Rc::new(RefCell::new(Some(TextEdit {
+        range: 0..5,
+        text: "ALPHA!".into(),
+    })));
+    let weak = Rc::downgrade(&doc);
+    let next = pending.clone();
+    let handler = buffer.connect_end_user_action(move |_| {
+        let edit = next.borrow_mut().take();
+        if let (Some(doc), Some(edit)) = (weak.upgrade(), edit) {
+            doc.apply_edits(&[edit], Origin::User).unwrap();
+        }
+    });
+    let applied = Rc::new(RefCell::new(Vec::new()));
+    let sink = applied.clone();
+    doc.connect_before_apply(move |_, edits, origin| {
+        sink.borrow_mut().push((edits.to_vec(), origin));
+    });
+    let agent = Origin::Agent { call: 1 };
+    buffer.begin_user_action();
+    doc.apply_edits(
+        &[
+            TextEdit::insert(17, "delta\n"),
+            TextEdit {
+                range: 6..10,
+                text: "BETA".into(),
+            },
+        ],
+        agent,
+    )
+    .unwrap();
+    let current = doc.text();
+    assert_eq!(current, "ALPHA!\nBETA\ngamma\ndelta\n");
+    assert_index_exact(&doc, "edits moved past a change");
+    assert_eq!(
+        applied.borrow().last(),
+        Some(&(
+            vec![
+                TextEdit::insert(18, "delta\n"),
+                TextEdit {
+                    range: 7..11,
+                    text: "BETA".into(),
+                },
+            ],
+            agent
+        ))
+    );
+    {
+        let mut review = doc.review.borrow_mut();
+        let review = review.as_mut().unwrap();
+        review.recompute(&current);
+        assert_eq!(review.baseline(), "ALPHA!\nbeta\ngamma\n");
+        let hunks: Vec<(usize, usize)> = review
+            .hunks()
+            .iter()
+            .map(|h| (h.cur_bytes.start, h.cur_bytes.end))
+            .collect();
+        assert_eq!(hunks, [(7, 12), (18, 24)]);
+    }
+    // The handler changes "gamma" while an agent edit of it waits: refused.
+    let at = current.find("gamma").unwrap();
+    pending.replace(Some(TextEdit {
+        range: at + 1..at + 4,
+        text: "AMM".into(),
+    }));
+    let edit = TextEdit {
+        range: at..at + 5,
+        text: "Gamma".into(),
+    };
+    let refused = doc.apply_edits(std::slice::from_ref(&edit), agent);
+    assert_eq!(refused, Err(EditError::Conflict(edit)));
+    assert_eq!(doc.text(), current.replace("gamma", "gAMMa"));
+    assert_eq!(
+        applied.borrow().last().map(|(_, origin)| *origin),
+        Some(Origin::User),
+        "only the handler's edit was applied"
+    );
+    buffer.disconnect(handler);
+    // Balanced: the user action is open again (GTK would log a critical otherwise).
+    buffer.end_user_action();
+    assert_eq!(doc.text(), current.replace("gamma", "gAMMa"));
 }
 
 /// `apply_edits` of a replace_all of `$` with 20 000 matches (5000 lines) in a file under

@@ -21,9 +21,11 @@
 //! with typing in the editor while the bar is shown. A new query waits for that scan before it
 //! selects its first match ([`FindBar::scanned`]): asking the context at once would scan the
 //! rest of the file in one go when nothing matches (about 115 ms on 60 000 lines, at every pause
-//! in typing the query). GTK keeps one primary selection at a time, so selecting the entry's
-//! text takes the editor's selection away: the match the bar selected last still counts as
-//! selected while the cursor stays at its start and the text is unchanged ([`Found`]).
+//! in typing the query). For the same reason a step (F3, Enter, …) before that looks for its
+//! match in the background, and the steps and Replaces that follow it wait for it
+//! ([`FindBar::step`]). GTK keeps one primary selection at a time, so selecting the entry's text
+//! takes the editor's selection away: the match the bar selected last still counts as selected
+//! while the cursor stays at its start and the text is unchanged ([`Found`]).
 //!
 //! The rows wrap (the toggles, then the replace buttons, onto lines of their own) rather than
 //! make the editor wider than its minimum.
@@ -114,6 +116,29 @@ struct Target {
     /// Where a new query's first match is looked for once the search has counted
     /// ([`FindBar::scanned`]).
     pending: Cell<Option<Start>>,
+    /// The search has counted the matches of the query since it was set: a step finds its
+    /// match at once from then on (see [`FindBar::step`]).
+    counted: Cell<bool>,
+    /// The step that waits for the search to scan as far as its match (see [`FindBar::step`]).
+    stepping: RefCell<Option<Stepping>>,
+}
+
+/// A step looking for its match in the background (see [`FindBar::step`]).
+struct Stepping {
+    /// Cancelled when the search ends or the query changes; GtkSourceView cancels it too when
+    /// the buffer changes.
+    cancellable: gio::Cancellable,
+    /// What was asked for meanwhile, in order; it follows the step.
+    queued: Vec<Queued>,
+}
+
+/// A step or Replace asked for while a step looks for its match in the background.
+#[derive(Clone, Copy, Debug)]
+enum Queued {
+    /// `true`: forward.
+    Step(bool),
+    /// Replaces the match the steps before it selected (see [`FindBar::replace_one`]).
+    Replace,
 }
 
 /// A buffer character offset and the document version it was taken in.
@@ -165,7 +190,27 @@ impl Target {
             mark_set: Some((buffer.downgrade(), mark_set)),
             found: Cell::new(None),
             pending: Cell::new(None),
+            counted: Cell::new(false),
+            stepping: RefCell::new(None),
         }
+    }
+
+    /// Forgets the step looking for its match in the background, and the steps queued behind
+    /// it.
+    fn cancel_stepping(&self) {
+        if let Some(stepping) = self.stepping.take() {
+            stepping.cancellable.cancel();
+        }
+    }
+
+    /// Puts `next` behind the step looking for its match in the background; false when none
+    /// does.
+    fn queue(&self, next: Queued) -> bool {
+        let mut stepping = self.stepping.borrow_mut();
+        if let Some(stepping) = stepping.as_mut() {
+            stepping.queued.push(next);
+        }
+        stepping.is_some()
     }
 
     /// The match a step or Replace starts from: the selection, else the [`Found`] match while it
@@ -191,6 +236,7 @@ impl Drop for Target {
         {
             buffer.disconnect(id);
         }
+        self.cancel_stepping();
         // The highlights go now, whoever still holds the context.
         self.context.set_highlight(false);
     }
@@ -692,6 +738,11 @@ impl FindBar {
         if !force && self.settings.search_text().as_deref() == query {
             return;
         }
+        if let Some(target) = self.target.borrow().as_ref() {
+            // The search counts again, and a step looking for a match of the old one is moot.
+            target.counted.set(false);
+            target.cancel_stepping();
+        }
         self.settings.set_search_text(query);
         self.count.set_text("");
         if let Some((editor, _)) = self.current()
@@ -713,9 +764,11 @@ impl FindBar {
     /// quick now): a new query's first match is selected, then the label updated.
     fn scanned(&self) {
         let pending = self.target.borrow().as_ref().and_then(|t| {
-            (t.context.occurrences_count() >= 0)
-                .then(|| t.pending.take())
-                .flatten()
+            let counted = t.context.occurrences_count() >= 0;
+            if counted {
+                t.counted.set(true);
+            }
+            counted.then(|| t.pending.take()).flatten()
         });
         if let Some(from) = pending
             && let Some((editor, context)) = self.current()
@@ -769,51 +822,118 @@ impl FindBar {
 
     /// Selects the next (or previous) match after (before) the selection, wrapping around; rings
     /// the bell when there is none.
-    fn step(&self, forward: bool) -> bool {
+    ///
+    /// Until the search has counted the matches of a new query (it scans the buffer in idle
+    /// steps), GtkSourceView would scan the text up to the match on the spot: all of it when the
+    /// only match is near the end or there is none (up to 47 ms on the 60 000 lines of
+    /// `large.tex`, 8 ms on 10 000). So the match is looked for in the background then
+    /// (`forward_async`, which waits for the idle scan to get there), and the steps and Replaces
+    /// asked for meanwhile follow it, in order. An edit of the buffer, a new query or the end of
+    /// the search drops them.
+    fn step(self: &Rc<Self>, forward: bool) {
         let Some((editor, context)) = self.current() else {
-            return false;
+            return;
         };
         if self.settings.search_text().is_none() {
-            return false;
+            return;
         }
         self.cancel_pending();
-        let (start, end) = self.match_bounds(&editor).unwrap_or_else(|| {
+        let target = self.target.borrow();
+        let Some(target) = target.as_ref() else {
+            return;
+        };
+        if target.queue(Queued::Step(forward)) {
+            return;
+        }
+        let (start, end) = target.match_bounds(&editor).unwrap_or_else(|| {
             let buffer = editor.buffer();
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
             (cursor, cursor)
         });
-        let search = |from: &gtk::TextIter| {
-            if forward {
-                context.forward(from)
-            } else {
-                context.backward(from)
-            }
-        };
-        let mut found = search(if forward { &end } else { &start });
-        // An empty match (`^`, `\b`) at the selection is found again: look on from the next
-        // character.
-        if found
-            .as_ref()
-            .is_some_and(|(s, e, _)| s == e && *s == start && *e == end)
-        {
-            let mut from = if forward { end } else { start };
-            if forward {
-                from.forward_char();
-            } else {
-                from.backward_char();
-            }
-            found = search(&from);
+        // (An invalid expression finds nothing, at once.)
+        if target.counted.get() || context.regex_error().is_some() {
+            self.show_step(&editor, find_at_once(&context, &start, &end, forward));
+            return;
         }
+        let cancellable = gio::Cancellable::new();
+        target.stepping.replace(Some(Stepping {
+            cancellable: cancellable.clone(),
+            queued: Vec::new(),
+        }));
+        let weak = Rc::downgrade(self);
+        let ours = cancellable.clone();
+        let version = editor.document().version();
+        let from = if forward { end } else { start };
+        search_async(&context, &from, forward, &cancellable, move |searched| {
+            // GtkSourceView calls back from inside its scan, and goes on with the search's state
+            // when this returns: the match is taken (and the next search started) from the main
+            // loop.
+            let found = searched.map(|found| found.map(|(s, e)| (s.offset(), e.offset())));
+            glib::idle_add_local_once(move || {
+                if let Some(find) = weak.upgrade() {
+                    find.stepped(&ours, version, found);
+                }
+            });
+        });
+    }
+
+    /// A step's background search ended (see [`FindBar::step`]) with the character offsets of
+    /// its match, `version` being the document's version when it began: the match is selected
+    /// (or the bell rings), then the steps and Replaces asked for meanwhile are taken.
+    /// Cancelled, or with the text changed since, it takes them with it. (It never finds an
+    /// empty match at the selection, which `find_at_once` steps past: GtkSourceView matches no
+    /// empty text.)
+    fn stepped(
+        self: &Rc<Self>,
+        cancellable: &gio::Cancellable,
+        version: u64,
+        found: Result<Option<(i32, i32)>, glib::Error>,
+    ) {
+        let Some((editor, _)) = self.current() else {
+            return;
+        };
+        let queued = {
+            let target = self.target.borrow();
+            let Some(target) = target.as_ref() else {
+                return;
+            };
+            let mut stepping = target.stepping.borrow_mut();
+            if stepping
+                .as_ref()
+                .is_none_or(|s| s.cancellable != *cancellable)
+            {
+                return;
+            }
+            let found = match found {
+                Ok(found) if editor.document().version() == version => found,
+                _ => {
+                    stepping.take();
+                    return;
+                }
+            };
+            let buffer = editor.buffer();
+            let queued = stepping.take().map(|s| s.queued).unwrap_or_default();
+            drop(stepping);
+            let found = found.map(|(s, e)| (buffer.iter_at_offset(s), buffer.iter_at_offset(e)));
+            self.show_step(&editor, found);
+            queued
+        };
+        for next in queued {
+            match next {
+                Queued::Step(forward) => self.step(forward),
+                Queued::Replace => self.replace_one(),
+            }
+        }
+    }
+
+    /// Selects a step's match, or rings the bell when it found none.
+    fn show_step(&self, editor: &Editor, found: Option<(gtk::TextIter, gtk::TextIter)>) {
         match found {
-            Some((start, end, _)) => {
-                self.select_match(&editor, &start, &end);
+            Some((start, end)) => {
+                self.select_match(editor, &start, &end);
                 self.refresh_count();
-                true
             }
-            None => {
-                self.entry.error_bell();
-                false
-            }
+            None => self.entry.error_bell(),
         }
     }
 
@@ -840,10 +960,19 @@ impl FindBar {
     }
 
     /// Replaces the selected match (see [`Target::match_bounds`]), then selects the next one.
-    fn replace_one(&self) {
+    /// While a step looks for its match in the background, it waits for it.
+    fn replace_one(self: &Rc<Self>) {
         let Some((editor, context)) = self.current() else {
             return;
         };
+        if self
+            .target
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| t.queue(Queued::Replace))
+        {
+            return;
+        }
         let Some(replacement) = self.replacement() else {
             self.entry.error_bell();
             return;
@@ -988,7 +1117,7 @@ impl FindBar {
     }
 
     /// Replace, as the button does.
-    pub fn replace(&self) {
+    pub fn replace(self: &Rc<Self>) {
         self.replace_one();
     }
 
@@ -1110,6 +1239,113 @@ fn select(editor: &Editor, start: &gtk::TextIter, end: &gtk::TextIter) {
     } else {
         let x = f64::from(at.x() - visible.x()) / f64::from(visible.width().max(1));
         view.scroll_to_mark(&insert, 0.0, true, x.clamp(0.0, 1.0), 0.5);
+    }
+}
+
+/// The next match after `end` (`forward`) or the previous one before `start`, wrapping around,
+/// looked for at once. An empty match (`^`, `\b`) at `start..end` is found again, so the search
+/// looks on from the next character.
+fn find_at_once(
+    context: &sourceview5::SearchContext,
+    start: &gtk::TextIter,
+    end: &gtk::TextIter,
+    forward: bool,
+) -> Option<(gtk::TextIter, gtk::TextIter)> {
+    let search = |from: &gtk::TextIter| {
+        let found = if forward {
+            context.forward(from)
+        } else {
+            context.backward(from)
+        };
+        found.map(|(s, e, _)| (s, e))
+    };
+    let found = search(if forward { end } else { start });
+    if found
+        .as_ref()
+        .is_some_and(|(s, e)| s == e && s == start && e == end)
+    {
+        let mut from = if forward { *end } else { *start };
+        if forward {
+            from.forward_char();
+        } else {
+            from.backward_char();
+        }
+        return search(&from);
+    }
+    found
+}
+
+/// What a background search gives its callback: the match (`None`: there is none), or the error
+/// it was cancelled with.
+type Searched = Result<Option<(gtk::TextIter, gtk::TextIter)>, glib::Error>;
+
+/// `gtk_source_search_context_forward_async` (`backward_async`): looks for the next (previous)
+/// match from `from`, wrapping around, as the search's idle scan gets there, and calls `done`
+/// with it. GtkSourceView cancels it, and `done` gets the error, when the buffer changes, the
+/// search's settings change or another one starts. (sourceview5's binding reads the match's
+/// iters also when there is none.)
+fn search_async(
+    context: &sourceview5::SearchContext,
+    from: &gtk::TextIter,
+    forward: bool,
+    cancellable: &gio::Cancellable,
+    done: impl FnOnce(Searched) + 'static,
+) {
+    use glib::translate::{ToGlibPtr, ToGlibPtrMut, Uninitialized, from_glib_full};
+    type Done = (bool, Box<dyn FnOnce(Searched)>);
+    unsafe extern "C" fn finished(
+        source: *mut glib::gobject_ffi::GObject,
+        result: *mut gio::ffi::GAsyncResult,
+        data: glib::ffi::gpointer,
+    ) {
+        // SAFETY: `data` is the box `search_async` leaked for this call, taken back once.
+        let (forward, done) = *unsafe { Box::from_raw(data.cast::<Done>()) };
+        let finish = if forward {
+            sourceview5::ffi::gtk_source_search_context_forward_finish
+        } else {
+            sourceview5::ffi::gtk_source_search_context_backward_finish
+        };
+        let mut error = std::ptr::null_mut();
+        // SAFETY: the search context and its result, two iters to fill in (left as they are
+        // without a match, and not read then), no wrap-around flag (it is optional) and an
+        // empty error location.
+        let (found, start, end) = unsafe {
+            let mut start = gtk::TextIter::uninitialized();
+            let mut end = gtk::TextIter::uninitialized();
+            let found = finish(
+                source.cast(),
+                result,
+                start.to_glib_none_mut().0,
+                end.to_glib_none_mut().0,
+                std::ptr::null_mut(),
+                &mut error,
+            );
+            (found, start, end)
+        };
+        let searched = if error.is_null() {
+            Ok((found != glib::ffi::GFALSE).then_some((start, end)))
+        } else {
+            // SAFETY: `finish` set `error`, which the caller owns.
+            Err(unsafe { from_glib_full(error) })
+        };
+        done(searched);
+    }
+    let start = if forward {
+        sourceview5::ffi::gtk_source_search_context_forward_async
+    } else {
+        sourceview5::ffi::gtk_source_search_context_backward_async
+    };
+    let data: Box<Done> = Box::new((forward, Box::new(done)));
+    // SAFETY: the context and an iter of its buffer, a cancellable (with one, GtkSourceView
+    // always calls back), and the callback with its data, which it takes back.
+    unsafe {
+        start(
+            context.to_glib_none().0,
+            from.to_glib_none().0,
+            cancellable.to_glib_none().0,
+            Some(finished),
+            Box::into_raw(data).cast(),
+        );
     }
 }
 

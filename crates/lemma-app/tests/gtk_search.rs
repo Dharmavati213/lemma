@@ -54,6 +54,10 @@ fn main() -> ExitCode {
         ("find_bar_highlights_counts_and_wraps", find_counts),
         ("find_bar_options_and_invalid_expressions", find_options),
         (
+            "find_bar_steps_before_the_count_in_the_background",
+            find_steps_before_the_count,
+        ),
+        (
             "find_bar_actions_follow_the_focus_and_vim",
             find_focus_and_vim,
         ),
@@ -75,6 +79,14 @@ fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_search_10k_frame_budget", perf_10k));
         tests.push(("perf_find_bar_replace_all_large_tex", perf_find_replace_all));
+        tests.push((
+            "perf_find_bar_replace_all_under_review_large_tex",
+            perf_find_replace_all_review,
+        ));
+        tests.push((
+            "perf_find_bar_step_before_the_scan_large_tex",
+            perf_find_step_before_scan,
+        ));
     }
     common::run(&tests)
 }
@@ -1026,6 +1038,8 @@ fn find_counts() {
     let status = find.status();
     assert!(status.open);
     assert_eq!(status.query.as_deref(), Some("sheaf"));
+    // The new search has not counted yet: the match is looked for in the background.
+    common::pump_until(TIMEOUT, || selected(&editor).is_some());
     assert_eq!(selected(&editor), Some((0, "sheaf".into())));
     common::pump_for(Duration::from_millis(30));
     assert!(editor.view().has_focus());
@@ -1064,6 +1078,89 @@ fn find_options() {
     assert!(find.entry().tooltip_text().is_none());
     run(&fx, "win.find-next");
     assert_eq!(editor.document().text(), FIND_DOC);
+}
+
+/// F3, Shift+F3 and Enter before the search has counted a new query's matches: each looks for
+/// its match in the background (the main loop has not run yet, so nothing is selected), the
+/// steps asked for meanwhile follow in order, and the result is that of the same steps once the
+/// search has counted. An edit or a new query drops the step that waits; a regular expression
+/// is looked for so too, and Replace waits for the step before it.
+fn find_steps_before_the_count() {
+    let (fx, editor, find) = find_fixture("find-steps");
+    run(&fx, "win.find");
+    let steps = |keys: &[&str]| {
+        for key in keys {
+            match *key {
+                "F3" => run(&fx, "win.find-next"),
+                "Shift+F3" => run(&fx, "win.find-prev"),
+                _ => find.entry().emit_activate(),
+            }
+        }
+    };
+    let keys = ["F3", "Enter", "F3", "Shift+F3"];
+    let presheaf = FIND_DOC.find("presheaf").unwrap() + 3;
+    find.search_now("sheaf");
+    steps(&keys);
+    assert_eq!(selected(&editor), None, "not looked for at once");
+    common::pump_until(TIMEOUT, || selected(&editor).is_some());
+    assert_eq!(counted(&find).label, "2 of 4");
+    assert_eq!(selected(&editor), Some((presheaf, "sheaf".into())));
+    // Counted: the same steps at once.
+    editor.place_cursor_at(0);
+    steps(&keys);
+    assert_eq!(selected(&editor), Some((presheaf, "sheaf".into())));
+    // An edit while a step waits drops it; the next step goes on.
+    editor.place_cursor_at(0);
+    find.search_now("glue");
+    run(&fx, "win.find-next");
+    editor
+        .buffer()
+        .insert(&mut editor.buffer().end_iter(), "% glue\n");
+    counted(&find);
+    common::pump_for(Duration::from_millis(50));
+    assert_eq!(selected(&editor), None);
+    run(&fx, "win.find-next");
+    let glue = FIND_DOC.find("glue").unwrap();
+    assert_eq!(selected(&editor), Some((glue, "glue".into())));
+    // A new query drops it too: its own first match is selected.
+    editor.place_cursor_at(0);
+    find.search_now("sheaf");
+    run(&fx, "win.find-prev");
+    find.search_now("stalk");
+    counted(&find);
+    common::pump_for(Duration::from_millis(50));
+    let stalk = FIND_DOC.find("stalk").unwrap();
+    assert_eq!(selected(&editor), Some((stalk, "stalk".into())));
+    // A regular expression, backwards from the start: the last match, wrapping around.
+    find.set_options(false, false, true);
+    editor.place_cursor_at(0);
+    find.search_now(r"\\emph\{\w+\}");
+    run(&fx, "win.find-prev");
+    assert_eq!(selected(&editor), None);
+    common::pump_until(TIMEOUT, || selected(&editor).is_some());
+    assert_eq!(selected(&editor).unwrap().1, r"\emph{stalk}");
+    find.set_options(false, false, false);
+    // Replace follows the step it waits for: pressed three times, it selects the first match,
+    // then replaces it and the next one, as once counted.
+    editor.place_cursor_at(0);
+    find.search_now("sheaf");
+    find.set_replacement(Some("faisceau"));
+    let before = editor.document().text();
+    for _ in 0..3 {
+        find.replace();
+    }
+    assert_eq!(editor.document().text(), before, "nothing replaced at once");
+    common::pump_until(TIMEOUT, || {
+        editor.document().text().matches("faisceau").count() == 2
+            && selected(&editor).is_some_and(|(_, s)| s == "Sheaf")
+    });
+    let text = before.replacen("sheaf", "faisceau", 2);
+    assert_eq!(editor.document().text(), text);
+    assert_eq!(
+        selected(&editor),
+        Some((text.find("Sheaf glues").unwrap(), "Sheaf".into()))
+    );
+    find.set_replacement(None);
 }
 
 fn find_focus_and_vim() {
@@ -1312,6 +1409,141 @@ fn perf_find_replace_all() {
          updates alone take {index_took:?}",
         changes.len()
     );
+}
+
+/// The find bar's Replace All on `large.tex` under review: two agent replace_alls make 5000
+/// hunks first (every `\section{Section N}` and `\title{Probe document}` line), then Replace
+/// All of every `x` (20 000 matches on other lines), which GtkSourceView applies one match
+/// after the other and the review gets change by change (`FileReview::on_edit`, user edits:
+/// each goes into the baseline). Prints its time, the review's recompute after it, and the same
+/// Replace All without a review.
+fn perf_find_replace_all_review() {
+    let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
+    for reviewed in [true, false] {
+        let fx = fixture("find-review-perf", &[("large.tex", &large)]);
+        let editor = fx.open("large.tex");
+        let doc = editor.document().clone();
+        if reviewed {
+            review_ui::on_turn_started(&fx.state, 1);
+            review_ui::start_review(&doc, false);
+            for (old, new) in [
+                ("\\section{Section", "\\section{Part"),
+                ("\\title{Probe document}", "\\title{Probe}"),
+            ] {
+                let edits = lemma_review::str_replace(&doc.text(), old, new, true).unwrap();
+                doc.apply_edits(&edits, lemma_core::Origin::Agent { call: 1 })
+                    .unwrap();
+            }
+            review_ui::recompute(&doc);
+            review_ui::on_turn_ended(&fx.state, 1);
+            assert_eq!(review_ui::hunk_count(&doc), 5000);
+        }
+        focus(&editor);
+        let find = find_bar::bar(&fx.state).expect("a find bar");
+        run(&fx, "win.find");
+        find.set_options(true, false, false);
+        find.search_now("x");
+        assert_eq!(counted(&find).total, Some(20_000));
+        find.set_replacement(Some("y"));
+        let started = Instant::now();
+        find.replace_every();
+        let took = started.elapsed();
+        let started = Instant::now();
+        if reviewed {
+            review_ui::recompute(&doc);
+        }
+        let recompute = started.elapsed();
+        if reviewed {
+            let review = doc.review.borrow();
+            let review = review.as_ref().unwrap();
+            assert_eq!(review.hunks().len(), 5000);
+            assert!(!review.baseline().contains('x'), "the user's edits");
+        }
+        eprintln!(
+            "find bar Replace All of 20 000 matches on large.tex {}: {took:?}{}",
+            if reviewed {
+                "with 5000 hunks under review"
+            } else {
+                "without a review"
+            },
+            if reviewed {
+                format!(", the review's recompute after it {recompute:?}")
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+/// F3, Shift+F3 and Enter in the entry right after a new query, before the search has counted
+/// its matches, on `large.tex` (60 000 lines) and its first 10 000 lines, from the start of the
+/// file: for a query with matches all over (`Line 4`), one whose only match is the last line
+/// (`\end{document}`) and one without matches. Each step looks for its match in the background
+/// (`FindBar::step`; looking at once took up to 47 ms on `large.tex` and 7.7 ms on 10 000
+/// lines): the key's own work must stay within §3 rule 1's 2 ms on 10 000 lines (release
+/// builds). Prints it, the longest main-loop step until the match is selected (the search's own
+/// idle scan included), and the key once the search has counted.
+fn perf_find_step_before_scan() {
+    let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
+    let mut first: String = large.split_inclusive('\n').take(10_000).collect();
+    first.push_str("\\end{document}\n");
+    let mut slowest = Duration::ZERO;
+    for (name, text) in [("large.tex", &large), ("its first 10 000 lines", &first)] {
+        let fx = fixture("find-step-perf", &[("main.tex", text)]);
+        let editor = fx.open("main.tex");
+        focus(&editor);
+        let find = find_bar::bar(&fx.state).expect("a find bar");
+        run(&fx, "win.find");
+        find.set_options(true, false, false);
+        for query in ["Line 4", "\\end{document}", "zebra"] {
+            for key in ["F3", "Shift+F3", "Enter"] {
+                let step = || match key {
+                    "F3" => run(&fx, "win.find-next"),
+                    "Shift+F3" => run(&fx, "win.find-prev"),
+                    _ => find.entry().emit_activate(),
+                };
+                // A new search: the context scans the file again from the start.
+                editor.place_cursor_at(0);
+                find.search_now("");
+                find.search_now(query);
+                let started = Instant::now();
+                step();
+                let before = started.elapsed();
+                let context = glib::MainContext::default();
+                let mut longest = Duration::ZERO;
+                let mut last = Instant::now();
+                let deadline = last + TIMEOUT;
+                let done = || {
+                    find.status().total.is_some()
+                        && (query == "zebra" || selected(&editor).is_some())
+                };
+                while !done() {
+                    assert!(Instant::now() < deadline, "the step ends");
+                    context.iteration(false);
+                    let now = Instant::now();
+                    longest = longest.max(now - last);
+                    last = now;
+                }
+                common::pump_for(Duration::from_millis(20));
+                editor.place_cursor_at(0);
+                let started = Instant::now();
+                step();
+                let after = started.elapsed();
+                eprintln!(
+                    "    {name}: {key} on {query:?} before the count {before:?} (longest main-loop \
+                     step until its match {longest:?}), after it {after:?}"
+                );
+                if !name.starts_with("large") {
+                    slowest = slowest.max(before);
+                }
+            }
+        }
+    }
+    if cfg!(debug_assertions) {
+        eprintln!("    debug build: the 2 ms budget is checked in release builds only");
+    } else {
+        assert!(slowest <= Duration::from_millis(2), "{slowest:?}");
+    }
 }
 
 /// Replace and Replace All change the matches only: live environment rename (`envtools`) stays

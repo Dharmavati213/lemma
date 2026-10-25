@@ -72,6 +72,9 @@ pub enum EditError {
     NotDescending,
     /// The inserted text contains U+0000, which a document cannot hold.
     NulCharacter,
+    /// Closing the user action left open changed the text inside this edit's range before it
+    /// could be applied (see [`Document::apply_edits`]).
+    Conflict(TextEdit),
 }
 
 impl fmt::Display for EditError {
@@ -80,6 +83,11 @@ impl fmt::Display for EditError {
             Self::InvalidRange(e) => write!(f, "edit range {:?} does not fit the text", e.range),
             Self::NotDescending => f.write_str("edits must be descending and non-overlapping"),
             Self::NulCharacter => f.write_str("the text contains a NUL character (U+0000)"),
+            Self::Conflict(e) => write!(
+                f,
+                "the text at {:?} changed before the edit could be applied",
+                e.range
+            ),
         }
     }
 }
@@ -155,7 +163,7 @@ pub struct Document {
     /// far, in runs of one origin, which the review gets at once when they are all applied
     /// (`FileReview::on_edits`), so that thousands of them (a replace_all) cost it O(log hunks)
     /// each, not O(hunks). A change made meanwhile with another origin (an `end-user-action`
-    /// handler's own `apply_edits`, such as the environment rename's) starts a run of its own.
+    /// handler's own `apply_edits` when the edits' user action ends) starts a run of its own.
     review_edits: RefCell<Option<Vec<EditRun>>>,
     pub(crate) saver: Saver,
     /// Incremented after every change.
@@ -168,6 +176,9 @@ pub struct Document {
     /// True while the buffer has a user action open (between the outermost `begin-user-action`
     /// and `end-user-action`); Vim's insert mode keeps one open for the whole insert session.
     user_action_open: Cell<bool>,
+    /// While [`Document::apply_edits`] closes a user action left open: the changes the
+    /// `end-user-action` handlers make meanwhile, in order (see [`Document::close_user_action`]).
+    closing_changes: RefCell<Option<Vec<TextEdit>>>,
     /// A save of this version ended while a user action was open (see [`Document::mark_saved`]).
     saved_in_action: Cell<Option<u64>>,
     next_observer: Cell<u64>,
@@ -242,6 +253,7 @@ impl Document {
             saved_version: Cell::new(Some(0)),
             pending: RefCell::new(None),
             user_action_open: Cell::new(false),
+            closing_changes: RefCell::new(None),
             saved_in_action: Cell::new(None),
             next_observer: Cell::new(0),
             edit_observers: Observers::default(),
@@ -394,12 +406,19 @@ impl Document {
     /// Edits that are not the user's (`origin` other than `User`) are always an undo step of
     /// their own: a user action left open across main-loop iterations (Vim's insert mode keeps
     /// one for the whole insert session) is closed before them and opened again after them.
+    /// Closing it runs the `end-user-action` handlers, which may change the text the caller
+    /// computed `edits` against (live environment rename gives the partner the name typed so
+    /// far): the edits then move past those changes, as positions do (an edit that starts at or
+    /// after a change's end moves by its length difference), and are refused with
+    /// [`EditError::Conflict`] when a change replaced text inside one of them. The
+    /// [`Document::connect_before_apply`] observers see the edits as they are applied.
     ///
     /// A review gets all the changes at once when they are applied (`FileReview::on_edits`),
     /// and a closed document's text and line index are rebuilt once (see `apply_to_shadow`);
     /// the observers see each change as usual.
     ///
-    /// Nothing is applied when any edit does not fit the text or inserts U+0000.
+    /// Nothing is applied when any edit does not fit the text or inserts U+0000, or conflicts
+    /// with what closing the user action changed (that change stays).
     pub fn apply_edits(&self, edits: &[TextEdit], origin: Origin) -> Result<(), EditError> {
         if !edits.windows(2).all(|w| w[1].range.end <= w[0].range.start) {
             return Err(EditError::NotDescending);
@@ -408,18 +427,28 @@ impl Document {
         if edits.is_empty() {
             return Ok(());
         }
+        let buffer = self.buffer();
+        let closed = buffer
+            .as_ref()
+            .filter(|_| origin != Origin::User && self.user_action_open.get())
+            .map(|buffer| self.close_user_action(buffer));
+        let moved;
+        let edits = match &closed {
+            Some((_, changes)) if !changes.is_empty() => {
+                moved = move_past(edits, changes).map_err(EditError::Conflict)?;
+                self.check_edits(&moved)?;
+                &moved[..]
+            }
+            _ => edits,
+        };
         for f in self.apply_observers.snapshot() {
             f(self, edits, origin);
         }
         self.with_origin(origin, || {
             let review = ReviewEdits::begin(self);
-            match self.buffer() {
+            match &buffer {
                 Some(buffer) => {
-                    let split = origin != Origin::User && self.user_action_open.get();
-                    if split {
-                        buffer.end_user_action();
-                    }
-                    let _action = UserAction::begin(&buffer, split);
+                    let _action = UserAction::begin(buffer);
                     for edit in edits {
                         // Every change invalidates iters, so each one is looked up just before
                         // use.
@@ -445,6 +474,22 @@ impl Document {
             }
         });
         Ok(())
+    }
+
+    /// Ends the user action left open on `buffer` (see [`Document::apply_edits`]) and returns
+    /// what the `end-user-action` handlers changed meanwhile, in order (each change with the
+    /// offsets of its moment), with a guard that begins a user action again when dropped.
+    fn close_user_action(&self, buffer: &sourceview5::Buffer) -> (Reopen, Vec<TextEdit>) {
+        let outer = self.closing_changes.replace(Some(Vec::new()));
+        buffer.end_user_action();
+        let reopen = Reopen(buffer.clone());
+        let changes = self.closing_changes.replace(outer).unwrap_or_default();
+        // Closed while another apply_edits closes one (a handler's own edits): that one moves
+        // past these changes too.
+        if let Some(outer) = self.closing_changes.borrow_mut().as_mut() {
+            outer.extend_from_slice(&changes);
+        }
+        (reopen, changes)
     }
 
     /// Applies `edits` (checked, descending) to a closed document's shadow in one pass: the text
@@ -595,8 +640,9 @@ impl Document {
     }
 
     /// Calls `f(doc, edits, origin)` at the start of every [`Document::apply_edits`] that will
-    /// change the text (agent, review and reload edits all come this way), before anything is
-    /// applied: the snippet driver ends its sessions there.
+    /// change the text (agent, review and reload edits all come this way), before its edits are
+    /// applied and with them as they will be (after a user action left open was closed, see
+    /// there): the snippet driver ends its sessions there.
     pub fn connect_before_apply(
         &self,
         f: impl Fn(&Document, &[TextEdit], Origin) + 'static,
@@ -949,6 +995,9 @@ impl Document {
         if edit.range.is_empty() && edit.text.is_empty() {
             return;
         }
+        if let Some(changes) = self.closing_changes.borrow_mut().as_mut() {
+            changes.push(edit.clone());
+        }
         self.report_before(&edit);
         let mut index = self.line_index.borrow_mut();
         let delta = index.line_delta(&edit);
@@ -1064,27 +1113,53 @@ impl Drop for ReviewEdits<'_> {
     }
 }
 
-/// One user action on a buffer, ended when dropped (also on a panic). `reopen` begins another one
-/// afterwards, for a user action that was closed before this one began.
+/// One user action on a buffer, ended when dropped (also on a panic).
 struct UserAction<'a> {
     buffer: &'a sourceview5::Buffer,
-    reopen: bool,
 }
 
 impl<'a> UserAction<'a> {
-    fn begin(buffer: &'a sourceview5::Buffer, reopen: bool) -> Self {
+    fn begin(buffer: &'a sourceview5::Buffer) -> Self {
         buffer.begin_user_action();
-        Self { buffer, reopen }
+        Self { buffer }
     }
 }
 
 impl Drop for UserAction<'_> {
     fn drop(&mut self) {
         self.buffer.end_user_action();
-        if self.reopen {
-            self.buffer.begin_user_action();
+    }
+}
+
+/// A user action left open that [`Document::apply_edits`] closed before edits that are not the
+/// user's: another one begins when this is dropped (after the edits, after a refusal, or on a
+/// panic).
+struct Reopen(sourceview5::Buffer);
+
+impl Drop for Reopen {
+    fn drop(&mut self) {
+        self.0.begin_user_action();
+    }
+}
+
+/// `edits` (descending, with offsets in some text) moved past `changes` that were made to that
+/// text first, in order, each with the offsets of its moment: an edit that starts at or after
+/// a change's end moves by the change's length difference, one that ends at or before its
+/// start stays where it is. A change that replaced text inside an edit (or inserted text
+/// strictly inside it) makes `Err` of that edit, as given. The edits stay descending.
+fn move_past(edits: &[TextEdit], changes: &[TextEdit]) -> Result<Vec<TextEdit>, TextEdit> {
+    let mut moved = edits.to_vec();
+    for change in changes {
+        let (c, len) = (&change.range, change.text.len());
+        for (i, e) in moved.iter_mut().enumerate() {
+            if c.end <= e.range.start {
+                e.range = e.range.start - c.len() + len..e.range.end - c.len() + len;
+            } else if c.start < e.range.end {
+                return Err(edits[i].clone());
+            }
         }
     }
+    Ok(moved)
 }
 
 /// [`Lines`] over a buffer and its exact line index: line `i` is the text between GTK's line
@@ -1202,7 +1277,97 @@ pub fn language_for(path: &Path) -> Option<sourceview5::Language> {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_line_deltas;
+    use super::{compose_line_deltas, move_past};
+    use lemma_core::TextEdit;
+
+    /// Edits moved past earlier changes still change the text they were meant for. Random
+    /// texts, changes and descending edits, with every byte of the text tracked by an id: an edit
+    /// of a range is refused exactly when a change removed one of its bytes or put text between
+    /// two of them, and otherwise covers exactly its bytes; an insertion stays between the same
+    /// bytes of the first text; the edits stay descending.
+    #[test]
+    fn edits_move_past_earlier_changes() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..5000 {
+            let len = 1 + next(24);
+            let mut ids: Vec<usize> = (0..len).collect();
+            let mut fresh = len;
+            let mut changes = Vec::new();
+            for _ in 0..1 + next(3) {
+                let a = next(ids.len() + 1);
+                let b = a + next(ids.len() - a + 1);
+                let n = next(4);
+                if a == b && n == 0 {
+                    continue; // a document reports no empty change
+                }
+                ids.splice(a..b, fresh..fresh + n);
+                fresh += n;
+                changes.push(TextEdit {
+                    range: a..b,
+                    text: "c".repeat(n),
+                });
+            }
+            let mut edits = Vec::new();
+            let mut at = len;
+            for _ in 0..1 + next(4) {
+                let end = at - next(at + 1);
+                let start = end - next((end + 1).min(4));
+                edits.push(TextEdit {
+                    range: start..end,
+                    text: "e".into(),
+                });
+                at = start;
+            }
+            let mut want = Vec::new();
+            for edit in &edits {
+                let (s, t) = (edit.range.start, edit.range.end);
+                let got = move_past(std::slice::from_ref(edit), &changes);
+                if s < t {
+                    let first = ids.iter().position(|&id| id == s);
+                    let kept = first.filter(|&p| {
+                        ids.get(p..p + t - s) == Some(&(s..t).collect::<Vec<_>>()[..])
+                    });
+                    match kept {
+                        Some(p) => {
+                            assert_eq!(got.as_ref().map(|m| m[0].range.clone()), Ok(p..p + t - s))
+                        }
+                        None => assert_eq!(got, Err(edit.clone()), "{changes:?} {edit:?}"),
+                    }
+                } else if let Ok(moved) = &got {
+                    let q = moved[0].range.start;
+                    assert!(
+                        ids[..q].iter().all(|&id| id >= len || id < s),
+                        "{changes:?} {edit:?}"
+                    );
+                    assert!(
+                        ids[q..].iter().all(|&id| id >= len || id >= s),
+                        "{changes:?} {edit:?}"
+                    );
+                }
+                want.push(got);
+            }
+            // All at once: one of the edits refused on its own, or each moved as on its own.
+            let all = move_past(&edits, &changes);
+            let refused: Vec<&TextEdit> = want.iter().filter_map(|w| w.as_ref().err()).collect();
+            match all {
+                Err(e) => assert!(refused.contains(&&e), "{e:?} is one of {refused:?}"),
+                Ok(_) if !refused.is_empty() => panic!("{refused:?} are refused on their own"),
+                Ok(moved) => {
+                    let each: Vec<TextEdit> =
+                        want.into_iter().map(|w| w.unwrap().remove(0)).collect();
+                    assert_eq!(moved, each);
+                    assert!(moved.windows(2).all(|w| w[1].range.end <= w[0].range.start));
+                    assert!(moved.first().is_none_or(|e| e.range.end <= ids.len()));
+                }
+            }
+        }
+    }
 
     /// Composing the line changes of random splices gives one change that covers them all:
     /// the lines before its start and after its end are the same in the first and last text.

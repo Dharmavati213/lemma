@@ -1040,7 +1040,14 @@ they conflict with the sections above, this section wins.
     replacements are `Origin::User` edits (a review treats them as typing), unlike the Search
     page's Replace All, which is a named review turn; live environment rename stays out of them.
     A new query selects its first match only once the search's idle scan has counted the
-    matches, so typing the query never scans the file in one go (§3 rule 1).
+    matches, so typing the query never scans the file in one go (§3 rule 1). F3, Shift+F3 and
+    Enter before that count look for their match in the background (2026-10-25:
+    `forward_async`/`backward_async`, which wait for the idle scan to get there; a step that
+    scanned on the spot took up to 47 ms on `large.tex` and 8 ms on 10 000 lines when the only
+    match was near the end or there was none); the steps and Replaces asked for meanwhile
+    follow in order (a Replace replaces the match the steps before it selected), and an edit, a
+    new query or the end of the search drops them. Once counted, steps are synchronous as
+    before.
 - **Keys (§9.3):**
   - The key layer runs before VimIMContext (verified).
   - With Vim on and an editor focused, Ctrl+W, Ctrl+O and Ctrl+N (New File; Vim's next line) go
@@ -1219,6 +1226,16 @@ they conflict with the sections above, this section wins.
     environment rename's, keeps its own). Typing, undo and redo, and the find bar's Replace All
     (GtkSourceView's) still reach `on_edit` change by change. Nothing reads a review while a
     buffer signal runs.
+  - Measured 2026-10-25 (release, loaded machine; `gtk_search`
+    `perf_find_bar_replace_all_under_review_large_tex`): the find bar's Replace All of 20 000
+    matches on `large.tex` takes 3.0 s with 5000 hunks under review and 0.58 s without a
+    review. The review's part is `on_edit` of 40 000 user changes: 0.76 s without hunks (each
+    folds into the baseline, `String::replace_range`, O(file)) and 2.1 s with 5000 (the growth
+    of the hunks before each change is summed, and the hunks and intervals after it are moved:
+    O(hunks)). `on_edits` batches only Agent and Reload edits, so handing it these user edits at
+    once would give the same result at the same cost; a gain needs a batched path for user
+    edits in the review (the baseline rebuilt once, the hunks beyond each edit set aside), not
+    done.
   - A closed document's `apply_edits` builds the new text in one pass and its line index once,
     instead of per edit. Every change is still reported on its own (edit and change observers,
     the version, and the line delta, taken from the index before all the edits: each lies before
@@ -1234,6 +1251,18 @@ they conflict with the sections above, this section wins.
     a run of changes down the text (`apply_edits`) or up it (the find bar's Replace All, one
     delete and one insert per match) costs the lines in between. On `large.tex`, Replace All
     of 20 000 matches spent 0.24 s of its 0.92 s in line index updates, now 8 ms of 0.61 s.
+- **Edits that close an open user action (§10.3, 2026-10-25):** `Document::apply_edits` with
+  an origin other than `User` closes a user action left open (Vim's insert mode) before its
+  edits, which runs the `end-user-action` handlers; live environment rename's gives the partner
+  the name typed so far there, after the caller computed the edits against the text before.
+  The document records the changes made while the action closes (`close_user_action`) and
+  moves the edits past them as positions move (`move_past`: an edit at or after a change's end
+  by its length difference, one at or before its start not at all), so they replace what they
+  were computed for. When a change replaced or inserted text inside one of the edits, the call
+  fails with `EditError::Conflict` and applies none of them (the agent's tool reports it; the
+  handler's change stays). The action is opened again after the edits or the refusal. The
+  `connect_before_apply` observers run after the close and get the edits as applied. (Before,
+  the edits went in at the old offsets: one byte off after a star typed into `\begin{align}`.)
 - **Problems (§5, 2026-10-25):**
   - The Problems page builds a build's rows when it is shown, and lists at most
     `MAX_SECTION_ROWS` (500) of its problems, the most severe ones (errors, then warnings, then

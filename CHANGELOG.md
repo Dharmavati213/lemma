@@ -100,6 +100,11 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - The API backend appends each streamed piece of an answer or of its thinking in place instead
   of copying everything received so far, which made a long answer cost time quadratic in its
   length on the agent's thread (32,000 pieces: under 1 ms instead of 230 ms).
+- F3, Shift+F3 and Enter in the find bar right after a new query, while the search is still
+  counting its matches, no longer hold up the window until they find their match (up to 47 ms
+  in a 60 000-line file when the only match is near the end or there is none, 8 ms in 10 000
+  lines): the match is looked for in the background, and pressing the key several times still
+  goes on that many matches.
 - Of the last 64 tool calls, the editor keeps the first 2 KB of each reply instead of the whole
   reply (often a whole file), and forgets them when the agent stops.
 - A table in an agent's answer is no longer built again on every frame while it streams: only
@@ -154,6 +159,11 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - Keeping or rejecting one change no longer lets Keep Turn and Reject Turn decide the change
   after it as the turn's alone when what the turn changed there is not known exactly (another
   edit cut into it): they leave it to be decided by hand, as before the first decision.
+- An agent edit (or a Reject, a reformat) could change the wrong text when it came while Vim's
+  insert mode was on and the `\end` of an environment whose `\begin` name was just typed had
+  not followed yet: the rename went first, and the edit landed as many bytes off as the name
+  grew or shrank. The edit now lands where it was meant; one that changes that very name is
+  refused, and the agent is told that the text changed.
 - An agent edit that only inserts or only deletes text could crash Lemma when a non-ASCII
   character (é, ∑, …) sat 256 bytes before it.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive

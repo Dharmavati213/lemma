@@ -231,6 +231,13 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `tests/review.rs` `undo_and_redo_of_an_agent_action_beyond_the_record_cap` and `gtk_review`
   `undo_and_redo_of_a_large_agent_edit_keep_it_under_review` (real `undo` and `redo` of the
   buffer).
+- Edits that close an open user action move past what its `end-user-action` handlers changed:
+  `document::tests::edits_move_past_earlier_changes` (random texts, changes and edits, each
+  byte tracked by an id: a moved edit covers the same bytes, or is refused exactly when a change
+  went inside it), `gtk_document` `edits_move_past_what_closing_the_user_action_changed` (a
+  handler's change, the observers, the review, the refusal, the action open again) and
+  `gtk_envtools` `agent_edits_while_a_rename_waits_land_where_meant` (live rename's partner,
+  inside a user action left open as Vim's insert mode does).
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -272,13 +279,14 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `usage_errors_and_help` run the binary. The command line's parsing (with files on disk) and
   the sweep of old session files are unit tests in `cli.rs` and `session.rs`.
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
-  `find_bar_*` tests (counts and wrapping, the options and invalid expressions, the actions
-  following the focus and Vim, the prefill and the query a match keeps, Replace and Replace All
-  as one undo step, replacements as user edits under review and without live environment rename,
-  tab switches and closing tabs and windows freeing the search), and its keys on real key events
-  in `gtk_shell_m3` (Ctrl+F shared with the PDF's search, Vim's Ctrl+F and Ctrl+H, the Search
-  page's own Ctrl+H). `LEMMA_TEST_SNAPSHOTS` adds `find-bar.png` and `find-bar-narrow.png` (the
-  rows wrapped).
+  `find_bar_*` tests (counts and wrapping, the options and invalid expressions, steps before
+  the search has counted looked for in the background, the steps and Replaces after them
+  following in order, the actions following the focus and Vim, the prefill and the query a
+  match keeps, Replace and Replace All as one undo step, replacements as user edits under
+  review and without live environment rename, tab switches and closing tabs and windows freeing
+  the search), and its keys on real key events in `gtk_shell_m3` (Ctrl+F shared with the PDF's
+  search, Vim's Ctrl+F and Ctrl+H, the Search page's own Ctrl+H). `LEMMA_TEST_SNAPSHOTS` adds
+  `find-bar.png` and `find-bar-narrow.png` (the rows wrapped).
 - **Go to Line, New File and Save As:** `gtk_palette`'s `quick_open_goes_to_lines` (`:N`,
   `:N:C`, `file:N`, the clamping, Back) and its real keys (Ctrl+G, the digits typed after the
   `:`, Ctrl+N in a picker is its Down); `gtk_window`'s `new_file_*` and `save_as_*` tests, with
@@ -332,6 +340,8 @@ check the budgets only in release builds:
 | `gtk_git_gutter` `perf_git_gutter_keystrokes_large_tex` | the git gutter's main-thread cost per keystroke on `large.tex` (with against without the gutter) and per diff |
 | `gtk_search` `perf_search_10k_frame_budget` | the Search page's work per main-loop step while 10 000 matches stream in ≤ 4 ms |
 | `gtk_search` `perf_find_bar_replace_all_large_tex` | the find bar's Replace All of 20 000 matches on `large.tex`, and what the same line index updates take alone (printed) |
+| `gtk_search` `perf_find_bar_replace_all_under_review_large_tex` | the same Replace All with 5000 hunks under review and without a review, and the recompute after it (printed) |
+| `gtk_search` `perf_find_bar_step_before_the_scan_large_tex` | F3, Shift+F3 and Enter right after a new query, before the search has counted, on `large.tex` and its first 10 000 lines: the key's own work ≤ 2 ms on 10 000 lines; prints the longest main-loop step until the match and the key once counted |
 | `lemma-review` `perf_unaccept_accept_all` | Alt+U of an Accept all of 5000 hunks ≤ 100 ms |
 | `lemma-review` `perf_on_edits_replace_all` | a replace_all fed to a review at once (`on_edits`): 20 000 matches ≤ 0.5 s and linear (≤ 6× the time of 10 000); 20 000 over 5000 hunks, or right after accepting or rejecting them, ≤ 0.5 s |
 | `lemma-review` `perf_undo_and_redo_of_a_replace_all` | the buffer's undo and redo of a replace_all of 5000 matches in an open buffer (10 000 changes, each recognized by its record), with their recomputes: ≤ 1 s each, every hunk back (measured 0.14 s and 0.21 s) |

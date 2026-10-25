@@ -31,6 +31,10 @@ fn main() -> ExitCode {
     common::run(&[
         ("live_rename_is_one_undo_step", live_rename),
         ("live_rename_ends_outside_the_name", live_rename_ends),
+        (
+            "agent_edits_while_a_rename_waits_land_where_meant",
+            agent_edits_during_live_rename,
+        ),
         ("change_environment_popover", change_environment),
         ("toggle_star_and_delete_environment", star_and_delete),
         ("align_insert_row_add_column", align_actions),
@@ -290,6 +294,73 @@ fn live_rename_ends() {
     common::pump_for(Duration::from_millis(30));
     assert!(doc.text().contains("\\end{proofsy}"));
     assert!(doc.text().contains("\\begin{proofs x}"));
+}
+
+/// Agent edits that arrive while the user action stays open (Vim's insert mode keeps one) and
+/// the partner still waits for its rename (from an idle): closing the action renames the
+/// partner first, and the edits, computed against the text before, still change what the agent
+/// meant, after the partner as before it. An edit that the rename overlaps is refused, and the
+/// user action is open again either way.
+fn agent_edits_during_live_rename() {
+    let text = format!("{ALIGN_DOC}Tail.\n");
+    let f = fixture("live-rename-agent", &text, None);
+    let editor = f.open();
+    let doc = editor.document().clone();
+    let buffer = editor.buffer();
+    let agent = Origin::Agent { call: 1 };
+    // Typing a star into the `\begin` name inside one open user action, as Vim's insert mode.
+    buffer.begin_user_action();
+    assert!(editor.place_cursor_at(offset_of(&editor, "{align}", 6)));
+    buffer.insert_interactive_at_cursor("*", true);
+    assert!(envtools::linked(&editor).is_some_and(|l| l.dirty));
+    assert!(doc.text().contains("\\end{align}\n"), "the idle renames it");
+    let (tail, class) = (
+        offset_of(&editor, "Tail.", 0),
+        offset_of(&editor, "article", 0),
+    );
+    doc.apply_edits(
+        &[
+            TextEdit {
+                range: tail..tail + 4,
+                text: "End".into(),
+            },
+            TextEdit {
+                range: class..class + "article".len(),
+                text: "amsart".into(),
+            },
+        ],
+        agent,
+    )
+    .unwrap();
+    let want = format!(
+        "{}End.\n",
+        ALIGN_DOC
+            .replace("{align}", "{align*}")
+            .replace("{article}", "{amsart}")
+    );
+    assert_eq!(doc.text(), want);
+    // The rename again (once the agent's edits are no longer the latest), then an agent edit
+    // of the whole `\end{align*}`.
+    common::pump_for(Duration::from_millis(30));
+    buffer.insert_interactive_at_cursor("*", true);
+    assert!(envtools::linked(&editor).is_some_and(|l| l.dirty));
+    let end = offset_of(&editor, "\\end{align*}", 0);
+    let refused = doc.apply_edits(
+        &[TextEdit {
+            range: end..end + "\\end{align*}".len(),
+            text: "\\end{gather}".into(),
+        }],
+        agent,
+    );
+    assert!(
+        matches!(refused, Err(lemma_app::document::EditError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(doc.text(), want.replace("{align*}", "{align**}"));
+    // Balanced: the user action is open again (GTK would log a critical otherwise).
+    buffer.end_user_action();
+    common::pump_for(Duration::from_millis(30));
+    assert_eq!(doc.text(), want.replace("{align*}", "{align**}"));
 }
 
 fn change_environment() {
