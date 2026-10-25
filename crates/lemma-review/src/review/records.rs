@@ -16,11 +16,17 @@
 //! records come right after it.
 //!
 //! The records of the newest decision (a Reject all) and the agent edits of the newest turn (a
-//! replace_all and the edits around it) are all kept (up to [`MAX_TURN_RECORDS`] of the turn's),
-//! so that the whole decision or turn is recognized when it is undone and redone; older ones are
-//! dropped beyond a cap. An edit only meets the records next to it, so the ranges are kept in a
-//! [`Points`] index: an edit costs the records it meets (and those between it and the edit
-//! before), not every record.
+//! replace_all and the edits around it) are all kept (up to [`MAX_TURN_RECORDS`] of the turn's,
+//! taking at most [`MAX_RECORD_BYTES`]), so that the whole decision or turn is recognized when it
+//! is undone and redone; older ones are dropped beyond a cap of records and of bytes. An edit
+//! only meets the records next to it, so the ranges are kept in a [`Points`] index: an edit costs
+//! the records it meets (and those between it and the edit before), not every record.
+//!
+//! Only a buffer's undo and redo take up an agent edit's record, and they reach only the edits
+//! made in that buffer: a closed document's text goes into a new buffer as not undoable. So while
+//! the text is in no buffer ([`Records::set_closed`]) agent edits are not recorded, and the
+//! records only undo and redo use are dropped whenever the text goes into a buffer or out of it.
+//! A reject's record stays: Alt+U takes it up again with an `Origin::Review` edit, buffer or not.
 //!
 //! Recognition is best effort: an edit it misses is classified by the Inside rule like any other
 //! History edit.
@@ -32,21 +38,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 /// Top-level records kept at most (oldest dropped first). The rejects of the newest decision and
-/// the agent edits of the newest turn are never dropped, however many there are (see
-/// [`Records::begin_decision`] and [`Records::push_agent`]).
+/// the agent edits of the newest turn are not dropped by it, however many there are (see
+/// [`Records::begin_decision`], and [`Records::push_agent`] for the turn's own bounds).
 const MAX_RECORDS: usize = 512;
 /// Records dropped at once when the list is full, so that a long run of agent edits (a
 /// replace_all) does not shift the whole list for every one of them.
 const DROP_AT_ONCE: usize = MAX_RECORDS / 8;
 /// Agent records of the newest turn kept at most whatever the cap (its last ones): a few hundred
 /// bytes each, so that a replace_all of every space in a big file does not take hundreds of
-/// megabytes. That is 16 384 matches in an open buffer (a deletion and an insertion each), 32 768
-/// in a closed document.
+/// megabytes. That is 16 384 matches in an open buffer (a deletion and an insertion each).
 const MAX_TURN_RECORDS: u64 = 1 << 15;
+/// What the top-level records take at most, about (see [`Record::cost`]): beyond, the oldest are
+/// dropped as beyond [`MAX_RECORDS`], and the newest turn's agent records are kept whatever the
+/// caps only while they take less. [`MAX_TURN_RECORDS`] small records fit (about 14 MB), 32 of
+/// the largest an open buffer records ([`MAX_AGENT_RECORD_BYTES`]). The newest decision's rejects
+/// are kept beyond it: they are as many as the hunks it decided, and hold their texts.
+const MAX_RECORD_BYTES: usize = 16 << 20;
+/// What a record takes besides its texts, about: the record itself, its entries in the list and
+/// in [`Points`], and the allocations of its texts.
+const RECORD_OVERHEAD: usize = 400;
 
 /// Agent edits whose texts are larger than this (before plus after) are not recorded: a record
 /// holds copies of them, and undoing such an edit is still classified by the Inside rule.
 const MAX_AGENT_RECORD_BYTES: usize = 256 * 1024;
+
+/// What a record with these texts (the range's now, before and after the edit) takes, about:
+/// the texts and [`RECORD_OVERHEAD`]. The records it keeps are not counted.
+fn cost(texts: [&str; 3]) -> usize {
+    RECORD_OVERHEAD + texts.iter().map(|t| t.len()).sum::<usize>()
+}
 
 /// What a record is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +153,29 @@ struct Record {
 }
 
 impl Record {
+    /// What the record takes, about ([`cost`]). Only an edit it meets changes its text, while it
+    /// is out of the list, so it is the same when it leaves the list as when it went in.
+    fn cost(&self) -> usize {
+        cost([&self.content, &self.before, &self.after])
+    }
+
+    /// Whether the record is of use without a buffer: a reject that Alt+U can take up again (or
+    /// whose edit is about to be applied). Only the buffer's undo and redo take up the others.
+    fn outlives_buffer(&self) -> bool {
+        matches!(self.kind, Kind::Reject(_)) && self.state != State::Undone
+    }
+
+    /// Drops the records kept in this one that only the buffer's undo and redo would bring
+    /// back: those an undo cut (its redo restores them), and those of no use without a buffer
+    /// that this edit cut (its undo, which Alt+U is for a reject, restores them).
+    fn keep_what_outlives_buffer(&mut self) {
+        self.cut_backward.clear();
+        self.cut_forward.retain(Record::outlives_buffer);
+        for kept in &mut self.cut_forward {
+            kept.keep_what_outlives_buffer();
+        }
+    }
+
     fn step(&self) -> Step {
         match self.state {
             State::Applying => Step::Apply,
@@ -242,9 +285,44 @@ pub(super) struct Records {
     /// Records the last completed step brought back, to be checked against the text (see
     /// [`retain_restored`](Self::retain_restored)).
     restored: Vec<u64>,
+    /// The text is in no buffer: only records of use without one are kept (see
+    /// [`set_closed`](Self::set_closed)).
+    closed: bool,
+    /// What the records in `list` take ([`Record::cost`]).
+    bytes: usize,
+    /// What the newest turn's agent records in `list` (from `turn_from` on) take of it.
+    turn_bytes: usize,
 }
 
 impl Records {
+    /// The text went out of every buffer (`closed`), or into a new one, whose undo history starts
+    /// empty: no buffer undo or redo can reach the edits recorded so far, so the records only
+    /// they take up go (those of agent edits, and of rejects undone since). While the text is in
+    /// no buffer, agent edits are not recorded, and a reject's record goes once Alt+U undid it.
+    /// The other rejects' records stay, for Alt+U.
+    pub fn set_closed(&mut self, closed: bool) {
+        if closed == self.closed {
+            return;
+        }
+        self.closed = closed;
+        let gone: Vec<u64> = self
+            .list
+            .iter()
+            .filter(|(_, r)| !r.outlives_buffer())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in gone {
+            self.forget(id);
+        }
+        for r in self.list.values_mut() {
+            r.keep_what_outlives_buffer();
+        }
+        self.redoing = false;
+        self.restored.clear();
+        // The next agent edit starts the newest turn's records again.
+        self.turn = None;
+    }
+
     /// A decision starts: the reject records pushed from now on (until the next decision starts)
     /// are kept whatever the cap.
     pub fn begin_decision(&mut self) {
@@ -270,6 +348,7 @@ impl Records {
             .collect();
         self.droppable.extend(older);
         self.turn_from = self.next_id;
+        self.turn_bytes = 0;
         self.turn = Some(turn);
     }
 
@@ -291,16 +370,24 @@ impl Records {
         for r in &context.cut {
             self.forget(r.id);
         }
+        if self.closed {
+            // No buffer can undo it (see `set_closed`).
+            return;
+        }
         if self.turn != Some(turn) {
             self.begin_turn(turn);
         }
-        if self.next_id - self.turn_from >= MAX_TURN_RECORDS {
-            // A huge turn keeps its last records only.
-            if self
-                .list
-                .get(&self.turn_from)
-                .is_some_and(|r| r.kind == Kind::Agent)
+        // A huge turn keeps its last records only: at most MAX_TURN_RECORDS of them, taking at
+        // most MAX_RECORD_BYTES.
+        let cost = cost([&after, &before, &after]);
+        while self.turn_from < self.next_id
+            && (self.next_id - self.turn_from >= MAX_TURN_RECORDS
+                || self.turn_bytes + cost > MAX_RECORD_BYTES)
+        {
+            if let Some(r) = self.list.get(&self.turn_from)
+                && r.kind == Kind::Agent
             {
+                self.turn_bytes -= r.cost();
                 self.droppable.insert(self.turn_from);
             }
             self.turn_from += 1;
@@ -372,6 +459,14 @@ impl Records {
                 self.forget(id);
             }
         }
+        // And beyond the bytes, as many as it takes.
+        let cost = cost([&content, &before, &after]);
+        while self.bytes + cost > MAX_RECORD_BYTES {
+            let Some(id) = self.droppable.pop_first() else {
+                break;
+            };
+            self.forget(id);
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.attach(Box::new(Record {
@@ -392,8 +487,12 @@ impl Records {
         id
     }
 
-    /// Puts `record` into the list at its `range`.
+    /// Puts `record` into the list at its `range`. Without a buffer, a record of no use without
+    /// one (a reject Alt+U just undid) is dropped instead.
     fn attach(&mut self, record: Box<Record>) {
+        if self.closed && !record.outlives_buffer() {
+            return;
+        }
         let id = record.id;
         debug_assert!(!self.list.contains_key(&id), "record {id} is kept twice");
         self.points.insert(id, &record.range);
@@ -407,6 +506,11 @@ impl Records {
         if !kept {
             self.droppable.insert(id);
         }
+        let cost = record.cost();
+        self.bytes += cost;
+        if record.kind == Kind::Agent && kept {
+            self.turn_bytes += cost;
+        }
         self.list.insert(id, record);
     }
 
@@ -418,6 +522,11 @@ impl Records {
         }
         self.undone.remove(&id);
         self.droppable.remove(&id);
+        let cost = record.cost();
+        self.bytes -= cost;
+        if record.kind == Kind::Agent && id >= self.turn_from {
+            self.turn_bytes -= cost;
+        }
         Some(record)
     }
 
@@ -615,6 +724,26 @@ impl Records {
         self.droppable.clear();
         self.undone.clear();
         self.restored.clear();
+        self.bytes = 0;
+        self.turn_bytes = 0;
+    }
+
+    /// How many records are kept and what they take, about ([`Record::cost`]).
+    pub fn held(&self) -> (usize, usize) {
+        (self.list.len(), self.bytes)
+    }
+
+    /// Panics when what the records are said to take is not what they take.
+    #[cfg(test)]
+    pub fn check_costs(&self) {
+        let bytes: usize = self.list.values().map(|r| r.cost()).sum();
+        let turn: usize = self
+            .list
+            .range(self.turn_from..)
+            .filter(|(_, r)| r.kind == Kind::Agent)
+            .map(|(_, r)| r.cost())
+            .sum();
+        assert_eq!((self.bytes, self.turn_bytes), (bytes, turn), "record bytes");
     }
 
     /// The edits re-applying the proposals of these reject records (Alt+U), descending. Records
@@ -821,7 +950,10 @@ impl Points {
 
 #[cfg(test)]
 mod tests {
-    use super::{Context, Kind, MAX_TURN_RECORDS, Points, Records, Reopen};
+    use super::{
+        Context, Kind, MAX_RECORD_BYTES, MAX_TURN_RECORDS, Points, Records, Reopen, Step, cost,
+    };
+    use lemma_core::Origin;
     use std::collections::BTreeSet;
 
     /// How many agent records are kept.
@@ -872,6 +1004,77 @@ mod tests {
         }
         assert!(rejects.iter().all(|&id| records.contains(id)));
         assert_eq!(agent_records(&records), turn - 20 * 64 + 20);
+    }
+
+    /// The records take about `MAX_RECORD_BYTES` at most: a turn of large agent edits keeps its
+    /// last ones that fit, and older records go to make room, though fewer than `MAX_RECORDS`.
+    #[test]
+    fn records_take_at_most_the_bytes() {
+        let mut records = Records::default();
+        for i in 0..100 {
+            agent(&mut records, i, 1);
+        }
+        let large = "a".repeat(128 << 10);
+        let first = records.next_id;
+        for i in 0..200 {
+            let at = 1_000_000 + i * (large.len() + 1);
+            records.push_agent(
+                at..at + large.len(),
+                String::new(),
+                large.clone(),
+                Context::default(),
+                2,
+            );
+            records.check_costs();
+        }
+        let fit = MAX_RECORD_BYTES / cost([&large, "", &large]);
+        let (kept, bytes) = records.held();
+        assert!(bytes <= MAX_RECORD_BYTES, "{bytes} bytes");
+        assert_eq!((kept, agent_records(&records)), (fit, fit));
+        assert!((first + 200 - fit as u64..first + 200).all(|id| records.contains(id)));
+    }
+
+    /// Without a buffer, only the rejects' records stay: an agent edit is not recorded, the
+    /// records of earlier ones go (those a reject cut too), and a reject's goes once Alt+U
+    /// undid it. In a buffer again, agent edits are recorded again.
+    #[test]
+    fn without_a_buffer_only_rejects_are_kept() {
+        let mut records = Records::default();
+        let reopen = Reopen {
+            pair: 0,
+            occurrence: 0,
+            user_touched: false,
+        };
+        // An agent insertion inside a proposal that a reject takes back, which cuts its record.
+        records.push_agent(10..11, String::new(), "a".into(), Context::default(), 1);
+        records.begin_decision();
+        let (proposal, restored) = ("0123456789abcde", "xy");
+        let reject = records.push_reject(5..20, proposal.into(), restored.into(), reopen);
+        let (claim, _) = records.observe(5, 20, restored, Origin::Review, true);
+        assert!(claim.is_some_and(|c| c.done && c.step == Step::Apply));
+        assert_eq!(records.list[&reject].cut_forward.len(), 1);
+        records.push_agent(30..31, String::new(), "b".into(), Context::default(), 1);
+        assert_eq!(records.held().0, 2);
+
+        records.set_closed(true);
+        records.check_costs();
+        assert_eq!(records.list.keys().copied().collect::<Vec<_>>(), [reject]);
+        assert!(records.list[&reject].cut_forward.is_empty());
+        records.push_agent(40..41, String::new(), "c".into(), Context::default(), 1);
+        assert_eq!(records.held().0, 1, "agent edits are not recorded");
+        // Alt+U re-applies the proposal and undoes the reject: nothing can redo it now.
+        let current = format!("{}{restored}{}", "_".repeat(5), "_".repeat(30));
+        let edits = records.reapply_edits(&[reject], &current);
+        assert_eq!(edits.len(), 1);
+        let e = &edits[0];
+        let (claim, _) = records.observe(e.range.start, e.range.end, &e.text, Origin::Review, true);
+        assert!(claim.is_some_and(|c| c.done && c.step == Step::Undo));
+        records.check_costs();
+        assert_eq!(records.held(), (0, 0));
+
+        records.set_closed(false);
+        records.push_agent(50..51, String::new(), "d".into(), Context::default(), 1);
+        assert_eq!(agent_records(&records), 1);
     }
 
     /// Renumbering the turns (a review restored from an earlier session moves the session's

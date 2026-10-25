@@ -44,6 +44,10 @@ fn main() -> ExitCode {
             "undo_and_redo_of_a_large_agent_edit_keep_it_under_review",
             undo_redo_large_agent_edit,
         ),
+        (
+            "closed_documents_keep_only_the_records_of_rejects",
+            closed_documents_records,
+        ),
         ("alt_u_reverts_accept_and_reject", review_undo),
         ("navigation_wraps_across_files", navigation),
         ("decisions_advance_to_the_next_hunk", auto_advance),
@@ -457,6 +461,65 @@ fn undo_redo_large_agent_edit() {
         "hunks after the redo, and agent changes in the baseline"
     );
     assert_eq!(f.ids("main.tex"), ids, "every hunk comes back with its id");
+}
+
+/// The agent's replace_all of 600 matches in each of three closed files and an open one. The
+/// closed files' reviews keep no record of the agent's changes, which no buffer undo can reach
+/// (a closed document opens as not undoable), and closing the open file's tab drops the records
+/// of its buffer's. Rejecting every file records the rejects, and Alt+U takes them back in every
+/// file, each hunk with its id, on disk too; the rejects' records go then.
+fn closed_documents_records() {
+    let original: String = (0..600)
+        .map(|i| format!("Line {i} uses \\R here.\nPlain line {i}.\n"))
+        .collect();
+    let names = ["a.tex", "b.tex", "c.tex", "open.tex"];
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (*n, original.as_str())).collect();
+    let f = fixture("closed-records", &files);
+    let editor = f.open("open.tex");
+    let held = |file: &str| {
+        let doc = f.doc(file);
+        let review = doc.review.borrow();
+        review.as_ref().expect("under review").held_records()
+    };
+    for file in names {
+        let reply = f.agent(
+            1,
+            EditorRequest::Edit {
+                path: file.into(),
+                old_string: "\\R".into(),
+                new_string: "\\mathbb{R}".into(),
+                replace_all: true,
+            },
+        );
+        assert!(!reply.is_error, "edit failed: {}", reply_text(&reply));
+        assert_eq!(f.hunks(file).len(), 600, "{file}");
+    }
+    for file in &names[..3] {
+        assert!(!f.doc(file).is_open());
+        assert_eq!(held(file), (0, 0), "{file}");
+    }
+    assert!(held("open.tex").0 >= 600, "{:?}", held("open.tex"));
+    f.state.close_editor(&editor, false);
+    drop(editor);
+    common::pump_until(TIMEOUT, || !f.doc("open.tex").is_open());
+    assert_eq!(f.hunks("open.tex").len(), 600);
+    assert_eq!(held("open.tex"), (0, 0), "the closed tab's records");
+
+    let ids: Vec<Vec<HunkId>> = names.iter().map(|n| f.ids(n)).collect();
+    let proposal = f.doc("a.tex").text();
+    f.action("review-reject-all");
+    for file in names {
+        f.wait_saved(file);
+        assert_eq!(f.disk(file), original, "{file}");
+        assert_eq!(held(file).0, 600, "{file}: the rejects' records");
+    }
+    f.action("review-undo");
+    for (file, ids) in names.iter().zip(&ids) {
+        assert_eq!(f.ids(file), *ids, "{file}: Alt+U brings every hunk back");
+        f.wait_saved(file);
+        assert_eq!(f.disk(file), proposal, "{file}");
+        assert_eq!(held(file), (0, 0), "{file}");
+    }
 }
 
 fn review_undo() {

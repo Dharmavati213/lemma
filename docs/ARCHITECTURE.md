@@ -1258,6 +1258,25 @@ they conflict with the sections above, this section wins.
     the baseline). A per-action log of the agent's changes, recognizing them where no record
     does, was the alternative; the records also bring back the turns, segments and records
     that an undo or a redo restores, and now cost O(log records) an edit.
+  - Records without a buffer (2026-10-25): only the buffer's undo and redo take up an agent
+    edit's record, or a reject's once it is undone, and they reach only the edits made in that
+    buffer (a closed document's text goes into a new buffer as not undoable). So
+    `FileReview::set_in_buffer(false)` (a closed document: `review_ui::start_review` and
+    `adopt_review` tell a new review, `Document::close_buffer` and `open_in_buffer` a change)
+    drops those records, with the ones kept in them, and while the text is in no buffer agent
+    edits are not recorded and a reject's record goes once Alt+U undid it. What stays is what
+    Alt+U takes up without a buffer: the records of rejects not undone (Reject, Reject all,
+    Reject Turn; the turns and segments parked under them), and the rejects they cut. Measured
+    with a counting allocator (release): the review of a closed document after a replace_all
+    of 600 matches takes 342 KB instead of 600 KB (430 bytes a match; Replace in Project over
+    50 such files: 17 MB instead of 30 MB), of 20 000 matches 11.5 MB instead of 20.1 MB; an
+    open document's of 600 matches takes 846 KB, now 340 KB once its tab closes.
+  - The records take at most about `MAX_RECORD_BYTES` (16 MiB; their texts and 400 bytes
+    each): beyond it the oldest go, as beyond the cap of 512, and the newest turn's agent
+    records are kept beyond the cap only that far, so `MAX_TURN_RECORDS` small ones (about
+    14 MB) but 32 of the largest (`MAX_AGENT_RECORD_BYTES`). The newest decision's rejects are
+    kept beyond it (as many as the hunks it decided, with their texts). 200 replacements of
+    100 KiB blocks in an open buffer: the review took 185 MB, 60 MB of it records, now 140 MB.
   - Still O(edits × hunks): Review and History edits (a Reject all and its Alt+U, the buffer's
     undo and redo) reach `on_edit` one by one, each moving the hunks, segments and attribution
     after it, as typing does. Where they go down the text, each new hunk goes in front of the
@@ -1391,6 +1410,10 @@ they conflict with the sections above, this section wins.
     opened with `open_file`, the others with `WindowState::open_file_in_background` (a tab that
     is not selected, focused or drawn); a document with a line gets its cursor there, which the
     session restore then leaves alone (`session::keep_position`). The desktop entry passes `%F`.
+    A tab saved before it was ever drawn keeps the first line its last session had only while
+    its cursor is still on that session's line and the command line did not put it there;
+    otherwise its first line is the cursor's, so a background `+LINE` tab is restored showing
+    its line (it kept the old session's scroll, also when that did not show the same line).
   - The session restore opens its tabs in the background too, the saved active tab first (in a
     window without tabs the first tab opened is the one shown), so a tab not shown runs nothing
     that waits for its first frame (spell checking, completion's popup; §7) and the focus stays

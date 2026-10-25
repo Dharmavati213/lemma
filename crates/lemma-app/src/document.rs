@@ -833,8 +833,10 @@ impl Document {
     }
 
     /// Shows a closed document in `buffer`: the buffer gets the shadow text (not undoable, not
-    /// reported as a change) and becomes the document's text. Does nothing if already open, or
-    /// if the text contains U+0000, which a buffer cannot hold (the document stays closed).
+    /// reported as a change) and becomes the document's text, and the review learns that buffer
+    /// undo can reach the edits from now on (`FileReview::set_in_buffer`). Does nothing if
+    /// already open, or if the text contains U+0000, which a buffer cannot hold (the document
+    /// stays closed).
     pub fn open_in_buffer(self: &Rc<Self>, buffer: &sourceview5::Buffer) {
         let dirty = self.is_dirty();
         {
@@ -857,10 +859,14 @@ impl Document {
         });
         self.connect_buffer(buffer);
         self.start_line_states();
+        if let Some(review) = self.review.borrow_mut().as_mut() {
+            review.set_in_buffer(true);
+        }
     }
 
     /// Stops using the buffer (its editor is closing) and keeps the current text as the shadow.
     /// Unsaved buffer changes stay in the shadow; save or reload first if that is not wanted.
+    /// The review drops what only the buffer's undo would have used (`FileReview::set_in_buffer`).
     pub fn close_buffer(&self) {
         let Some(buffer) = self.buffer() else {
             return;
@@ -878,6 +884,9 @@ impl Document {
         self.saved_version
             .set((!buffer.is_modified() || saved_in_action).then_some(self.version.get()));
         self.kind.replace(DocKind::Closed { shadow });
+        if let Some(review) = self.review.borrow_mut().as_mut() {
+            review.set_in_buffer(false);
+        }
     }
 
     /// Records that the file holds the text of `version`: a closed document remembers it, an open

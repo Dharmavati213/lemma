@@ -237,6 +237,14 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `tests/review.rs` `undo_and_redo_of_an_agent_action_beyond_the_record_cap` and `gtk_review`
   `undo_and_redo_of_a_large_agent_edit_keep_it_under_review` (real `undo` and `redo` of the
   buffer).
+- The records kept without a buffer and their bytes: `review::records::tests`
+  (`without_a_buffer_only_rejects_are_kept`, `records_take_at_most_the_bytes`), the random
+  sessions of `review::tests::model_stays_exact`, which take the text out of its buffer and back
+  (`set_in_buffer`; `check_records` also checks what the records are said to take),
+  `tests/review.rs` `a_review_in_no_buffer_records_only_rejects` (Alt+U of a Reject all and of
+  a Reject Turn) and `closing_keeps_the_records_alt_u_takes_up`, and `gtk_review`
+  `closed_documents_keep_only_the_records_of_rejects` (replace_all of 600 matches in closed
+  files and a closed tab keep no agent records; Reject all and Alt+U across closed files).
 - Edits that close an open user action move past what its `end-user-action` handlers changed:
   `document::tests::edits_move_past_earlier_changes` (random texts, changes and edits, each
   byte tracked by an id: a moved edit covers the same bytes, or is refused exactly when a change
@@ -278,12 +286,13 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
 - **Start-up and sessions:** `gtk_session`'s `session_restores_tabs_in_the_background` (no tab
   but the shown one is selected, focused or spell-checked during a restore),
   `startup_opens_several_files_and_a_line` (`app::open_documents`: the first FILE shown, the
-  others behind it, `+LINE` and `FILE:LINE:COLUMN` winning over the session's place, the root
-  kept when the first does not open), `startup_shows_a_blank_page_while_opening`,
-  `session_panes_before_the_first_frame` and `session_remembers_the_window_size` (`last.json`'s
-  window size, maximized under Broadway too); `gtk_app`'s `several_files_and_lines` and
-  `usage_errors_and_help` run the binary. The command line's parsing (with files on disk) and
-  the sweep of old session files are unit tests in `cli.rs` and `session.rs`.
+  others behind it, `+LINE` and `FILE:LINE:COLUMN` winning over the session's place, also in
+  the session saved before such a tab is shown, the root kept when the first does not open),
+  `startup_shows_a_blank_page_while_opening`, `session_panes_before_the_first_frame` and
+  `session_remembers_the_window_size` (`last.json`'s window size, maximized under Broadway
+  too); `gtk_app`'s `several_files_and_lines` and `usage_errors_and_help` run the binary. The
+  command line's parsing (with files on disk) and the sweep of old session files are unit
+  tests in `cli.rs` and `session.rs`.
 - **Recovery of unsaved changes** (`recovery.rs`): unit tests for the file format, the
   decision on a file found when a document opens, the bar's texts, the copy delays, the writer
   (the newest operation per file wins, the process's lock), a running writer told by its lock,

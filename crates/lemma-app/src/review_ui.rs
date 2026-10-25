@@ -168,6 +168,7 @@ pub fn start_review(doc: &DocRef, new_file: bool) {
         new_file |= saved_new_file;
         // Its agent edits belong to the window's current turn.
         review.set_turn(current_turn_of(doc));
+        review.set_in_buffer(doc.is_open());
         doc.review.replace(Some(review));
     }
     let known = with_tracked(doc, |t| t.new_file |= new_file).is_some();
@@ -189,6 +190,7 @@ pub fn start_review(doc: &DocRef, new_file: bool) {
 /// recomputed after changes.
 pub fn adopt_review(doc: &DocRef, mut review: FileReview) {
     review.set_turn(current_turn_of(doc));
+    review.set_in_buffer(doc.is_open());
     doc.review.replace(Some(review));
     start_review(doc, false);
     recompute(doc);

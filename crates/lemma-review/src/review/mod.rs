@@ -224,6 +224,24 @@ impl FileReview {
         self.attr_turn
     }
 
+    /// Tells the review whether its text is in an editor's buffer (true, the default) or in no
+    /// buffer (a closed document). Buffer undo and redo (`Origin::History`) reach only the edits
+    /// made in their buffer, and a closed document's text goes into a new buffer as not
+    /// undoable: so each change drops the records of Lemma's own edits that only they would take
+    /// up (an agent edit's, a reject's once undone), and while the text is in no buffer, agent
+    /// edits are not recorded. The records of rejects stay, for Alt+U
+    /// ([`undo_review_action`](Self::undo_review_action)).
+    pub fn set_in_buffer(&mut self, in_buffer: bool) {
+        self.records.set_closed(!in_buffer);
+    }
+
+    /// How many records of its own edits the review keeps (to recognize the buffer's undo and
+    /// redo of them, and for Alt+U of rejects), and about how many bytes they take (tests and
+    /// measurements).
+    pub fn held_records(&self) -> (usize, usize) {
+        self.records.held()
+    }
+
     /// The hunks of turn `turn` alone (`turns == [turn]`), in text order. Hunks that also hold
     /// other turns' edits are not among them (see [`mixed_hunks_of_turn`](Self::mixed_hunks_of_turn)).
     pub fn hunks_of_turn(&self, turn: u32) -> Vec<&Hunk> {
@@ -635,10 +653,11 @@ impl FileReview {
         class
     }
 
-    /// Panics when a record does not hold the text at its range; `after` names the change. In
-    /// text order, so that the hunk list is walked once.
+    /// Panics when a record does not hold the text at its range (or what they take is counted
+    /// wrong); `after` names the change. In text order, so that the hunk list is walked once.
     #[cfg(test)]
     pub(super) fn check_records(&self, after: impl Fn() -> String) {
+        self.records.check_costs();
         let (mut i, mut grown) = (0, 0);
         for (range, content) in self.records.in_text_order() {
             while self

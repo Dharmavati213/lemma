@@ -173,6 +173,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - After a build, Lemma looks for the packages of the distribution again (they may have become
   local ones) without touching the file system on the main thread: with 40 packages that was 52
   path lookups each time.
+- Files under review that are not open take less memory. The review kept a record of each of
+  the agent's changes (or Replace in Project's) to such a file, which only an editor's undo
+  could use, though a file that opens starts with an empty undo history; it no longer does, and
+  closing a tab drops those of its changes. Replace in Project of 600 matches in each of 50
+  closed files: 17 MB instead of 30 MB; one file with 20 000: 11.5 MB instead of 20 MB. Alt+U
+  still takes back a Reject all or a Reject Turn in a closed file. In an open file, the records
+  that let Ctrl+Z and Ctrl+Shift+Z of the agent's last turn keep it under review take at most
+  about 16 MB: 200 changes of 100 KB each kept 60 MB of them.
 
 ### Fixed
 
@@ -266,6 +274,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - An ACP agent other than Claude Code (Pi, Codex, Gemini CLI, …) that answered the first
   prompt with an error (a quota, an expired login) went without Lemma's instructions for the
   rest of the session; the next prompt now carries them.
+- A file opened at a line behind the first one (`lemma main.tex chapter.tex:250`) that was not
+  shown before the session was saved came back at that line next time, but scrolled to where
+  the session before had left it, with the cursor out of view. It now comes back showing its
+  line.
 
 ## epsilon (0.1.0), 2026-10-20
 

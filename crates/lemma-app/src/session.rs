@@ -21,8 +21,11 @@
 //! session that is about to be restored. What the window cannot see at the moment of a save is
 //! carried over from the session it restored (or saved last): the place of a PDF that is not
 //! shown (no build yet, or a pane never laid out), the visibility of a pane while it is an
-//! overlay (a narrow window), the first line of a restored tab that has not been drawn yet. The
-//! restored state is saved once the restore is done.
+//! overlay (a narrow window), the first line of a restored tab that has not been drawn yet. A
+//! tab that has not been drawn and whose cursor is not on the line that session saved, or whose
+//! cursor the command line put on a line ([`keep_position`], a tab behind the first), saves its
+//! cursor's line as its first line, so the next restore shows the cursor. The restored state is
+//! saved once the restore is done.
 //!
 //! **The last session.** `Paths::last_session_file()` (`sessions/last.json`, a [`LastSession`])
 //! names the project root and the selected file of the window that saved last, and the size of
@@ -758,10 +761,16 @@ impl Session {
             let iter = buffer.iter_at_mark(&buffer.get_insert());
             doc.line_index().position(doc.byte_offset(&iter))
         };
+        // A tab that never drew keeps the last session's first line while its cursor is on the
+        // line saved with it; otherwise, or when the command line put the cursor there (`lemma
+        // +LINE FILE`, even on that very line), the next restore shows the cursor's line at the
+        // top.
         let top = match self.pending_scroll.borrow().get(doc.path()) {
             Some(&top) => top,
             None => top_line(editor).unwrap_or_else(|| {
+                let kept = self.kept_positions.borrow().iter().any(|p| p == doc.path());
                 last.and_then(|l| l.tabs.iter().find(|t| t.path == path))
+                    .filter(|t| t.line == line && !kept)
                     .map_or(line, |t| t.top)
             }),
         };

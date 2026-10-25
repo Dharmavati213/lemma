@@ -658,6 +658,83 @@ fn undo_review_action_after_accept_all_and_reject_all() {
     assert_eq!(s.ids(), ids);
 }
 
+/// A review whose text is in no buffer (a closed document) keeps no record of agent edits, which
+/// no buffer undo can reach: a replace_all of 600 matches leaves none. Its rejects are recorded,
+/// and Alt+U takes back a Reject all and a Reject Turn, every hunk with its id; a reject's record
+/// goes once Alt+U undid it.
+#[test]
+fn a_review_in_no_buffer_records_only_rejects() {
+    let base: String = (0..600)
+        .map(|i| format!("Line {i} uses \\R here.\nPlain line {i}.\n"))
+        .collect();
+    let mut s = Session::new(&base);
+    s.review.set_in_buffer(false);
+    s.review.set_turn(1);
+    let edits = str_replace(&s.text, "\\R", "\\mathbb{R}", true).unwrap();
+    s.edits(&edits, Origin::Agent { call: 1 });
+    s.recompute();
+    let (ids, proposal) = (s.ids(), s.text.clone());
+    assert_eq!(ids.len(), 600);
+    assert_eq!(s.review.held_records(), (0, 0));
+
+    s.reject_all();
+    assert_eq!(s.text, base);
+    assert_eq!(s.review.held_records().0, 600, "the rejects' records");
+    let Some(UndoAction::Edits(restored)) = s.undo_review() else {
+        panic!("Alt+U of the Reject all")
+    };
+    assert_eq!(restored.len(), 600);
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.ids(), ids);
+    assert_eq!(
+        s.review.held_records(),
+        (0, 0),
+        "undone, nothing can redo them"
+    );
+
+    let rejected = s.review.reject_turn(1, &s.text);
+    assert_eq!(rejected.len(), 600);
+    s.edits(&rejected, Origin::Review);
+    s.recompute();
+    assert_eq!(s.text, base);
+    assert!(matches!(s.undo_review(), Some(UndoAction::Edits(_))));
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.ids(), ids);
+    assert!(s.hunks().iter().all(|h| h.turns == [1]));
+}
+
+/// A document that closes drops the records only its buffer's undo and redo used: those of the
+/// agent's edits (also those the rejects cut) and of a reject undone by Ctrl+Z. The record of a
+/// reject still done stays, so Alt+U takes it back after the document closed, and again after
+/// it opened in a new buffer, with its turn.
+#[test]
+fn closing_keeps_the_records_alt_u_takes_up() {
+    let mut s = Session::new(DOC);
+    s.review.set_turn(4);
+    s.agent_replace("a point", "a closed point");
+    s.agent_replace("\\end{document}", "\\end{document}\n% eof");
+    let ids = s.ids();
+    assert_eq!(ids.len(), 2);
+    assert!(s.hunks().iter().all(|h| h.turns == [4]));
+    let proposal = s.text.clone();
+    let (kept, _) = s.review.held_records();
+    assert!(kept >= 2, "the agent edits' records: {kept}");
+    s.reject(ids[0]);
+    let (edit, replaced) = s.reject(ids[1]);
+    s.undo_replace(&edit, &replaced);
+    s.recompute();
+    assert_eq!(s.ids(), [ids[1]], "Ctrl+Z took the second reject back");
+
+    s.review.set_in_buffer(false);
+    assert_eq!(s.review.held_records().0, 1, "the first reject's record");
+    s.review.set_in_buffer(true);
+    assert_eq!(s.review.held_records().0, 1);
+    assert!(matches!(s.undo_review(), Some(UndoAction::Edits(_))));
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.ids(), ids);
+    assert!(s.hunks().iter().all(|h| h.turns == [4]));
+}
+
 #[test]
 fn undo_review_action_skips_actions_edited_since() {
     let mut s = Session::new("a\nb\nbcde\n");

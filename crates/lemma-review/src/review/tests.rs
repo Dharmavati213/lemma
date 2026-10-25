@@ -144,6 +144,8 @@ enum Op {
     /// Decide every other hunk (from the n-th) as one decision.
     AcceptSome(usize),
     RejectSome(usize),
+    /// The text goes into a new buffer, or out of every buffer (`set_in_buffer`).
+    InBuffer(bool),
     /// Every occurrence of `from` replaced by `to` as one action (a replace_all), edit by edit.
     All {
         origin: u8,
@@ -174,6 +176,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0u32..3).prop_map(Op::RejectTurn),
         1 => (0usize..2).prop_map(Op::AcceptSome),
         1 => (0usize..2).prop_map(Op::RejectSome),
+        1 => any::<bool>().prop_map(Op::InBuffer),
     ]
 }
 
@@ -283,6 +286,7 @@ fn play(r: &mut FileReview, current: &mut String, op: &Op) -> Result<(), String>
                 apply(r, current, e, Origin::Review);
             }
         }
+        Op::InBuffer(in_buffer) => r.set_in_buffer(*in_buffer),
         Op::Accept(_) | Op::Reject(_) => {}
     }
     Ok(())
@@ -333,7 +337,8 @@ fn config() -> ProptestConfig {
 proptest! {
     #![proptest_config(config())]
 
-    /// Any mix of edits (every origin), recomputes, decisions and undos keeps the model exact.
+    /// Any mix of edits (every origin), recomputes, decisions and undos, with the text in a
+    /// buffer or not, keeps the model exact.
     #[test]
     fn model_stays_exact(
         base in prop::sample::select(BASES),

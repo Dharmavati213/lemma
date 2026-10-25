@@ -653,7 +653,8 @@ fn line_in_view(editor: &Editor, line: u32) -> bool {
 
 /// The command line's documents (`app::open_documents`): the first is shown and focused at
 /// once, the others open behind it in order; a line puts the cursor there, in view once the
-/// tab is shown, and wins over the place the session saved.
+/// tab is shown, and wins over the place the session saved, also in the session saved before
+/// the tab was shown (its first line was the old session's, which need not show that line).
 fn several_files() {
     let base = common::temp_dir("several");
     let dir = base.join("proj");
@@ -676,7 +677,8 @@ fn several_files() {
         &SessionFile {
             version: session::VERSION,
             root: dir.to_string_lossy().into_owned(),
-            tabs: vec![tab("b.tex", 20, 10), tab("c.tex", 0, 0)],
+            // b.tex on the line the command line gives, scrolled away from it.
+            tabs: vec![tab("b.tex", 249, 10), tab("c.tex", 0, 0)],
             active: Some(1),
             ..SessionFile::default()
         },
@@ -715,6 +717,17 @@ fn several_files() {
     assert_eq!(tab_paths(&w, &dir), ["main.tex", "b.tex", "c.tex"]);
     assert!(Rc::ptr_eq(&w.active_editor().unwrap(), &main));
     assert_eq!(cursor(&b), (249, 6), "not the session's place");
+    // Saved before b.tex was ever shown, its first line is its cursor's, not the one the
+    // session had for it (though on the same line): the next restore shows the cursor.
+    let saved_b = || {
+        session::save(&w);
+        session::flush(&w);
+        let saved = session_file(&w);
+        let tab = saved.tabs.iter().find(|t| t.path == "b.tex").cloned();
+        tab.expect("b.tex is saved")
+    };
+    let tab = saved_b();
+    assert_eq!((tab.line, tab.top), (249, 249));
     w.select_editor(&b);
     common::pump_until(TIMEOUT, || b.view().is_mapped() && line_in_view(&b, 249));
     for _ in 0..2 {
@@ -724,6 +737,7 @@ fn several_files() {
         line_in_view(&b, 249),
         "the session's scroll does not follow"
     );
+    assert_eq!(saved_b().top, top_line(&b), "once shown, its view's");
     // A document that does not open is reported; the others open all the same.
     write(&dir, &[("binary.tex", "a\0b\n")]);
     let errors = block_on(app::open_documents(
