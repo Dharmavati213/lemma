@@ -219,25 +219,59 @@ impl Model {
             .all(|tile| self.cache.contains(&key(Some(tile))))
     }
 
-    /// The scale to request `page` at: the target scale, except while a zoom waits for its
-    /// re-render ([`RERENDER_DELAY`]). Then a page with a texture of the shown generation and
-    /// mode to stand in (at the target scale, or a whole page at another) keeps that scale and
-    /// waits for the re-render. A page without one (it came into view as the zoom went out) is
-    /// rendered at once at the zoom's own scale, which is what the re-render will want, rather
-    /// than at the old scale only to be rendered again 120 ms later.
-    fn request_q(&self, page: u32, generation: u64) -> u16 {
+    /// The scale to request `page` at (in a view of `view_width` showing `viewport`): the target
+    /// scale, except while a zoom waits for its re-render ([`RERENDER_DELAY`]). Then a page with
+    /// a texture of the shown generation and mode to stand in keeps that scale and waits for the
+    /// re-render: the target scale, or that of a whole page or of tiles rendered earlier in the
+    /// same zoom (a pinch, several Ctrl+wheel notches), so that a page in bands gets the ones it
+    /// lacks at the scale of its first, and [`Model::fallback_tiles`] draws them all. A page
+    /// without one (it came into view as the zoom went out) is rendered at once at the zoom's
+    /// own scale, which is what the re-render will want, rather than at the old scale only to be
+    /// rendered again 120 ms later. So is a page that is one bitmap at the zoom's scale while its
+    /// tiles at the target scale do not cover it in view (the band rendered ahead below the view,
+    /// or the bands in view before the zoom went out), unless a whole page of another scale
+    /// stands in: one bitmap now costs less than the tiles it lacks at the old scale, which the
+    /// re-render would replace with that bitmap.
+    fn request_q(&self, page: u32, generation: u64, view_width: f64, viewport: Rect) -> u16 {
         let live = scale_q(self.zoom, self.device_scale);
         if live == self.target_q {
             return live;
         }
-        self.cache
+        let keys = self
+            .cache
             .keys_of_page(page)
             .iter()
-            .filter(|k| k.generation == generation && k.dark == self.dark)
-            .filter(|k| k.scale_q == self.target_q || k.tile.is_none())
+            .filter(|k| k.generation == generation && k.dark == self.dark);
+        let whole_at_live = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.layout.page_size(page))
+            .is_some_and(|size| tile_grid(size, live).is_none());
+        if whole_at_live && !self.page_complete(page, view_width, viewport) {
+            // Whole: at the scale of a whole page that stands in, else at the zoom's.
+            return keys
+                .filter(|k| k.tile.is_none())
+                .map(|k| k.scale_q)
+                .min_by_key(|q| q.abs_diff(live))
+                .unwrap_or(live);
+        }
+        // Tiles of this zoom are of a scale between the target's and the zoom's. (Tiles left
+        // from an earlier zoom can be of any scale, and the tiles a page lacks would then be
+        // rendered at that scale, however large.)
+        let zoomed = live.min(self.target_q)..=live.max(self.target_q);
+        keys.filter(|k| k.tile.is_none() || zoomed.contains(&k.scale_q))
+            // The target scale first, then a whole page (the one nearest the zoom's scale), then
+            // the tiles that `fallback_tiles` draws, those nearest the target scale. (A band asked
+            // for at one notch can arrive after the next notch asked for the page at its own
+            // scale; growing the later group would leave it undrawn.)
+            .min_by_key(|k| {
+                let near = match k.tile {
+                    None => k.scale_q.abs_diff(live),
+                    Some(_) => k.scale_q.abs_diff(self.target_q),
+                };
+                (k.scale_q != self.target_q, k.tile.is_some(), near)
+            })
             .map(|k| k.scale_q)
-            // The target scale first, then the one nearest the zoom's.
-            .min_by_key(|&q| (q != self.target_q, q.abs_diff(live)))
             .unwrap_or(live)
     }
 
@@ -277,7 +311,7 @@ impl Model {
             let Some(size) = doc.layout.page_size(page) else {
                 return;
             };
-            let scale_q = self.request_q(page, doc.generation);
+            let scale_q = self.request_q(page, doc.generation, width, viewport);
             if tile_grid(size, scale_q).is_some() {
                 // Tiled pages: the visible tiles of the visible pages.
                 if visible.contains(&page) {
@@ -326,7 +360,9 @@ impl Model {
     /// The tiles of the band that scrolling down shows next, with their page and scale, when it
     /// is on a tiled page: the row below the view on the last visible page, or once that page's
     /// last row is in view, the first row of the page after it. Empty when that page is not
-    /// tiled (it is asked for whole) or there is none.
+    /// tiled (it is asked for whole) or there is none, and while a zoom waits for its re-render,
+    /// when the page keeps another scale than the zoom's (see [`Model::request_q`]): the
+    /// re-render would render that band again.
     fn next_band(
         &self,
         doc: &Doc,
@@ -336,21 +372,27 @@ impl Model {
         if visible.is_empty() {
             return Vec::new();
         }
+        let live = scale_q(self.zoom, self.device_scale);
         for page in [visible.end - 1, visible.end] {
             let Some(size) = doc.layout.page_size(page) else {
                 continue;
             };
-            let scale_q = self.request_q(page, doc.generation);
+            // The viewport is as wide as the view.
+            let scale_q = self.request_q(page, doc.generation, viewport.width, viewport);
             if tile_grid(size, scale_q).is_none() {
                 // A whole page; the page after it may still be tiled (pages of other sizes).
                 continue;
             }
-            // The viewport is as wide as the view.
             let rect = page_rect(&doc.layout, page, self.zoom, viewport.width);
             let band = geometry::tiles_below(size, scale_q, rect, viewport);
-            if !band.is_empty() {
-                return band.into_iter().map(|tile| (page, scale_q, tile)).collect();
+            if band.is_empty() {
+                continue;
             }
+            // The page keeps its scale until the re-render, which would render this band again.
+            if scale_q != live {
+                return Vec::new();
+            }
+            return band.into_iter().map(|tile| (page, scale_q, tile)).collect();
         }
         Vec::new()
     }
@@ -408,6 +450,55 @@ impl Model {
             })
             .copied()
             .collect()
+    }
+
+    /// What `draw` puts on the visible `page` of `generation` (in a view of `view_width` showing
+    /// `viewport`), bottom to top: whether paper goes first (a page not complete, with no whole
+    /// page to stand in), then the textures: the stand-ins while the page is not complete, then
+    /// its current tiles.
+    fn layers(
+        &self,
+        page: u32,
+        generation: u64,
+        view_width: f64,
+        viewport: Rect,
+    ) -> (bool, Vec<PageKey>) {
+        let size = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.layout.page_size(page))
+            .unwrap_or((1.0, 1.0));
+        let tiled = tile_grid(size, self.target_q).is_some();
+        let mut paper = false;
+        let mut layers = Vec::new();
+        if !self.page_complete(page, view_width, viewport) {
+            let whole = self.fallback_key(page, generation);
+            let tiles = self.fallback_tiles(page, generation);
+            let tiles_better = tiles.first().is_some_and(|t| {
+                whole.is_none_or(|w| {
+                    self.stand_in_rank(t, generation) < self.stand_in_rank(&w, generation)
+                })
+            });
+            match whole {
+                Some(key) => layers.push(key),
+                None => paper = true,
+            }
+            if tiles_better {
+                layers.extend(tiles);
+            }
+        } else if !tiled {
+            layers.extend(self.fallback_key(page, generation));
+        }
+        if tiled {
+            layers.extend(
+                self.cache
+                    .keys_of_page(page)
+                    .iter()
+                    .copied()
+                    .filter(|k| k.tile.is_some() && self.is_current(k, generation)),
+            );
+        }
+        (paper, layers)
     }
 
     /// True when `key` is of the current generation, scale and mode (what the view requests).
@@ -923,36 +1014,10 @@ mod imp {
             let paper = model.paper();
             for &(page, rect) in &pages {
                 let size = doc.layout.page_size(page).unwrap_or((1.0, 1.0));
-                let tiled = tile_grid(size, model.target_q).is_some();
                 // Bottom to top: stand-ins while the page is incomplete, then the current tiles.
-                let mut layers: Vec<PageKey> = Vec::new();
-                if !model.page_complete(page, width, viewport) {
-                    let whole = model.fallback_key(page, generation);
-                    let tiles = model.fallback_tiles(page, generation);
-                    let tiles_better = tiles.first().is_some_and(|t| {
-                        whole.is_none_or(|w| {
-                            model.stand_in_rank(t, generation) < model.stand_in_rank(&w, generation)
-                        })
-                    });
-                    match whole {
-                        Some(key) => layers.push(key),
-                        None => snapshot.append_color(&paper, &graphene_rect(rect)),
-                    }
-                    if tiles_better {
-                        layers.extend(tiles);
-                    }
-                } else if !tiled {
-                    layers.extend(model.fallback_key(page, generation));
-                }
-                if tiled {
-                    layers.extend(
-                        model
-                            .cache
-                            .keys_of_page(page)
-                            .iter()
-                            .copied()
-                            .filter(|k| k.tile.is_some() && model.is_current(k, generation)),
-                    );
+                let (paper_first, layers) = model.layers(page, generation, width, viewport);
+                if paper_first {
+                    snapshot.append_color(&paper, &graphene_rect(rect));
                 }
                 for key in layers {
                     let Some(texture) = model.cache.get(&key) else {
@@ -1545,6 +1610,27 @@ impl PdfView {
     /// was created.
     pub fn bitmaps_received(&self) -> usize {
         self.imp().model.borrow().received
+    }
+
+    /// The keys of the cached textures of the 0-based `page`, in no particular order.
+    pub fn cached_keys(&self, page: u32) -> Vec<PageKey> {
+        self.imp().model.borrow().cache.keys_of_page(page).to_vec()
+    }
+
+    /// The textures drawn for the 0-based `page` while it is visible, bottom to top: the ones
+    /// that stand in while it is not complete, then its current tiles (tests check what a zoom
+    /// shows while it waits for its re-render).
+    pub fn drawn_keys(&self, page: u32) -> Vec<PageKey> {
+        let imp = self.imp();
+        let (width, height) = imp.view_size();
+        let (sx, sy) = imp.scroll();
+        let model = imp.model.borrow();
+        let Some(generation) = model.doc.as_ref().map(|d| d.generation) else {
+            return Vec::new();
+        };
+        model
+            .layers(page, generation, width, Rect::new(sx, sy, width, height))
+            .1
     }
 
     /// Bytes of bitmap data in the texture cache.

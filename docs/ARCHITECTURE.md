@@ -1483,8 +1483,20 @@ they conflict with the sections above, this section wins.
     generation and mode to stand in (one that came into view as the zoom went out) is requested
     at the zoom's own scale, not at the old target scale (`Model::request_q`). A page with a
     stand-in keeps its scale and waits for the timer: the target scale as before, or that of a
-    whole page rendered earlier in the same zoom (a pinch, several Ctrl+wheel notches), which
-    is not asked for again at the old scale.
+    whole page or bands rendered earlier in the same zoom (a pinch, several Ctrl+wheel notches;
+    bands of a scale between the target's and the zoom's), which is not asked for again at the
+    old scale. So a page in bands gets the ones it lacks at the scale of its first, and
+    `Model::fallback_tiles` draws them all (each notch used to ask for it again at its own
+    scale, and only one scale's bands were drawn). A band asked for at one notch can arrive
+    after the next notch asked for the page at its own scale: of bands of several scales, the
+    page keeps those nearest the target scale, the ones `fallback_tiles` draws, and of a whole
+    page and bands, the whole page. A page that is one bitmap at the zoom's scale while its
+    tiles at the target scale do not cover it in view (the band rendered ahead below the view,
+    the bands in view before the zoom went out, as after Ctrl+1 from far in) is requested whole
+    at the zoom's scale, or keeps a whole page of another, rather than in more tiles at the old
+    one. Meanwhile the band below the view is asked for only at the zoom's own scale
+    (`Model::next_band`): one at the scale its page keeps would be rendered again by the
+    re-render.
   - The zoom follows the view in one of three modes (`pdf_view::Fit`: width, page, none);
     `PageLayout::fit_page_zoom` fits the tallest page and its gaps to the height, at most the
     width's zoom. The session's `PdfPlace` gains `fit` (default width, so older files load; a

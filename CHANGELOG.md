@@ -123,8 +123,13 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   rendered ahead before.
 - Zooming the PDF out renders the pages that come into view at the new zoom right away, instead
   of at the old zoom and then again 120 ms later (over several Ctrl+wheel notches or a pinch,
-  such a page then waits for the final zoom): zooming pdf50 out sixfold now renders 9 pages
-  instead of 14, and the texture cache holds 7.8 MiB instead of 13 MiB meanwhile.
+  such a page then waits for the final zoom, and a page in bands gets the bands it lacks at the
+  scale of its first ones): zooming pdf50 out sixfold now renders 9 pages instead of 14, and the
+  texture cache holds 7.8 MiB instead of 13 MiB meanwhile. Until the final zoom, the band below
+  the view is not rendered ahead at the old zoom either, and a page in bands or tiles that is
+  one bitmap at the new zoom and shows more than they cover is rendered whole at the new zoom at
+  once: Ctrl+1 from 700% renders 4 pages, where it rendered 18 tiles at 700% (65 MiB) and then
+  the same 4 pages.
 - The Problems page builds its rows only when it is shown, and lists at most 500 of a build's
   problems, the most severe ones (errors, then warnings, then bad boxes), followed by a line
   saying how many more there are. The ones left out keep their gutter marks and are still

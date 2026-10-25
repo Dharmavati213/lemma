@@ -1,11 +1,12 @@
 //! The PDF preview, builds and diagnostics (WP1.6 acceptance, ARCHITECTURE §6 and §10.7):
 //! `--demo pdf`, scrolling cost and the cache cap, reload anchors, an unchanged PDF that is not
-//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale), large
-//! pages in full-width bands (the band below the view rendered ahead, search highlights and dark
-//! mode over bands), Fit Page and 100%, handing the PDF to another application, dark mode, save
-//! → build → diagnostics (and a build with nothing to do), stopping a build, and SyncTeX in both
-//! directions; with a fake latexmk, the build toasts, a latexmk that is not installed, and Clean
-//! Build Files and Rebuild.
+//! reloaded, anchored zoom (zooming out renders the new pages once, at the new scale; pages in
+//! bands or tiles are rendered whole once they are one bitmap, and over several notches keep the
+//! scale of their first bands, which are all drawn), large pages in full-width bands (the band
+//! below the view rendered ahead, search highlights and dark mode over bands), Fit Page and
+//! 100%, handing the PDF to another application, dark mode, save → build → diagnostics (and a
+//! build with nothing to do), stopping a build, and SyncTeX in both directions; with a fake
+//! latexmk, the build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -24,8 +25,10 @@ use lemma_app::workspace::Workspace;
 use lemma_build::{BuildStatus, PdfStamp};
 use lemma_config::Config;
 use lemma_core::{ProjectRoot, Severity};
+use lemma_pdf::PageKey;
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
@@ -41,6 +44,14 @@ fn main() -> ExitCode {
         (
             "zoom_out_renders_at_the_live_scale",
             zoom_out_renders_at_the_live_scale,
+        ),
+        (
+            "zoom_out_of_tiles_renders_whole_pages",
+            zoom_out_of_tiles_renders_whole_pages,
+        ),
+        (
+            "zoom_out_in_notches_keeps_one_scale_of_bands",
+            zoom_out_in_notches_keeps_one_scale_of_bands,
         ),
         (
             "large_pages_are_drawn_from_full_width_bands",
@@ -678,6 +689,317 @@ fn zoom_out_renders_at_the_live_scale() {
     state.window.destroy();
 }
 
+/// Shows `tests/fixtures/pdf/stress.pdf` (23 Letter pages, in bands from scale_q 24 on) in light
+/// mode.
+fn show_stress(state: &WindowState) -> PdfView {
+    let stress = common::fixtures().join("pdf/stress.pdf");
+    state
+        .pdf
+        .get()
+        .unwrap()
+        .open(&stress.canonicalize().unwrap());
+    wait_for_pages(state);
+    let view = view(state);
+    if view.is_dark() {
+        activate(state, "win.pdf-invert");
+    }
+    view
+}
+
+/// Runs the main loop until `done`, adding the render requests outstanding after each iteration
+/// to `asked`. (A bitmap arrives an iteration after its request at the earliest, so every request
+/// is seen, also those rendered at once.)
+fn pump_asking(view: &PdfView, asked: &mut HashSet<PageKey>, mut done: impl FnMut() -> bool) {
+    common::pump_until(TIMEOUT, || {
+        let done = done();
+        if !done {
+            asked.extend(view.outstanding_keys());
+        }
+        done
+    });
+}
+
+/// The fraction of the rows of the 0-based `page` in view that the textures `keys` of it cover
+/// (whole pages, or full-width bands).
+fn rows_covered(view: &PdfView, page: u32, keys: &[PageKey]) -> f64 {
+    let size = view.page_size(page).unwrap();
+    let layout = view.layout().unwrap();
+    let (_, top, width, height) = layout.page_rect(page, view.zoom(), f64::from(view.width()));
+    let (_, sy) = view.scroll_position();
+    let shown = (
+        top.max(sy),
+        (top + height).min(sy + f64::from(view.height())),
+    );
+    if shown.1 <= shown.0 {
+        return 1.0;
+    }
+    let mut spans: Vec<(f64, f64)> = keys
+        .iter()
+        .map(|key| match key.tile {
+            None => (top, top + height),
+            Some(tile) => {
+                let (_, y, _, h) = lemma_pdf::tile_rect(size, key.scale_q, tile);
+                // Logical pixels per pixel of the bitmap.
+                let k = width / size.0 / lemma_pdf::scale_of(key.scale_q);
+                (top + f64::from(y) * k, top + f64::from(y + h) * k)
+            }
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut covered, mut reached) = (0.0, shown.0);
+    for (from, to) in spans {
+        let (from, to) = (from.max(reached), to.min(shown.1));
+        if to > from {
+            covered += to - from;
+            reached = to;
+        }
+    }
+    covered / (shown.1 - shown.0)
+}
+
+/// Zooming out of pages in tiles (stress.pdf) to a zoom at which they are one bitmap, with the
+/// bottom of the view in the gap above a page whose first band or row of tiles was rendered ahead
+/// at the old scale: no bitmap is asked for at the old scale or in tiles before the re-render, and
+/// no page twice. Ctrl+minus from zoom × scale 3.25 (bands, as in `large_pages_in_bands`) shows
+/// no more of the page below than that band, so it is drawn from it until the re-render, and the
+/// band after it is not rendered ahead at the old scale meanwhile. Ctrl+1 from zoom × scale 7
+/// (tiles of about 1024²) shows more of it, and of the page above, than their tiles cover: both
+/// are rendered whole at the new scale at once, which the re-render keeps (here they were asked
+/// for in 18 tiles at the old scale, 65 MiB, then whole).
+fn zoom_out_of_tiles_renders_whole_pages() {
+    let dir = common::temp_dir("zoom-out-tiles");
+    let state = window(&dir, config());
+    let view = show_stress(&state);
+    let ds = view.device_scale();
+    let settle = || {
+        wait_for_pages(&state);
+        common::pump_until(TIMEOUT, || view.outstanding_requests() == 0);
+    };
+    // At `zoom`, the bottom of the view in the gap under the 0-based `page`, so the first row of
+    // the page after it is rendered ahead.
+    let bottom_in_the_gap_under = |page: u32, zoom: f64| {
+        view.set_zoom(zoom, None);
+        let q = lemma_pdf::scale_q(view.zoom(), ds);
+        common::pump_until(TIMEOUT, || view.render_scale_q() == q);
+        let layout = view.layout().unwrap();
+        let (_, top, _, page_height) = layout.page_rect(page, view.zoom(), f64::from(view.width()));
+        let height = f64::from(view.height());
+        view.set_scroll_position(0.0, top + page_height + pdf_view::PAGE_GAP / 2.0 - height);
+        settle();
+        let ahead: Vec<_> = view
+            .cached_keys(page + 1)
+            .iter()
+            .map(|k| (k.scale_q, k.tile))
+            .collect();
+        println!("  at scale {q}, the page below the view has {ahead:?}");
+        assert!(
+            ahead
+                .iter()
+                .any(|&(scale, tile)| scale == q && tile.is_some_and(|(_, row)| row == 0)),
+            "its first row ahead"
+        );
+    };
+    let zoom_out = |what: &str, zoom: &dyn Fn(), below: u32| {
+        let old = view.render_scale_q();
+        let received = view.bitmaps_received();
+        zoom();
+        let live = lemma_pdf::scale_q(view.zoom(), ds);
+        let visible = view.visible_pages();
+        assert!(visible.contains(&below));
+        assert!(visible.clone().all(|p| {
+            let size = view.page_size(p).unwrap();
+            lemma_pdf::tile_grid(size, old).is_some() && lemma_pdf::tile_grid(size, live).is_none()
+        }));
+        // Whether its tiles at the old scale cover what is in view of the page below.
+        let covered = view.is_page_rendered(below);
+        // Every request until the re-render, then those of the re-render.
+        let mut early = HashSet::new();
+        pump_asking(&view, &mut early, || view.render_scale_q() != old);
+        assert_eq!(view.render_scale_q(), live);
+        let mut late = HashSet::new();
+        pump_asking(&view, &mut late, || {
+            view.visible_pages().all(|p| view.is_page_rendered(p))
+                && view.outstanding_requests() == 0
+        });
+        let sorted = |keys: &HashSet<PageKey>| {
+            let mut keys: Vec<_> = keys.iter().map(|k| (k.page, k.scale_q, k.tile)).collect();
+            keys.sort_unstable();
+            keys
+        };
+        let renders = view.bitmaps_received() - received;
+        println!(
+            "  {what}, scale {old} -> {live}, pages {visible:?} (the one below covered: \
+             {covered}): asked for {:?}, then {:?}; {renders} renders, cache {:.1} of {} MiB",
+            sorted(&early),
+            sorted(&late),
+            view.cache_used() as f64 / f64::from(1 << 20),
+            view.cache_cap() >> 20
+        );
+        assert!(
+            early.iter().all(|k| k.scale_q == live && k.tile.is_none()),
+            "asked for at the old scale or in tiles: {:?}",
+            sorted(&early)
+        );
+        // Each page once, whole.
+        let asked: HashSet<PageKey> = early.union(&late).copied().collect();
+        let pages: HashSet<u32> = asked.iter().map(|k| k.page).collect();
+        assert_eq!(pages.len(), asked.len(), "a page asked for twice");
+        assert!(renders <= asked.len(), "{renders} renders");
+        assert!(view.cache_used() <= view.cache_cap());
+        covered
+    };
+    bottom_in_the_gap_under(7, 3.25 / ds);
+    assert!(
+        zoom_out("Ctrl+minus", &|| view.zoom_out(), 8),
+        "the page below shows only its first band"
+    );
+    bottom_in_the_gap_under(11, 7.0 / ds);
+    let far = view.render_scale_q();
+    assert_eq!(
+        lemma_pdf::tile_size(view.page_size(12).unwrap(), far).map(|(w, _)| w < 1100),
+        Some(true),
+        "tiles of about 1024²"
+    );
+    assert!(
+        !zoom_out("Ctrl+1", &|| view.reset_zoom(), 12),
+        "the page below shows more than its first row"
+    );
+    state.window.destroy();
+}
+
+/// Zooming out in notches (Ctrl+wheel, a pinch) at zooms at which stress.pdf's pages are all in
+/// bands, anchored at the bottom of the view: the page that comes into view from above, with
+/// nothing to stand in for it, gets its bands at the first notch's scale and keeps that scale
+/// until the re-render, so each band is rendered once before it, and they are all drawn. (Each
+/// notch used to ask for the page again at its own scale, and only the bands of the scale nearest
+/// the old one were drawn, so the rest of the page was blank while bands that covered it were
+/// cached.) Notches 3 ms apart, faster than a band renders, can leave bands of several scales:
+/// the page then grows the group that is drawn (it grew the one nearest the zoom's scale, which
+/// was not), so once the bitmaps asked for are there, all it has cached is drawn. The re-render
+/// then draws everything from bands at the final scale.
+fn zoom_out_in_notches_keeps_one_scale_of_bands() {
+    let dir = common::temp_dir("zoom-notches");
+    let state = window(&dir, config());
+    let view = show_stress(&state);
+    let ds = view.device_scale();
+    let settle = || {
+        wait_for_pages(&state);
+        common::pump_until(TIMEOUT, || view.outstanding_requests() == 0);
+    };
+    let for_a_while = |duration: Duration| {
+        let started = Instant::now();
+        move || started.elapsed() >= duration
+    };
+    let scales = |keys: &[PageKey]| {
+        let mut scales: Vec<u16> = keys.iter().map(|k| k.scale_q).collect();
+        scales.sort_unstable();
+        scales.dedup();
+        scales
+    };
+    // Seven notches with the top of the view at the top of the page after the 0-based `page`,
+    // which has no texture: `quick`, each 3 ms after the last, else once its bitmaps are there.
+    let notches = |page: u32, quick: bool| {
+        view.set_zoom(6.0 / ds, None);
+        let q = lemma_pdf::scale_q(view.zoom(), ds);
+        common::pump_until(TIMEOUT, || view.render_scale_q() == q);
+        let layout = view.layout().unwrap();
+        let (width, height) = (f64::from(view.width()), f64::from(view.height()));
+        view.set_scroll_position(0.0, layout.page_rect(page + 1, view.zoom(), width).1);
+        settle();
+        assert!(view.cached_keys(page).is_empty());
+        let size = view.page_size(page).unwrap();
+        let received = view.bitmaps_received();
+        let bottom = Some((width / 2.0, height));
+        let mut requested = HashSet::new();
+        // The requests until the bitmaps asked for are there, while the zoom still moves (as in
+        // a pinch, which keeps the re-render waiting).
+        let finish = |requested: &mut HashSet<PageKey>| {
+            while view.outstanding_requests() > 0 {
+                view.set_zoom(view.zoom() * (1.0 + 1e-6), bottom);
+                pump_asking(&view, requested, for_a_while(Duration::from_millis(20)));
+            }
+            assert_eq!(view.render_scale_q(), q, "the re-render waits");
+        };
+        let check = |what: &str| {
+            let (generation, dark) = (view.generation(), view.is_dark());
+            let cached: Vec<_> = view
+                .cached_keys(page)
+                .into_iter()
+                .filter(|k| Some(k.generation) == generation && k.dark == dark)
+                .collect();
+            let drawn = view.drawn_keys(page);
+            let (covered, available) = (
+                rows_covered(&view, page, &drawn),
+                rows_covered(&view, page, &cached),
+            );
+            println!(
+                "  {what}: page {} drawn from {:?} covering {:.0}% of it in view; cached {:?} \
+                 covering {:.0}%",
+                page + 1,
+                scales(&drawn),
+                covered * 100.0,
+                scales(&cached),
+                available * 100.0
+            );
+            assert!(covered >= available - 1e-9, "bands cached but not drawn");
+        };
+        let mut live = q;
+        for notch in 1..=7 {
+            view.zoom_by(1.0 / 1.1, bottom);
+            live = lemma_pdf::scale_q(view.zoom(), ds);
+            assert!(
+                lemma_pdf::tile_grid(size, live).is_some(),
+                "in bands at {live}"
+            );
+            if quick {
+                pump_asking(&view, &mut requested, for_a_while(Duration::from_millis(3)));
+            } else {
+                pump_asking(
+                    &view,
+                    &mut requested,
+                    for_a_while(Duration::from_millis(10)),
+                );
+                finish(&mut requested);
+                check(&format!("notch {notch} at scale {live}"));
+            }
+        }
+        if quick {
+            finish(&mut requested);
+            check(&format!("quick notches to scale {live}"));
+        }
+        let asked: Vec<_> = requested
+            .iter()
+            .filter(|k| k.page == page)
+            .map(|k| (k.scale_q, k.tile))
+            .collect();
+        let renders = view.bitmaps_received() - received;
+        println!(
+            "  page {} asked for {asked:?}; {renders} renders of {} bitmaps asked for",
+            page + 1,
+            requested.len()
+        );
+        assert!(!asked.is_empty());
+        assert!(
+            quick || asked.iter().all(|&(scale, _)| scale == asked[0].0),
+            "page {} asked for at several scales: {asked:?}",
+            page + 1
+        );
+        assert!(renders <= requested.len(), "a bitmap rendered twice");
+        // The re-render: everything at the final scale.
+        common::pump_until(TIMEOUT, || view.render_scale_q() == live);
+        settle();
+        let drawn = view.drawn_keys(page);
+        assert!(
+            !drawn.is_empty() && drawn.iter().all(|k| k.scale_q == live),
+            "{drawn:?}"
+        );
+        assert!(view.cache_used() <= view.cache_cap());
+    };
+    notches(6, false);
+    notches(14, true);
+    state.window.destroy();
+}
+
 /// Pages too large for one bitmap (stress.pdf at zoom × scale 3.25 is 1989 × 2574 px, as a
 /// fit-width page on a HiDPI pane about 1000 px wide) are drawn from full-width bands: the ones
 /// in view, then the one that scrolling down shows next, so that a scroll by a band finds it
@@ -686,17 +1008,7 @@ fn zoom_out_renders_at_the_live_scale() {
 fn large_pages_in_bands() {
     let dir = common::temp_dir("bands");
     let state = window(&dir, config());
-    let stress = common::fixtures().join("pdf/stress.pdf");
-    state
-        .pdf
-        .get()
-        .unwrap()
-        .open(&stress.canonicalize().unwrap());
-    wait_for_pages(&state);
-    let view = view(&state);
-    if view.is_dark() {
-        activate(&state, "win.pdf-invert");
-    }
+    let view = show_stress(&state);
     let ds = view.device_scale();
     view.set_zoom(3.25 / ds, None);
     let q = lemma_pdf::scale_q(view.zoom(), ds);
