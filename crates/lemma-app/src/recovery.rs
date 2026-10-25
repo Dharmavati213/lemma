@@ -34,22 +34,30 @@
 //! Project does), so each change is a hunk to keep or reject against the text the document has
 //! now (the file on disk), and saves the documents that had no other unsaved changes: as after an
 //! agent's edit, the disk holds the proposal, and a reject puts the old text back.
-//! **Discard** ([`discard_offered`]) removes the files. While a document's file is read or
-//! offered, no copy of the document is written, so the recovered text is never overwritten before
-//! the user answers; a tab closed meanwhile leaves the file for the next time it opens. A
-//! recovery file that cannot be read or parsed is logged and left alone, one that holds the
-//! document's text is removed, and one of another file (whose path hashes the same) is ignored.
-//! So is the copy of a document that another Lemma still has open with unsaved changes (Lemma
-//! runs one process per window, and two can show the same file): every process that writes
-//! recovery files holds a lock on `<pid>.lock` in the directory while it runs ([`lock_file`]),
-//! and a file whose writer still holds its lock is not left by a crash ([`is_running`]).
+//! **Discard** ([`discard_offered`]) throws the texts away, and the files that hold nothing else
+//! go. While a document's file is read, no copy of the document is written. While its text is
+//! offered, the copies go on, and each keeps the offered text in the file after the document's
+//! ([`RecoveryFile::earlier`]), so neither what the user types meanwhile nor the recovered text
+//! is lost before the user answers: the next time the document opens, the bar offers both, one
+//! after the other, the newest first (Review and Discard answer the one the bar names, and the
+//! bar then names the next; neither text holds the other's changes, so Review of the next waits
+//! until the hunks of the one reviewed before it are kept or rejected). A tab closed meanwhile
+//! leaves the file for the next time it opens.
+//! A recovery file that cannot be read or parsed is logged and left alone, one that holds no text
+//! but the document's is removed, and one of another file (whose path hashes the same) is
+//! ignored. So is the copy of a document that another Lemma still has open with unsaved changes
+//! (Lemma runs one process per window, and two can show the same file): every process that
+//! writes recovery files holds a lock on `<pid>.lock` in the directory while it runs
+//! ([`lock_file`]), and a file whose writer still holds its lock is not left by a crash
+//! ([`is_running`]).
 //!
 //! **Signals** (Unix): the app ([`connect_termination`], for runs that do not quit by themselves)
 //! writes every edited document's file on `SIGTERM`, `SIGHUP` and `SIGINT` (Ctrl+C in the
 //! terminal, which also killed the process and its unsaved changes), synchronously
 //! ([`write_now`]), then closes the windows as Ctrl+Q does, but without asking about the
-//! changes, which stay in their files. Windows has no such signals: the timer and the copy on
-//! focus loss cover it.
+//! changes, which stay in their files. A signal the process was started with ignored stays
+//! ignored (`nohup lemma` keeps running when its terminal closes). Windows has no such signals:
+//! the timer and the copy on focus loss cover it.
 //!
 //! **Pruning.** Once per process, 10 s after an interactive start ([`prune_once`]), the jobs
 //! thread removes the temporary files of writes a crash interrupted, the lock files of processes
@@ -78,7 +86,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A document's text is copied this long after its last change.
@@ -126,6 +134,36 @@ pub struct RecoveryFile {
     pub pid: Option<u32>,
     /// The document's text.
     pub text: String,
+    /// Older texts of the document that this file held, which were offered and not answered yet
+    /// when it was written (the user edited the document while the bar offered them), newest
+    /// first. They are offered after `text`, one after the other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<RecoveredText>,
+}
+
+/// One of the texts of a [`RecoveryFile`]: `text` and what the file records with it, or one of
+/// its `earlier` texts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredText {
+    /// As [`RecoveryFile::disk_hash`]: the file on disk this text is based on.
+    #[serde(default)]
+    pub disk_hash: Option<u64>,
+    /// When the text was copied (Unix time, seconds).
+    #[serde(default)]
+    pub saved_at: u64,
+    pub text: String,
+}
+
+impl RecoveryFile {
+    /// The file's texts, newest first: `text`, then the `earlier` ones.
+    pub fn into_texts(self) -> Vec<RecoveredText> {
+        let newest = RecoveredText {
+            disk_hash: self.disk_hash,
+            saved_at: self.saved_at,
+            text: self.text,
+        };
+        std::iter::once(newest).chain(self.earlier).collect()
+    }
 }
 
 /// The recovery file of the document at `path` (normalized): `recovery_dir/<fnv1a64(path) as 16
@@ -142,14 +180,15 @@ pub fn lock_file(recovery_dir: &Path, pid: u32) -> PathBuf {
 }
 
 /// The bytes of the recovery file of the document at `path` (a [`RecoveryFile`] written by this
-/// process).
+/// process), with the `earlier` texts after `text`.
 pub fn encode(
     path: &Path,
     disk_hash: Option<u64>,
     saved_at: u64,
     text: &str,
+    earlier: &[Arc<RecoveredText>],
 ) -> Result<Vec<u8>, String> {
-    /// [`RecoveryFile`] without copying the text.
+    /// [`RecoveryFile`] without copying the texts.
     #[derive(Serialize)]
     struct Borrowed<'a> {
         version: u32,
@@ -158,6 +197,8 @@ pub fn encode(
         saved_at: u64,
         pid: u32,
         text: &'a str,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        earlier: Vec<&'a RecoveredText>,
     }
     serde_json::to_vec(&Borrowed {
         version: VERSION,
@@ -166,6 +207,7 @@ pub fn encode(
         saved_at,
         pid: std::process::id(),
         text,
+        earlier: earlier.iter().map(|t| &**t).collect(),
     })
     .map_err(|e| e.to_string())
 }
@@ -176,11 +218,12 @@ pub fn parse(bytes: &[u8]) -> Result<RecoveryFile, String> {
 }
 
 /// What a document that opens does with the recovery file it has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
-    /// Offer the text; `changed`: the file on disk is no longer the one the text was based on.
-    Offer { changed: bool },
-    /// The document holds that text already: there is nothing to recover, and the file goes.
+    /// Offer these texts of the file, newest first, one after the other.
+    Offer(Vec<RecoveredText>),
+    /// The document holds the file's texts already: there is nothing to recover, and the file
+    /// goes.
     Remove,
     /// The file belongs to another document (whose path hashes the same), holds a text no
     /// document can hold (with U+0000), or is the copy of a document another Lemma that still
@@ -188,24 +231,28 @@ pub enum Found {
     Ignore,
 }
 
-/// Decides what the document at `path` (whose file on disk hashes to `disk_hash`, `None` when it
-/// does not exist, and whose text is `text`) does with the recovery file `file`; `writer_runs`:
-/// the process that wrote it, another Lemma, still runs ([`is_running`]).
-pub fn decide(
-    file: &RecoveryFile,
-    path: &Path,
-    disk_hash: Option<u64>,
-    text: &str,
-    writer_runs: bool,
-) -> Found {
-    if writer_runs || file.path != path.to_string_lossy() || file.text.contains('\0') {
-        Found::Ignore
-    } else if file.text == text {
+/// Decides what the document at `path`, whose text is `text`, does with the recovery file
+/// `file`; `writer_runs`: the process that wrote it, another Lemma, still runs ([`is_running`]).
+/// The file's texts are offered, newest first, but those the document holds already and those
+/// equal to a newer one.
+pub fn decide(file: RecoveryFile, path: &Path, text: &str, writer_runs: bool) -> Found {
+    if writer_runs || file.path != path.to_string_lossy() {
+        return Found::Ignore;
+    }
+    let texts = file.into_texts();
+    if texts.iter().any(|t| t.text.contains('\0')) {
+        return Found::Ignore;
+    }
+    let mut offered: Vec<RecoveredText> = Vec::with_capacity(texts.len());
+    for t in texts {
+        if t.text != text && offered.iter().all(|o| o.text != t.text) {
+            offered.push(t);
+        }
+    }
+    if offered.is_empty() {
         Found::Remove
     } else {
-        Found::Offer {
-            changed: file.disk_hash != disk_hash,
-        }
+        Found::Offer(offered)
     }
 }
 
@@ -359,9 +406,17 @@ fn unix_now() -> u64 {
 
 // ----- writing -----
 
-/// A copy of a document's text, with what its recovery file records about it.
+/// What a document's recovery file is to hold: a copy of its text, the texts offered for it and
+/// not answered yet, or both.
 struct Snapshot {
     path: PathBuf,
+    own: Option<OwnText>,
+    /// Newest first: after `own` (its [`RecoveryFile::earlier`]), or in its place.
+    offered: Vec<Arc<RecoveredText>>,
+}
+
+/// A copy of a document's text, with what its recovery file records about it.
+struct OwnText {
     disk_hash: Option<u64>,
     saved_at: u64,
     /// One copy of the buffer, taken on the main thread (a `GString` can go to the jobs thread).
@@ -431,7 +486,15 @@ fn perform(file: &Path, op: Op) -> Result<(), String> {
     let shown = |e: std::io::Error| format!("{}: {e}", file.display());
     match op {
         Op::Write(s) => {
-            let bytes = encode(&s.path, s.disk_hash, s.saved_at, &s.text)?;
+            let bytes = match (&s.own, s.offered.split_first()) {
+                (Some(own), _) => {
+                    encode(&s.path, own.disk_hash, own.saved_at, &own.text, &s.offered)
+                }
+                (None, Some((first, rest))) => {
+                    encode(&s.path, first.disk_hash, first.saved_at, &first.text, rest)
+                }
+                (None, None) => return perform(file, Op::Remove),
+            }?;
             write_atomically(file, &bytes).map_err(shown)
         }
         Op::Remove => match std::fs::remove_file(file) {
@@ -477,25 +540,29 @@ pub fn flush() {
 
 // ----- one window -----
 
-/// What a window knows about a document's recovery file.
+/// What a window knows about a document's recovery file and the copy of the document's text in
+/// it (the texts it offers are an [`Offer`]).
 enum Entry {
     /// Being read (the document just opened): nothing is copied meanwhile.
     Checking,
-    /// Offered in the bar: nothing is copied until the user answers.
-    Offered(Offer),
     /// This window's: the file holds the text of the document's `version` (`None` after a
-    /// write failed: the next copy writes it again).
+    /// write failed, or when the file is to be written anew: the next copy writes it).
     Written { version: Option<u64> },
     /// The user threw the text of `version` away: it is not copied again (the window losing the
     /// focus as it closes would), only a later change is.
     Discarded { version: u64 },
 }
 
-/// A recovered text waiting in the bar.
+/// The recovered texts of a document that the bar offers. Its recovery file keeps them, after
+/// the copy of the document's own text when there is one, until the user answers.
 struct Offer {
     doc: Weak<Document>,
-    file: RecoveryFile,
-    changed: bool,
+    /// Not answered yet, newest first, never empty: the bar names the first, and the next one
+    /// once that is answered.
+    texts: Vec<Arc<RecoveredText>>,
+    /// Review applied one of the document's texts in this window (none of the others holds its
+    /// changes: see [`review`]).
+    reviewed: bool,
 }
 
 /// An attached editor, its document's edit observer and its buffer's `modified-changed` handler.
@@ -525,6 +592,7 @@ struct Recovery {
     last_change: Cell<Option<Instant>>,
     /// By document path.
     entries: RefCell<HashMap<PathBuf, Entry>>,
+    offers: RefCell<HashMap<PathBuf, Offer>>,
     watched: RefCell<Vec<Watched>>,
     bar: Bar,
     /// A write failure was reported (once per window).
@@ -556,6 +624,7 @@ pub fn install(state: &Rc<WindowState>) {
         first_change: Cell::new(None),
         last_change: Cell::new(None),
         entries: RefCell::new(HashMap::new()),
+        offers: RefCell::new(HashMap::new()),
         watched: RefCell::new(Vec::new()),
         bar: Bar::new(state),
         reported: Cell::new(false),
@@ -631,9 +700,9 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     }
 }
 
-/// Undoes [`attach`]: the tab closes. An offer leaves the bar (its file stays, for the next time
-/// the document opens); the copy of a document with unsaved changes stays too (the window
-/// closes, or the system ends the process).
+/// Undoes [`attach`]: the tab closes. An offer leaves the bar (its texts stay in the file, for the
+/// next time the document opens); the copy of a document with unsaved changes stays too (the
+/// window closes, or the system ends the process).
 pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     let Some(rec) = recovery(state) else {
         return;
@@ -653,23 +722,25 @@ pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         doc.disconnect(observer);
         editor.buffer().disconnect(modified);
         let entry = rec.entries.borrow_mut().remove(doc.path());
-        match entry {
-            Some(Entry::Offered(_)) => rec.refresh_bar(),
-            Some(Entry::Written { .. }) if !doc.is_dirty() => rec.queue(doc.path(), Op::Remove),
-            _ => {}
+        if matches!(entry, Some(Entry::Written { .. })) && !doc.is_dirty() {
+            rec.queue_without_own(doc.path());
+        }
+        if rec.offers.borrow_mut().remove(doc.path()).is_some() {
+            rec.refresh_bar();
         }
     }
 }
 
 /// The user threw `doc`'s unsaved changes away (Discard in the "Save changes?" dialog, `:qa!`):
-/// its recovery file goes too, and that text is not copied again. A file offered in the bar
-/// stays: it holds older changes, which the user has not answered about.
+/// their copy goes from its recovery file too, and that text is not copied again. The texts
+/// the bar offers stay in the file: they hold older changes, which the user has not answered
+/// about.
 pub fn discard(state: &WindowState, doc: &Document) {
     let Some(rec) = recovery(state) else {
         return;
     };
     let written = match rec.entries.borrow().get(doc.path()) {
-        Some(Entry::Checking | Entry::Offered(_)) => return,
+        Some(Entry::Checking) => return,
         Some(Entry::Written { .. }) => true,
         Some(Entry::Discarded { .. }) | None => false,
     };
@@ -680,7 +751,7 @@ pub fn discard(state: &WindowState, doc: &Document) {
         },
     );
     if written {
-        rec.queue(doc.path(), Op::Remove);
+        rec.queue_without_own(doc.path());
     }
 }
 
@@ -756,9 +827,13 @@ pub fn shown(state: &WindowState) -> Option<String> {
         .then(|| rec.bar.label.text().to_string())
 }
 
-/// The bar's Review: applies every offered text as hunks of one "Recovered changes" review turn,
-/// shows the first hunk and saves the documents that had no other unsaved changes. Resolves to
-/// the number of hunks of the documents it changed.
+/// The bar's Review: applies the text it offers for each document as hunks of one "Recovered
+/// changes" review turn, shows the first hunk and saves the documents that had no other unsaved
+/// changes; a document's older texts are offered next. None of a document's texts holds
+/// another's changes (each was copied while the others waited), so a text stays offered while
+/// the hunks of another one's Review, or hunks over a file on disk the text was not based on,
+/// are still to decide: applied over them, it would take their lines away unseen (their
+/// baseline never had them). Resolves to the number of hunks of the documents it changed.
 pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
     let (rec, state) = (recovery(state), state.clone());
     async move {
@@ -768,8 +843,8 @@ pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
         let mut turn = None;
         let mut changed: Vec<DocRef> = Vec::new();
         let mut to_save: Vec<DocRef> = Vec::new();
-        for (path, offer) in rec.take_offers() {
-            let doc = offer.doc.upgrade().filter(|doc| {
+        for (path, weak, offered, reviewed) in rec.take_answered() {
+            let doc = weak.upgrade().filter(|doc| {
                 state
                     .workspace
                     .get(doc.path())
@@ -778,10 +853,25 @@ pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
             let Some(doc) = doc else {
                 continue;
             };
+            // The edits are computed against the text that closing an open user action leaves.
+            doc.settle_user_action();
             let clean = !doc.is_dirty();
-            let edits = doc.with_text(|text| lemma_review::minimal_edits(text, &offer.file.text));
+            let edits = doc.with_text(|text| lemma_review::minimal_edits(text, &offered.text));
             if edits.is_empty() {
-                rec.queue(&path, Op::Remove);
+                rec.rewrite(&doc);
+                continue;
+            }
+            // Hunks the text does not hold (see above) are decided first.
+            review_ui::recompute_if_stale(&doc);
+            if review_ui::hunk_count(&doc) > 0
+                && (reviewed || doc.saver.disk_hash() != offered.disk_hash)
+            {
+                rec.offer_again(&path, weak, offered, reviewed);
+                state.toast(&format!(
+                    "Keep or reject the changes to “{}” first: the recovered text does not have \
+                     them",
+                    doc.display_name()
+                ));
                 continue;
             }
             let turn = *turn.get_or_insert_with(|| review_ui::begin_named_turn(&state, TURN_NAME));
@@ -790,7 +880,9 @@ pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
                 doc.apply_edits(&edits, Origin::Agent { call: 0 })
             });
             if let Err(e) = applied {
-                // The file stays for the next time the document opens.
+                // Still offered, and kept in the file (also for the next time the document
+                // opens).
+                rec.offer_again(&path, weak, offered, reviewed);
                 state.toast(&format!(
                     "Could not recover the changes to “{}”: {e}",
                     doc.display_name()
@@ -798,13 +890,12 @@ pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
                 continue;
             }
             review_ui::recompute(&doc);
-            // The file holds the document's text now: this window takes it over.
-            rec.entries.borrow_mut().insert(
-                path,
-                Entry::Written {
-                    version: Some(doc.version()),
-                },
-            );
+            if let Some(offer) = rec.offers.borrow_mut().get_mut(&path) {
+                offer.reviewed = true;
+            }
+            // The document holds the answered text now: the file holds the document's text in
+            // its place, with the texts still offered.
+            rec.rewrite(&doc);
             if clean {
                 to_save.push(doc.clone());
             }
@@ -829,20 +920,24 @@ pub fn review(state: &Rc<WindowState>) -> impl Future<Output = usize> + use<> {
                 Err(e) => state.toast(&format!("Could not save “{}”: {e}", doc.display_name())),
             }
         }
-        rec.changed_if_dirty();
+        // The texts offered next were based on the file before these saves.
+        rec.refresh_bar();
         changed.iter().map(|doc| review_ui::hunk_count(doc)).sum()
     }
 }
 
-/// The bar's Discard: removes every offered file.
+/// The bar's Discard: removes the texts it offers from their files (and the files that hold
+/// nothing else); a document's older texts are offered next.
 pub fn discard_offered(state: &WindowState) {
     let Some(rec) = recovery(state) else {
         return;
     };
-    for (path, _) in rec.take_offers() {
-        rec.queue(&path, Op::Remove);
+    for (path, weak, _, _) in rec.take_answered() {
+        match weak.upgrade() {
+            Some(doc) => rec.rewrite(&doc),
+            None => rec.queue_without_own(&path),
+        }
     }
-    rec.changed_if_dirty();
 }
 
 impl Bar {
@@ -939,14 +1034,6 @@ impl Recovery {
         }
     }
 
-    /// [`Recovery::changed`] when a document of the window has unsaved changes (an offer was
-    /// answered: copies of its document were held back meanwhile).
-    fn changed_if_dirty(self: &Rc<Self>) {
-        if self.documents().iter().any(|doc| doc.is_dirty()) {
-            self.changed();
-        }
-    }
-
     fn arm(self: &Rc<Self>, after: Duration) {
         let weak = Rc::downgrade(self);
         let id = glib::timeout_add_local_once(after, move || {
@@ -1000,11 +1087,12 @@ impl Recovery {
         docs
     }
 
-    /// Queues a copy of `doc`'s text if it has unsaved changes that its file does not hold yet
-    /// (nothing while its file is read or offered), or the removal of its file if it has none.
+    /// Queues a copy of `doc`'s text, with the texts the bar offers for it, if it has unsaved
+    /// changes that its file does not hold yet (nothing while its file is read), or its file
+    /// without the copy if it has none.
     fn copy(&self, doc: &DocRef) {
         let written = match self.entries.borrow().get(doc.path()) {
-            Some(Entry::Checking | Entry::Offered(_)) => return,
+            Some(Entry::Checking) => return,
             Some(Entry::Discarded { version }) if *version == doc.version() => return,
             Some(Entry::Written { version }) => Some(*version),
             Some(Entry::Discarded { .. }) | None => None,
@@ -1012,7 +1100,7 @@ impl Recovery {
         if !doc.is_dirty() {
             self.entries.borrow_mut().remove(doc.path());
             if written.is_some() {
-                self.queue(doc.path(), Op::Remove);
+                self.queue_without_own(doc.path());
             }
             return;
         }
@@ -1025,9 +1113,12 @@ impl Recovery {
         };
         let snapshot = Snapshot {
             path: doc.path().to_path_buf(),
-            disk_hash: doc.saver.disk_hash(),
-            saved_at: unix_now(),
-            text,
+            own: Some(OwnText {
+                disk_hash: doc.saver.disk_hash(),
+                saved_at: unix_now(),
+                text,
+            }),
+            offered: self.offered_texts(doc.path()),
         };
         self.entries.borrow_mut().insert(
             doc.path().to_path_buf(),
@@ -1038,22 +1129,73 @@ impl Recovery {
         self.queue(doc.path(), Op::Write(snapshot));
     }
 
+    /// Queues `doc`'s file anew: an answer took one of the texts the bar offered for it. The file
+    /// holds a copy of the document's text while it has unsaved changes (unless the user threw
+    /// that text away, or recovery is off) and the texts still offered; without either, it goes.
+    fn rewrite(&self, doc: &DocRef) {
+        let enabled = self.state.upgrade().is_some_and(|s| self.enabled(&s));
+        let own = enabled
+            && match self.entries.borrow().get(doc.path()) {
+                Some(Entry::Checking) => false,
+                Some(Entry::Discarded { version }) => *version != doc.version(),
+                Some(Entry::Written { .. }) | None => true,
+            };
+        if own {
+            self.entries
+                .borrow_mut()
+                .insert(doc.path().to_path_buf(), Entry::Written { version: None });
+            self.copy(doc);
+        } else {
+            self.queue_without_own(doc.path());
+        }
+    }
+
+    /// Queues the recovery file of the document at `path` without a copy of the document's text:
+    /// with the texts the bar offers for it, or its removal when it offers none.
+    fn queue_without_own(&self, path: &Path) {
+        let offered = self.offered_texts(path);
+        let op = if offered.is_empty() {
+            Op::Remove
+        } else {
+            Op::Write(Snapshot {
+                path: path.to_path_buf(),
+                own: None,
+                offered,
+            })
+        };
+        self.queue(path, op);
+    }
+
+    /// The texts the bar offers for the document at `path`, newest first.
+    fn offered_texts(&self, path: &Path) -> Vec<Arc<RecoveredText>> {
+        self.offers
+            .borrow()
+            .get(path)
+            .map(|offer| offer.texts.clone())
+            .unwrap_or_default()
+    }
+
     /// `doc` has no unsaved changes any more: its copy goes.
     fn cleaned(&self, doc: &Document) {
         let entry = self.entries.borrow().get(doc.path()).map(|e| match e {
             Entry::Written { .. } => Some(true),
             Entry::Discarded { .. } => Some(false),
-            Entry::Checking | Entry::Offered(_) => None,
+            Entry::Checking => None,
         });
         if let Some(Some(written)) = entry {
             self.entries.borrow_mut().remove(doc.path());
             if written {
-                self.queue(doc.path(), Op::Remove);
+                self.queue_without_own(doc.path());
             }
+        }
+        // Saved: the file on disk may no longer be the one an offered text was based on.
+        if self.offers.borrow().contains_key(doc.path()) {
+            self.refresh_bar();
         }
     }
 
-    /// `[editor] recovery` was turned off: the window's copies go (an offer stays in the bar).
+    /// `[editor] recovery` was turned off: the window's copies go (an offer stays in the bar, and
+    /// its texts in their files).
     fn switched_off(&self) {
         self.cancel_timer();
         let written: Vec<PathBuf> = self
@@ -1065,7 +1207,7 @@ impl Recovery {
             .collect();
         for path in written {
             self.entries.borrow_mut().remove(&path);
-            self.queue(&path, Op::Remove);
+            self.queue_without_own(&path);
         }
     }
 
@@ -1150,27 +1292,30 @@ impl Recovery {
             }
         };
         if let Some((file, writer_runs)) = found {
-            let disk_hash = doc.saver.disk_hash();
-            let found =
-                doc.with_text(|text| decide(&file, doc.path(), disk_hash, text, writer_runs));
+            let (pid, owner) = (file.pid, file.path.clone());
+            let found = doc.with_text(|text| decide(file, doc.path(), text, writer_runs));
             match found {
-                Found::Offer { changed } => {
-                    tracing::info!("recovery: offering {shown} for {}", doc.path().display());
-                    self.entries.borrow_mut().insert(
+                Found::Offer(texts) => {
+                    tracing::info!(
+                        "recovery: offering {} text(s) of {shown} for {}",
+                        texts.len(),
+                        doc.path().display()
+                    );
+                    self.offers.borrow_mut().insert(
                         doc.path().to_path_buf(),
-                        Entry::Offered(Offer {
+                        Offer {
                             doc: Rc::downgrade(doc),
-                            file,
-                            changed,
-                        }),
+                            texts: texts.into_iter().map(Arc::new).collect(),
+                            reviewed: false,
+                        },
                     );
                     self.refresh_bar();
                 }
                 Found::Remove => self.queue(doc.path(), Op::Remove),
                 Found::Ignore if writer_runs => {
-                    tracing::info!("recovery: {shown} is kept by process {:?}", file.pid);
+                    tracing::info!("recovery: {shown} is kept by process {pid:?}");
                 }
-                Found::Ignore => tracing::info!("recovery: {shown} belongs to {}", file.path),
+                Found::Ignore => tracing::info!("recovery: {shown} belongs to {owner}"),
             }
         }
         // Changes made while the file was read were not copied.
@@ -1186,39 +1331,62 @@ impl Recovery {
         };
         let now = unix_now();
         let mut offers: Vec<(PathBuf, OfferLabel)> = self
-            .entries
+            .offers
             .borrow()
             .iter()
-            .filter_map(|(path, entry)| match entry {
-                Entry::Offered(offer) => Some((
-                    path.clone(),
-                    OfferLabel {
-                        name: review_ui::relative_name(&state, path),
-                        age: now.saturating_sub(offer.file.saved_at),
-                        changed: offer.changed,
-                    },
-                )),
-                _ => None,
+            .filter_map(|(path, offer)| {
+                let first = offer.texts.first()?;
+                let label = OfferLabel {
+                    name: review_ui::relative_name(&state, path),
+                    age: now.saturating_sub(first.saved_at),
+                    changed: offer
+                        .doc
+                        .upgrade()
+                        .is_some_and(|doc| doc.saver.disk_hash() != first.disk_hash),
+                };
+                Some((path.clone(), label))
             })
             .collect();
         offers.sort_by(|a, b| a.0.cmp(&b.0));
         offers
     }
 
-    /// Takes every offer out (sorted by path) and hides the bar.
-    fn take_offers(&self) -> Vec<(PathBuf, Offer)> {
-        let mut taken: Vec<(PathBuf, Offer)> = self
-            .entries
-            .borrow_mut()
-            .extract_if(|_, e| matches!(e, Entry::Offered(_)))
-            .filter_map(|(path, e)| match e {
-                Entry::Offered(offer) => Some((path, offer)),
-                _ => None,
-            })
-            .collect();
+    /// Takes the text the bar offers for each document out (sorted by path), with the document
+    /// and its offer's [`Offer::reviewed`]: the bar offers the next ones, if any.
+    fn take_answered(&self) -> Vec<(PathBuf, Weak<Document>, Arc<RecoveredText>, bool)> {
+        let mut taken = Vec::new();
+        self.offers.borrow_mut().retain(|path, offer| {
+            if !offer.texts.is_empty() {
+                let text = offer.texts.remove(0);
+                taken.push((path.clone(), offer.doc.clone(), text, offer.reviewed));
+            }
+            !offer.texts.is_empty()
+        });
         taken.sort_by(|a, b| a.0.cmp(&b.0));
         self.refresh_bar();
         taken
+    }
+
+    /// Offers `text` for the document at `path` again, before its other texts: an answer could
+    /// not take it.
+    fn offer_again(
+        &self,
+        path: &Path,
+        doc: Weak<Document>,
+        text: Arc<RecoveredText>,
+        reviewed: bool,
+    ) {
+        self.offers
+            .borrow_mut()
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Offer {
+                doc,
+                texts: Vec::new(),
+                reviewed,
+            })
+            .texts
+            .insert(0, text);
+        self.refresh_bar();
     }
 
     /// Shows the bar with the offers, or hides it without any.
@@ -1301,7 +1469,9 @@ pub fn prune_dir(dir: &Path, now: SystemTime) -> usize {
 
 /// Calls `f(signal)` on the main thread when the process gets `SIGTERM`, `SIGHUP` or `SIGINT`,
 /// instead of letting the signal end it (GLib's Unix signal source: the handler itself only
-/// wakes the main loop). Once per process; the app connects it for runs that do not quit by
+/// wakes the main loop). A signal the process was started with ignored stays ignored: `nohup`
+/// ignores `SIGHUP` so that the program outlives its terminal, and a shell's background job may
+/// ignore `SIGINT`. Once per process; the app connects it for runs that do not quit by
 /// themselves.
 #[cfg(unix)]
 pub fn connect_termination(f: impl Fn(i32) + 'static) {
@@ -1347,6 +1517,12 @@ mod signals {
             return;
         }
         for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            // GLib installs its handler over `SIG_IGN` too, and the signal would end the process
+            // after all.
+            if ignored(signal) {
+                tracing::info!("signal {signal} is ignored, as the process was started");
+                continue;
+            }
             // SAFETY: `dispatch` matches `GSourceFunc`, its data is a plain integer (no
             // destroy notify needed), and the source is attached to the default main context,
             // which the GTK main thread (this one) runs, so `HANDLER` is read on this thread.
@@ -1361,6 +1537,17 @@ mod signals {
             }
         }
     }
+
+    /// True when the process ignores `signal` (its disposition is `SIG_IGN`).
+    fn ignored(signal: libc::c_int) -> bool {
+        // SAFETY: with no new action, `sigaction` only reads the current one into `old`, a
+        // zeroed `struct sigaction` (a valid value of the plain C struct) that outlives the call.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1371,7 +1558,7 @@ mod tests {
     fn files_round_trip_and_are_named_by_the_path() {
         let path = Path::new("/home/u/thesis/main.tex");
         let text = "\\section{Intro}\r\n“quoted” \\\\ \"x\"\n";
-        let bytes = encode(path, Some(u64::MAX - 1), 1_700_000_000, text).unwrap();
+        let bytes = encode(path, Some(u64::MAX - 1), 1_700_000_000, text, &[]).unwrap();
         let file = parse(&bytes).unwrap();
         assert_eq!(
             file,
@@ -1382,10 +1569,12 @@ mod tests {
                 saved_at: 1_700_000_000,
                 pid: Some(std::process::id()),
                 text: text.into(),
+                earlier: Vec::new(),
             }
         );
+        assert!(!String::from_utf8(bytes).unwrap().contains("earlier"));
         // A new file that was never saved has no hash.
-        let new = parse(&encode(path, None, 1, "x").unwrap()).unwrap();
+        let new = parse(&encode(path, None, 1, "x", &[]).unwrap()).unwrap();
         assert_eq!(new.disk_hash, None);
         // Only the path and the text are required.
         let bare = parse(br#"{"path": "/a.tex", "text": "t"}"#).unwrap();
@@ -1393,9 +1582,29 @@ mod tests {
             (bare.version, bare.saved_at, bare.disk_hash, bare.pid),
             (0, 0, None, None)
         );
+        assert!(bare.earlier.is_empty());
         assert!(parse(b"{\"path\": \"/a.tex\"}").is_err());
         assert!(parse(b"not json").is_err());
         assert!(parse(b"").is_err());
+        // Texts still offered when the copy was written follow its text, newest first.
+        let recovered = |disk_hash, saved_at, text: &str| RecoveredText {
+            disk_hash,
+            saved_at,
+            text: text.into(),
+        };
+        let earlier = [
+            Arc::new(recovered(Some(3), 200, "offered\n")),
+            Arc::new(recovered(None, 100, "oldest\n")),
+        ];
+        let both = parse(&encode(path, Some(4), 300, "typed\n", &earlier).unwrap()).unwrap();
+        assert_eq!(
+            both.into_texts(),
+            [
+                recovered(Some(4), 300, "typed\n"),
+                recovered(Some(3), 200, "offered\n"),
+                recovered(None, 100, "oldest\n")
+            ]
+        );
 
         let dir = Path::new("/state/recovery");
         let a = file_for(dir, path);
@@ -1412,49 +1621,72 @@ mod tests {
             version: VERSION,
             path: "/p/main.tex".into(),
             disk_hash: Some(7),
-            saved_at: 0,
+            saved_at: 5,
             pid: Some(1),
             text: "unsaved".into(),
+            earlier: Vec::new(),
         };
+        let recovered = |disk_hash, saved_at, text: &str| RecoveredText {
+            disk_hash,
+            saved_at,
+            text: text.into(),
+        };
+        let unsaved = recovered(Some(7), 5, "unsaved");
         assert_eq!(
-            decide(&file, path, Some(7), "saved", false),
-            Found::Offer { changed: false }
-        );
-        // The file changed on disk since, or is gone.
-        assert_eq!(
-            decide(&file, path, Some(8), "other", false),
-            Found::Offer { changed: true }
-        );
-        assert_eq!(
-            decide(&file, path, None, "", false),
-            Found::Offer { changed: true }
+            decide(file.clone(), path, "saved", false),
+            Found::Offer(vec![unsaved.clone()])
         );
         // Nothing the document lacks.
-        assert_eq!(
-            decide(&file, path, Some(8), "unsaved", false),
-            Found::Remove
-        );
+        assert_eq!(decide(file.clone(), path, "unsaved", false), Found::Remove);
         // Another document whose path hashes the same; a text no document can hold; the copy of
         // a document that another Lemma, still running, has open.
         assert_eq!(
-            decide(&file, Path::new("/p/other.tex"), Some(7), "saved", false),
+            decide(file.clone(), Path::new("/p/other.tex"), "saved", false),
             Found::Ignore
         );
         let nul = RecoveryFile {
             text: "a\0b".into(),
             ..file.clone()
         };
-        assert_eq!(decide(&nul, path, Some(7), "saved", false), Found::Ignore);
-        assert_eq!(decide(&file, path, Some(7), "saved", true), Found::Ignore);
-        // A new file that was never saved, opened again while it still does not exist.
-        let new = RecoveryFile {
-            disk_hash: None,
-            ..file
+        assert_eq!(decide(nul, path, "saved", false), Found::Ignore);
+        assert_eq!(decide(file.clone(), path, "saved", true), Found::Ignore);
+        // Texts still offered when the copy was written come after its text, newest first, but
+        // those the document holds and those equal to a newer one.
+        let several = RecoveryFile {
+            earlier: vec![
+                recovered(Some(6), 4, "offered"),
+                recovered(Some(6), 3, "unsaved"),
+                recovered(Some(5), 2, "saved"),
+                recovered(None, 1, "oldest"),
+            ],
+            ..file.clone()
         };
         assert_eq!(
-            decide(&new, path, None, "", false),
-            Found::Offer { changed: false }
+            decide(several.clone(), path, "saved", false),
+            Found::Offer(vec![
+                unsaved,
+                recovered(Some(6), 4, "offered"),
+                recovered(None, 1, "oldest")
+            ])
         );
+        assert_eq!(
+            decide(several, path, "unsaved", false),
+            Found::Offer(vec![
+                recovered(Some(6), 4, "offered"),
+                recovered(Some(5), 2, "saved"),
+                recovered(None, 1, "oldest")
+            ])
+        );
+        let nul_earlier = RecoveryFile {
+            earlier: vec![recovered(None, 1, "a\0b")],
+            ..file.clone()
+        };
+        assert_eq!(decide(nul_earlier, path, "saved", false), Found::Ignore);
+        let held = RecoveryFile {
+            earlier: vec![recovered(Some(6), 4, "unsaved")],
+            ..file
+        };
+        assert_eq!(decide(held, path, "unsaved", false), Found::Remove);
     }
 
     #[test]
@@ -1529,9 +1761,12 @@ mod tests {
         let snapshot = |text: &str| {
             Op::Write(Snapshot {
                 path: PathBuf::from("/p/main.tex"),
-                disk_hash: Some(1),
-                saved_at: 2,
-                text: text.into(),
+                own: Some(OwnText {
+                    disk_hash: Some(1),
+                    saved_at: 2,
+                    text: text.into(),
+                }),
+                offered: Vec::new(),
             })
         };
         let writer = Writer::default();
@@ -1558,6 +1793,48 @@ mod tests {
             parse(&std::fs::read(&file).unwrap()).unwrap().text,
             "flushed"
         );
+        // The texts offered for the document follow the copy of its text; without a copy, the
+        // newest of them takes its place; with neither, the file goes.
+        let offered = |own: Option<&str>| {
+            Op::Write(Snapshot {
+                path: PathBuf::from("/p/main.tex"),
+                own: own.map(|text| OwnText {
+                    disk_hash: Some(1),
+                    saved_at: 2,
+                    text: text.into(),
+                }),
+                offered: ["newer", "older"]
+                    .into_iter()
+                    .map(|text| {
+                        Arc::new(RecoveredText {
+                            disk_hash: Some(3),
+                            saved_at: 1,
+                            text: text.into(),
+                        })
+                    })
+                    .collect(),
+            })
+        };
+        let texts = |file: &Path| -> Vec<String> {
+            let read = parse(&std::fs::read(file).unwrap()).unwrap();
+            read.into_texts().into_iter().map(|t| t.text).collect()
+        };
+        lock(&writer.queued).insert(file.clone(), offered(Some("typed")));
+        writer.flush();
+        assert_eq!(texts(&file), ["typed", "newer", "older"]);
+        lock(&writer.queued).insert(file.clone(), offered(None));
+        writer.flush();
+        assert_eq!(texts(&file), ["newer", "older"]);
+        let none = Op::Write(Snapshot {
+            path: PathBuf::from("/p/main.tex"),
+            own: None,
+            offered: Vec::new(),
+        });
+        lock(&writer.queued).insert(file.clone(), none);
+        writer.flush();
+        assert!(!file.exists());
+        lock(&writer.queued).insert(file.clone(), snapshot("flushed"));
+        writer.flush();
         // Private to the user, with no temporary file left behind.
         #[cfg(unix)]
         {

@@ -476,6 +476,23 @@ impl Document {
         Ok(())
     }
 
+    /// Ends a user action left open on the buffer (Vim's insert mode keeps one) and begins it
+    /// again, so that its `end-user-action` handlers make their changes now (live environment
+    /// rename gives the partner the name typed so far), as [`Document::apply_edits`] would make
+    /// them before edits that are not the user's. Code that computes such edits from the text
+    /// and records something about them before they apply (a review's reject: the agent's
+    /// feedback, the turns, the Alt+U journal) calls this before it reads the text, so the edits
+    /// fit the text they apply to and are not refused after the record. Nothing happens without
+    /// an open action.
+    pub fn settle_user_action(&self) {
+        if self.user_action_open.get()
+            && let Some(buffer) = self.buffer()
+        {
+            buffer.end_user_action();
+            buffer.begin_user_action();
+        }
+    }
+
     /// Ends the user action left open on `buffer` (see [`Document::apply_edits`]) and returns
     /// what the `end-user-action` handlers changed meanwhile, in order (each change with the
     /// offsets of its moment), with a guard that begins a user action again when dropped.

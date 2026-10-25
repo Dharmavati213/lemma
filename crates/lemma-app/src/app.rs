@@ -517,7 +517,8 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
 /// with every unsaved change: every window writes the recovery files of its edited documents now
 /// ([`recovery::write_now`](crate::recovery::write_now)) and closes as Ctrl+Q closes it, but
 /// without asking about the changes, which the files keep. A second signal while the windows
-/// close ends the process at once.
+/// close ends the process at once. A signal the process was started with ignored stays ignored
+/// (`nohup lemma` outlives its terminal).
 #[cfg(unix)]
 fn quit_on_termination_signals(app: &adw::Application, shared: &Rc<Shared>) {
     let (app, weak) = (app.downgrade(), Rc::downgrade(shared));

@@ -81,10 +81,15 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   `~/.local/state/lemma/recovery/`; saving or discarding the changes removes it. When the
   document next opens, a bar says "Unsaved changes to “main.tex” from 5 minutes ago were
   recovered" (and whether the file changed on disk since): Review shows them as hunks of a
-  "Recovered changes" turn, to keep or reject one by one, and Discard throws them away. A New
-  File that was never saved gets its tab back with the session. On Linux and macOS, `SIGTERM`,
-  `SIGHUP` and Ctrl+C in the terminal no longer kill Lemma on the spot: it writes the copies and
-  closes its window without asking. `[editor] recovery = false` (or Preferences) turns it off.
+  "Recovered changes" turn, to keep or reject one by one, and Discard throws them away. While
+  the bar waits for an answer, what you type in that document is copied too, next to the
+  recovered text: after another crash, the bar offers both, the newest first (Review of the
+  older one waits until the changes Review made from the newer one are kept or rejected, so
+  that it cannot take them away unseen). A New File that was never saved gets its tab back
+  with the session. On Linux and macOS, `SIGTERM`, `SIGHUP` and Ctrl+C in the terminal no
+  longer kill Lemma on the spot: it writes the copies and closes its window without asking (a
+  Lemma started with `nohup` still keeps running when its terminal closes).
+  `[editor] recovery = false` (or Preferences) turns it off.
 
 ### Changed
 
@@ -246,8 +251,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - An agent edit (or a Reject, a reformat) could change the wrong text when it came while Vim's
   insert mode was on and the `\end` of an environment whose `\begin` name was just typed had
   not followed yet: the rename went first, and the edit landed as many bytes off as the name
-  grew or shrank. The edit now lands where it was meant; one that changes that very name is
-  refused, and the agent is told that the text changed.
+  grew or shrank. The edit now lands where it was meant. An agent edit that changes that very
+  name is refused, and the agent is told that the text changed; a reformat is refused with a
+  message. Reject (of a change, a file, a turn or everything), Alt+U and Review in the recovery
+  bar let the rename go in first and then work on the text it leaves.
 - An agent edit that only inserts or only deletes text could crash Lemma when a non-ASCII
   character (é, ∑, …) sat 256 bytes before it.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive

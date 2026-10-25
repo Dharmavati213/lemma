@@ -10,14 +10,14 @@ use adw::prelude::*;
 use lemma_agent::{EditorRequest, ToolReply};
 use lemma_app::agent_edits;
 use lemma_app::document::DocRef;
-use lemma_app::editor::Editor;
+use lemma_app::editor::{Editor, envtools};
 use lemma_app::review_ui::{self, Decision};
 use lemma_app::testmode::{self, review::reply_text};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
-use lemma_core::ProjectRoot;
-use lemma_review::{Hunk, HunkId};
+use lemma_core::{Origin, ProjectRoot, TextEdit};
+use lemma_review::{Hunk, HunkId, ReviewEvent};
 use sourceview5::prelude::*;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,10 @@ fn main() -> ExitCode {
             replies_and_feedback,
         ),
         ("user_typing_and_hunks", user_typing),
+        (
+            "decisions_after_a_pending_rename_settle_it_first",
+            decisions_after_a_pending_rename,
+        ),
         ("whole_file_and_all_files_decisions", bulk_decisions),
         ("rejected_new_file_goes_to_the_trash", new_file_trash),
         ("ex_commands_and_chords", ex_commands_and_chords),
@@ -982,6 +986,97 @@ fn user_typing() {
             .text()
             .starts_with("line 1\ntyped line 2\n")
     );
+}
+
+/// Vim's insert mode keeps a user action open, and live environment rename gives the `\end` the
+/// name typed into its `\begin` when that action closes. A reject of the hunk that holds the
+/// `\end` lets that rename go in first (`Document::settle_user_action`) and works on the text it
+/// leaves. The reject was refused before, after the review had recorded it: the hunk stayed
+/// without its turn, the agent was told it had been rejected, and Alt+U had lost it. Alt+N
+/// (`decide`), a row of the Changes panel (`decide_hunks`) and Reject File (`decide_document`);
+/// Alt+U brings each reject back with its turn.
+fn decisions_after_a_pending_rename() {
+    let text = "\\documentclass{article}\n\\begin{document}\n\\begin{align}\n  a &= b\n\
+                \\end{align}\nTail.\n\\end{document}\n";
+    let f = fixture("pending-rename", &[("main.tex", text)]);
+    let editor = f.open("main.tex");
+    let doc = editor.document().clone();
+    let buffer = editor.buffer().clone();
+    common::pump_until(TIMEOUT, || doc.has_line_states());
+    // A turn changes the `\end` line and the line before it: one hunk around the `\end`'s name.
+    let turn = review_ui::begin_named_turn(&f.state, "Test turn");
+    review_ui::start_review(&doc, false);
+    let (old, new) = ("  a &= b\n\\end{align}\n", "  a &= c\n\\end{align}%\n");
+    let at = text.find(old).unwrap();
+    let edit = TextEdit {
+        range: at..at + old.len(),
+        text: new.into(),
+    };
+    review_ui::in_turn(&doc, turn, || {
+        doc.apply_edits(&[edit], Origin::Agent { call: 0 })
+    })
+    .unwrap();
+    review_ui::recompute(&doc);
+    common::pump_for(Duration::from_millis(30));
+    let rejected = || {
+        doc.review.borrow_mut().as_mut().map_or(0, |r| {
+            r.drain_events()
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::Rejected { .. }))
+                .count()
+        })
+    };
+    // Types `letter` at the end of the `\begin` name, in a user action left open.
+    let type_pending = |letter: &str| {
+        let text = doc.text();
+        let name = text.find("\\begin{al").unwrap() + "\\begin{".len();
+        assert!(editor.place_cursor_at(name + text[name..].find('}').unwrap()));
+        buffer.begin_user_action();
+        buffer.insert_interactive_at_cursor(letter, true);
+        assert!(
+            envtools::linked(&editor).is_some_and(|l| l.dirty),
+            "the rename waits"
+        );
+    };
+    // The text once a reject has given the hunk its old text back, the `\begin` renamed.
+    let rejected_text = |name: &str| text.replace("{align}\n  a", &format!("{{{name}}}\n  a"));
+
+    let hunks = f.hunks("main.tex");
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(hunks[0].turns, [turn]);
+    rejected();
+    type_pending("x");
+    assert_eq!(
+        review_ui::decide(&f.state, &doc, hunks[0].id, Decision::Reject),
+        Ok(())
+    );
+    buffer.end_user_action();
+    assert_eq!(doc.text(), rejected_text("alignx"));
+    assert!(f.hunks("main.tex").is_empty());
+    assert_eq!(rejected(), 1);
+    // Alt+U brings the hunk back with its turn, and the rename that went into it.
+    f.action("review-undo");
+    let hunks = f.hunks("main.tex");
+    assert_eq!(hunks.len(), 1, "{}", doc.text());
+    assert_eq!(hunks[0].turns, [turn]);
+    assert!(doc.text().contains("\\end{alignx}%\n"), "{}", doc.text());
+
+    type_pending("y");
+    review_ui::decide_hunks(&f.state, &doc, &[hunks[0].id], Decision::Reject);
+    buffer.end_user_action();
+    assert_eq!(doc.text(), rejected_text("alignxy"));
+    assert!(f.hunks("main.tex").is_empty());
+    assert_eq!(rejected(), 1);
+    f.action("review-undo");
+    assert_eq!(f.hunks("main.tex")[0].turns, [turn]);
+
+    type_pending("z");
+    review_ui::decide_document(&f.state, &doc, Decision::Reject);
+    buffer.end_user_action();
+    assert_eq!(doc.text(), rejected_text("alignxyz"));
+    assert!(f.hunks("main.tex").is_empty());
+    assert_eq!(rejected(), 1);
+    f.wait_saved("main.tex");
 }
 
 fn bulk_decisions() {

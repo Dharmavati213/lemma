@@ -251,7 +251,12 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   went inside it), `gtk_document` `edits_move_past_what_closing_the_user_action_changed` (a
   handler's change, the observers, the review, the refusal, the action open again) and
   `gtk_envtools` `agent_edits_while_a_rename_waits_land_where_meant` (live rename's partner,
-  inside a user action left open as Vim's insert mode does).
+  inside a user action left open as Vim's insert mode does). Review decisions settle such an
+  action before they read the text (`Document::settle_user_action`): `gtk_review`
+  `decisions_after_a_pending_rename_settle_it_first` (Alt+N, a Changes panel row and Reject File
+  on a hunk that holds the waiting partner: the rename goes in, the reject applies, one
+  `Rejected` event, and Alt+U brings the hunk back with its turn; each failed without its
+  settle).
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -303,11 +308,20 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   hunks of a "Recovered changes" turn that a reject undoes, Discard, a corrupt file ignored, a
   matching one removed, another running Lemma's copy left alone until its lock goes),
   `recovery_restores_tabs_never_saved` (the session brings back the tab of a New File whose
-  copy a crash left, only with recovery on) and `recovery_survives_sigterm_and_sigint`, which
-  runs the real app (`app::run`) in a child process (`LEMMA_RECOVERY_CHILD`) with temporary XDG
-  directories, types into it, sends `SIGTERM` (and `SIGINT`) and checks that the window closed,
-  the process ended successfully and the recovery file holds the typed text, which the next
-  window offers.
+  copy a crash left, only with recovery on), `recovery_keeps_offered_texts_while_editing` (a
+  document edited while its offer waits: `copy_now` and `write_now` keep the offered text after
+  the typed one, the next window offers both, the newest first, and Review and Discard of one
+  keep the other), `recovery_reviews_offered_texts_one_at_a_time` (the older text waits while
+  the hunks of the newer one's Review are undecided, whether that Review saved or not; once
+  they are kept, it applies, and a reject gives the newer text back; each half failed without
+  its check), `recovery_review_with_a_user_action_left_open` (a waiting live rename goes in
+  before Review; a Review the document refuses keeps the text offered and in its file) and
+  `recovery_survives_sigterm_and_sigint`, which runs the real app (`app::run`) in a child
+  process (`LEMMA_RECOVERY_CHILD`, with `SIGTERM`, `SIGHUP` and `SIGINT` at their defaults)
+  with temporary XDG directories, types into it, sends `SIGTERM` (and `SIGINT`) and checks that
+  the window closed, the process ended successfully and the recovery file holds the typed text,
+  which the next window offers; a child started with `SIGHUP` ignored, as `nohup` starts it,
+  keeps running when it gets one.
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
   `find_bar_*` tests (counts and wrapping, the options and invalid expressions, steps before
   the search has counted looked for in the background, the steps and Replaces after them

@@ -1466,6 +1466,11 @@ enum Pick<'a> {
 fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: Decision) -> usize {
     // Decisions need hunks that describe the text exactly (typing may be 50 ms ahead).
     recompute_if_stale(doc);
+    if decision == Decision::Reject {
+        // The review follows what closing an open user action changes edit by edit, so the
+        // picked hunks keep their ids (see `decide`).
+        doc.settle_user_action();
+    }
     let before = hunk_count(doc);
     let text = doc.text();
     match decision {
@@ -1636,6 +1641,13 @@ pub fn decide(
     id: HunkId,
     decision: Decision,
 ) -> Result<(), String> {
+    if decision == Decision::Reject {
+        // What closing an open user action changes goes in first: the review records a reject
+        // before its edit applies, and a refusal would leave that record wrong (see
+        // `Document::settle_user_action`). A keep applies no edit, and leaves Vim's insert
+        // session one undo step.
+        doc.settle_user_action();
+    }
     let text = doc.text();
     match decision {
         Decision::Accept => {
@@ -1809,6 +1821,10 @@ pub fn decide_document(state: &Rc<WindowState>, doc: &DocRef, decision: Decision
 /// Accepts or rejects every hunk of `doc` without journalling the decision; true when there was
 /// something to decide.
 fn decide_all_in(state: &Rc<WindowState>, doc: &DocRef, decision: Decision) -> bool {
+    if decision == Decision::Reject {
+        // See `decide`.
+        doc.settle_user_action();
+    }
     let text = doc.text();
     match decision {
         Decision::Accept => {
@@ -1917,6 +1933,8 @@ pub fn undo_last(state: &Rc<WindowState>) {
 /// cannot be reverted any more (it is then dropped: an older decision is never reverted in its
 /// place); otherwise the first line of the hunk that came back, if any.
 fn undo_in(state: &Rc<WindowState>, doc: &DocRef) -> Option<Option<u32>> {
+    // The journal gives up its entry before the edits apply (see `decide`).
+    doc.settle_user_action();
     let action = {
         let text = doc.text();
         let mut review = doc.review.borrow_mut();

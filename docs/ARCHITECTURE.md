@@ -1347,6 +1347,16 @@ they conflict with the sections above, this section wins.
   handler's change stays). The action is opened again after the edits or the refusal. The
   `connect_before_apply` observers run after the close and get the edits as applied. (Before,
   the edits went in at the old offsets: one byte off after a star typed into `\begin{align}`.)
+  Callers that record something before they apply such edits settle the action first
+  (`Document::settle_user_action`: end it, so its handlers run, and begin it again) and only
+  then read the text: the review's rejects (`review_ui::decide`, `decide_picked`,
+  `decide_all_in`: a reject journals itself, parks its turns and queues the agent's `Rejected`
+  feedback before its edits apply, and a refusal after that left the hunk without its turn,
+  told the agent it was rejected and spent the Alt+U entry), Alt+U (`undo_in`, whose journal
+  gives up its entry first) and the recovery bar's Review. A keep applies no edits and does not
+  settle (Vim's insert session stays one undo step). `decide_picked` settles after
+  `recompute_if_stale`: the review follows the handler's change edit by edit, so the hunk ids
+  its caller picked stay valid.
 - **Problems (§5, 2026-10-25):**
   - The Problems page builds a build's rows when it is shown, and lists at most
     `MAX_SECTION_ROWS` (500) of its problems, the most severe ones (errors, then warnings, then
@@ -1509,7 +1519,11 @@ they conflict with the sections above, this section wins.
     of the bytes the file held when the document last read or wrote it; `null` for a file that
     did not exist), `saved_at` Unix seconds, `pid` the writing process, `text` the document's
     text byte for byte (its line breaks; the charset is the file's, read again when the document
-    opens). Only `path` and `text` are required when it is read. A process that writes recovery
+    opens). An optional `earlier: [{disk_hash, saved_at, text}]` (newest first, left out when
+    empty) holds the texts the bar offered for the document and the user had not answered yet
+    when the copy was written; it comes after `text`, or one of them takes the place of `text`
+    when the document itself has no unsaved changes (`recovery::Snapshot`: `own`, `offered`).
+    Only `path` and `text` are required when it is read. A process that writes recovery
     files holds an exclusive lock (`File::try_lock`: `flock`, `LockFileEx`) on `<pid>.lock` in
     the directory until it ends (`recovery::lock_file`), so a file whose writer still holds its
     lock is a copy of a document another Lemma (one process per window) has open, not one a
@@ -1521,37 +1535,58 @@ they conflict with the sections above, this section wins.
     `large.tex`; a keystroke only notes the time, §3 rule 1) and serialized and written on the
     jobs thread through a temporary file that is `sync_data`'d and renamed. One writer per
     process keeps the newest queued operation per file (a copy or a removal), so an older one
-    never runs after a newer one. The file goes when the document is clean again (its buffer's
+    never runs after a newer one. The copy goes when the document is clean again (its buffer's
     `modified-changed`: saved, reloaded, undone, `:q!`), when the user picks Discard in the
     "Save changes?" dialog (tab or window) or runs `:qa!` (`recovery::discard`, which also keeps
     that version from being copied again, as the window losing the focus while it closes would),
-    and when `[editor] recovery` is turned off. A window's close (after the shell's close-request
+    and when `[editor] recovery` is turned off; the file goes with it unless it still holds
+    offered texts (`queue_without_own`). A window's close (after the shell's close-request
     handler proceeds), its destroy and the end of `app::run` do the queued operations
     synchronously (like the session's close-time write, an exception to §3 rule 2). Nothing is
     copied or read in windows without `Paths` or that quit by themselves (`state.scripted`;
     `recovery::set_enabled` for tests with temporary directories).
   - Offers: a document that gets a tab without unsaved changes reads its file on the jobs thread
     (`recovery::decide`): another path (a hash collision), a text with U+0000 or a writer that
-    still runs is ignored, a text equal to the document's removes the file, any other is
-    offered; an unreadable or corrupt file is logged and left alone. The session restore opens
-    the tab of a file that is gone (a New File never saved) when such a copy of it is left
-    (`recovery::is_left`), as an empty document that offers it. While a document's file is read
-    or offered, no copy of it is written. One bar per window (a revealer under the conflict bar,
-    as the file monitor's) names the offered documents and how long ago they were copied, and
-    says when the file changed on disk since (`disk_hash` differs). Review (`recovery::review`)
-    applies every offered text with `minimal_edits` against the document's current text as
-    `Origin::Agent { call: 0 }` edits of one `review_ui::begin_named_turn` turn, "Recovered
-    changes", then saves the documents that had no unsaved changes (§4.5: disk holds the
-    proposal; quick fixes do the same); Discard removes the files. A tab closed while its file
-    is offered keeps the file for its next opening.
+    still runs is ignored; of the file's texts (`text`, then `earlier`), those that equal the
+    document's text or a newer one are dropped and the others are offered, newest first, one at
+    a time (`recovery::Offer`); a file with none left is removed; an unreadable or corrupt file
+    is logged and left alone. The session restore opens the tab of a file that is gone (a New
+    File never saved) when such a copy of it is left (`recovery::is_left`), as an empty document
+    that offers it. While a document's file is read, no copy of it is written. While it offers
+    texts, the copies go on and keep the texts not answered yet after the document's own
+    (`earlier`), so a crash, a kill or a signal before the answer loses neither the typing nor
+    the recovered text; the next opening offers both. (Before, nothing was copied while a text
+    was offered, and hours of typing next to an unanswered bar were lost with the process.) One
+    bar per window (a revealer under the conflict bar, as the file monitor's) names the offered
+    documents and how long ago their first offered texts were copied, and says when the file
+    changed on disk since (the text's `disk_hash` is not the document's, as it is when the bar
+    is shown: a save while the bar is up updates it). Review (`recovery::review`) takes each
+    document's first offered text, settles a user action left open
+    (`Document::settle_user_action`), and applies the text with `minimal_edits` against the
+    document's current text as `Origin::Agent { call: 0 }` edits of one
+    `review_ui::begin_named_turn` turn, "Recovered changes", then saves the documents that had
+    no unsaved changes (§4.5: disk holds the proposal; quick fixes do the same); a document that
+    refuses the edits (`EditError::Conflict`) keeps the text offered and in its file. None of a
+    file's texts holds another's changes (each was copied while the others waited), and an
+    agent-origin edit over hunks still to decide replaces their proposal, whose lines then go
+    without a hunk (their baseline never had them). So a text stays offered, with a toast, while
+    the document has hunks and Review applied another of its texts in this window
+    (`Offer::reviewed`) or the file on disk is not the one the text was based on (after a save of
+    the text reviewed before it, or across a restart). Discard takes the first offered texts
+    out. After either, the file holds the document's text (while it has unsaved changes) and the
+    texts still offered, which the bar names next. A tab closed while its file offers texts keeps
+    them for its next opening.
   - Signals (Unix): for runs that do not quit by themselves, `app::run` attaches GLib Unix signal
     sources (`g_unix_signal_add_full`, declared in `recovery.rs`: glib 0.22 no longer wraps it)
-    for `SIGTERM`, `SIGHUP` and `SIGINT` (Ctrl+C killed the process with its changes too). The
-    handler, on the main thread, writes every window's dirty documents synchronously
-    (`recovery::write_now`) and closes the windows with `WindowState::close_without_asking` (the
-    normal close: session, review state, the agent; no dialog); with no window yet, the app
-    quits. A second signal while they close exits at once with 128 + the signal. Windows has
-    no such signals: the timer and the copy on focus loss cover it.
+    for `SIGTERM`, `SIGHUP` and `SIGINT` (Ctrl+C killed the process with its changes too), but
+    not for a signal the process was started with ignored (`sigaction` reads `SIG_IGN`: `nohup`
+    ignores `SIGHUP`), which GLib would otherwise take over, ending a `nohup lemma` when its
+    terminal closed. The handler, on the main thread, writes every window's dirty documents
+    synchronously (`recovery::write_now`) and closes the windows with
+    `WindowState::close_without_asking` (the normal close: session, review state, the agent; no
+    dialog); with no window yet, the app quits. A second signal while they close exits at once
+    with 128 + the signal. Windows has no such signals: the timer and the copy on focus loss
+    cover it.
   - `recovery::prune_once`, with the session sweep (10 s after an interactive start, once per
     process, on the jobs thread): removes `*.tmp` files older than 10 minutes, `*.lock` files
     as old that no process holds, and recovery files not written for 180 days.

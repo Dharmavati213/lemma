@@ -22,7 +22,7 @@ use lemma_app::agent::history::{self, HistoryReason};
 use lemma_app::agent::panel::{self, PanelCommand};
 use lemma_app::app;
 use lemma_app::cli::FileArg;
-use lemma_app::editor::{Editor, spell};
+use lemma_app::editor::{Editor, envtools, spell};
 use lemma_app::history_ui;
 use lemma_app::pdf::pdf_view;
 use lemma_app::recovery;
@@ -83,6 +83,18 @@ fn main() -> ExitCode {
         ),
         ("recovery_offers_reviews_and_discards", recovery_offers),
         ("recovery_restores_tabs_never_saved", recovery_new_file),
+        (
+            "recovery_keeps_offered_texts_while_editing",
+            recovery_offered_while_editing,
+        ),
+        (
+            "recovery_reviews_offered_texts_one_at_a_time",
+            recovery_offered_one_at_a_time,
+        ),
+        (
+            "recovery_review_with_a_user_action_left_open",
+            recovery_review_open_action,
+        ),
         #[cfg(unix)]
         ("recovery_survives_sigterm_and_sigint", recovery_sigterm),
     ];
@@ -1572,7 +1584,7 @@ fn write_recovery(paths: &Paths, file: &Path, disk: &str, age: u64, text: &str) 
     let recovery_file = recovery_file(paths, &path);
     std::fs::create_dir_all(recovery_file.parent().unwrap()).unwrap();
     let hash = fnv1a64(&[disk.as_bytes()]);
-    let bytes = recovery::encode(&path, Some(hash), unix_now() - age, text).unwrap();
+    let bytes = recovery::encode(&path, Some(hash), unix_now() - age, text, &[]).unwrap();
     std::fs::write(&recovery_file, bytes).unwrap();
     recovery_file
 }
@@ -1836,7 +1848,7 @@ fn recovery_offers() {
         recovery::shown(&state).unwrap(),
         "Unsaved changes to “main.tex” from 5 minutes ago were recovered"
     );
-    // Nothing is copied over the offered file meanwhile.
+    // A document without unsaved changes copies nothing over the offered file.
     recovery::copy_now(&state);
     snapshot_dialog(&state, "recovery-bar");
     let hunks = block_on(recovery::review(&state));
@@ -1918,7 +1930,13 @@ fn recovery_new_file() {
     let new = dir.join("new.tex");
     let file = recovery_file(&paths, &new);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let bytes = recovery::encode(&normalize(&new), None, unix_now() - 150, "never saved\n");
+    let bytes = recovery::encode(
+        &normalize(&new),
+        None,
+        unix_now() - 150,
+        "never saved\n",
+        &[],
+    );
     std::fs::write(&file, bytes.unwrap()).unwrap();
     let tab = |path: &str| TabState {
         path: path.into(),
@@ -1960,6 +1978,256 @@ fn recovery_new_file() {
     close(w);
 }
 
+/// The texts of the recovery file `file`, newest first (none without the file).
+fn recovered_texts(file: &Path) -> Vec<String> {
+    recovered(file).map_or_else(Vec::new, |f| {
+        f.into_texts().into_iter().map(|t| t.text).collect()
+    })
+}
+
+/// A document whose recovered text the bar offers is edited for hours without an answer: its
+/// copies (after the delay, on focus loss, on `SIGTERM`) keep the offered text after the new
+/// one, so a crash loses neither. The next window offers both, the newest first; answering one
+/// keeps the other.
+fn recovery_offered_while_editing() {
+    let base = common::temp_dir("recovery-offered-editing");
+    let dir = base.join("proj");
+    let disk = "one\ntwo\n";
+    write(&dir, &[("main.tex", disk)]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let old = "OLD RECOVERED\none\ntwo\n";
+    let file = write_recovery(&paths, &dir.join("main.tex"), disk, 3 * 86_400 + 10, old);
+    let offered = recovered(&file).unwrap();
+    let hour = Duration::from_secs(3600);
+
+    let state = window(&dir, &paths, |_| {});
+    recovery::set_enabled(&state, Some(true));
+    recovery::set_delays(&state, hour, hour);
+    let editor = open(&state, &dir, "main.tex");
+    let buffer = editor.buffer().clone();
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    let bar = "Unsaved changes to “main.tex” from 3 days ago were recovered";
+    assert_eq!(recovery::shown(&state).unwrap(), bar);
+    buffer.insert(&mut buffer.start_iter(), "NEW WORK\n");
+    recovery::copy_now(&state);
+    recovery::flush();
+    let copy = recovered(&file).unwrap();
+    assert_eq!(copy.text, format!("NEW WORK\n{disk}"));
+    assert_eq!(copy.disk_hash, Some(fnv1a64(&[disk.as_bytes()])));
+    assert!(copy.saved_at.abs_diff(unix_now()) < 60);
+    assert_eq!(
+        copy.earlier,
+        offered.into_texts(),
+        "the offered text, as it was"
+    );
+    // What the signals write, too; the bar still offers the old text.
+    buffer.insert(&mut buffer.start_iter(), "MORE\n");
+    recovery::write_now(&state);
+    let newest = format!("MORE\nNEW WORK\n{disk}");
+    assert_eq!(recovered_texts(&file), [newest.as_str(), old]);
+    assert_eq!(recovery::shown(&state).unwrap(), bar);
+    // The window goes, as in a crash.
+    close(state);
+    assert_eq!(recovered_texts(&file), [newest.as_str(), old]);
+
+    // The next window offers the newest text first.
+    let state = window(&dir, &paths, |_| {});
+    recovery::set_enabled(&state, Some(true));
+    recovery::set_delays(&state, hour, hour);
+    let editor = open(&state, &dir, "main.tex");
+    let doc = editor.document().clone();
+    let buffer = editor.buffer().clone();
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    assert_eq!(
+        recovery::shown(&state).unwrap(),
+        "Unsaved changes to “main.tex” from less than a minute ago were recovered"
+    );
+    assert!(block_on(recovery::review(&state)) >= 1);
+    assert_eq!(doc.text(), newest);
+    // Saved, as a document without other changes is; the old text is offered next, its file
+    // keeps it, and the bar says that the file changed on disk since (the save wrote another
+    // text than the one it was based on).
+    common::pump_until(TIMEOUT, || {
+        !doc.is_dirty() && recovered_texts(&file) == [old]
+    });
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.tex")).unwrap(),
+        newest
+    );
+    assert_eq!(
+        recovery::offered(&state),
+        [normalize(&dir.join("main.tex"))]
+    );
+    assert_eq!(
+        recovery::shown(&state).unwrap(),
+        format!("{bar}; the file changed on disk since")
+    );
+    // Typing on is copied with it; Discard takes the old text out and keeps the copy.
+    buffer.insert(&mut buffer.start_iter(), "X");
+    recovery::copy_now(&state);
+    recovery::flush();
+    let typed = format!("X{newest}");
+    assert_eq!(recovered_texts(&file), [typed.as_str(), old]);
+    bar_button(&state, "Discard").emit_clicked();
+    assert_eq!(recovery::shown(&state), None);
+    recovery::flush();
+    assert_eq!(recovered_texts(&file), [typed]);
+    assert_eq!(block_on(doc.save()), Ok(()));
+    common::pump_until(TIMEOUT, || !file.exists());
+    close(state);
+}
+
+/// A document's offered texts are reviewed one at a time, and none holds the changes of another
+/// (each was copied while the others waited for an answer). So a text waits while the hunks of
+/// the one reviewed before it are there to decide: applied over them, it would take their lines
+/// away unseen (their baseline never had them), and a save would take them off the disk. That
+/// Review saved the document, or (`typed`: it had unsaved changes) did not. Once the hunks are
+/// kept, the text applies against the one the document has, which a reject gives back.
+fn recovery_offered_one_at_a_time() {
+    for typed in [false, true] {
+        let base = common::temp_dir(&format!("recovery-one-at-a-time-{typed}"));
+        let dir = base.join("proj");
+        let disk = "one\ntwo\n";
+        write(&dir, &[("main.tex", disk)]);
+        let dir = dir.canonicalize().unwrap();
+        let paths = paths_in(&base.join("xdg"));
+        let main = dir.join("main.tex");
+        let (newest, old) = ("one\ntwo\nNEW WORK\n", "OLD RECOVERED\none\ntwo\n");
+        // The copy of a document edited while its old text waited in the bar, both based on
+        // `disk`.
+        let file = recovery_file(&paths, &main);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let hash = Some(fnv1a64(&[disk.as_bytes()]));
+        let earlier = [std::sync::Arc::new(recovery::RecoveredText {
+            disk_hash: hash,
+            saved_at: unix_now() - 3 * 86_400,
+            text: old.into(),
+        })];
+        let bytes = recovery::encode(&normalize(&main), hash, unix_now() - 60, newest, &earlier);
+        std::fs::write(&file, bytes.unwrap()).unwrap();
+
+        let state = window(&dir, &paths, |_| {});
+        recovery::set_enabled(&state, Some(true));
+        let editor = open(&state, &dir, "main.tex");
+        let doc = editor.document().clone();
+        common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+        if typed {
+            editor
+                .buffer()
+                .insert(&mut editor.buffer().end_iter(), "typed\n");
+        }
+        let hunks = block_on(recovery::review(&state));
+        assert!(hunks >= 1);
+        assert_eq!(doc.text(), newest);
+        let mut bar = "Unsaved changes to “main.tex” from 3 days ago were recovered".to_owned();
+        if typed {
+            assert!(doc.is_dirty());
+        } else {
+            common::pump_until(TIMEOUT, || {
+                !doc.is_dirty() && recovered_texts(&file) == [old]
+            });
+            bar.push_str("; the file changed on disk since");
+        }
+        assert_eq!(recovery::shown(&state).unwrap(), bar);
+        // The old text waits for the new one's hunks, in the bar and in the file.
+        assert_eq!(block_on(recovery::review(&state)), 0, "typed: {typed}");
+        assert_eq!(doc.text(), newest);
+        assert_eq!(review_ui::hunk_count(&doc), hunks);
+        assert_eq!(recovery::offered(&state), [normalize(&main)]);
+        assert_eq!(recovery::shown(&state).unwrap(), bar);
+        recovery::flush();
+        assert_eq!(recovered_texts(&file).last().map(String::as_str), Some(old));
+        let on_disk = if typed { disk } else { newest };
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), on_disk);
+        // Kept: the old text applies against the new one, which a reject gives back.
+        review_ui::decide_document(&state, &doc, Decision::Accept);
+        assert!(block_on(recovery::review(&state)) >= 1);
+        assert_eq!(doc.text(), old);
+        assert_eq!(recovery::shown(&state), None);
+        review_ui::decide_document(&state, &doc, Decision::Reject);
+        assert_eq!(doc.text(), newest);
+        common::pump_until(TIMEOUT, || {
+            !file.exists() && std::fs::read_to_string(&main).unwrap() == newest
+        });
+        close(state);
+    }
+}
+
+/// Review while a user action is left open, as Vim's insert mode leaves one. Live environment
+/// rename gives the `\end` inside the recovered change the name typed into its `\begin` when the
+/// action closes: that goes in first, and the recovered text applies to the text it leaves (it
+/// was refused). A Review the document refuses all the same (closing the action changed the text
+/// inside the change) leaves the text offered and in its file, which the copy of the document's
+/// unsaved text does not overwrite.
+fn recovery_review_open_action() {
+    let base = common::temp_dir("recovery-open-action");
+    let dir = base.join("proj");
+    let disk = "one\ntwo\nthree\n";
+    let env_disk = "\\begin{align}\na\n\\end{align}\n";
+    write(&dir, &[("main.tex", disk), ("env.tex", env_disk)]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let recovered_main = "one\nTWO\nthree\n";
+    let file = write_recovery(&paths, &dir.join("main.tex"), disk, 600, recovered_main);
+    let recovered_env = "\\begin{align}\nb\n\\end{align}%\n";
+    write_recovery(&paths, &dir.join("env.tex"), env_disk, 600, recovered_env);
+    let state = window(&dir, &paths, |_| {});
+    recovery::set_enabled(&state, Some(true));
+    recovery::set_delays(&state, Duration::from_secs(3600), Duration::from_secs(3600));
+
+    let env = open(&state, &dir, "env.tex");
+    let env_doc = env.document().clone();
+    common::pump_until(TIMEOUT, || {
+        env_doc.has_line_states() && recovery::shown(&state).is_some()
+    });
+    let buffer = env.buffer().clone();
+    buffer.begin_user_action();
+    assert!(env.place_cursor_at("\\begin{align".len()));
+    buffer.insert_interactive_at_cursor("x", true);
+    assert!(
+        envtools::linked(&env).is_some_and(|l| l.dirty),
+        "the rename waits"
+    );
+    assert!(block_on(recovery::review(&state)) >= 1);
+    buffer.end_user_action();
+    assert_eq!(env_doc.text(), recovered_env);
+    assert_eq!(recovery::shown(&state), None);
+
+    let editor = open(&state, &dir, "main.tex");
+    let doc = editor.document().clone();
+    let buffer = editor.buffer().clone();
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    let bar = recovery::shown(&state).unwrap();
+    // Each close of the action changes the second line.
+    buffer.begin_user_action();
+    buffer.insert(&mut buffer.start_iter(), "x");
+    let handler = buffer.connect_end_user_action(|buffer| {
+        buffer.insert(&mut buffer.iter_at_offset(6), "Z");
+    });
+    assert_eq!(block_on(recovery::review(&state)), 0);
+    buffer.disconnect(handler);
+    assert_eq!(
+        recovery::offered(&state),
+        [normalize(&dir.join("main.tex"))]
+    );
+    assert_eq!(recovery::shown(&state), Some(bar));
+    recovery::copy_now(&state);
+    recovery::flush();
+    assert_eq!(
+        recovered_texts(&file),
+        [doc.text().as_str(), recovered_main]
+    );
+    buffer.end_user_action();
+    // Review again, without the handler.
+    assert!(block_on(recovery::review(&state)) >= 1);
+    assert_eq!(doc.text(), recovered_main);
+    assert_eq!(recovery::shown(&state), None);
+    recovery::flush();
+    assert_eq!(recovered_texts(&file), [recovered_main]);
+    close(state);
+}
+
 /// The recovery bar's button labelled `label`.
 fn bar_button(state: &WindowState, label: &str) -> gtk::Button {
     fn find(widget: &gtk::Widget, label: &str, in_bar: bool) -> Option<gtk::Button> {
@@ -1984,10 +2252,16 @@ fn bar_button(state: &WindowState, label: &str) -> gtk::Button {
 
 /// `SIGTERM` (a shutdown) and `SIGINT` (Ctrl+C in the terminal) to a Lemma with unsaved
 /// changes (the real app, in a child process): the window closes without asking, the changes are
-/// in their recovery file, and the next window that opens the document offers them.
+/// in their recovery file, and the next window that opens the document offers them. A Lemma
+/// started with `SIGHUP` ignored, as `nohup` starts it, keeps running when it gets one (its
+/// terminal closed); `SIGTERM` then ends it as before.
 #[cfg(unix)]
 fn recovery_sigterm() {
-    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
+    for (signal, ignored, name) in [
+        (libc::SIGTERM, None, "SIGTERM"),
+        (libc::SIGINT, None, "SIGINT"),
+        (libc::SIGTERM, Some(libc::SIGHUP), "nohup"),
+    ] {
         let base = common::temp_dir(&format!("recovery-{name}"));
         let dir = base.join("proj");
         write(&dir, &[("main.tex", "hello\n")]);
@@ -1995,7 +2269,7 @@ fn recovery_sigterm() {
         let paths = paths_in(&base.join("xdg"));
         let main = dir.join("main.tex");
         let file = recovery_file(&paths, &main);
-        kill_editing_child(&main, &base.join("xdg"), signal, &file);
+        kill_editing_child(&main, &base.join("xdg"), ignored, signal, &file);
         let copy = recovered(&file).expect("a recovery file");
         assert_eq!(copy.text, "UNSAVED WORK hello\n", "{name}");
         assert_eq!(copy.disk_hash, Some(fnv1a64(&[b"hello\n"])));
@@ -2011,13 +2285,16 @@ fn recovery_sigterm() {
     }
 }
 
-/// Runs `recovery_child` on `main` with the XDG directories under `xdg`, waits until it typed,
-/// checks that nothing is copied yet (`file`), sends it `signal` and waits until the app closed
-/// its window and the process ended successfully.
+/// Runs `recovery_child` on `main` with the XDG directories under `xdg` (and `SIGTERM`, `SIGHUP`
+/// and `SIGINT` at their defaults, but `ignored`, which it ignores), waits until it typed, checks
+/// that nothing is copied yet (`file`), sends it `ignored` and checks that it keeps running, sends
+/// it `signal` and waits until the app closed its window and the process ended successfully.
 #[cfg(unix)]
-fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
+fn kill_editing_child(main: &Path, xdg: &Path, ignored: Option<i32>, signal: i32, file: &Path) {
     use std::io::{BufRead as _, BufReader};
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    use std::os::unix::process::CommandExt as _;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .env(RECOVERY_CHILD_ENV, main)
         .env("LEMMA_CONFIG", "/dev/null")
         .env("HOME", xdg.join("home"))
@@ -2025,9 +2302,24 @@ fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
         .env("XDG_STATE_HOME", xdg.join("state"))
         .env("XDG_DATA_HOME", xdg.join("data"))
         .env("XDG_CACHE_HOME", xdg.join("cache"))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the child");
+        .stdout(std::process::Stdio::piped());
+    // Not what this process got: a test run started with a signal ignored would hang.
+    // SAFETY: between fork and exec the closure only calls signal(2), which is
+    // async-signal-safe, and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for s in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+                let action = if Some(s) == ignored {
+                    libc::SIG_IGN
+                } else {
+                    libc::SIG_DFL
+                };
+                libc::signal(s, action);
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn the child");
     let (lines, received) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().unwrap();
     std::thread::spawn(move || {
@@ -2037,8 +2329,8 @@ fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
             }
         }
     });
-    let wait_for = |wanted: &str| {
-        let deadline = Instant::now() + Duration::from_secs(60);
+    let wait_for = |wanted: &str, timeout: Duration| {
+        let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match received.recv_timeout(left) {
@@ -2048,15 +2340,30 @@ fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
             }
         }
     };
-    if !wait_for("typed") {
+    if !wait_for("typed", Duration::from_secs(60)) {
         let _ = child.kill();
         let _ = child.wait();
         panic!("the child did not type");
     }
     assert!(!file.exists(), "nothing is copied before the delay");
-    // SAFETY: kill(2) on our own child process, which has not been reaped yet.
+    let pid = i32::try_from(child.id()).unwrap();
+    if let Some(ignored) = ignored {
+        // SAFETY: kill(2) on our own child process, which has not been reaped yet.
+        unsafe {
+            libc::kill(pid, ignored);
+        }
+        // A signal the app handles closes its window within milliseconds.
+        let closed = wait_for("closed", Duration::from_secs(2));
+        let running = child.try_wait().unwrap().is_none();
+        if closed || !running {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(!closed && running, "signal {ignored} ended the child");
+    }
+    // SAFETY: as above.
     unsafe {
-        libc::kill(i32::try_from(child.id()).unwrap(), signal);
+        libc::kill(pid, signal);
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
@@ -2071,7 +2378,10 @@ fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "signal {signal}: {status}");
-    assert!(wait_for("closed"), "the app did not close its window");
+    assert!(
+        wait_for("closed", Duration::from_secs(60)),
+        "the app did not close its window"
+    );
 }
 
 /// A child process of `recovery_survives_sigterm_and_sigint`: the real app (`app::run`, its
