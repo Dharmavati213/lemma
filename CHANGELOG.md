@@ -277,15 +277,6 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   of several lines, Vim's `.`), instead of inside each change: with 5000 numbers, ten line
   changes at once cost 26 ms, now 3 ms, and a key that adds a line no longer spends 2.6 ms in
   its handler (the numbers move after it, before the frame).
-
-### Fixed
-
-- The agent's `get_review_state` no longer answers a large review with more than the agent
-  can take: about 250 pending changes already passed Claude Code's limit for a tool's result
-  (25,000 tokens), and 8000 changes in 301 files made a reply of 605 KB. It quotes at most 50
-  changes of a file and about 48 KB of diff in all, and counts the rest with the lines they
-  span, which `read_file` shows (that reply is now 52 KB, made in 5.5 ms instead of 40 ms); a
-  change too long to quote by itself, such as a new file the agent wrote, is counted too.
 - Opening a LaTeX document no longer loads GtkSourceView's LaTeX syntax definitions again each
   time (they were given to every new document and taken away at once, which freed them): a
   400-line chapter opens in 14 ms instead of 44 ms, and a session of 20 such tabs restores in
@@ -306,6 +297,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Fixed
 
+- The agent's `get_review_state` no longer answers a large review with more than the agent
+  can take: about 250 pending changes already passed Claude Code's limit for a tool's result
+  (25,000 tokens), and 8000 changes in 301 files made a reply of 605 KB. It quotes at most 50
+  changes of a file and about 48 KB of diff in all, and counts the rest with the lines they
+  span, which `read_file` shows (that reply is now 52 KB, made in 5.5 ms instead of 40 ms); a
+  change too long to quote by itself, such as a new file the agent wrote, is counted too.
 - The word count of a project over 1 MiB whose main document is small (a book or thesis with
   `\include`d chapters) is no longer started when the main document is first shown: the size
   limit looked at the project index before it had read the chapters. texcount then kept a core
