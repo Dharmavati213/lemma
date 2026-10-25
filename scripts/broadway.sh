@@ -11,4 +11,7 @@ if [ ! -S "$SOCK" ]; then
 fi
 export GDK_BACKEND=broadway BROADWAY_DISPLAY="${DISP}"
 unset WAYLAND_DISPLAY DISPLAY
+# GTK's own input method: with an IBus or Fcitx module installed, GTK would pick it and talk to
+# the desktop's input method daemon, which answers keys asynchronously (racy real-key tests).
+export GTK_IM_MODULE=gtk-im-context-simple
 exec "$@"

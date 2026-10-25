@@ -44,7 +44,10 @@ through **`scripts/broadway.sh <command…>`**:
 - it starts (or reuses) an offscreen `gtk4-broadwayd` on display `:7` (`LEMMA_BROADWAY_DISPLAY`
   overrides it);
 - it sets `GDK_BACKEND=broadway` and unsets `WAYLAND_DISPLAY` and `DISPLAY`, then `exec`s the
-  command, so the measured process is the command itself.
+  command, so the measured process is the command itself;
+- it sets `GTK_IM_MODULE=gtk-im-context-simple`, GTK's own input method: with an IBus or Fcitx
+  module installed GTK would otherwise pick it, talk to the desktop's input method daemon and
+  get keys back asynchronously.
 
 To watch a Broadway session, open `http://127.0.0.1:8087` (display `:7` serves on port 8080 + 7).
 
