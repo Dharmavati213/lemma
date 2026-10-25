@@ -50,9 +50,11 @@
 //!   directory moved out of the project) go to `completion::files_moved` once per batch, which
 //!   lists the project's files again when they changed.
 //! - **Outside the folder**, the directories that hold files the project index reads from disk
-//!   (a central `.bib`, a chapter `\input` through `../`; at most [`MAX_OUTSIDE_DIRS`]) are
-//!   watched for the index only ([`watch_outside`]): a changed, created or deleted source file
-//!   there goes to `completion::disk_changed` and nothing else (no reload, no review).
+//!   (a central `.bib`, a chapter `\input` through `../` or through a symbolic link in the
+//!   folder, which the walk above does not follow; at most [`MAX_OUTSIDE_DIRS`]) are watched, as
+//!   they are on disk, for the index only ([`watch_outside`]): a changed, created or deleted
+//!   source file there goes to `completion::disk_changed` and nothing else (no reload, no
+//!   review).
 
 use super::bridge;
 use crate::document::{DocRef, Document};
@@ -720,7 +722,7 @@ impl Watcher {
             .collect();
         self.first_pending.set(None);
         // Outside the root only the project index looks: it reads again what it has of them
-        // (by the path its directory is watched under, as the index names it).
+        // (by the path its directory is watched under, where the index found its files).
         if let Some(state) = self.state.upgrade() {
             for path in &outside {
                 completion::disk_changed(&state, path, false);

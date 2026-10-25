@@ -1206,18 +1206,27 @@ they conflict with the sections above, this section wins.
     and there is no 40-line limit.
   - Files outside the workspace folder: `prune` records the directories of what is read from
     disk (the files it keeps but the open documents, unread includes too, and the
-    bibliographies), and after every `index_changed` (and when the root moves) those outside
-    the folder go to `watcher::watch_outside`, which watches the first
-    `watcher::MAX_OUTSIDE_DIRS` (32) for the index only and drops the others. A source file
-    changed, created or deleted there (or the directory deleted) goes to
-    `completion::disk_changed` by the path as the index names it; nothing is reloaded or
-    reviewed outside the folder.
+    bibliographies) as they are on disk: the discovery job normalizes each file and
+    bibliography it reads or tries to read, and `Feed::real_paths` keeps where it is (a file
+    no job read, past the cap, counts by the directory the index names). So a symbolic link in
+    the folder to a folder or a file elsewhere (`refs` → `~/central`, `refs.bib` →
+    `~/Zotero/export.bib`), which the folder's watcher does not follow, counts as outside.
+    After every `index_changed` (and when the root moves) those outside the folder go to
+    `watcher::watch_outside`, which watches the first `watcher::MAX_OUTSIDE_DIRS` (32) for the
+    index only and drops the others. A source file changed, created or deleted there (or the
+    directory deleted) goes to `completion::disk_changed` by its path on disk, which
+    `keys_naming` matches with the index's paths (a key with the same file name normalized, a
+    key whose recorded path is that one or under it: a file linked under another name, the
+    files of a deleted folder that a link led to); nothing is reloaded or reviewed outside the
+    folder.
   - The feed looks open documents up without the file system: `wanted` and
     `merge_discovered` compare the paths as the index names them with the open documents'
     keys; the discovery job normalizes each file it read (`ReadFile::key`), and a path that
-    names an open document through a symbolic link goes to `unreadable`. After a build the
-    distribution packages, retried on the jobs thread, cost the main thread no `normalize`
-    (52 with 40 packages before; `workspace::normalizations` counts them per thread).
+    names an open document through a symbolic link goes to `unreadable` until that document's
+    tab closes (`detach` takes the keys that name it out, so the next pass reads the file
+    through the link). After a build the distribution packages, retried on the jobs thread,
+    cost the main thread no `normalize` (52 with 40 packages before;
+    `workspace::normalizations` counts them per thread).
 - **Batched review feed (§4.1, §10.3, 2026-10-25):**
   - `FileReview::on_edits(edits, origin)` takes the changes of one action at once (in the
     order they are applied, each ending at or before the start of the one before, with the

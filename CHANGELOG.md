@@ -158,8 +158,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   tag from the whole text, which on a 60k-line document kept the main thread busy for about
   1.2 s afterwards (typing and scrolling stuttered meanwhile); it now takes under 1 ms.
 - Typing the name after `\end{` no longer copies the whole document on every key to find the
-  environment that is open: the proposals take 0.1 ms instead of 3.5 ms on a 60k-line
-  document.
+  environment that is open; it reads only the 256 KiB before the cursor. On a 60k-line
+  document the proposals take 0.35 ms instead of 3.5 ms, and 0.75 ms at the top level of the
+  body (`\end{document}`), where all of those 256 KiB are looked through.
 - The math hover and the live preview read a document's preamble and definitions again only
   after an edit that could change them (in the preamble or a definition, or one that types or
   deletes a backslash, a `%` or a line break), not after every edit: on a 60k-line document,
@@ -209,10 +210,11 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   changed by `git checkout`, a file that an `\input` named before it existed, and images created
   or deleted (for `\includegraphics{`). A deleted chapter takes its labels with it.
 - The same goes now for files outside the project's folder: a bibliography in a central folder
-  (`\addbibresource{../central/refs.bib}`) or a chapter included through `../` that another
-  program changes, deletes or writes again reaches completion, the undefined-reference check
-  and the Outline without a build (up to 32 such folders are watched). Before, they were read
-  again only after the next build.
+  (`\addbibresource{../central/refs.bib}`, or `refs/refs.bib` with `refs` a symbolic link to
+  that folder, or `refs.bib` itself a link to a reference manager's export) or a chapter
+  included through `../` or a link that another program changes, deletes or writes again
+  reaches completion, the undefined-reference check and the Outline without a build (up to 32
+  such folders are watched). Before, they were read again only after the next build.
 - Figures and tables in chapters that are not open show their captions in the Outline (before,
   only with a `\label` after the caption, or the build's list of figures), a caption further
   than 40 lines below its `\begin{figure}` is found, and a `\caption*` gives a label in its float

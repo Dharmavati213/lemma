@@ -67,6 +67,10 @@ fn main() -> ExitCode {
             "the_project_feed_follows_files_outside_the_folder",
             project_feed_outside_the_folder,
         ),
+        (
+            "the_project_feed_reads_a_linked_chapter_whose_tab_closed",
+            project_feed_linked_chapter_closed,
+        ),
         ("triggers_on_the_scanners_contexts", triggers),
         ("accepting_each_kind_of_proposal", accepting),
         ("accepted_proposals_rank_higher", recency),
@@ -671,8 +675,13 @@ fn project_feed_at_its_cap() {
     std::fs::write(dir.join("main.tex"), main).unwrap();
     std::fs::write(dir.join("aaa.tex"), aaa).unwrap();
     let f = fixture_at(&dir, "main.tex", false);
-    let idle =
-        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    // The lint of the opened root too: its findings, shown when chktex is done, resolve paths
+    // of their own (counted below if a slow run ends after the build).
+    let idle = || {
+        lemma_app::agent::watcher::is_idle(&f.state)
+            && !completion::project_busy(&f.state)
+            && lemma_app::lint::is_idle(&f.state)
+    };
     let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
     common::pump_until(TIMEOUT, idle);
     assert!(has("c:298") && !has("s:0"), "the cap");
@@ -814,19 +823,32 @@ fn project_feed_reads_local_packages() {
 
 /// Files of the index outside the workspace folder that other programs change reach it
 /// without a build, as the files inside do: a central bibliography (`../central/refs.bib`) and
-/// a chapter included through `../`, changed, deleted and written again. The file monitor
-/// watches their directories for the index only while the index has files there (at most 32
-/// of them), not the folder's own.
+/// a chapter included through `../`, changed, deleted and written again, and a bibliography and
+/// a chapter in folders elsewhere that symbolic links in the folder lead to (`refs/lib.bib`,
+/// `refs` a link to `../library`; `zotero.bib`, a link to `../library/export.bib`), changed,
+/// and the chapter deleted with its folder. The file monitor watches their directories (as they
+/// are on disk) for the index only while the index has files there (at most 32 of them), not
+/// the folder's own.
 fn project_feed_outside_the_folder() {
     let base = common::temp_dir("feed-outside");
     let dir = base.join("thesis");
-    for sub in ["thesis", "central", "shared"] {
+    for sub in ["thesis", "central", "shared", "library", "drafts"] {
         std::fs::create_dir_all(base.join(sub)).unwrap();
+    }
+    #[cfg(unix)]
+    for (link, to) in [
+        ("refs", "../library"),
+        ("linked", "../drafts"),
+        ("zotero.bib", "../library/export.bib"),
+    ] {
+        std::os::unix::fs::symlink(to, dir.join(link)).unwrap();
     }
     std::fs::write(
         dir.join("main.tex"),
-        "\\documentclass{article}\n\\addbibresource{../central/refs.bib}\n\\begin{document}\n\
-         \\input{../shared/intro}\nPROBE\n\\printbibliography\n\\end{document}\n",
+        "\\documentclass{article}\n\\addbibresource{../central/refs.bib}\n\
+         \\addbibresource{refs/lib.bib}\n\\addbibresource{zotero.bib}\n\\begin{document}\n\
+         \\input{../shared/intro}\n\\input{linked/notes}\nPROBE\n\\printbibliography\n\
+         \\end{document}\n",
     )
     .unwrap();
     std::fs::write(
@@ -839,17 +861,38 @@ fn project_feed_outside_the_folder() {
         "\\section{Intro}\\label{sec:intro}\n",
     )
     .unwrap();
+    std::fs::write(
+        base.join("library/lib.bib"),
+        "@book{Linked, title = {Linked}, year = {2010}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("library/export.bib"),
+        "@book{Exported, title = {Exported}, year = {2020}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("drafts/notes.tex"),
+        "\\section{Notes}\\label{sec:notes}\n",
+    )
+    .unwrap();
     let f = fixture_at(&dir, "main.tex", false);
     let base = lemma_app::workspace::normalize(&base);
     let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
     let cites = || -> Vec<String> {
         let index = f.state.workspace.index.borrow();
-        index.all_bib().iter().map(|e| e.key.clone()).collect()
+        let mut keys: Vec<String> = index.all_bib().iter().map(|e| e.key.clone()).collect();
+        keys.sort();
+        keys
     };
-    assert!(has("sec:intro"));
-    assert_eq!(cites(), ["Old"]);
+    assert!(has("sec:intro") && has("sec:notes"));
+    assert_eq!(cites(), ["Exported", "Linked", "Old"]);
     let watched = || lemma_app::agent::watcher::watched_outside(&f.state);
-    assert_eq!(watched(), [base.join("central"), base.join("shared")]);
+    let outside = |dirs: &[&str]| -> Vec<PathBuf> { dirs.iter().map(|d| base.join(d)).collect() };
+    assert_eq!(
+        watched(),
+        outside(&["central", "drafts", "library", "shared"])
+    );
     std::fs::write(
         base.join("central/refs.bib"),
         "@book{Old, title = {Old}, year = {2000}}\n@book{New, title = {New}, year = {2026}}\n",
@@ -860,10 +903,34 @@ fn project_feed_outside_the_folder() {
         "\\section{Intro}\\label{sec:outside}\n",
     )
     .unwrap();
+    // Exported again by a reference manager, edited elsewhere: through the links.
+    std::fs::write(
+        base.join("library/lib.bib"),
+        "@book{Linked, title = {Linked}, year = {2010}}\n\
+         @book{Relinked, title = {Relinked}, year = {2026}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("library/export.bib"),
+        "@book{Exported, title = {Exported}, year = {2020}}\n\
+         @book{Reexported, title = {Reexported}, year = {2026}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("drafts/notes.tex"),
+        "\\section{Notes}\\label{sec:renoted}\n",
+    )
+    .unwrap();
     f.wait("the files outside written elsewhere", || {
-        has("sec:outside") && !has("sec:intro") && cites() == ["Old", "New"]
+        has("sec:outside")
+            && !has("sec:intro")
+            && has("sec:renoted")
+            && !has("sec:notes")
+            && cites() == ["Exported", "Linked", "New", "Old", "Reexported", "Relinked"]
     });
     assert!(f.labels("\\cite{Ne").contains(&"New".to_owned()));
+    assert!(f.labels("\\cite{Reli").contains(&"Relinked".to_owned()));
+    assert!(f.labels("\\cite{Reex").contains(&"Reexported".to_owned()));
     // Deleted, then written again (the `\input` still names it).
     std::fs::remove_file(base.join("shared/intro.tex")).unwrap();
     f.wait("the chapter outside deleted", || !has("sec:outside"));
@@ -880,7 +947,7 @@ fn project_feed_outside_the_folder() {
     let (mut start, mut end) = (buffer.iter_at_offset(at), buffer.iter_at_offset(at + 24));
     buffer.delete(&mut start, &mut end);
     f.wait("the directory outside no longer watched", || {
-        !has("sec:back") && watched() == [base.join("central")]
+        !has("sec:back") && watched() == outside(&["central", "drafts", "library"])
     });
     // Forty directories outside: the first 32 are watched.
     for i in 0..40 {
@@ -895,8 +962,66 @@ fn project_feed_outside_the_folder() {
         let watched = watched();
         watched.len() == 32
             && watched.first() == Some(&base.join("central"))
-            && watched.last() == Some(&base.join("o30"))
+            && watched.last() == Some(&base.join("o28"))
     });
+    // The folder a link leads to deleted with its files: their paths no longer resolve, yet
+    // what they had leaves the index.
+    std::fs::remove_dir_all(base.join("drafts")).unwrap();
+    f.wait("the linked folder deleted", || !has("sec:renoted"));
+    assert!(cites().contains(&"Relinked".to_owned()));
+}
+
+/// A chapter included through a symbolic link (`\input{shared/intro}`, `shared` a link to
+/// `real`) that is open by its real path when the root is first read (a session restores both
+/// tabs) is indexed from its tab, not read through the link. When its tab closes, it is read
+/// from disk through the link: its labels stay in the index without a build.
+fn project_feed_linked_chapter_closed() {
+    let dir = common::temp_dir("feed-linked");
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real", dir.join("shared")).unwrap();
+    std::fs::write(
+        dir.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\n\\input{shared/intro}\n\
+         See \\ref{sec:intro}.\nPROBE\n\\printbibliography\n\\end{document}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("real/intro.tex"),
+        "\\section{Intro}\\label{sec:intro}\n",
+    )
+    .unwrap();
+    let dir = lemma_app::workspace::normalize(&dir);
+    // The chapter first, then the root.
+    let f = fixture_at(&dir, "real/intro.tex", false);
+    let _root = block_on(f.state.open_file(&dir.join("main.tex"))).expect("open the root");
+    let idle =
+        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    let has = |label: &str| f.state.workspace.index.borrow().find_label(label).is_some();
+    let indexed = || -> Vec<PathBuf> {
+        let index = f.state.workspace.index.borrow();
+        let mut keys: Vec<PathBuf> = index.files.keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    common::pump_for(Duration::from_millis(300));
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(
+        indexed(),
+        [dir.join("main.tex"), dir.join("real/intro.tex")]
+    );
+    assert!(has("sec:intro"));
+    f.state.close_editor(&f.editor, false);
+    common::pump_for(Duration::from_millis(300));
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(
+        indexed(),
+        [dir.join("main.tex"), dir.join("shared/intro.tex")],
+        "the chapter read through the link once its tab closed"
+    );
+    assert!(has("sec:intro"));
+    lemma_app::labels::check_now(&f.state);
+    assert_eq!(lemma_app::labels::undefined(&f.state), []);
 }
 
 /// Opening only a chapter: the root next to it is found (it includes the chapter), with its
@@ -1499,8 +1624,11 @@ fn perf_keystroke() {
     }
 }
 
-/// `\end{equation` typed by hand near the end of `tests/fixtures/large.tex` (60k lines): the
-/// proposals after each key, which look for the environment open at the cursor.
+/// `\end{` typed by hand near the end of `tests/fixtures/large.tex` (60k lines): the proposals
+/// after each key, which look for the environment open at the cursor. `\end{equation` closes an
+/// equation opened two lines up; `\end{document`, typed at the top level of the body, finds
+/// every environment closed in the whole 256 KiB it looks back at (`\begin{document}` is 60k
+/// lines up).
 fn perf_end_large() {
     let dir = project("perf-end");
     std::fs::copy(common::fixtures().join("large.tex"), dir.join("large.tex")).unwrap();
@@ -1510,41 +1638,62 @@ fn perf_end_large() {
     let buffer = f.buffer().clone();
     let at = f.text().rfind("\\end{document}").unwrap();
     buffer.place_cursor(&f.editor.iter_near(at).unwrap());
-    buffer.insert_at_cursor("\\begin{equation}\n  a = b\n\n");
+    buffer.insert_at_cursor("\n\\begin{equation}\n  a = b\n\n");
+    // `name` typed after `\end{` ten times on the cursor's line (an empty one): the time of the
+    // proposals after each key from the brace on.
+    let typed = |name: &str, first: Option<&str>| -> Vec<Duration> {
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+            for c in format!("\\end{{{name}").chars() {
+                buffer.insert_at_cursor(&c.to_string());
+                let started = Instant::now();
+                let items = completion::items_at_cursor(&f.state, &f.editor);
+                let took = started.elapsed();
+                if c != '\\' && argument_typed(&buffer) {
+                    times.push(took);
+                    if let Some(first) = first {
+                        assert_eq!(items.first().map(|i| i.label.as_str()), Some(first));
+                    }
+                }
+            }
+            let mut start = buffer.iter_at_line(line).unwrap();
+            let mut end = start;
+            end.forward_to_line_end();
+            buffer.delete(&mut start, &mut end);
+        }
+        times.sort();
+        times
+    };
+    // In the equation (the empty line before `\end{document}`).
     let mut cursor = buffer.iter_at_mark(&buffer.get_insert());
     cursor.backward_char();
     buffer.place_cursor(&cursor);
-    let mut times = Vec::new();
-    for _ in 0..10 {
-        let line = buffer.iter_at_mark(&buffer.get_insert()).line();
-        for c in "\\end{equation".chars() {
-            buffer.insert_at_cursor(&c.to_string());
-            let started = Instant::now();
-            let items = completion::items_at_cursor(&f.state, &f.editor);
-            let took = started.elapsed();
-            if c != '\\' && argument_typed(&buffer) {
-                times.push(took);
-                assert_eq!(items.first().map(|i| i.label.as_str()), Some("equation"));
-            }
-        }
-        let mut start = buffer.iter_at_line(line).unwrap();
-        let mut end = start;
-        end.forward_to_line_end();
-        buffer.delete(&mut start, &mut end);
+    let near = typed("equation", Some("equation"));
+    // At the top level (the empty line before `\begin{equation}`).
+    buffer.place_cursor(&f.editor.iter_near(at).unwrap());
+    let top = typed("document", None);
+    let lines = buffer.line_count();
+    let p = |times: &[Duration], q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    for (what, times) in [("an open equation", &near), ("the top level", &top)] {
+        println!(
+            "    proposals after `\\end{{` in {what} on {lines} lines ({} keys): p50 {:?}, p90 \
+             {:?}, max {:?}",
+            times.len(),
+            p(times, 0.5),
+            p(times, 0.9),
+            times[times.len() - 1]
+        );
     }
-    times.sort();
-    let p = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
-    let (p50, p90) = (p(0.5), p(0.9));
-    println!(
-        "    proposals after `\\end{{` on {} lines ({} keys): p50 {p50:?}, p90 {p90:?}, max {:?}",
-        buffer.line_count(),
-        times.len(),
-        times[times.len() - 1]
-    );
     if cfg!(debug_assertions) {
         println!("    (debug build: the budget is checked in release)");
     } else {
-        assert!(p90 <= Duration::from_millis(3), "p90 {p90:?} over 3 ms");
+        let (near, top) = (p(&near, 0.9), p(&top, 0.9));
+        assert!(near <= Duration::from_millis(3), "p90 {near:?} over 3 ms");
+        assert!(
+            top <= Duration::from_millis(1),
+            "p90 {top:?} over 1 ms at the top level"
+        );
     }
 }
 

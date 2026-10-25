@@ -364,7 +364,13 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   and a chapter outside the workspace folder (`../central/refs.bib`, `\input{../shared/intro}`)
   as another program would: changed, deleted and written again, they reach the index through
   the directories the file monitor watches for it (`watcher::watched_outside`), which go when
-  the `\input` does; of 40 such directories the first 32 are watched.
+  the `\input` does; of 40 such directories the first 32 are watched. A bibliography and a
+  chapter in folders that symbolic links in the workspace folder lead to (`refs/lib.bib`,
+  `\input{linked/notes}`, and `zotero.bib`, a link to `export.bib` there) are watched in those
+  folders, and the chapter leaves the index when the linked folder is deleted.
+  `the_project_feed_reads_a_linked_chapter_whose_tab_closed` opens a chapter by its real path
+  before the root that includes it through a link, and checks that the chapter is read from
+  disk through the link once its tab closes.
 - **The Outline and typing:** `gtk_outline` `prose_typed_recomputes_nothing_a_caption_its_row`
   types words into a paragraph with a pause after each (the document is indexed again each
   time) and checks that the outline is not recomputed (`outline::stats(…).syncs`); two lines
@@ -405,7 +411,7 @@ check the budgets only in release builds:
 | `gtk_typing` `perf_typing_keys` | typing-helper keys on a 5k-line document ≤ 2 ms p99 |
 | `gtk_typing` `perf_typing_large_tex` | Enter and `\end` keys (which scan environments) on `large.tex` ≤ 2 ms p90 |
 | `gtk_completion` `perf_completion_keystroke` | keystroke to frame with completion, autosnippets and highlighting on a 5k-line document ≤ 8 ms p99 |
-| `gtk_completion` `perf_completion_end_large_tex` | the proposals after each key of `\end{equation` near the end of `large.tex` (they look for the open environment) ≤ 3 ms p90 (measured 0.1 ms; 3.7 ms when each key copied the document) |
+| `gtk_completion` `perf_completion_end_large_tex` | the proposals after each key of `\end{` near the end of `large.tex` (they look for the open environment in the 256 KiB before the cursor): `\end{equation` two lines below its `\begin` ≤ 3 ms p90 (measured 0.35 ms), and `\end{document` at the top level of the body, which looks through all of them, ≤ 1 ms p90 (measured 0.75 ms; 4 ms when they were read from the buffer line by line); 3.7 ms when each key copied the document |
 | `lemma-complete` `perf_complete` | completion ≤ 3 ms p99 with all tables and a 7k-line project index |
 | `lemma-complete` `perf_word_list_project` | the words of a generated 300-file project (120k lines, 26k words) added at once: linear, twice the files ≤ 2.5× the time (measured 0.16–0.19 s; 0.7–0.9 s when each file re-sorted and copied the list) |
 | `agent::markdown` `perf_render_long_message` | re-rendering a streaming 100 kB answer ≤ 2 ms per frame |

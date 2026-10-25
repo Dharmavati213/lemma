@@ -800,7 +800,21 @@ pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     if let Some(attached) = removed {
         attached.shutdown();
         // What its file holds now (saved or reloaded while it was open) no discovery job read.
-        shared.disk_text_unread(editor.document().path());
+        let path = editor.document().path();
+        shared.disk_text_unread(path);
+        // A path that names it through a symbolic link was set aside while its live text was
+        // indexed (see `merge_discovered`): it is read from disk again.
+        let links = keys_naming(
+            shared.feed.unreadable.borrow().iter(),
+            path,
+            &shared.feed.real_paths.borrow(),
+        );
+        {
+            let mut unreadable = shared.feed.unreadable.borrow_mut();
+            for link in &links {
+                unreadable.remove(link);
+            }
+        }
         // Once the document has left the workspace (right after this), what only it reached
         // leaves the index.
         let weak = Rc::downgrade(&shared);
@@ -1160,8 +1174,16 @@ impl Attached {
         // After `\end{`, the environment that is open at the cursor comes first.
         let closing = argument_command(&position.line_before) == Some("end");
         if closing {
+            // The text looked back at, in one slice (a GTK call per line cost as much as copying
+            // the whole document): `OPEN_ENV_SCAN` characters hold at least as many bytes, and
+            // `open_environment` keeps to its byte budget. From a character offset, not a line
+            // start, so that a very long line cannot make it larger.
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
-            if let Some(open) = open_environment(lines_before(&cursor)) {
+            let mut start = cursor;
+            let scan = i32::try_from(OPEN_ENV_SCAN).unwrap_or(i32::MAX);
+            start.set_offset((cursor.offset() - scan).max(0));
+            let before = buffer.slice(&start, &cursor, true);
+            if let Some(open) = open_environment(before.rsplit('\n')) {
                 promote_open_environment(&mut items, &open, typed);
             }
         }
@@ -1436,27 +1458,6 @@ pub fn open_environment<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Op
         left = left.checked_sub(line.len() + 1)?;
     }
     None
-}
-
-/// The text before `cursor`, line by line from its own line up (each without its line break),
-/// read from the buffer one line at a time.
-fn lines_before(cursor: &gtk::TextIter) -> impl Iterator<Item = glib::GString> {
-    let buffer = cursor.buffer();
-    let mut next = Some(*cursor);
-    std::iter::from_fn(move || {
-        let end = next.take()?;
-        let mut start = end;
-        start.set_line_offset(0);
-        if start.line() > 0 {
-            let mut above = start;
-            above.backward_line();
-            if !above.ends_line() {
-                above.forward_to_line_end();
-            }
-            next = Some(above);
-        }
-        Some(buffer.slice(&start, &end, true))
-    })
 }
 
 /// The `\begin{name}` (`true`) and `\end{name}` (`false`) of `line` before its comment.
@@ -1742,12 +1743,12 @@ pub fn index_busy(state: &WindowState) -> bool {
 }
 
 /// The file monitor saw the file at `path` change, appear or go, by another program: `path` is
-/// normalized, or, outside the workspace folder, as the index names it (the monitor watches
-/// those directories by the index's paths). When the project index has it from disk (an
-/// included file that is not open, a bibliography, open or not) or could not read it before (an
-/// `\input` written before its file), it is read again on the jobs thread (a file that is gone
-/// leaves the index), and the label checks and the Outline follow once the index has caught up.
-/// True when that happens.
+/// normalized (outside the workspace folder, the monitor watches the directories where the
+/// discovery jobs found the index's files on disk), or, for a file outside that no job read, as
+/// the index names it. When the project index has it from disk (an included file that is not
+/// open, a bibliography, open or not) or could not read it before (an `\input` written before
+/// its file), it is read again on the jobs thread (a file that is gone leaves the index), and
+/// the label checks and the Outline follow once the index has caught up. True when that happens.
 /// Open LaTeX documents are indexed from their live text and need nothing. `own_write`: Lemma
 /// wrote the file (a save), whose text the index has already (`labels::saved`), so it is read
 /// only when the index could not read it before (deleted by another program, then saved).
@@ -1818,8 +1819,8 @@ struct Feed {
     discovering: Cell<bool>,
     again: Cell<bool>,
     /// Paths that could not be read, or that name an open document through a symbolic link
-    /// (its live text is indexed under its own name): not read again until a build, or until
-    /// the file monitor sees them change.
+    /// (its live text is indexed under its own name): not read again until a build, until the
+    /// file monitor sees them change, or (a link) until that document closes.
     unreadable: RefCell<HashSet<PathBuf>>,
     /// Directories already searched for `.tex` files.
     searched: RefCell<HashSet<PathBuf>>,
@@ -1838,9 +1839,15 @@ struct Feed {
     /// leaves a document's index as it was skips it only while these are the same.
     followed: RefCell<Option<Followed>>,
     /// The directories of the files the index reads from disk, or would read (an `\input` of
-    /// a file that does not exist yet), as the last [`Shared::prune`] kept them: those outside
-    /// the workspace folder are watched for the index ([`Shared::watch_outside`]).
+    /// a file that does not exist yet), as the last [`Shared::prune`] kept them, where they are
+    /// on disk ([`Feed::real_paths`]): those outside the workspace folder are watched for the
+    /// index ([`Shared::watch_outside`]).
     disk_dirs: RefCell<BTreeSet<PathBuf>>,
+    /// Where each file a discovery job read or tried to read is on disk, by the path as the
+    /// index names it: resolved on the jobs thread, so a file through a `refs` link in the
+    /// folder to a central folder is in that folder (which the folder's watcher does not see),
+    /// and a `refs.bib` linked to a reference manager's export is that export.
+    real_paths: RefCell<HashMap<PathBuf, PathBuf>>,
     /// The root whose `.aux` is loaded.
     aux_root: RefCell<Option<PathBuf>>,
     /// The `.aux` beside the PDF of the last build, read before the usual places.
@@ -1933,22 +1940,23 @@ type Followed = (Option<PathBuf>, HashSet<PathBuf>);
 type BaseInputs = (Arc<WordList>, Vec<(PathBuf, u64)>);
 
 /// A file a discovery job read: `key`, its path normalized on the jobs thread (the key of the
-/// document it would be, when it was read; else the path); `listed` when it was found by
-/// listing a directory (a possible root), not through an include; `hash`, of its text
-/// ([`text_hash`]).
+/// document it would be, when it was read; else the path); `real`, where it is on disk (also
+/// when it could not be read: through its directory); `listed` when it was found by listing a
+/// directory (a possible root), not through an include; `hash`, of its text ([`text_hash`]).
 struct ReadFile {
     path: PathBuf,
     key: PathBuf,
+    real: PathBuf,
     read: IndexedFile,
     listed: bool,
     hash: u64,
 }
 
-/// What a discovery job read.
+/// What a discovery job read; each bibliography with where it is on disk.
 #[derive(Default)]
 struct Discovered {
     files: Vec<ReadFile>,
-    bibs: Vec<(PathBuf, Option<Vec<BibEntry>>)>,
+    bibs: Vec<(PathBuf, PathBuf, Option<Vec<BibEntry>>)>,
     aux: Option<(PathBuf, AuxInfo)>,
     searched: Vec<PathBuf>,
     /// The theorem environments the files were indexed with.
@@ -2184,7 +2192,8 @@ impl Shared {
 
     /// Has the file monitor watch the directories outside the workspace folder that hold files
     /// the index reads from disk ([`Feed::disk_dirs`]): a central `.bib`, a chapter included
-    /// through `../`, a root above the folder. Their changes then reach the index as those of
+    /// through `../` or through a symbolic link in the folder (the folder's watcher does not
+    /// follow links), a root above the folder. Their changes then reach the index as those of
     /// the files inside it do.
     fn watch_outside(&self, state: &Rc<WindowState>) {
         let root = state.workspace.root().path().to_path_buf();
@@ -2463,12 +2472,14 @@ impl Shared {
         for ReadFile {
             path,
             key,
+            real,
             read,
             listed,
             hash,
         } in found.files
         {
             self.feed.stale.borrow_mut().remove(&path);
+            self.feed.real_paths.borrow_mut().insert(path.clone(), real);
             if open.contains(&key) {
                 // The live text is indexed instead. A path that names it through a symbolic
                 // link is not read again on every pass.
@@ -2519,8 +2530,9 @@ impl Shared {
             }
         }
         changed |= self.promote_candidates(&state);
-        for (path, entries) in found.bibs {
+        for (path, real, entries) in found.bibs {
             self.feed.stale.borrow_mut().remove(&path);
+            self.feed.real_paths.borrow_mut().insert(path.clone(), real);
             let mut index = state.workspace.index.borrow_mut();
             match entries {
                 Some(entries) => {
@@ -2646,14 +2658,18 @@ impl Shared {
         index.bibs.retain(|path, _| bibs.contains(path));
         drop(index);
         // Where what is read from disk lives: the files kept but the open documents (and the
-        // includes not read yet), and the bibliographies.
-        let disk_dirs: BTreeSet<PathBuf> = keep
-            .iter()
-            .filter(|path| !open.contains(*path))
-            .chain(&bibs)
-            .filter_map(|path| path.parent())
-            .map(Path::to_path_buf)
-            .collect();
+        // includes not read yet), and the bibliographies. In the directories where the discovery
+        // jobs found them on disk; a file no job read (past the cap, or before its first pass)
+        // in the one the index names.
+        let disk_dirs: BTreeSet<PathBuf> = {
+            let real_paths = self.feed.real_paths.borrow();
+            keep.iter()
+                .filter(|path| !open.contains(*path))
+                .chain(&bibs)
+                .filter_map(|path| real_paths.get(path).unwrap_or(path).parent())
+                .map(Path::to_path_buf)
+                .collect()
+        };
         self.feed.disk_dirs.replace(disk_dirs);
         // The `.aux` of a root that is no longer the project's goes too.
         let root = self.project_root(state);
@@ -2708,6 +2724,10 @@ impl Shared {
             .text_hashes
             .borrow_mut()
             .retain(|p, _| keep.contains(p) || candidates.contains_key(p));
+        self.feed
+            .real_paths
+            .borrow_mut()
+            .retain(|p, _| keep.contains(p) || bibs.contains(p) || candidates.contains_key(p));
         dropped
     }
 
@@ -2744,18 +2764,20 @@ impl Shared {
     /// Another program (or Lemma, `own_write`) changed, created or deleted the file at `path`
     /// (see [`disk_changed`]); true when the index reads it again.
     fn disk_changed(self: &Rc<Self>, state: &WindowState, path: &Path, own_write: bool) -> bool {
+        let real_paths = self.feed.real_paths.borrow();
         let indexed = if own_write {
             Vec::new()
         } else {
             let index = state.workspace.index.borrow();
             // Open documents are indexed from their live text; bibliographies are read from
             // disk even while they are open.
-            let mut keys = keys_naming(index.files.keys(), path);
+            let mut keys = keys_naming(index.files.keys(), path, &real_paths);
             keys.retain(|key| state.workspace.get(key).is_none_or(|d| !d.is_open()));
-            keys.extend(keys_naming(index.bibs.keys(), path));
+            keys.extend(keys_naming(index.bibs.keys(), path, &real_paths));
             keys
         };
-        let unreadable = keys_naming(self.feed.unreadable.borrow().iter(), path);
+        let unreadable = keys_naming(self.feed.unreadable.borrow().iter(), path, &real_paths);
+        drop(real_paths);
         if indexed.is_empty() && unreadable.is_empty() {
             return false;
         }
@@ -2913,7 +2935,7 @@ impl Shared {
         let tex = disk_files
             .iter()
             .filter(|f| f.extension().is_some_and(|e| e == "tex"));
-        if !keys_naming(tex, path).is_empty() {
+        if !keys_naming(tex, path, &self.feed.real_paths.borrow()).is_empty() {
             self.feed.base_stale.set(true);
         }
     }
@@ -3029,10 +3051,20 @@ fn lexical_join(dir: &Path, rel: impl AsRef<Path>) -> PathBuf {
 /// The keys among `keys` that name the file at the normalized `path` (as the file monitor
 /// reports it), or a file under it (a directory renamed with its files). The index keys files
 /// lexically, so a key with the same file name is also normalized (a directory reached through
-/// a symbolic link); only those touch the file system.
-fn keys_naming<'a>(keys: impl Iterator<Item = &'a PathBuf>, path: &Path) -> Vec<PathBuf> {
+/// a symbolic link); only those touch the file system. So does a key that a discovery job found
+/// at `path` on disk, or under it ([`Feed::real_paths`]): a file linked under another name, and
+/// the files of a directory a link leads to once it is deleted (the paths through the link no
+/// longer resolve).
+fn keys_naming<'a>(
+    keys: impl Iterator<Item = &'a PathBuf>,
+    path: &Path,
+    real_paths: &HashMap<PathBuf, PathBuf>,
+) -> Vec<PathBuf> {
     keys.filter(|key| {
         key.starts_with(path)
+            || real_paths
+                .get(*key)
+                .is_some_and(|real| real.starts_with(path))
             || (key.file_name() == path.file_name() && crate::workspace::normalize(key) == path)
     })
     .cloned()
@@ -3206,8 +3238,11 @@ fn read_wanted(wanted: Wanted) -> Discovered {
             continue;
         }
         let hash = text.as_deref().map(text_hash).unwrap_or_default();
+        // Where it is on disk, symbolic links resolved (a file that does not exist through its
+        // directory): the file monitor watches that directory for it.
+        let real = crate::workspace::normalize(&path);
         let key = match text {
-            Some(_) => crate::workspace::normalize(&path),
+            Some(_) => real.clone(),
             None => path.clone(),
         };
         let read = text.map(|text| {
@@ -3217,6 +3252,7 @@ fn read_wanted(wanted: Wanted) -> Discovered {
         found.files.push(ReadFile {
             path,
             key,
+            real,
             read,
             listed,
             hash,
@@ -3224,7 +3260,8 @@ fn read_wanted(wanted: Wanted) -> Discovered {
     }
     for path in wanted.bibs {
         let entries = read_text(&path, MAX_FILE_BYTES).map(|text| scan_bib(&text));
-        found.bibs.push((path, entries));
+        let real = crate::workspace::normalize(&path);
+        found.bibs.push((path, real, entries));
     }
     if let Some((root, candidates)) = wanted.aux {
         let mut aux = AuxInfo::default();
@@ -3406,8 +3443,9 @@ mod tests {
         );
     }
 
-    /// The index keys a file changed on disk names: itself, the files under a directory, and a
-    /// key that reaches it through a symbolic link.
+    /// The index keys a file changed on disk names: itself, the files under a directory, a key
+    /// that reaches it through a symbolic link, also once the directory the link leads to is
+    /// deleted, and a key linked to it under another name.
     #[test]
     fn keys_naming_a_changed_path() {
         let dir = std::env::temp_dir().join(format!("lemma-keys-naming-{}", std::process::id()));
@@ -3424,7 +3462,8 @@ mod tests {
             std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
             keys.push(dir.join("link/ch1.tex"));
         }
-        let mut named = keys_naming(keys.iter(), &dir.join("real/ch1.tex"));
+        let none = HashMap::new();
+        let mut named = keys_naming(keys.iter(), &dir.join("real/ch1.tex"), &none);
         let mut expected = vec![dir.join("real/ch1.tex")];
         if cfg!(unix) {
             expected.push(dir.join("link/ch1.tex"));
@@ -3433,10 +3472,35 @@ mod tests {
         expected.sort();
         assert_eq!(named, expected);
         assert_eq!(
-            keys_naming(keys.iter(), &dir.join("real")),
+            keys_naming(keys.iter(), &dir.join("real"), &none),
             [dir.join("real/ch1.tex"), dir.join("real/ch2.tex")]
         );
-        assert!(keys_naming(keys.iter(), &dir.join("re")).is_empty());
+        assert!(keys_naming(keys.iter(), &dir.join("re"), &none).is_empty());
+        // The directory the link leads to, deleted: the path through the link no longer
+        // resolves, but where a discovery job found it on disk tells.
+        std::fs::remove_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("link/ch1.tex");
+        let renamed = dir.join("refs.bib");
+        let keys = [link.clone(), dir.join("other/ch1.tex"), renamed.clone()];
+        let real_paths = HashMap::from([
+            (link.clone(), dir.join("real/ch1.tex")),
+            (renamed.clone(), dir.join("central/export.bib")),
+        ]);
+        assert_eq!(
+            keys_naming(keys.iter(), &dir.join("real"), &real_paths),
+            std::slice::from_ref(&link)
+        );
+        assert_eq!(
+            keys_naming(keys.iter(), &dir.join("real/ch1.tex"), &real_paths),
+            [link]
+        );
+        assert!(keys_naming(keys.iter(), &dir.join("real"), &none).is_empty());
+        assert!(keys_naming(keys.iter(), &dir.join("real/ch3.tex"), &real_paths).is_empty());
+        // A `refs.bib` linked to a reference manager's export.
+        assert_eq!(
+            keys_naming(keys.iter(), &dir.join("central/export.bib"), &real_paths),
+            [renamed]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
