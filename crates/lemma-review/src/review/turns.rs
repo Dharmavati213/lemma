@@ -286,6 +286,38 @@ impl Attribution {
             }
         }
     }
+
+    /// The furthest end of an interval starting at or before `x`, or `x` (see
+    /// `FileReview::on_edits`).
+    pub fn reach(&self, x: usize) -> usize {
+        self.turns.iter().fold(x, |hi, (_, list)| {
+            // The ends are sorted like the starts.
+            let i = list.partition_point(|r| r.start <= x);
+            i.checked_sub(1).map_or(hi, |i| hi.max(list[i].end))
+        })
+    }
+
+    /// Takes out every interval starting after `x`, by turn, each list ascending.
+    pub fn split_off_above(&mut self, x: usize) -> Vec<(u32, Vec<Range<usize>>)> {
+        let mut out = Vec::new();
+        for (t, list) in &mut self.turns {
+            let i = list.partition_point(|r| r.start <= x);
+            if i < list.len() {
+                out.push((*t, list.split_off(i)));
+            }
+        }
+        self.turns.retain(|(_, list)| !list.is_empty());
+        out
+    }
+
+    /// Appends intervals of `turn` (ascending) that lie after all of its intervals and touch none
+    /// of them: the inverse of [`split_off_above`](Self::split_off_above).
+    pub fn append(&mut self, turn: u32, intervals: Vec<Range<usize>>) {
+        match self.turns.binary_search_by_key(&turn, |(t, _)| *t) {
+            Ok(i) => self.turns[i].1.extend(intervals),
+            Err(i) => self.turns.insert(i, (turn, intervals)),
+        }
+    }
 }
 
 /// Whether one of `list`'s intervals (sorted, disjoint) touches `r`.

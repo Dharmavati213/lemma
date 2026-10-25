@@ -26,11 +26,11 @@ impl Session {
         e.apply(&mut self.text);
     }
 
-    /// Several changes in descending order (one user action).
+    /// Several changes in descending order (one user action), reported at once as the GUI's
+    /// `Document::apply_edits` does.
     pub fn edits(&mut self, edits: &[TextEdit], origin: Origin) {
-        for e in edits {
-            self.edit(e, origin);
-        }
+        self.review.on_edits(edits, origin);
+        apply_all(&mut self.text, edits);
     }
 
     pub fn recompute(&mut self) -> HunkDelta {

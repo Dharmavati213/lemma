@@ -12,6 +12,7 @@
 //! edits replaced is kept exactly where possible ([`segments`]), so that a turn's own changes can
 //! be taken back ([`per_turn`]).
 
+mod batch;
 mod ids;
 mod journal;
 mod model;
@@ -126,6 +127,9 @@ pub struct FileReview {
     /// Bumped by every change of the state (see [`FileReview::generation`]).
     generation: u64,
     created_unix: u64,
+    /// While [`FileReview::on_edits`] (or Alt+U of several regions) runs: what `on_edit` consults
+    /// instead of the whole hunk list (see `batch`).
+    batch: Option<batch::Batch>,
 }
 
 impl FileReview {
@@ -155,6 +159,7 @@ impl FileReview {
             parked_segments: Vec::new(),
             generation: 0,
             created_unix,
+            batch: None,
         }
     }
 
@@ -1093,27 +1098,38 @@ impl FileReview {
     /// Reverts accepted regions in the baseline; `true` if any could be reverted.
     fn unaccept(&mut self, mut regions: Vec<Accepted>, current: &str) -> bool {
         regions.sort_by_key(|r| std::cmp::Reverse(r.cur.start));
+        if regions.len() > 1 {
+            // An Accept all of thousands of hunks (see `batch`).
+            return self.unaccept_batch(regions, current);
+        }
+        self.unaccept_each(regions, current)
+    }
+
+    /// [`unaccept`](Self::unaccept) of `regions` (descending) one after the other.
+    fn unaccept_each(&mut self, regions: Vec<Accepted>, current: &str) -> bool {
         let mut any = false;
         for region in regions {
-            any |= self.unaccept_region(region, current);
+            any |= self.unaccept_region(region, current).is_some();
         }
         any
     }
 
     /// Puts `old_text` back into the baseline under an accepted region and re-creates its hunk.
-    fn unaccept_region(&mut self, r: Accepted, current: &str) -> bool {
+    /// Returns how far that moved the baseline after it (bytes and lines), `None` when the
+    /// region can no longer be reverted.
+    fn unaccept_region(&mut self, r: Accepted, current: &str) -> Option<(isize, i64)> {
         let (s, e) = (r.cur.start, r.cur.end);
         if !r.valid || current.get(s..e) != Some(r.new_text.as_str()) {
-            return false;
+            return None;
         }
         // The region must still be unchanged text between hunks.
         let i = self.first_ending_after(s);
         if self.hunks.get(i).is_some_and(|h| h.cur_bytes.start < e) {
-            return false;
+            return None;
         }
         let bs = crate::text::offset(s, -self.growth_before(i));
         if self.baseline.get(bs..bs + (e - s)) != Some(r.new_text.as_str()) {
-            return false;
+            return None;
         }
         let (cur_line, base_line) = self.gap_lines(i, bs);
         self.baseline.replace_range(bs..bs + (e - s), &r.old_text);
@@ -1139,6 +1155,9 @@ impl FileReview {
             undo_reported: None,
             reopen: None,
         };
+        if let Some(batch) = &mut self.batch {
+            batch.merged(i, &[], hunk.id, 0);
+        }
         self.hunks.insert(i, hunk);
         self.meta.insert(i, meta);
         for h in &mut self.hunks[i + 1..] {
@@ -1150,7 +1169,7 @@ impl FileReview {
         }
         self.put_back(&r.parked, &(s..e));
         self.refresh_turns_near(&(s..e));
-        true
+        Some((delta, lines))
     }
 }
 

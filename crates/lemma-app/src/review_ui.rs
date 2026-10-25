@@ -257,6 +257,14 @@ pub fn before_edit(doc: &Document, edit: &TextEdit, origin: Origin) {
     }
 }
 
+/// [`before_edit`] for the changes of one `Document::apply_edits` at once, in the order they were
+/// made (each with the pre-edit offsets of its moment): feeds `FileReview::on_edits`.
+pub fn before_edits(doc: &Document, edits: &[TextEdit], origin: Origin) {
+    if let Some(review) = doc.review.borrow_mut().as_mut() {
+        review.on_edits(edits, origin);
+    }
+}
+
 /// Called after every change of a document that has a review: schedules [`recompute`]. Agent,
 /// review, history and reload changes are recomputed before the next frame; user typing 50 ms
 /// after the last keystroke.

@@ -1,7 +1,7 @@
 //! The Alt+U journal: the last accepts and rejects, newest last.
 
 use super::segments::Parked;
-use crate::text::shift_range;
+use crate::text::{shift_bytes, shift_range, signed};
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -72,6 +72,38 @@ impl Journal {
             if let Entry::Accept(regions) = entry {
                 for r in regions.iter_mut().filter(|r| r.valid) {
                     r.valid = shift_range(&mut r.cur, a, b, len);
+                }
+            }
+        }
+    }
+
+    /// [`track`](Self::track) for each of `edits` (`(a, b, len)`) in turn, where each edit ends
+    /// at or before the start of the one before it (`FileReview::on_edits`), in
+    /// O((ranges + edits) log edits): a range is left alone by the edits after it, which come
+    /// first, and only moved by those before it, which come last.
+    pub fn track_all(&mut self, edits: &[(usize, usize, usize)]) {
+        // below[k]: the net length change of edits[k..].
+        let mut below = vec![0; edits.len() + 1];
+        for (k, &(a, b, len)) in edits.iter().enumerate().rev() {
+            below[k] = below[k + 1] + signed(len) - signed(b - a);
+        }
+        for entry in &mut self.entries {
+            let Entry::Accept(regions) = entry else {
+                continue;
+            };
+            for r in regions.iter_mut().filter(|r| r.valid) {
+                let mut k = edits.partition_point(|&(a, _, _)| a > r.cur.end);
+                while let Some(&(a, b, len)) = edits.get(k) {
+                    if b < r.cur.start {
+                        // This edit and every later one lie before the range.
+                        shift_bytes(&mut r.cur, below[k]);
+                        break;
+                    }
+                    if !shift_range(&mut r.cur, a, b, len) {
+                        r.valid = false;
+                        break;
+                    }
+                    k += 1;
                 }
             }
         }

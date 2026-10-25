@@ -11,6 +11,11 @@
 //!    [`crate::review_ui::after_edit`] runs, and the [`Document::connect_lines_changed`]
 //!    observers get the changed line range.
 //!
+//! The changes of one [`Document::apply_edits`] (an agent's replace_all may make tens of
+//! thousands) reach the review together once they are all applied
+//! ([`crate::review_ui::before_edits`]), and a closed document rebuilds its text and line index
+//! once for all of them; the observers still see every change.
+//!
 //! While the document is open, the scanner's [`LineStates`] are kept exact for the text
 //! (`line_states`): built when the buffer becomes the text (on the jobs thread from
 //! [`ASYNC_SCAN_LINES`] lines on, synchronously below), then updated after every change with
@@ -146,6 +151,12 @@ pub struct Document {
     origin_before_history: Cell<Option<Origin>>,
     /// The agent-edit review of this file, if any (WP1.2 creates and drops it).
     pub review: RefCell<Option<FileReview>>,
+    /// While [`Document::apply_edits`] changes a document under review: the changes reported so
+    /// far, in runs of one origin, which the review gets at once when they are all applied
+    /// (`FileReview::on_edits`), so that thousands of them (a replace_all) cost it O(log hunks)
+    /// each, not O(hunks). A change made meanwhile with another origin (an `end-user-action`
+    /// handler's own `apply_edits`, such as the environment rename's) starts a run of its own.
+    review_edits: RefCell<Option<Vec<EditRun>>>,
     pub(crate) saver: Saver,
     /// Incremented after every change.
     version: Cell<u64>,
@@ -225,6 +236,7 @@ impl Document {
             origin: Cell::new(Origin::User),
             origin_before_history: Cell::new(None),
             review: RefCell::new(None),
+            review_edits: RefCell::new(None),
             saver: Saver::new(),
             version: Cell::new(0),
             saved_version: Cell::new(Some(0)),
@@ -383,6 +395,10 @@ impl Document {
     /// their own: a user action left open across main-loop iterations (Vim's insert mode keeps
     /// one for the whole insert session) is closed before them and opened again after them.
     ///
+    /// A review gets all the changes at once when they are applied (`FileReview::on_edits`),
+    /// and a closed document's text and line index are rebuilt once (see `apply_to_shadow`);
+    /// the observers see each change as usual.
+    ///
     /// Nothing is applied when any edit does not fit the text or inserts U+0000.
     pub fn apply_edits(&self, edits: &[TextEdit], origin: Origin) -> Result<(), EditError> {
         if !edits.windows(2).all(|w| w[1].range.end <= w[0].range.start) {
@@ -395,41 +411,75 @@ impl Document {
         for f in self.apply_observers.snapshot() {
             f(self, edits, origin);
         }
-        self.with_origin(origin, || match self.buffer() {
-            Some(buffer) => {
-                let split = origin != Origin::User && self.user_action_open.get();
-                if split {
-                    buffer.end_user_action();
-                }
-                let _action = UserAction::begin(&buffer, split);
-                for edit in edits {
-                    // Every change invalidates iters, so each one is looked up just before use.
-                    if !edit.range.is_empty()
-                        && let (Some(mut start), Some(mut end)) = (
-                            self.iter_at_byte(edit.range.start),
-                            self.iter_at_byte(edit.range.end),
-                        )
-                    {
-                        buffer.delete(&mut start, &mut end);
+        self.with_origin(origin, || {
+            let review = ReviewEdits::begin(self);
+            match self.buffer() {
+                Some(buffer) => {
+                    let split = origin != Origin::User && self.user_action_open.get();
+                    if split {
+                        buffer.end_user_action();
                     }
-                    if !edit.text.is_empty()
-                        && let Some(mut at) = self.iter_at_byte(edit.range.start)
-                    {
-                        buffer.insert(&mut at, &edit.text);
+                    let _action = UserAction::begin(&buffer, split);
+                    for edit in edits {
+                        // Every change invalidates iters, so each one is looked up just before
+                        // use.
+                        if !edit.range.is_empty()
+                            && let (Some(mut start), Some(mut end)) = (
+                                self.iter_at_byte(edit.range.start),
+                                self.iter_at_byte(edit.range.end),
+                            )
+                        {
+                            buffer.delete(&mut start, &mut end);
+                        }
+                        if !edit.text.is_empty()
+                            && let Some(mut at) = self.iter_at_byte(edit.range.start)
+                        {
+                            buffer.insert(&mut at, &edit.text);
+                        }
                     }
                 }
+                None => self.apply_to_shadow(edits),
             }
-            None => {
-                for edit in edits {
-                    self.before_change(edit.clone());
-                    if let DocKind::Closed { shadow } = &mut *self.kind.borrow_mut() {
-                        edit.apply(shadow);
-                    }
-                    self.after_change();
-                }
+            if let Some(review) = review {
+                review.finish();
             }
         });
         Ok(())
+    }
+
+    /// Applies `edits` (checked, descending) to a closed document's shadow in one pass: the text
+    /// and the line index are rebuilt once, instead of moving everything after each edit (O(text)
+    /// per edit). Each change is still reported on its own, with its line delta taken from the
+    /// index before all of them: an edit lies before every edit applied before it, so the lines
+    /// up to its end are still those of that text. (No observer of a closed document reads its
+    /// text while a change is reported: the build's line journal and the problems' line trackers
+    /// only count lines, and the outline only schedules work.)
+    fn apply_to_shadow(&self, edits: &[TextEdit]) {
+        let edits: Vec<&TextEdit> = edits
+            .iter()
+            .filter(|e| !(e.range.is_empty() && e.text.is_empty()))
+            .collect();
+        let deltas: Vec<(u32, u32, u32)> = {
+            let index = self.line_index.borrow();
+            edits.iter().map(|e| index.line_delta(e)).collect()
+        };
+        if let DocKind::Closed { shadow } = &mut *self.kind.borrow_mut() {
+            let added: usize = edits.iter().map(|e| e.text.len()).sum();
+            let mut text = String::with_capacity(shadow.len() + added);
+            let mut pos = 0;
+            for e in edits.iter().rev() {
+                text.push_str(&shadow[pos..e.range.start]);
+                text.push_str(&e.text);
+                pos = e.range.end;
+            }
+            text.push_str(&shadow[pos..]);
+            self.line_index.replace(LineIndex::new(&text));
+            *shadow = text;
+        }
+        for (edit, delta) in edits.into_iter().zip(deltas) {
+            self.report_before(edit);
+            self.report_after(edit, delta);
+        }
     }
 
     fn check_edits(&self, edits: &[TextEdit]) -> Result<(), EditError> {
@@ -899,13 +949,7 @@ impl Document {
         if edit.range.is_empty() && edit.text.is_empty() {
             return;
         }
-        let origin = self.origin.get();
-        if self.review.borrow().is_some() {
-            crate::review_ui::before_edit(self, &edit, origin);
-        }
-        for f in self.edit_observers.snapshot() {
-            f(self, &edit, origin);
-        }
+        self.report_before(&edit);
         let mut index = self.line_index.borrow_mut();
         let delta = index.line_delta(&edit);
         index.apply(&edit);
@@ -914,10 +958,36 @@ impl Document {
         self.pending.replace(Some(PendingChange { edit, delta }));
     }
 
+    /// What a change reports before it is applied: the review hook (or, while
+    /// [`Document::apply_edits`] runs, the changes collected for it) and the
+    /// [`Document::connect_edit`] observers.
+    fn report_before(&self, edit: &TextEdit) {
+        let origin = self.origin.get();
+        if self.review.borrow().is_some() {
+            if let Some(runs) = self.review_edits.borrow_mut().as_mut() {
+                match runs.last_mut() {
+                    Some((o, edits)) if *o == origin => edits.push(edit.clone()),
+                    _ => runs.push((origin, vec![edit.clone()])),
+                }
+            } else {
+                crate::review_ui::before_edit(self, edit, origin);
+            }
+        }
+        for f in self.edit_observers.snapshot() {
+            f(self, edit, origin);
+        }
+    }
+
     fn after_change(&self) {
         let Some(PendingChange { edit, delta }) = self.pending.take() else {
             return;
         };
+        self.report_after(&edit, delta);
+    }
+
+    /// What a change reports once it is applied, `delta` being its `LineIndex::line_delta`: the
+    /// version, the review hook, the scanner states and the line and change observers.
+    fn report_after(&self, edit: &TextEdit, delta: (u32, u32, u32)) {
         let (first, removed, added) = delta;
         self.version.set(self.version.get() + 1);
         let origin = self.origin.get();
@@ -931,7 +1001,7 @@ impl Document {
             f(first, removed, added);
         }
         for f in self.changed_observers.snapshot() {
-            f(self, &edit, origin);
+            f(self, edit, origin);
         }
     }
 }
@@ -955,6 +1025,42 @@ struct RestoreOrigin<'a> {
 impl Drop for RestoreOrigin<'_> {
     fn drop(&mut self) {
         self.doc.origin.set(self.previous);
+    }
+}
+
+/// Changes of one origin, in the order they were made (see `Document::review_edits`).
+type EditRun = (Origin, Vec<TextEdit>);
+
+/// Collects the changes [`Document::apply_edits`] makes to a document under review, so that the
+/// review gets them at once (see `Document::review_edits`). Dropped without
+/// [`finish`](Self::finish) (on a panic), it only stops collecting.
+struct ReviewEdits<'a> {
+    doc: &'a Document,
+}
+
+impl<'a> ReviewEdits<'a> {
+    /// Starts collecting when `doc` has a review (and is not collecting already).
+    fn begin(doc: &'a Document) -> Option<Self> {
+        if doc.review.borrow().is_none() || doc.review_edits.borrow().is_some() {
+            return None;
+        }
+        doc.review_edits.replace(Some(Vec::new()));
+        Some(Self { doc })
+    }
+
+    /// Gives the review the changes collected, in the order they were made, each run with its
+    /// origin.
+    fn finish(self) {
+        let runs = self.doc.review_edits.take().unwrap_or_default();
+        for (origin, edits) in runs {
+            crate::review_ui::before_edits(self.doc, &edits, origin);
+        }
+    }
+}
+
+impl Drop for ReviewEdits<'_> {
+    fn drop(&mut self) {
+        self.doc.review_edits.replace(None);
     }
 }
 

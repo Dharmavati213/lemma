@@ -1,15 +1,45 @@
 use crate::TextEdit;
+use std::fmt;
 use std::ops::Range;
 
 /// Byte offsets of line starts. Line count = number of '\n' + 1 (same as GtkTextBuffer).
 ///
 /// The index also tracks the text length, so it can be kept exact by mirroring every buffer
 /// change through [`LineIndex::apply`] and compared against a fresh [`LineIndex::new`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// An edit moves the start of every line after it. So the index keeps the starts of the lines
+/// after the last edit as distances from the end of the text, which an edit before them leaves
+/// alone, and an edit only converts the lines between it and the edit before: a run of edits
+/// going down or up the text (an agent's replace_all, a replace all in the find bar) costs the
+/// lines between consecutive edits, not the lines after each of them.
+#[derive(Clone)]
 pub struct LineIndex {
-    /// `starts[0] == 0`; `starts[i]` is the byte after the `i`-th `'\n'`.
+    /// `starts[0] == 0`; line `i` starts at byte `starts[i]` for `i < split`, and `starts[i]`
+    /// bytes before the end of the text for `i >= split`.
     starts: Vec<usize>,
     len: usize,
+    /// The first line whose start is kept from the end (`starts.len()` when none is).
+    split: usize,
+}
+
+impl PartialEq for LineIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.starts.len() == other.starts.len()
+            && (0..self.starts.len()).all(|i| self.start(i) == other.start(i))
+    }
+}
+
+impl Eq for LineIndex {}
+
+impl fmt::Debug for LineIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let starts: Vec<usize> = (0..self.starts.len()).map(|i| self.start(i)).collect();
+        f.debug_struct("LineIndex")
+            .field("starts", &starts)
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 impl Default for LineIndex {
@@ -26,9 +56,30 @@ impl LineIndex {
         starts.push(0);
         starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
         Self {
+            split: starts.len(),
             starts,
             len: text.len(),
         }
+    }
+
+    /// The start of line `i` (see `starts`).
+    fn start(&self, i: usize) -> usize {
+        if i < self.split {
+            self.starts[i]
+        } else {
+            self.len - self.starts[i]
+        }
+    }
+
+    /// How many lines start at or before `offset`.
+    fn starting_by(&self, offset: usize) -> usize {
+        let (front, back) = self.starts.split_at(self.split);
+        let n = front.partition_point(|&s| s <= offset);
+        if n < front.len() {
+            return n;
+        }
+        // Distances from the end descend, so the starts they stand for ascend.
+        n + back.partition_point(|&d| self.len - d <= offset)
     }
 
     /// Number of lines; at least 1.
@@ -42,7 +93,7 @@ impl LineIndex {
     /// # Panics
     /// If `line >= self.line_count()`.
     pub fn line_start(&self, line: u32) -> usize {
-        self.starts[line as usize]
+        self.start(line as usize)
     }
 
     /// Byte offset of (`line`, `col_byte`). `col_byte` = GtkTextIter::line_index().
@@ -56,14 +107,14 @@ impl LineIndex {
     /// (line, col_byte) of a byte offset. Offsets past the end map into the last line.
     pub fn position(&self, offset: usize) -> (u32, u32) {
         let line = self.line_of(offset);
-        (line, (offset - self.starts[line as usize]) as u32)
+        (line, (offset - self.start(line as usize)) as u32)
     }
 
     /// The line containing `offset`. The offset of a `'\n'` belongs to the line it ends;
     /// offsets past the end map to the last line.
     pub fn line_of(&self, offset: usize) -> u32 {
-        // starts[0] == 0 <= offset, so the partition point is at least 1.
-        (self.starts.partition_point(|&s| s <= offset) - 1) as u32
+        // starts[0] == 0 <= offset, so at least one line starts by it.
+        (self.starting_by(offset) - 1) as u32
     }
 
     /// Length in bytes of the indexed text.
@@ -77,14 +128,16 @@ impl LineIndex {
     /// If `line >= self.line_count()`.
     pub fn line_range(&self, line: u32) -> Range<usize> {
         let i = line as usize;
-        let end = match self.starts.get(i + 1) {
-            Some(&next) => next - 1,
-            None => self.len,
+        let end = if i + 1 < self.starts.len() {
+            self.start(i + 1) - 1
+        } else {
+            self.len
         };
-        self.starts[i]..end
+        self.start(i)..end
     }
 
-    /// Update for an edit expressed in pre-edit offsets. O(lines after the edit).
+    /// Update for an edit expressed in pre-edit offsets. O(lines between this edit and the one
+    /// before), plus a move of the lines after it when the edit changes the number of lines.
     pub fn apply(&mut self, e: &TextEdit) {
         let (a, b) = (e.range.start, e.range.end);
         debug_assert!(
@@ -95,14 +148,24 @@ impl LineIndex {
         let removed = b - a;
         let added = e.text.len();
         // Line starts in (a, b] were created by newlines inside the replaced range.
-        let lo = self.starts.partition_point(|&s| s <= a);
-        let hi = self.starts.partition_point(|&s| s <= b);
-        for s in &mut self.starts[hi..] {
-            // s > b >= removed, so this never underflows.
-            *s = *s - removed + added;
+        let lo = self.starting_by(a);
+        let hi = self.starting_by(b);
+        // The lines after the edit keep their distance from the end and those before it their
+        // offset, so only the lines between it and the previous edit change form.
+        let len = self.len;
+        if hi < self.split {
+            for s in &mut self.starts[hi..self.split] {
+                *s = len - *s;
+            }
+        } else if self.split < lo {
+            for s in &mut self.starts[self.split..lo] {
+                *s = len - *s;
+            }
         }
+        let inserted = e.text.bytes().filter(|&c| c == b'\n').count();
         self.starts
             .splice(lo..hi, e.text.match_indices('\n').map(|(i, _)| a + i + 1));
+        self.split = lo + inserted;
         self.len = self.len - removed + added;
     }
 
@@ -274,6 +337,49 @@ mod tests {
                 prop_assert_eq!(new_lines.len(), old_lines.len() - r + a);
                 prop_assert_eq!(&old_lines[..f], &new_lines[..f]);
                 prop_assert_eq!(&old_lines[f + r..], &new_lines[f + a..]);
+            }
+        }
+
+        /// Runs of edits going down the text (as `Document::apply_edits` makes them) or up it
+        /// (as GtkSourceView's replace all does), which keep a shift pending: after each edit
+        /// every line start, position and line range is that of a fresh index.
+        #[test]
+        fn runs_of_edits_match_a_fresh_index(
+            start in text(),
+            run in prop::collection::vec((0usize..6, 0usize..4, text()), 1..24),
+            down in any::<bool>(),
+        ) {
+            let floor = |t: &str, mut i: usize| {
+                i = i.min(t.len());
+                while !t.is_char_boundary(i) {
+                    i -= 1;
+                }
+                i
+            };
+            let mut text = start;
+            let mut idx = LineIndex::new(&text);
+            let mut pos = if down { text.len() } else { 0 };
+            for (gap, len, insert) in run {
+                let e = if down {
+                    let b = floor(&text, pos.saturating_sub(gap));
+                    TextEdit { range: floor(&text, b.saturating_sub(len))..b, text: insert }
+                } else {
+                    let a = floor(&text, pos + gap);
+                    TextEdit { range: a..floor(&text, a + len), text: insert }
+                };
+                pos = if down { e.range.start } else { e.range.start + e.text.len() };
+                let fresh_before = LineIndex::new(&text);
+                prop_assert_eq!(idx.line_delta(&e), fresh_before.line_delta(&e));
+                e.apply(&mut text);
+                idx.apply(&e);
+                let fresh = LineIndex::new(&text);
+                prop_assert_eq!(&idx, &fresh);
+                for line in 0..fresh.line_count() {
+                    prop_assert_eq!(idx.line_range(line), fresh.line_range(line));
+                }
+                for offset in 0..=text.len() + 1 {
+                    prop_assert_eq!(idx.position(offset), fresh.position(offset));
+                }
             }
         }
 

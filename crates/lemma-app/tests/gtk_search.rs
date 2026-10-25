@@ -74,6 +74,7 @@ fn main() -> ExitCode {
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_search_10k_frame_budget", perf_10k));
+        tests.push(("perf_find_bar_replace_all_large_tex", perf_find_replace_all));
     }
     common::run(&tests)
 }
@@ -1272,6 +1273,45 @@ fn find_replace_review() {
             .contains("\\emph{sheaf} and \\emph{stalk}")
     );
     assert!(doc.text().contains("\\emph{faisceau} and \\emph{germ}"));
+}
+
+/// The find bar's Replace All on `large.tex` (60k lines): GtkSourceView replaces the matches one
+/// after the other, a delete and an insert each, and the document's line index follows every
+/// one of those changes (`LineIndex::apply`). Prints the time of Replace All of every `x`
+/// (20 000 matches) and what the same line index updates take alone (0.24 s of 0.92 s while
+/// each change moved every line start after it; 8 ms of 0.61 s now).
+fn perf_find_replace_all() {
+    let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
+    let fx = fixture("find-perf", &[("large.tex", &large)]);
+    let editor = fx.open("large.tex");
+    focus(&editor);
+    let find = find_bar::bar(&fx.state).expect("a find bar");
+    run(&fx, "win.find");
+    find.set_options(true, false, false);
+    find.search_now("x");
+    assert_eq!(counted(&find).total, Some(20_000));
+    find.set_replacement(Some("y"));
+    let doc = editor.document().clone();
+    let changes = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = changes.clone();
+    doc.connect_edit(move |_, edit, _| sink.borrow_mut().push(edit.clone()));
+    let started = Instant::now();
+    find.replace_every();
+    let took = started.elapsed();
+    let changes = changes.borrow();
+    let mut index = lemma_core::LineIndex::new(&large);
+    let started = Instant::now();
+    for e in changes.iter() {
+        std::hint::black_box(index.line_delta(e));
+        index.apply(e);
+    }
+    let index_took = started.elapsed();
+    assert_eq!(index, *doc.line_index());
+    eprintln!(
+        "find bar Replace All on large.tex: {} changes in {took:?}, of which the line index \
+         updates alone take {index_took:?}",
+        changes.len()
+    );
 }
 
 /// Replace and Replace All change the matches only: live environment rename (`envtools`) stays

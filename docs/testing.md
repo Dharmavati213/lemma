@@ -211,6 +211,16 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
 - Pure crates test with plain `cargo test -p <crate>`.
 - Property tests use `proptest`. Each suite documents its default case count; set
   `PROPTEST_CASES=10000` locally for a deeper run (the review core asks for ≥ 2000 by default).
+- The review's batched feed (`FileReview::on_edits`) is checked against `on_edit` change by
+  change by a differential property in its white-box tests
+  (`review::tests::on_edits_is_on_edit_for_each_edit`): random sessions of every kind of step
+  on documents of a few KiB, then a random batch (spread out, adjacent, replace_all-like) for
+  each origin; every field of the two reviews must be equal. Alt+U of an Accept all
+  (`unaccept_batch`) is checked the same way against putting the regions back one by one
+  (`review::tests::unaccept_batch_is_unaccept_each`). `tests/common`'s `Session::edits`
+  goes through `on_edits` too, so every review suite uses it; `gtk_document`
+  `replace_all_under_review_reports_every_change` checks `Document::apply_edits` (what the
+  review gets, the observers, the line deltas and the version) on a closed and an open document.
 - `lemma-mcp` has an end-to-end test (`crates/lemma-mcp/tests/bridge.rs`) that runs the real
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
@@ -223,8 +233,8 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   `regress2_*` (M2: `crates/lemma-agent/tests/regress2_a_{acp,mcp}.rs`,
   `crates/lemma-review/tests/regress2_d.rs`, `crates/lemma-complete/tests/regress2_e2.rs`,
   `crates/lemma-app/tests/regress2_c.rs`, `gtk_regress2_{b,c,d,e1,e2,f}.rs`). The only ignored
-  one is `regress2_d`'s `regress2_replace_all_20k_matches_is_fast` (the open defect D-5, a
-  release timing test that fails until it is fixed; run it with `cargo test --release -p
+  one is `regress2_d`'s `regress2_replace_all_20k_matches_is_fast` (D-5, fixed: a release
+  timing test, about 0.1 s there but 4 s in a debug build; run it with `cargo test --release -p
   lemma-review --test regress2_d -- --ignored regress2_replace_all`). The M3 integration's
   regression test is `gtk_agent_panel` `regress3_inline_popover_of_a_closed_tab_leaves_no_critical`;
   its other fixes are checked by assertions added to existing tests. The M5 review's 16 are
@@ -310,6 +320,11 @@ check the budgets only in release builds:
 | `gtk_pairs` `perf_pairs_cursor_moves_large_tex` | delimiter-pair highlight per cursor move on `large.tex` ≤ 0.5 ms p99 |
 | `gtk_git_gutter` `perf_git_gutter_keystrokes_large_tex` | the git gutter's main-thread cost per keystroke on `large.tex` (with against without the gutter) and per diff |
 | `gtk_search` `perf_search_10k_frame_budget` | the Search page's work per main-loop step while 10 000 matches stream in ≤ 4 ms |
+| `gtk_search` `perf_find_bar_replace_all_large_tex` | the find bar's Replace All of 20 000 matches on `large.tex`, and what the same line index updates take alone (printed) |
+| `lemma-review` `perf_unaccept_accept_all` | Alt+U of an Accept all of 5000 hunks ≤ 100 ms |
+| `lemma-review` `perf_on_edits_replace_all` | a replace_all fed to a review at once (`on_edits`): 20 000 matches ≤ 0.5 s and linear (≤ 6× the time of 10 000); 20 000 over 5000 hunks, or right after accepting them, ≤ 0.5 s; right after rejecting them, printed only (the records, O(edits × rejects)) |
+| `lemma-core` `perf_line_index_replace_all_large_tex` | the line index through the 40 000 changes of a replace all of 20 000 matches in `large.tex`, from the end and from the start, ≤ 50 ms each |
+| `gtk_document` `perf_apply_edits_replace_all` | `apply_edits` of 20 000 matches in a file under review: ≤ 0.5 s closed, ≤ 1.5 s open |
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 

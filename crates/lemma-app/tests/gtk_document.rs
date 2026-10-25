@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 fn main() -> ExitCode {
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         (
             "random_operations_keep_line_index_and_origins",
             random_operations,
@@ -30,6 +30,14 @@ fn main() -> ExitCode {
         ),
         ("byte_offsets_and_iters_round_trip", byte_offsets_round_trip),
         ("closed_documents", closed_documents),
+        (
+            "replace_all_under_review_reports_every_change",
+            replace_all_under_review,
+        ),
+        (
+            "nested_apply_edits_reach_the_review_with_their_origin",
+            nested_apply_edits_keep_their_origin,
+        ),
         ("observers_and_disconnect", observers_and_disconnect),
         ("save_round_trip_is_byte_identical", save_round_trip),
         ("saves_are_coalesced", saves_are_coalesced),
@@ -45,7 +53,11 @@ fn main() -> ExitCode {
             "workspace_open_missing_file_and_dedup",
             workspace_open_missing_and_dedup,
         ),
-    ])
+    ];
+    if std::env::args().any(|a| a == "--ignored") {
+        tests.push(("perf_apply_edits_replace_all", perf_replace_all));
+    }
+    common::run(&tests)
 }
 
 fn open_doc(text: &str) -> DocRef {
@@ -353,6 +365,196 @@ fn closed_documents() {
         "% ONE\ntwo\nthree\n",
         "the old buffer is disconnected"
     );
+}
+
+/// What a document reported while it changed: the edits (pre-edit offsets) and line deltas.
+type Reported = Rc<RefCell<(Vec<TextEdit>, Vec<(u32, u32, u32)>)>>;
+
+fn record_changes(doc: &DocRef) -> Reported {
+    let log: Reported = Rc::default();
+    let sink = log.clone();
+    doc.connect_edit(move |_, edit, _| sink.borrow_mut().0.push(edit.clone()));
+    let sink = log.clone();
+    doc.connect_lines_changed(move |first, removed, added| {
+        sink.borrow_mut().1.push((first, removed, added));
+    });
+    log
+}
+
+/// A replace_all with hundreds of matches in a file under review (agent edits, as the `edit`
+/// tool and Replace in Project apply them): the review gets the changes the document reports
+/// all at once (`FileReview::on_edits`) and ends as it would change by change; a closed document
+/// rebuilds its text and line index once and still reports every change (observers, line
+/// deltas, version) as it would one by one; an open one reports a delete and an insert per edit.
+fn replace_all_under_review() {
+    let text: String = (0..200)
+        .map(|i| format!("Line {i}: let $x_{i}$ and $é$ be given.\nPlain {i}.\n"))
+        .collect();
+    let agent = Origin::Agent { call: 1 };
+    for open in [false, true] {
+        let doc = if open {
+            open_doc(&text)
+        } else {
+            Document::new_closed(PathBuf::from("/tmp/x/closed.tex"), text.clone())
+        };
+        // An earlier agent change, already a hunk.
+        let mut review = lemma_review::FileReview::new(text.clone());
+        review.set_turn(1);
+        doc.review.replace(Some(review));
+        let at = text.find("Plain 100.").unwrap();
+        doc.apply_edits(&[TextEdit::delete(at..at + 6)], agent)
+            .unwrap();
+        doc.with_text(|t| doc.review.borrow_mut().as_mut().unwrap().recompute(t));
+        let before = doc.review.borrow().clone().unwrap();
+        let start = doc.text();
+        let edits = lemma_review::str_replace(&start, "$", "\\(", true).unwrap();
+        assert_eq!(edits.len(), 800);
+        let reported = record_changes(&doc);
+        let version = doc.version();
+        doc.apply_edits(&edits, agent).unwrap();
+
+        let mut want = start.clone();
+        lemma_core::apply_all(&mut want, &edits);
+        assert_eq!(doc.text(), want);
+        assert_index_exact(&doc, "a replace_all");
+        let (changes, lines) = reported.borrow().clone();
+        let expected: Vec<TextEdit> = if open {
+            edits
+                .iter()
+                .flat_map(|e| {
+                    [
+                        TextEdit::delete(e.range.clone()),
+                        TextEdit::insert(e.range.start, e.text.clone()),
+                    ]
+                })
+                .collect()
+        } else {
+            edits.clone()
+        };
+        assert_eq!(changes, expected, "open: {open}");
+        assert_eq!(doc.version(), version + changes.len() as u64);
+        let mut index = LineIndex::new(&start);
+        let deltas: Vec<(u32, u32, u32)> = changes
+            .iter()
+            .map(|e| {
+                let delta = index.line_delta(e);
+                index.apply(e);
+                delta
+            })
+            .collect();
+        assert_eq!(lines, deltas, "open: {open}");
+        // The review: as fed change by change.
+        let mut one_by_one = before;
+        for e in &changes {
+            one_by_one.on_edit(e, agent);
+        }
+        let mut review = doc.review.borrow_mut();
+        let review = review.as_mut().unwrap();
+        assert_eq!(review.hunks(), one_by_one.hunks());
+        assert_eq!(
+            review.to_persisted("x.tex".into(), &want),
+            one_by_one.to_persisted("x.tex".into(), &want)
+        );
+        // Word spans get a time budget (they may differ under load); the rest is exact.
+        let key = |r: &lemma_review::FileReview| -> Vec<_> {
+            r.hunks()
+                .iter()
+                .map(|h| {
+                    (
+                        h.id,
+                        h.cur_bytes.clone(),
+                        h.base_bytes.clone(),
+                        h.turns.clone(),
+                    )
+                })
+                .collect()
+        };
+        review.recompute(&want);
+        one_by_one.recompute(&want);
+        assert_eq!(key(review), key(&one_by_one));
+        // A hunk per changed line; the earlier change joins the lines around it into one.
+        assert_eq!(review.hunks().len(), 199, "open: {open}");
+    }
+}
+
+/// An `apply_edits` made while another one runs (an `end-user-action` handler's, as the
+/// environment rename's when an agent edit closes the user action Vim's insert mode keeps open)
+/// reaches the review with its own origin, in order: the user's change goes into the baseline,
+/// the agent's becomes a hunk.
+fn nested_apply_edits_keep_their_origin() {
+    let text = "alpha\nbeta\ngamma\n";
+    let doc = open_doc(text);
+    doc.review
+        .replace(Some(lemma_review::FileReview::new(text.to_owned())));
+    let buffer = buffer_of(&doc);
+    buffer.begin_user_action();
+    let weak = Rc::downgrade(&doc);
+    let once = Cell::new(true);
+    let handler = buffer.connect_end_user_action(move |_| {
+        if let Some(doc) = weak.upgrade()
+            && once.replace(false)
+        {
+            let end = doc.text().len();
+            doc.apply_edits(&[TextEdit::insert(end, "user\n")], Origin::User)
+                .unwrap();
+        }
+    });
+    doc.apply_edits(
+        &[TextEdit {
+            range: 0..5,
+            text: "ALPHA".into(),
+        }],
+        Origin::Agent { call: 1 },
+    )
+    .unwrap();
+    buffer.disconnect(handler);
+    buffer.end_user_action();
+    let current = doc.text();
+    assert_eq!(current, "ALPHA\nbeta\ngamma\nuser\n");
+    let mut review = doc.review.borrow_mut();
+    let review = review.as_mut().unwrap();
+    review.recompute(&current);
+    assert_eq!(review.baseline(), "alpha\nbeta\ngamma\nuser\n");
+    let hunks: Vec<(usize, usize)> = review
+        .hunks()
+        .iter()
+        .map(|h| (h.cur_bytes.start, h.cur_bytes.end))
+        .collect();
+    assert_eq!(hunks, [(0, 6)]);
+}
+
+/// `apply_edits` of a replace_all of `$` with 20 000 matches (5000 lines) in a file under
+/// review, closed and open (release builds; run with `cargo test --release -p lemma-app --test
+/// gtk_document -- --ignored perf`).
+fn perf_replace_all() {
+    let text: String = (0..5000)
+        .map(|i| format!("Line {i}: let $x_{i}$ and $y$ be given.\nPlain {i}.\n"))
+        .collect();
+    let edits = lemma_review::str_replace(&text, "$", "\\(", true).unwrap();
+    for open in [false, true] {
+        let doc = if open {
+            open_doc(&text)
+        } else {
+            Document::new_closed(PathBuf::from("/tmp/x/closed.tex"), text.clone())
+        };
+        let mut review = lemma_review::FileReview::new(text.clone());
+        review.set_turn(1);
+        doc.review.replace(Some(review));
+        let started = std::time::Instant::now();
+        doc.apply_edits(&edits, Origin::Agent { call: 1 }).unwrap();
+        let took = started.elapsed();
+        eprintln!(
+            "    apply_edits of {} matches under review, {}: {took:?}",
+            edits.len(),
+            if open { "open" } else { "closed" }
+        );
+        if cfg!(debug_assertions) {
+            eprintln!("    debug build: the budget is checked in release builds only");
+        } else {
+            let budget = Duration::from_millis(if open { 1500 } else { 500 });
+            assert!(took < budget, "{took:?}");
+        }
+    }
 }
 
 fn observers_and_disconnect() {

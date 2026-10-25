@@ -114,6 +114,16 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   Theorem}` in `preamble.tex`) appear in the Outline of the chapters that use them, open or
   not, and labels inside them get the theorem's title. Before, only the common names
   (`theorem`, `lemma`, …) did when the chapter was read before the preamble.
+- Replace All and the agent's replace_all with thousands of matches no longer freeze the
+  window. In a file under review (the agent's edits, Replace in Project, a reformat) the review
+  takes all the changes of one replace at once, in linear time, and a file that is not open is
+  rewritten in one pass instead of once per match: 20 000 matches in a 10 000-line file take
+  0.45 s instead of 5.5 s with the file open, 0.13 s instead of 2.8 s with it closed. The line
+  index no longer moves every line after each change, so the find bar's Replace All of 20 000
+  matches in a 60 000-line file takes 0.6 s instead of 0.9 s. Alt+U of an Accept all of
+  thousands of changes puts them back at once too (5000 changes: 21 ms instead of 0.27 s).
+- An agent edit that only inserts or only deletes text could crash Lemma when a non-ASCII
+  character (é, ∑, …) sat 256 bytes before it.
 - Windows: errors TeX reports in a file of the TeX distribution under a drive
   (`C:/texlive/…/geometry.sty:1005: …`), such as an unknown package option, reach the Problems
   page.

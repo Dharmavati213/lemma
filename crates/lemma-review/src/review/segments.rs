@@ -265,7 +265,18 @@ impl Segments {
             // segment.
             let (lo, hi) = self.free_around(&range);
             let left_ctx = {
-                let from = ctx_start.max(range.start.saturating_sub(MAX_SLIDE)).max(lo);
+                // On a char boundary: of the text before the hull, or of the hull after the edit.
+                let boundary = |x: usize| {
+                    if x < hull.start {
+                        ctx.is_char_boundary(at(x))
+                    } else {
+                        after.is_char_boundary(x - start)
+                    }
+                };
+                let mut from = ctx_start.max(range.start.saturating_sub(MAX_SLIDE)).max(lo);
+                while !boundary(from) {
+                    from += 1;
+                }
                 let mut s = String::new();
                 if from < hull.start {
                     s.push_str(&ctx[at(from)..at(hull.start)]);
@@ -424,6 +435,37 @@ impl Segments {
             s.turn = f(s.turn);
         }
     }
+
+    /// The furthest end of a segment starting at or before `x`, or `x` (see
+    /// `FileReview::on_edits`).
+    pub fn reach(&self, x: usize) -> usize {
+        // The ends are sorted like the starts.
+        let i = self.list.partition_point(|s| s.range.start <= x);
+        i.checked_sub(1)
+            .map_or(x, |i| x.max(self.list[i].range.end))
+    }
+
+    /// Where the last segment starts.
+    pub fn last_start(&self) -> Option<usize> {
+        self.list.last().map(|s| s.range.start)
+    }
+
+    /// Takes out the segments after the first one starting after `x` (that one stays: a
+    /// composed segment reads it as its neighbour), ascending.
+    pub fn split_off_above(&mut self, x: usize) -> Vec<Segment> {
+        let keep = self.list.partition_point(|s| s.range.start <= x) + 1;
+        if keep < self.list.len() {
+            self.list.split_off(keep)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Appends segments (sorted) that lie after all the others: the inverse of
+    /// [`split_off_above`](Self::split_off_above).
+    pub fn append(&mut self, segments: Vec<Segment>) {
+        self.list.extend(segments);
+    }
 }
 
 /// Segments and unknown places taken out by a decision, to be put back when it is undone. Their
@@ -448,6 +490,15 @@ impl Parked {
     /// Whether nothing was taken.
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty() && self.unknown.is_empty() && self.attribution.is_empty()
+    }
+
+    /// The furthest end of what was taken, put back at `anchor` (at least `anchor.end`).
+    pub fn end(&self, anchor: &Range<usize>) -> usize {
+        let ends = self.segments.iter().map(|s| s.2);
+        let ends = ends.chain(self.unknown.iter().chain(&self.attribution).map(|u| u.2));
+        ends.fold(anchor.end, |hi, e| {
+            hi.max(anchor.start.saturating_add_signed(e))
+        })
     }
 
     /// Renumbers the turns with `f`.

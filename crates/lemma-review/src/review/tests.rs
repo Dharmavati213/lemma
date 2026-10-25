@@ -3,6 +3,7 @@
 //! it) and the shape of the segments of `segments.rs`.
 
 use super::FileReview;
+use super::journal::Entry;
 use super::turns::touch;
 use crate::text::{count_newlines, line_span, to_u32};
 use lemma_core::{Origin, TextEdit};
@@ -143,6 +144,12 @@ enum Op {
     /// Decide every other hunk (from the n-th) as one decision.
     AcceptSome(usize),
     RejectSome(usize),
+    /// Every occurrence of `from` replaced by `to` as one action (a replace_all), edit by edit.
+    All {
+        origin: u8,
+        from: &'static str,
+        to: &'static str,
+    },
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -179,99 +186,113 @@ fn floor(s: &str, mut i: usize) -> usize {
     i
 }
 
+fn origin_of(n: u8) -> Origin {
+    match n {
+        0 => Origin::User,
+        1 => Origin::History,
+        2 => Origin::Review,
+        3 => Origin::Reload,
+        _ => Origin::Agent { call: 1 },
+    }
+}
+
 fn apply(r: &mut FileReview, current: &mut String, e: &TextEdit, origin: Origin) {
     r.on_edit(e, origin);
     e.apply(current);
+}
+
+/// Plays one step of a random session on `r` and its text `current`.
+fn play(r: &mut FileReview, current: &mut String, op: &Op) -> Result<(), String> {
+    match op {
+        Op::Edit {
+            origin,
+            at,
+            len,
+            text,
+        } => {
+            let a = floor(current, at % (current.len() + 1));
+            let b = floor(current, a + len);
+            let e = TextEdit {
+                range: a..b,
+                text: text.clone(),
+            };
+            apply(r, current, &e, origin_of(*origin));
+        }
+        Op::All { origin, from, to } => {
+            for e in &crate::str_replace(current, from, to, true).unwrap_or_default() {
+                apply(r, current, e, origin_of(*origin));
+            }
+        }
+        Op::Recompute => {
+            r.recompute(current);
+        }
+        Op::Accept(k) if !r.hunks.is_empty() => {
+            let id = r.hunks[k % r.hunks.len()].id;
+            r.accept(id, current).map_err(|e| format!("accept: {e}"))?;
+        }
+        Op::Reject(k) if !r.hunks.is_empty() => {
+            let id = r.hunks[k % r.hunks.len()].id;
+            let e = r.reject(id, current).map_err(|e| format!("reject: {e}"))?;
+            apply(r, current, &e, Origin::Review);
+        }
+        Op::Undo => match r.undo_review_action(current) {
+            Some(crate::UndoAction::Edits(edits)) => {
+                for e in &edits {
+                    apply(r, current, e, Origin::Review);
+                }
+            }
+            Some(crate::UndoAction::Unaccepted) | None => {}
+        },
+        Op::Turn => r.begin_turn(),
+        Op::SetTurn(t) => r.set_turn(*t),
+        Op::AcceptTurn(t) => {
+            let before = current.clone();
+            r.accept_turn(*t, current);
+            if *current != before {
+                return Err("accept_turn changed the text".into());
+            }
+            // Only hunks holding more than the turn's change may stay.
+            if r.check(current, 0..r.hunks.len()).is_ok()
+                && r.clusters(*t, current).iter().any(|c| c.keepable)
+            {
+                return Err(format!(
+                    "accept_turn({t}) left hunks that are the turn's alone"
+                ));
+            }
+        }
+        Op::RejectTurn(t) => {
+            let edits = r.reject_turn(*t, current);
+            for e in &edits {
+                apply(r, current, e, Origin::Review);
+            }
+        }
+        Op::AcceptSome(n) => {
+            let ids: Vec<_> = r.hunks.iter().skip(*n).step_by(2).map(|h| h.id).collect();
+            let accepted = r.accept_hunks(&ids, current);
+            if accepted != 0 && accepted != ids.len() {
+                return Err("accept_hunks accepted only some".into());
+            }
+            if accepted != 0 && ids.iter().any(|id| r.hunk(*id).is_some()) {
+                return Err("accept_hunks left a hunk".into());
+            }
+        }
+        Op::RejectSome(n) => {
+            let ids: Vec<_> = r.hunks.iter().skip(*n).step_by(2).map(|h| h.id).collect();
+            let edits = r.reject_hunks(&ids, current);
+            for e in &edits {
+                apply(r, current, e, Origin::Review);
+            }
+        }
+        Op::Accept(_) | Op::Reject(_) => {}
+    }
+    Ok(())
 }
 
 fn run(base: &str, ops: &[Op]) -> Result<(), String> {
     let mut r = FileReview::new(base.to_owned());
     let mut current = base.to_owned();
     for op in ops {
-        match op {
-            Op::Edit {
-                origin,
-                at,
-                len,
-                text,
-            } => {
-                let a = floor(&current, at % (current.len() + 1));
-                let b = floor(&current, a + len);
-                let origin = match origin {
-                    0 => Origin::User,
-                    1 => Origin::History,
-                    2 => Origin::Review,
-                    3 => Origin::Reload,
-                    _ => Origin::Agent { call: 1 },
-                };
-                let e = TextEdit {
-                    range: a..b,
-                    text: text.clone(),
-                };
-                apply(&mut r, &mut current, &e, origin);
-            }
-            Op::Recompute => {
-                r.recompute(&current);
-            }
-            Op::Accept(k) if !r.hunks.is_empty() => {
-                let id = r.hunks[k % r.hunks.len()].id;
-                r.accept(id, &current).map_err(|e| format!("accept: {e}"))?;
-            }
-            Op::Reject(k) if !r.hunks.is_empty() => {
-                let id = r.hunks[k % r.hunks.len()].id;
-                let e = r.reject(id, &current).map_err(|e| format!("reject: {e}"))?;
-                apply(&mut r, &mut current, &e, Origin::Review);
-            }
-            Op::Undo => match r.undo_review_action(&current) {
-                Some(crate::UndoAction::Edits(edits)) => {
-                    for e in &edits {
-                        apply(&mut r, &mut current, e, Origin::Review);
-                    }
-                }
-                Some(crate::UndoAction::Unaccepted) | None => {}
-            },
-            Op::Turn => r.begin_turn(),
-            Op::SetTurn(t) => r.set_turn(*t),
-            Op::AcceptTurn(t) => {
-                let before = current.clone();
-                r.accept_turn(*t, &current);
-                if current != before {
-                    return Err("accept_turn changed the text".into());
-                }
-                // Only hunks holding more than the turn's change may stay.
-                if r.check(&current, 0..r.hunks.len()).is_ok()
-                    && r.clusters(*t, &current).iter().any(|c| c.keepable)
-                {
-                    return Err(format!(
-                        "accept_turn({t}) left hunks that are the turn's alone"
-                    ));
-                }
-            }
-            Op::RejectTurn(t) => {
-                let edits = r.reject_turn(*t, &current);
-                for e in &edits {
-                    apply(&mut r, &mut current, e, Origin::Review);
-                }
-            }
-            Op::AcceptSome(n) => {
-                let ids: Vec<_> = r.hunks.iter().skip(*n).step_by(2).map(|h| h.id).collect();
-                let accepted = r.accept_hunks(&ids, &current);
-                if accepted != 0 && accepted != ids.len() {
-                    return Err("accept_hunks accepted only some".into());
-                }
-                if accepted != 0 && ids.iter().any(|id| r.hunk(*id).is_some()) {
-                    return Err("accept_hunks left a hunk".into());
-                }
-            }
-            Op::RejectSome(n) => {
-                let ids: Vec<_> = r.hunks.iter().skip(*n).step_by(2).map(|h| h.id).collect();
-                let edits = r.reject_hunks(&ids, &current);
-                for e in &edits {
-                    apply(&mut r, &mut current, e, Origin::Review);
-                }
-            }
-            Op::Accept(_) | Op::Reject(_) => {}
-        }
+        play(&mut r, &mut current, op)?;
         check_model(&r, &current).map_err(|e| format!("after {op:?}: {e}"))?;
     }
     // Recompute agrees with the model: the hunks still describe the text exactly.
@@ -341,4 +362,222 @@ fn edits_between_recomputes_keep_lines() {
     apply(&mut r, &mut cur, &TextEdit::insert(7, "Y"), Origin::User);
     check_model(&r, &cur).unwrap();
     assert!(r.hunks[0].user_touched);
+}
+
+/// An agent insertion or deletion is widened over the text up to `MAX_SLIDE` bytes before it,
+/// which may start inside a multibyte character: the widening starts at the next character.
+#[test]
+fn widening_starts_on_a_char_boundary() {
+    for pad in 0..4 {
+        let base = format!("{}{}abc\n", "é".repeat(200), "a".repeat(pad));
+        let mut r = FileReview::new(base.clone());
+        let mut cur = base.clone();
+        let end = base.len() - 1;
+        let agent = Origin::Agent { call: 1 };
+        apply(&mut r, &mut cur, &TextEdit::insert(end, "X"), agent);
+        apply(&mut r, &mut cur, &TextEdit::delete(end - 3..end - 2), agent);
+        check_model(&r, &cur).unwrap();
+        r.recompute(&cur);
+        check_model(&r, &cur).unwrap();
+        assert_eq!(r.hunks.len(), 1, "{pad}");
+    }
+}
+
+// ----- on_edits ---------------------------------------------------------------------------------
+
+const WORDS: &[&str] = &["alpha", "$x$", "\\beta", "é∑", "", "a\rb", "x x", "$"];
+
+/// A document of unique lines, long enough (up to ~2.5 KiB) that most of it lies beyond the reach
+/// of any one edit (a few hundred bytes, see `batch.rs`).
+fn long_document() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        (prop::sample::select(WORDS), prop::sample::select(WORDS)),
+        8..120,
+    )
+    .prop_map(|lines| {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| format!("l{i} {a} {b}\n"))
+            .collect()
+    })
+}
+
+/// Texts for edits: short ones, line breaks, multibyte characters, and long ones that make hunks,
+/// segments and attribution intervals reach past an edit's neighbourhood.
+fn edit_text() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => prop::sample::select(vec!["", "x", "yz", "\n", "a\nb", "é", "\\(", "$"])
+            .prop_map(str::to_owned),
+        1 => (1usize..80, 0usize..3).prop_map(|(n, kind)| match kind {
+            0 => "word ".repeat(n),
+            1 => "new line\n".repeat(n / 4 + 1),
+            _ => "∑é".repeat(n),
+        }),
+    ]
+}
+
+/// A replace_all of a common token, of any origin.
+fn all_op() -> impl Strategy<Value = Op> {
+    (
+        0u8..5,
+        prop::sample::select(vec!["$", "x", "\n", "é∑", " "]),
+        prop::sample::select(vec!["\\(", "", "yy", "\n\n", "$"]),
+    )
+        .prop_map(|(origin, from, to)| Op::All { origin, from, to })
+}
+
+/// A random session step on a long document: most often one of [`op`]'s, else a long edit or a
+/// replace_all of a common token.
+fn wide_op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        8 => op(),
+        2 => (0u8..5, any::<usize>(), 0usize..600, edit_text())
+            .prop_map(|(origin, at, len, text)| Op::Edit { origin, at, len, text }),
+        1 => all_op(),
+    ]
+}
+
+/// The changes of one action, as `apply_edits` gets them (descending, disjoint).
+#[derive(Clone, Debug)]
+enum Action {
+    /// Laid out from the end of the text down: each edit replaces `len` bytes ending `gap` bytes
+    /// before the start of the one before it (adjacent edits, insertions at one point, edits
+    /// within and beyond each other's reach).
+    Spread(Vec<(usize, usize, String)>),
+    /// Every occurrence of `from` replaced by `to`.
+    All(&'static str, &'static str),
+}
+
+fn action() -> impl Strategy<Value = Action> {
+    let gap = prop_oneof![0usize..4, 0usize..300, 0usize..1500];
+    let len = prop_oneof![0usize..4, 0usize..40, 0usize..700];
+    prop_oneof![
+        3 => prop::collection::vec((gap, len, edit_text()), 2..24).prop_map(Action::Spread),
+        1 => (
+            prop::sample::select(vec!["$", "x", "\n", "l1", " ", "é∑"]),
+            prop::sample::select(vec!["\\(", "", "zz", "\n", "$$"]),
+        )
+            .prop_map(|(from, to)| Action::All(from, to)),
+    ]
+}
+
+fn action_edits(current: &str, action: &Action) -> Vec<TextEdit> {
+    match action {
+        Action::Spread(spread) => {
+            let mut pos = current.len();
+            let mut edits = Vec::new();
+            for (gap, len, text) in spread {
+                let b = floor(current, pos.saturating_sub(*gap));
+                let a = floor(current, b.saturating_sub(*len));
+                edits.push(TextEdit {
+                    range: a..b,
+                    text: text.clone(),
+                });
+                pos = a;
+            }
+            edits
+        }
+        Action::All(from, to) => crate::str_replace(current, from, to, true).unwrap_or_default(),
+    }
+}
+
+/// Everything a review holds: its `Debug` form (every field), and the occurrence hints sorted
+/// (a `HashMap` prints in no fixed order).
+fn state(r: &FileReview) -> (String, Vec<(u64, u64)>) {
+    let mut r = r.clone();
+    let mut hints: Vec<(u64, u64)> = r.free_hints.drain().collect();
+    hints.sort_unstable();
+    (format!("{r:?}"), hints)
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// `on_edits` leaves a review exactly as `on_edit` for each edit in turn does (every field:
+    /// hunks and their bookkeeping, attribution, segments, records, journal, events), whatever
+    /// the review holds (a random session of every kind of step) and wherever the edits land,
+    /// for every origin.
+    #[test]
+    fn on_edits_is_on_edit_for_each_edit(
+        base in long_document(),
+        history in prop::collection::vec(wide_op(), 0..16),
+        action in action(),
+        origin in 0u8..5,
+    ) {
+        let mut r = FileReview::new(base.clone());
+        let mut current = base;
+        for op in &history {
+            // Only the state matters here, not what `play` checks about its step.
+            let _ = play(&mut r, &mut current, op);
+        }
+        let edits = action_edits(&current, &action);
+        let origin = origin_of(origin);
+        let mut one_by_one = r.clone();
+        for e in &edits {
+            one_by_one.on_edit(e, origin);
+        }
+        r.on_edits(&edits, origin);
+        prop_assert!(r.batch.is_none());
+        prop_assert_eq!(state(&r), state(&one_by_one));
+        lemma_core::apply_all(&mut current, &edits);
+        check_model(&r, &current).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// A step after a decision that leaves it the newest one: an edit of any origin, a replace_all
+/// or a recompute.
+fn later_op() -> impl Strategy<Value = Op> {
+    let len = prop_oneof![0usize..6, 0usize..600];
+    prop_oneof![
+        4 => (0u8..5, any::<usize>(), len, edit_text())
+            .prop_map(|(origin, at, len, text)| Op::Edit { origin, at, len, text }),
+        1 => all_op(),
+        1 => Just(Op::Recompute),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Alt+U of an Accept all, or of an accept of several hunks, puts the regions back at once
+    /// (`unaccept_batch`) exactly as one by one (every field of the review, then after a
+    /// recompute), also when edits since moved some of them or cut into them.
+    #[test]
+    fn unaccept_batch_is_unaccept_each(
+        base in long_document(),
+        history in prop::collection::vec(wide_op(), 0..16),
+        some in prop::option::of(0usize..2),
+        later in prop::collection::vec(later_op(), 0..4),
+    ) {
+        let mut r = FileReview::new(base.clone());
+        let mut current = base;
+        for op in &history {
+            let _ = play(&mut r, &mut current, op);
+        }
+        r.recompute(&current);
+        match some {
+            Some(n) => {
+                let _ = play(&mut r, &mut current, &Op::AcceptSome(n));
+            }
+            None => r.accept_all(&current),
+        }
+        for op in &later {
+            let _ = play(&mut r, &mut current, op);
+        }
+        let Some(Entry::Accept(regions)) = r.journal.pop() else {
+            return Ok(());
+        };
+        let mut sorted = regions.clone();
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.cur.start));
+        let mut one_by_one = r.clone();
+        let any = r.unaccept(regions, &current);
+        prop_assert!(r.batch.is_none());
+        prop_assert_eq!(any, one_by_one.unaccept_each(sorted, &current));
+        prop_assert_eq!(state(&r), state(&one_by_one));
+        check_model(&r, &current).map_err(TestCaseError::fail)?;
+        r.recompute(&current);
+        one_by_one.recompute(&current);
+        prop_assert_eq!(state(&r), state(&one_by_one));
+    }
 }

@@ -1020,7 +1020,8 @@ they conflict with the sections above, this section wins.
     alone.
   - `PersistedReview` gains optional `turn_edits` / `unknown_turn_edits`.
   - A dirty document keeps the entry captured at its last save.
-  - Open: `replace_all` with tens of thousands of matches is still quadratic (D-5).
+  - `replace_all` with tens of thousands of matches is linear (D-5, fixed 2026-10-25: see
+    "Batched review feed" below).
 - **Editor (§5):**
   - Completion, snippets and typing helpers run only in LaTeX documents.
   - Bracket type-over counts over the paragraph.
@@ -1158,6 +1159,51 @@ they conflict with the sections above, this section wins.
   - The label checks and the Outline wait for `completion::index_busy` (re-index timers and
     jobs, discovery passes), not for the words rebuilt 1.5 s later; `project_busy` still counts
     everything, for tests that want the feed settled.
+- **Batched review feed (§4.1, §10.3, 2026-10-25):**
+  - `FileReview::on_edits(edits, origin)` takes the changes of one action at once (in the
+    order they are applied, each ending at or before the start of the one before, with the
+    pre-edit offsets of its moment). The result is exactly that of `on_edit` for each in turn,
+    which is what it does for User, History and Review edits; a differential proptest
+    (`review::tests::on_edits_is_on_edit_for_each_edit`) compares every field of the review.
+  - For Agent and Reload edits it costs O(log hunks) per edit instead of O(hunks): before each
+    edit it sets aside the hunks, segments and attribution intervals beyond the edit's reach
+    (what `on_edit` reads for it: the hunks and segments it meets, `MAX_SLIDE` bytes past them,
+    and whatever reaches across that), keeping the first hunk and segment beyond, and brings
+    them back at the end moved by the edits since (`review/batch.rs`). Measured in release (on a
+    loaded machine): a replace_all of `$` with 20 000 matches 2.2 s → 0.11–0.15 s; 5000 matches
+    over 5000 hunks 0.76 s → 0.05 s; 20 000 right after Accept all of 5000 hunks 5.0 s → 0.15 s.
+  - Alt+U of an Accept all puts its regions back the same way (`unaccept_batch`, from the last
+    one down, with what lies beyond each set aside and its baseline offsets moved when it comes
+    back), with the result of putting them back one by one (differential proptest
+    `review::tests::unaccept_batch_is_unaccept_each`): 5000 hunks 0.27 s → 21 ms.
+  - Still O(edits × records): right after a Reject all of thousands of hunks the records keep
+    every reject of that decision and each edit goes through them (20 000 edits after rejecting
+    5000 hunks: 6.5 s → 1.0–1.4 s). An edit inside one hunk costs O(that hunk's text), as
+    before, so a replace_all inside one hunk that spans most of the file stays quadratic. Accept
+    all and its Alt+U still move the baseline after each region (`String::replace_range`):
+    about 0.25 s each for 20 000 hunks in a 1 MB file.
+  - `Document::apply_edits` gives the review the changes the document reported while it
+    applied them, at once when they are applied (`review_ui::before_edits`): a delete and an
+    insert per edit on an open buffer, the edits themselves on a closed document, in runs of one
+    origin (an `apply_edits` that an `end-user-action` handler makes meanwhile, such as the
+    environment rename's, keeps its own). Typing, undo and redo, and the find bar's Replace All
+    (GtkSourceView's) still reach `on_edit` change by change. Nothing reads a review while a
+    buffer signal runs.
+  - A closed document's `apply_edits` builds the new text in one pass and its line index once,
+    instead of per edit. Every change is still reported on its own (edit and change observers,
+    the version, and the line delta, taken from the index before all the edits: each lies before
+    the edits applied before it). No observer of a closed document reads its text while a change
+    is reported (the build's line journal and the problems' line trackers count lines; the
+    outline only schedules work), so one composed line notification was not used: it would move
+    the problems between two edits to the first changed line. `apply_edits` of 20 000 matches
+    under review in a 10 000-line file: 2.8 s → 0.13 s closed, 5.5 s → 0.45 s open.
+  - `LineIndex` keeps the starts of the lines after the last edit as distances from the end of
+    the text, which an edit before them does not change, so an edit converts only the lines
+    between it and the previous edit (and moves the starts after it only when it changes the
+    number of lines). The per-signal updates of the open buffer stay exact for `byte_offset`;
+    a run of changes down the text (`apply_edits`) or up it (the find bar's Replace All, one
+    delete and one insert per match) costs the lines in between. On `large.tex`, Replace All
+    of 20 000 matches spent 0.24 s of its 0.92 s in line index updates, now 8 ms of 0.61 s.
 - **Problems (§5, 2026-10-25):**
   - The Problems page builds a build's rows when it is shown, and lists at most
     `MAX_SECTION_ROWS` (500) of its problems, the most severe ones (errors, then warnings, then

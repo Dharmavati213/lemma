@@ -170,7 +170,7 @@ fn regress2_reject_turn_keeps_reloaded_change() {
 // ---- D-5: replace_all with many matches is superquadratic in on_edit ------------------------
 
 /// Feeds a replace_all of `$` → `\(` (four matches per line, descending as `str_replace` returns
-/// them) over `lines` lines through `on_edit`.
+/// them) over `lines` lines to a review at once (`on_edits`, as `Document::apply_edits` does).
 fn dollar_replace_all(lines: usize) -> (usize, Duration) {
     let text: String = (0..lines)
         .map(|i| format!("Line {i}: let $x_{i}$ and $y$ be given.\n"))
@@ -179,29 +179,25 @@ fn dollar_replace_all(lines: usize) -> (usize, Duration) {
     let mut review = FileReview::new(text);
     review.set_turn(1);
     let started = Instant::now();
-    for e in &edits {
-        review.on_edit(e, Origin::Agent { call: 1 });
-    }
+    review.on_edits(&edits, Origin::Agent { call: 1 });
     (edits.len(), started.elapsed())
 }
 
 /// A replace_all with 20k matches (every `$` of a 5000-line chapter, e.g. `$` → `\(`) must not
 /// freeze the main thread for seconds: ARCHITECTURE §7 accepts 0.5–0.7 s only for a pathological
-/// whole-file rewrite of 60k lines, but `on_edit` is superquadratic in the number of matches
-/// (10k: 0.4 s, 20k: 1.7 s, 40k: 6.3 s in release). Release build: `-- --ignored
-/// regress2_replace_all` (not named `perf_*`: it is the open defect D-5, so the perf run leaves it
-/// out).
+/// whole-file rewrite of 60k lines, but fed to `on_edit` one by one the matches were
+/// superquadratic (10k: 0.4 s, 20k: 1.7–2.2 s, 40k: 6.3 s in release). `on_edits` takes them in
+/// about 0.1 s. Release build: `-- --ignored regress2_replace_all` (about 4 s in a debug build,
+/// too slow for the default run).
 #[test]
-#[ignore = "M2 review: each match's hunk is inserted at the front of the public `Vec<Hunk>` (an \
-            O(n) move per `on_edit`); needs a batch `on_edits` used by `Document::apply_edits` \
-            (timing test; run in release with --ignored)"]
+#[ignore = "release timing test (D-5, fixed); run in release with --ignored regress2_replace_all"]
 fn regress2_replace_all_20k_matches_is_fast() {
     dollar_replace_all(200);
     let (n, took) = dollar_replace_all(5000);
-    eprintln!("replace_all of $: {n} edits, on_edit {took:?}");
+    eprintln!("replace_all of $: {n} edits, on_edits {took:?}");
     assert_eq!(n, 20_000);
     assert!(
         took < Duration::from_secs(1),
-        "on_edit for {n} replace_all matches took {took:?}"
+        "on_edits for {n} replace_all matches took {took:?}"
     );
 }

@@ -20,7 +20,7 @@ fn inside(cur: &Range<usize>, a: usize, b: usize) -> bool {
 }
 
 /// Net length change of a hunk (current minus baseline).
-fn growth(h: &Hunk) -> isize {
+pub(super) fn growth(h: &Hunk) -> isize {
     signed(h.cur_bytes.len()) - signed(h.base_bytes.len())
 }
 
@@ -49,7 +49,10 @@ impl FileReview {
 
     /// Net growth of `hunks[..i]`: current offset minus baseline offset in the gap after them.
     pub(super) fn growth_before(&self, i: usize) -> isize {
-        self.hunks[..i].iter().map(growth).sum()
+        match &self.batch {
+            Some(batch) => batch.growth_before(&self.hunks, i),
+            None => self.hunks[..i].iter().map(growth).sum(),
+        }
     }
 
     /// Length of the current text according to the model: the baseline's length plus the net
@@ -145,10 +148,14 @@ impl FileReview {
     /// so N hunks with equal texts (a replace_all) cost O(N) probes, not O(N²). Removing a hunk
     /// clears the hints ([`FileReview::forget_free_hints`]).
     pub(super) fn free_occurrence(&mut self, old: &str, new: &str, preferred: Option<u64>) -> u64 {
-        let hunks = &self.hunks;
+        let (hunks, batch) = (&self.hunks, &self.batch);
         let free = |o: &u64| {
             let id = hunk_id(old, new, *o);
-            hunks.iter().all(|h| h.id != id)
+            match batch {
+                // It knows the hunks `on_edits` set aside too.
+                Some(batch) => !batch.has(id),
+                None => hunks.iter().all(|h| h.id != id),
+            }
         };
         if let Some(o) = preferred.filter(free) {
             return o;
@@ -355,6 +362,9 @@ impl FileReview {
         if j > i + 1 {
             // The ids of the hunks merged into the first one are gone.
             self.forget_free_hints();
+        }
+        if let Some(batch) = &mut self.batch {
+            batch.merged(i, &self.hunks[i..j], hunk.id, lines);
         }
         self.hunks.splice(i..j, [hunk]);
         self.meta.splice(i..j, [meta]);

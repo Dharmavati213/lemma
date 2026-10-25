@@ -4,8 +4,8 @@
 //! They read `tests/fixtures/large.tex` (60k lines) and, when `LEMMA_PERF_CORPUS` names a
 //! directory, every `.tex` file in it.
 
-use lemma_core::{Origin, TextEdit};
-use lemma_review::FileReview;
+use lemma_core::{Origin, TextEdit, apply_all};
+use lemma_review::{FileReview, str_replace};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -143,4 +143,106 @@ fn perf_on_edit_keystroke() {
     eprintln!("  recompute after typing: {:?}", t.elapsed());
     assert_eq!(review.hunks().len(), 1);
     assert!(p99 < Duration::from_millis(2), "{p99:?}");
+}
+
+/// `lines` lines with four `$` each, between lines without one (so that each changed line is a
+/// hunk of its own).
+fn dollars(lines: usize) -> String {
+    (0..lines)
+        .map(|i| format!("Line {i}: let $x_{i}$ and $y$ be given.\nPlain {i}.\n"))
+        .collect()
+}
+
+/// Feeds `edits` (one replace_all) to `review` at once and applies them to `text`; returns how
+/// long the review took.
+fn feed(review: &mut FileReview, text: &mut String, edits: &[TextEdit]) -> Duration {
+    let t = Instant::now();
+    review.on_edits(edits, Origin::Agent { call: 1 });
+    let took = t.elapsed();
+    apply_all(text, edits);
+    took
+}
+
+/// A review holding the hunks of a replace_all of `$` over `lines` lines, recomputed.
+fn replaced_once(lines: usize) -> (FileReview, String) {
+    let mut text = dollars(lines);
+    let mut review = FileReview::new(text.clone());
+    review.set_turn(1);
+    let edits = str_replace(&text, "$", "\\(", true).unwrap();
+    feed(&mut review, &mut text, &edits);
+    review.recompute(&text);
+    (review, text)
+}
+
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_on_edits_replace_all() {
+    // A fresh review, 10k and 20k matches: linear.
+    let mut took = Vec::new();
+    for lines in [2500, 5000] {
+        let mut text = dollars(lines);
+        let mut review = FileReview::new(text.clone());
+        review.set_turn(1);
+        let edits = str_replace(&text, "$", "\\(", true).unwrap();
+        let t = feed(&mut review, &mut text, &edits);
+        eprintln!("perf_on_edits_replace_all: {} matches: {t:?}", edits.len());
+        took.push(t);
+    }
+    assert!(took[1] < Duration::from_millis(500), "{:?}", took[1]);
+    assert!(took[1] < took[0] * 6, "not linear: {took:?}");
+
+    // Over the 5000 hunks of a first replace_all (the growth of the hunks below an edit).
+    let (mut review, mut text) = replaced_once(5000);
+    let edits = str_replace(&text, "Line", "Row", true).unwrap();
+    let t = feed(&mut review, &mut text, &edits);
+    eprintln!(
+        "  {} matches over {} hunks: {t:?}",
+        edits.len(),
+        review.hunks().len()
+    );
+    assert!(t < Duration::from_millis(500), "{t:?}");
+
+    // After Accept all of 5000 hunks (a journal entry of 5000 regions).
+    let (mut review, mut text) = replaced_once(5000);
+    review.accept_all(&text);
+    review.recompute(&text);
+    let edits = str_replace(&text, "\\(", "$", true).unwrap();
+    let t = feed(&mut review, &mut text, &edits);
+    eprintln!(
+        "  {} matches after accepting 5000 hunks: {t:?}",
+        edits.len()
+    );
+    assert!(t < Duration::from_millis(500), "{t:?}");
+
+    // After Reject all of 5000 hunks the records keep every reject of that decision, and each
+    // edit still goes through all of them: O(edits × rejects), reported only.
+    let (mut review, mut text) = replaced_once(5000);
+    let rejects = review.reject_all(&text);
+    review.on_edits(&rejects, Origin::Review);
+    apply_all(&mut text, &rejects);
+    review.recompute(&text);
+    let edits = str_replace(&text, "$", "\\[", true).unwrap();
+    let t = feed(&mut review, &mut text, &edits);
+    eprintln!(
+        "  {} matches after rejecting 5000 hunks: {t:?}",
+        edits.len()
+    );
+}
+
+/// Alt+U of an Accept all of 5000 hunks puts them back at once: ≤ 100 ms (one by one, each
+/// went in front of those put back before it, 0.27 s; 20 000 hunks took seconds).
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_unaccept_accept_all() {
+    let (mut review, text) = replaced_once(5000);
+    let hunks = review.hunks().len();
+    review.accept_all(&text);
+    review.recompute(&text);
+    let t = Instant::now();
+    let undone = review.undo_review_action(&text);
+    let took = t.elapsed();
+    assert!(matches!(undone, Some(lemma_review::UndoAction::Unaccepted)));
+    assert_eq!(review.hunks().len(), hunks);
+    eprintln!("perf_unaccept_accept_all: {hunks} hunks: {took:?}");
+    assert!(took < Duration::from_millis(100), "{took:?}");
 }
