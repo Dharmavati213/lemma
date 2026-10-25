@@ -449,6 +449,57 @@ fn a_decision_leaves_the_next_hunks_unknown_places() {
     undecidable(&r, &cur);
 }
 
+/// A recompute gives a hunk whose texts a hunk had at the recompute before that hunk's word
+/// spans, if they were refined in time, and refines only the others (new texts, or spans
+/// refined past the deadline).
+#[test]
+fn recompute_keeps_the_word_spans_of_unchanged_texts() {
+    let base = "a\nlet x = alpha + 1;\nb\nlet y = gamma + 2;\nc\nlet z = delta + 3;\nd\n";
+    let mut r = FileReview::new(base.into());
+    let mut cur = base.to_owned();
+    let agent = Origin::Agent { call: 1 };
+    for (from, to) in [("delta", "omega"), ("gamma", "theta"), ("alpha", "beta")] {
+        let at = cur.find(from).unwrap();
+        let e = TextEdit {
+            range: at..at + from.len(),
+            text: to.into(),
+        };
+        apply(&mut r, &mut cur, &e, agent);
+    }
+    r.recompute(&cur);
+    assert_eq!(r.hunks.len(), 3);
+    assert!(r.meta.iter().all(|m| m.exact_words));
+    assert!(r.hunks.iter().all(|h| h.words.len() == 2), "{:?}", r.hunks);
+    let refined: Vec<_> = r.hunks.iter().map(|h| h.words.clone()).collect();
+    // Spans the word diff would not give, to tell kept ones from refined ones.
+    let marker = vec![crate::WordSpan {
+        side: crate::Side::New,
+        line: 0,
+        bytes: 0..1,
+    }];
+    for h in &mut r.hunks {
+        h.words = marker.clone();
+    }
+    r.meta[1].exact_words = false;
+    // Typing outside the hunks, and the agent changing the last hunk's text.
+    apply(
+        &mut r,
+        &mut cur,
+        &TextEdit::insert(0, "typed "),
+        Origin::User,
+    );
+    let at = cur.find("omega").unwrap();
+    apply(&mut r, &mut cur, &TextEdit::insert(at, "big "), agent);
+    r.recompute(&cur);
+    assert_eq!(r.hunks[0].words, marker, "kept");
+    assert_eq!(
+        r.hunks[1].words, refined[1],
+        "refined past the deadline before"
+    );
+    assert_ne!(r.hunks[2].words, marker, "new texts");
+    assert!(r.meta.iter().all(|m| m.exact_words));
+}
+
 // ----- on_edits ---------------------------------------------------------------------------------
 
 const WORDS: &[&str] = &["alpha", "$x$", "\\beta", "é∑", "", "a\rb", "x x", "$"];
@@ -549,12 +600,16 @@ fn action_edits(current: &str, action: &Action) -> Vec<TextEdit> {
 }
 
 /// Everything a review holds: its `Debug` form (every field), and the occurrence hints sorted
-/// (a `HashMap` prints in no fixed order). Word spans are left out: a recompute has 8 ms for them,
-/// and on a loaded machine one of two recomputes of the same texts may run out.
+/// (a `HashMap` prints in no fixed order). Word spans are left out, with whether they were refined
+/// in time: a recompute has 8 ms for them, and on a loaded machine one of two recomputes of the
+/// same texts may run out.
 fn state(r: &FileReview) -> (String, Vec<(u64, u64)>) {
     let mut r = r.clone();
     for h in &mut r.hunks {
         h.words.clear();
+    }
+    for m in &mut r.meta {
+        m.exact_words = false;
     }
     let mut hints: Vec<(u64, u64)> = r.free_hints.drain().collect();
     hints.sort_unstable();
@@ -648,5 +703,89 @@ proptest! {
         r.recompute(&current);
         one_by_one.recompute(&current);
         prop_assert_eq!(state(&r), state(&one_by_one));
+    }
+}
+
+/// Accepts the hunks at `picked` (ascending) one by one, from the last one down, each moving the
+/// baseline after it (`accept_at`), as the decisions did before `accept_many`.
+fn accept_each(r: &mut FileReview, picked: &[usize]) {
+    let mut regions = Vec::new();
+    let mut events = Vec::new();
+    for &k in picked.iter().rev() {
+        let (region, event) = r.accept_at(k);
+        regions.push(region);
+        events.push(event);
+    }
+    events.reverse();
+    r.events.extend(events);
+    r.journal.push(Entry::Accept(regions));
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Accept all, an accept of several hunks and Keep Turn rebuild the baseline once
+    /// (`accept_many`) with exactly the result of accepting the hunks one by one (every field of
+    /// the review, then after a recompute, and after Alt+U), with line hunks or provisional ones.
+    #[test]
+    fn accept_many_is_accept_each(
+        base in long_document(),
+        history in prop::collection::vec(wide_op(), 0..16),
+        recompute in any::<bool>(),
+        decision in 0usize..4,
+        turn in any::<prop::sample::Index>(),
+    ) {
+        let mut r = FileReview::new(base.clone());
+        let mut current = base;
+        for op in &history {
+            let _ = play(&mut r, &mut current, op);
+        }
+        if recompute {
+            r.recompute(&current);
+        }
+        if r.check(&current, 0..r.hunks.len()).is_err() {
+            return Ok(());
+        }
+        let picked: Vec<usize> = match decision {
+            0 => (0..r.hunks.len()).collect(),
+            1 | 2 => (decision - 1..r.hunks.len()).step_by(2).collect(),
+            _ => {
+                // A turn some hunk is of alone.
+                let mut turns: Vec<u32> = r
+                    .hunks
+                    .iter()
+                    .filter(|h| h.turns.len() == 1)
+                    .map(|h| h.turns[0])
+                    .collect();
+                turns.sort_unstable();
+                turns.dedup();
+                let Some(&turn) = turns.get(turn.index(turns.len().max(1))) else {
+                    return Ok(());
+                };
+                let clusters = r.clusters(turn, &current);
+                let mut picked: Vec<usize> = clusters
+                    .into_iter()
+                    .filter(|c| c.keepable)
+                    .flat_map(|c| c.hunks)
+                    .collect();
+                picked.sort_unstable();
+                picked
+            }
+        };
+        if picked.is_empty() {
+            return Ok(());
+        }
+        let mut one_by_one = r.clone();
+        r.accept_many(&picked, &current);
+        accept_each(&mut one_by_one, &picked);
+        prop_assert_eq!(state(&r), state(&one_by_one));
+        check_model(&r, &current).map_err(TestCaseError::fail)?;
+        r.recompute(&current);
+        one_by_one.recompute(&current);
+        prop_assert_eq!(state(&r), state(&one_by_one));
+        let undone = r.undo_review_action(&current);
+        prop_assert_eq!(undone, one_by_one.undo_review_action(&current));
+        prop_assert_eq!(state(&r), state(&one_by_one));
+        check_model(&r, &current).map_err(TestCaseError::fail)?;
     }
 }

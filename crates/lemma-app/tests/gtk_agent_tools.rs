@@ -411,13 +411,18 @@ fn file_tools() {
             ("main.tex", "alpha\nbeta\ngamma\n"),
             ("ch.tex", "one\n"),
             ("twice.tex", "x and x\n"),
+            ("cr.tex", "a\rb\nc\nd\n"),
         ],
     );
     let editor = f.open("main.tex");
     let doc = editor.document().clone();
 
+    // The reply quotes the changed lines with their context, read from the buffer.
     let text = f.call_text(edit("main.tex", "beta", "BETA"));
-    assert!(text.starts_with("Edited main.tex: line 2"), "{text}");
+    assert_eq!(
+        text,
+        "Edited main.tex: line 2\n     1\talpha\n     2\tBETA\n     3\tgamma\n"
+    );
     assert_eq!(
         f.disk("main.tex"),
         doc.text(),
@@ -425,9 +430,17 @@ fn file_tools() {
     );
     assert_eq!(review_ui::hunk_count(&doc), 1);
     // A closed file.
-    f.call_text(edit("ch.tex", "one", "ONE"));
+    let text = f.call_text(edit("ch.tex", "one", "ONE"));
+    assert_eq!(text, "Edited ch.tex: line 1\n     1\tONE\n");
     assert_eq!(f.disk("ch.tex"), "ONE\n");
     assert!(!f.state.workspace.get(&f.path("ch.tex")).unwrap().is_open());
+    // A buffer where a lone `\r` breaks a line for GTK but not for the line index.
+    f.open("cr.tex");
+    let text = f.call_text(edit("cr.tex", "c\n", "C\n"));
+    assert_eq!(
+        text,
+        "Edited cr.tex: line 2\n     1\ta\rb\n     2\tC\n     3\td\n"
+    );
 
     // read_file returns the live buffer, unsaved typing included.
     let buffer = editor.buffer();

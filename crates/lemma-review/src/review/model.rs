@@ -433,6 +433,7 @@ impl FileReview {
                 edit_reported: merged.iter().filter_map(|m| m.edit_reported).max(),
                 undo_reported: merged.iter().filter_map(|m| m.undo_reported).max(),
                 reopen: merged.iter().find_map(|m| m.reopen),
+                exact_words: false,
             };
             (self.hunks[i].id, meta)
         } else {
@@ -444,6 +445,7 @@ impl FileReview {
                 edit_reported: None,
                 undo_reported: None,
                 reopen: None,
+                exact_words: false,
             };
             (hunk_id(&old_text, &meta.new_text, occurrence), meta)
         };

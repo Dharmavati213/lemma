@@ -1245,6 +1245,32 @@ they conflict with the sections above, this section wins.
     one down, with what lies beyond each set aside and its baseline offsets moved when it comes
     back), with the result of putting them back one by one (differential proptest
     `review::tests::unaccept_batch_is_unaccept_each`): 5000 hunks 0.27 s → 21 ms.
+  - Accept all, an accept of several hunks and Keep Turn (`accept_many`, 2026-10-25) build the
+    new baseline in one pass (its gaps and the picked hunks' texts) and move the baseline
+    offsets and lines of the hunks left by a running sum. Then they take the picked hunks out
+    from the last one down, as accepting each did (`park_around`, the records, the attribution,
+    `prune_near`); of all that only `park_around` read the baseline, for the text of the
+    segments around a hunk, which it now reads from the checked `current`. The result is that
+    of accepting them one by one (differential proptest
+    `review::tests::accept_many_is_accept_each`, also after a recompute and after Alt+U).
+    Accept all on `large.tex` (release, medians of five runs in turn with the old code, load
+    8–10): 5001 hunks 153 ms → 10 ms, 20 001 hunks 521 ms → 50 ms, about what Reject all takes
+    (9 and 44 ms); Keep Turn 172 ms → 14 ms and 553 ms → 64 ms (`perf_accept_all_large_tex`).
+    An accept of every other hunk still moves the hunks, segments and intervals left after each
+    one it takes out of their lists: 2501 of 5001 hunks 108 ms → 29 ms, 10 001 of 20 001 hunks
+    0.73 s → 0.44 s.
+  - Word spans (2026-10-25): a recompute gives a hunk whose texts a hunk had at the recompute
+    before that hunk's word spans, when those were refined before the 8 ms deadline
+    (`Meta::exact_words`), and refines only the others (`LineDiff::refine_words`). A hunk is
+    one op of similar's line diff (its `Replace` hook makes one op of each run between equal
+    lines), and the inline diff reads that op's lines alone, so its spans depend on its texts
+    only; spans refined past the deadline may be coarser, so they are refined again at the next
+    recompute instead of being kept. The recompute after a keystroke outside the hunks of
+    `large.tex` (the same runs): 5001 hunks 43 ms → 30 ms, 20 001 hunks 152 ms → 81 ms; at load
+    5, 37–40 ms → 18–23 ms and 115–138 ms → 55–65 ms
+    (`perf_recompute_keeps_word_spans_large_tex`). What is left is the line diff (about 15 ms)
+    and making the hunks; the line diff is not windowed, so hunks still depend on the texts
+    only.
   - The records that recognize the buffer's undo and redo of Lemma's own edits
     (`review/records.rs`) keep their ranges in an index (`Points`), and an edit takes out only
     the records it meets. A range an edit does not meet lies wholly before or after it, so each
@@ -1284,6 +1310,15 @@ they conflict with the sections above, this section wins.
     does, was the alternative; the records also bring back the turns, segments and records
     that an undo or a redo restores, and with the index above they cost O(128) an edit in a
     run of edits, a few µs more after a jump.
+  - Which record a History edit belongs to (2026-10-25): of the records whose step it fits, one
+    in the middle of its step goes first, then one going the way the user went last; of
+    several, the one the buffer steps first, which is the newest for an undo and the oldest of
+    the undone ones for a redo (it redoes first what it undid last). Two agent insertions of one
+    text, the second right after the first (`\beta` added to a line twice), leave their empty
+    records at one place once undone; the newest took the first redo, and the second redo,
+    which no record claimed then, went into the baseline (property 9 of `tests/properties.rs`
+    found it at about 1000 cases; `tests/review.rs`
+    `redo_of_equal_insertions_at_one_place_brings_both_back`).
   - Records without a buffer (2026-10-25): only the buffer's undo and redo take up an agent
     edit's record, or a reject's once it is undone, and they reach only the edits made in that
     buffer (a closed document's text goes into a new buffer as not undoable). So
@@ -1310,8 +1345,9 @@ they conflict with the sections above, this section wins.
     matches in an open buffer (10 000 changes) 0.14 s and 0.21 s, four times that for twice the
     matches (`perf_undo_and_redo_of_a_replace_all`). An edit inside one hunk costs O(that
     hunk's text), as before, so a replace_all inside one hunk that spans most of the file stays
-    quadratic. Accept all and its Alt+U still move the baseline after each region
-    (`String::replace_range`): about 0.25 s each for 20 000 hunks in a 1 MB file.
+    quadratic. Alt+U of an Accept all still moves the baseline after each region
+    (`String::replace_range`): about 0.25 s for 20 000 hunks in a 1 MB file (Accept all itself
+    builds the baseline once, above).
   - `Document::apply_edits` gives the review the changes the document reported while it
     applied them, at once when they are applied (`review_ui::before_edits`): a delete and an
     insert per edit on an open buffer, the edits themselves on a closed document, in runs of one

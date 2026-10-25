@@ -26,6 +26,7 @@ use crate::review_ui;
 use crate::saver;
 use crate::workspace::Workspace;
 use gio::prelude::*;
+use gtk::prelude::TextBufferExt;
 use lemma_agent::{EditorRequest, ToolContent, ToolReply};
 use lemma_core::{LineIndex, Origin, PathError, TextEdit, fnv1a64};
 use lemma_review::{EditError, minimal_edits, str_replace};
@@ -687,12 +688,25 @@ async fn apply_as_agent(
         .map_err(|e| ToolError::Apply(e.to_string()))?;
     review_ui::recompute(doc);
     let save = doc.save();
-    let (changed, excerpt) = doc.with_text(|text| {
-        let index = LineIndex::new(text);
+    // From the document's line index and the quoted lines alone: on `large.tex`, copying an open
+    // buffer's whole text took 3.5–7 ms and indexing it again 1 ms, reading seven lines takes
+    // 16 µs. A buffer whose lines GTK counts otherwise (a lone `\r` breaks a line for it) is
+    // copied once instead, since each `line_text` would copy it then.
+    let (changed, excerpt) = {
+        let index = doc.line_index();
         let changed = changed_lines(edits, &index);
-        let excerpt = excerpt(text, &changed);
+        let lines_match = doc
+            .buffer()
+            .is_none_or(|b| u32::try_from(b.line_count()).is_ok_and(|n| n == index.line_count()));
+        let excerpt = if lines_match {
+            excerpt(&index, &changed, |n| doc.line_text(n).unwrap_or_default())
+        } else {
+            doc.with_text(|text| {
+                excerpt(&index, &changed, |n| text[index.line_range(n)].to_owned())
+            })
+        };
         (changed, excerpt)
-    });
+    };
     let save_error = save.await.err().map(|e| e.to_string());
     Ok(Applied {
         changed,
@@ -723,13 +737,15 @@ fn changed_lines(edits: &[TextEdit], index: &LineIndex) -> Vec<(u32, u32)> {
 }
 
 /// The `changed` line ranges with [`CONTEXT_LINES`] around them, merged, in `cat -n` format;
-/// at most [`MAX_QUOTED_LINES`] lines.
-fn excerpt(text: &str, changed: &[(u32, u32)]) -> String {
-    let lines = split_lines(text);
-    if lines.is_empty() {
-        return String::new();
+/// at most [`MAX_QUOTED_LINES`] lines. `index` is the text's, and `line(n)` its line `n` without
+/// the `\n`: only the quoted lines are read.
+fn excerpt(index: &LineIndex, changed: &[(u32, u32)], line: impl Fn(u32) -> String) -> String {
+    // The lines of `split_lines`: a final `\n` ends the last line rather than starting one.
+    let mut lines = index.line_count();
+    if lines > 1 && index.line_range(lines - 1).is_empty() {
+        lines -= 1;
     }
-    let last_line = lines.len() as u32 - 1;
+    let last_line = lines - 1;
     let mut regions: Vec<(u32, u32)> = Vec::new();
     for &(first, last) in changed {
         let region = (
@@ -752,7 +768,7 @@ fn excerpt(text: &str, changed: &[(u32, u32)]) -> String {
                 out.push_str("   ... (more changes; call read_file to see them)\n");
                 return out;
             }
-            push_numbered(&mut out, n as usize + 1, lines[n as usize]);
+            push_numbered(&mut out, n as usize + 1, &line(n));
             quoted += 1;
         }
     }
@@ -812,10 +828,16 @@ mod tests {
         assert_eq!(changed_lines(&edits, &index), vec![(1, 2), (4, 4)]);
     }
 
+    /// The excerpt of `text`, read through its line index.
+    fn excerpt_of(text: &str, changed: &[(u32, u32)]) -> String {
+        let index = LineIndex::new(text);
+        excerpt(&index, changed, |n| text[index.line_range(n)].to_owned())
+    }
+
     #[test]
     fn excerpts_merge_close_regions_and_add_context() {
         let text: String = (1..=30).map(|n| format!("line {n}\n")).collect();
-        let out = excerpt(&text, &[(9, 9), (12, 12), (25, 25)]);
+        let out = excerpt_of(&text, &[(9, 9), (12, 12), (25, 25)]);
         let numbers: Vec<&str> = out
             .lines()
             .map(|l| l.split('\t').next().unwrap().trim())
@@ -827,6 +849,23 @@ mod tests {
                 "26", "27", "28", "29"
             ]
         );
+    }
+
+    /// The excerpt quotes the lines `split_lines` gives, read through the line index: a final
+    /// line break ends the last line instead of starting an empty one, and a deletion at the end
+    /// of the text quotes the lines before it.
+    #[test]
+    fn excerpts_quote_the_lines_of_the_text() {
+        for (text, changed) in [
+            ("a\nb\n", (1, 1)),
+            ("a\nb", (1, 1)),
+            ("a\r\nb\r\n", (1, 1)),
+            ("a\nb\n", (2, 2)),
+        ] {
+            let out = excerpt_of(text, &[changed]);
+            assert_eq!(out, "     1\ta\n     2\tb\n", "{text:?}");
+        }
+        assert_eq!(excerpt_of("", &[(0, 0)]), "     1\t\n");
     }
 
     #[test]

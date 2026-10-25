@@ -547,9 +547,9 @@ impl Records {
     }
 
     /// Tracks the edit `[a, b) → text` through every record. Returns what the edit was recognized
-    /// as (the newest record that accepts it claims it; none when `claimable` is false, for an
-    /// edit known to be something else) and, when no record claimed it, what it did to the
-    /// records.
+    /// as (of the records that accept it, the one the buffer steps first claims it, see below;
+    /// none when `claimable` is false, for an edit known to be something else) and, when no
+    /// record claimed it, what it did to the records.
     pub fn observe(
         &mut self,
         a: usize,
@@ -571,10 +571,27 @@ impl Records {
         let ids = self.points.meeting(a, b);
         let mut met: Vec<Box<Record>> =
             ids.iter().rev().filter_map(|&id| self.detach(id)).collect();
-        // The newest record whose step the edit fits. A History edit can undo one edit and redo
-        // another at the same time when an agent edit reverted an earlier one; the user usually
-        // keeps stepping in the same direction, so that direction goes first.
+        // The record whose step the edit fits: one in the middle of its step, else one going the
+        // way the user went last (a History edit can undo one edit and redo another at the same
+        // time when an agent edit reverted an earlier one; the user usually keeps stepping in the
+        // same direction), else any. Of several, the one the buffer steps first: its undo takes
+        // back the latest edit first, the newest record, and its redo brings back first what it
+        // undid last, the oldest of the undone ones. Two agent insertions of one text, the second
+        // right after the first, leave their empty records at one place once undone: the newest
+        // took the first redo, and the second redo, which no record claimed then, went into the
+        // baseline.
         let accepting = |r: &Record| r.accepts(origin, a, b, text);
+        let first = |pick: &dyn Fn(&Record) -> bool| {
+            let mut fits = (0..met.len()).filter(|&i| pick(&met[i]) && accepting(&met[i]));
+            let newest = fits.next()?;
+            Some(if met[newest].state == State::Undone {
+                fits.filter(|&i| met[i].state == State::Undone)
+                    .last()
+                    .unwrap_or(newest)
+            } else {
+                newest
+            })
+        };
         let preferred = if self.redoing {
             State::Undone
         } else {
@@ -582,9 +599,9 @@ impl Records {
         };
         // Only undo/redo and our own review edits can be a recorded step (see `accepts`).
         let claimer = if claimable && matches!(origin, Origin::History | Origin::Review) {
-            met.iter()
-                .position(|r| r.state == preferred && accepting(r))
-                .or_else(|| met.iter().position(|r| accepting(r)))
+            first(&|r| r.in_progress)
+                .or_else(|| first(&|r| r.state == preferred))
+                .or_else(|| first(&|_| true))
         } else {
             None
         };

@@ -230,6 +230,28 @@ pub fn recompute(doc: &DocRef) -> HunkDelta {
         };
         doc.with_text(|text| review.recompute(text))
     };
+    recomputed(doc);
+    delta
+}
+
+/// [`recompute`] against `text`, which is `doc`'s current text: a decision that changes no text
+/// (a keep, Alt+U of one) recomputes against the copy it decided on instead of copying the
+/// buffer again (3.5–7 ms on `large.tex`).
+fn recompute_against(doc: &DocRef, text: &str) -> HunkDelta {
+    let delta = {
+        let mut review = doc.review.borrow_mut();
+        let Some(review) = review.as_mut() else {
+            return HunkDelta::default();
+        };
+        review.recompute(text)
+    };
+    recomputed(doc);
+    delta
+}
+
+/// After a recompute of `doc`'s review: the one scheduled is not needed any more, and the views,
+/// the banner and the Changes panel hear of the hunks.
+fn recomputed(doc: &DocRef) {
     let version = doc.version();
     with_tracked(doc, |t| {
         if let Some(timer) = t.timer.take() {
@@ -239,7 +261,6 @@ pub fn recompute(doc: &DocRef) -> HunkDelta {
     });
     doc.notify_hunks_changed();
     notify_controllers(doc);
-    delta
 }
 
 /// Runs a [`recompute`] that [`after_edit`] scheduled but has not run yet (code that reads the
@@ -1489,7 +1510,7 @@ fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: De
                     }
                 }
             }
-            recompute(doc);
+            recompute_against(doc, &text);
         }
         Decision::Reject => {
             let (edits, touched) = {
@@ -1658,11 +1679,11 @@ pub fn decide(
                 .ok_or("this file is not under review")?
                 .accept(id, &text);
             if let Err(e) = result {
-                recompute(doc);
+                recompute_against(doc, &text);
                 return Err(format!("Could not accept the change: {e}"));
             }
             record_decision(state, &[&**doc]);
-            recompute(doc);
+            recompute_against(doc, &text);
         }
         Decision::Reject => {
             let result = {
@@ -1835,7 +1856,7 @@ fn decide_all_in(state: &Rc<WindowState>, doc: &DocRef, decision: Decision) -> b
                 };
                 review.accept_all(&text);
             }
-            recompute(doc);
+            recompute_against(doc, &text);
         }
         Decision::Reject => {
             let (edits, touched) = {
@@ -1935,24 +1956,23 @@ pub fn undo_last(state: &Rc<WindowState>) {
 fn undo_in(state: &Rc<WindowState>, doc: &DocRef) -> Option<Option<u32>> {
     // The journal gives up its entry before the edits apply (see `decide`).
     doc.settle_user_action();
-    let action = {
-        let text = doc.text();
-        let mut review = doc.review.borrow_mut();
-        review.as_mut()?.undo_last_review_action(&text)
-    };
-    let restored_text = match action? {
-        UndoAction::Unaccepted => false,
+    let text = doc.text();
+    let action = doc
+        .review
+        .borrow_mut()
+        .as_mut()?
+        .undo_last_review_action(&text);
+    let delta = match action? {
+        UndoAction::Unaccepted => recompute_against(doc, &text),
         UndoAction::Edits(edits) => {
             if let Err(e) = doc.apply_edits(&edits, Origin::Review) {
                 state.toast(&format!("Could not restore the change: {e}"));
             }
-            true
+            let delta = recompute(doc);
+            save_quietly(state, doc);
+            delta
         }
     };
-    let delta = recompute(doc);
-    if restored_text {
-        save_quietly(state, doc);
-    }
     let line = delta.added.first().and_then(|id| {
         doc.review
             .borrow()

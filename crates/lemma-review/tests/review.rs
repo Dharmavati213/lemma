@@ -473,6 +473,33 @@ fn redo_of_an_agent_edit_brings_the_hunk_back() {
     assert_eq!(s.review.baseline(), "a\nb\nc\n");
 }
 
+/// Two agent insertions of one text, the second right after the first (`\beta` added to the end
+/// of a line twice): undone, both leave an empty record at the same place. The buffer redoes the
+/// first edit first, so its record must claim that redo, not the newest one: then the second
+/// redo found no record and went into the baseline (property 9 found it).
+#[test]
+fn redo_of_equal_insertions_at_one_place_brings_both_back() {
+    let base = "a\nm\nb\n";
+    let mut s = Session::new(base);
+    let first = [TextEdit::insert(3, "\\beta")];
+    s.edits(&first, Origin::Agent { call: 1 });
+    let second = [TextEdit::insert(8, "\\beta")];
+    s.edits(&second, Origin::Agent { call: 2 });
+    s.recompute();
+    let (ids, proposal) = (s.ids(), s.text.clone());
+    s.undo_action(&second, &[String::new()]);
+    s.undo_action(&first, &[String::new()]);
+    s.recompute();
+    assert_eq!(s.text, base);
+    assert!(s.review.is_clean(), "{:?}", s.hunks());
+    s.edits(&first, Origin::History);
+    s.edits(&second, Origin::History);
+    s.recompute();
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.review.baseline(), base, "a redo went into the baseline");
+    assert_eq!(s.ids(), ids);
+}
+
 /// Ctrl+Z then Ctrl+Shift+Z of one agent action with more changes than the records' cap of 512
 /// (a replace_all of 600 matches): the undo is recognized change by change (the agent hears
 /// `UndoneByUser`, not that the user edited its change), and the redo brings every hunk back,

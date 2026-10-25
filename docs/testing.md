@@ -224,10 +224,16 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   each origin; every field of the two reviews must be equal but the word spans (a recompute
   has 8 ms for them, which a loaded machine can run out of). Alt+U of an Accept all
   (`unaccept_batch`) is checked the same way against putting the regions back one by one
-  (`review::tests::unaccept_batch_is_unaccept_each`). `tests/common`'s `Session::edits`
-  goes through `on_edits` too, so every review suite uses it; `gtk_document`
-  `replace_all_under_review_reports_every_change` checks `Document::apply_edits` (what the
-  review gets, the observers, the line deltas and the version) on a closed and an open document.
+  (`review::tests::unaccept_batch_is_unaccept_each`), and so are Accept all, an accept of
+  several hunks and Keep Turn, which build the baseline once (`accept_many`), against accepting
+  the hunks one by one (`review::tests::accept_many_is_accept_each`). The word spans a
+  recompute keeps for texts a hunk had before:
+  `review::tests::recompute_keeps_the_word_spans_of_unchanged_texts`, and
+  `diff::tests::word_spans_past_the_deadline_are_not_exact` for those it refines again.
+  `tests/common`'s `Session::edits` goes through `on_edits` too, so every review suite uses it;
+  `gtk_document` `replace_all_under_review_reports_every_change` checks `Document::apply_edits`
+  (what the review gets, the observers, the line deltas and the version) on a closed and an
+  open document.
   The histories of both run with `play`'s checks of each step, and in the white-box tests every
   undo record is checked against the text after every change (`FileReview::check_records`), and
   `growth_before`'s sum from the end of the hunk list against the sum from the start.
@@ -236,7 +242,12 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   document and as an open buffer report it; a fortieth of the cases, at least 10),
   `tests/review.rs` `undo_and_redo_of_an_agent_action_beyond_the_record_cap` and `gtk_review`
   `undo_and_redo_of_a_large_agent_edit_keep_it_under_review` (real `undo` and `redo` of the
-  buffer).
+  buffer). Its shrunk failures are in `tests/properties.proptest-regressions`; the one where a
+  redo went into the baseline (two equal agent insertions at one place, undone and redone) is
+  also `tests/review.rs` `redo_of_equal_insertions_at_one_place_brings_both_back`. Run it deeper
+  in release: `PROPTEST_CASES=800000 cargo test --release -p lemma-review --test properties --
+  beyond_the_record_cap` gives it 20 000 cases (a fortieth), about 0.4 s each; processes with
+  different `PROPTEST_RNG_SEED`s and a quarter of the cases each share the work.
 - The records kept without a buffer and their bytes: `review::records::tests`
   (`without_a_buffer_only_rejects_are_kept`, `records_take_at_most_the_bytes`), the random
   sessions of `review::tests::model_stays_exact`, which take the text out of its buffer and back
@@ -426,6 +437,8 @@ check the budgets only in release builds:
 | `gtk_search` `perf_find_bar_replace_all_under_review_large_tex` | the same Replace All with 5000 hunks under review and without a review, and the recompute after it (printed) |
 | `gtk_search` `perf_find_bar_step_before_the_scan_large_tex` | F3, Shift+F3 and Enter right after a new query, before the search has counted, on `large.tex` and its first 10 000 lines: the key's own work ≤ 2 ms on 10 000 lines; prints the longest main-loop step until the match and the key once counted |
 | `lemma-review` `perf_unaccept_accept_all` | Alt+U of an Accept all of 5000 hunks ≤ 100 ms |
+| `lemma-review` `perf_accept_all_large_tex` | Accept all and Keep Turn of 5001 hunks in `large.tex` ≤ 50 ms, of 20 001 ≤ 200 ms (measured 7–21 and 35–54 ms, about what Reject all takes; 0.12–0.19 s and 0.50–0.67 s when each accept moved the baseline after it); prints an accept of every other hunk |
+| `lemma-review` `perf_recompute_keeps_word_spans_large_tex` | the recompute after a keystroke outside 5001 and 20 001 hunks of `large.tex`, whose texts keep their word spans: ≤ 80% of a recompute that refines them all, timed in turn with it, and ≤ 0.25 s (measured 18–31 ms and 55–88 ms; 37–52 ms and 115–171 ms while every recompute refined every hunk's spans) |
 | `lemma-review` `perf_on_edits_replace_all` | a replace_all fed to a review at once (`on_edits`): 20 000 matches ≤ 0.5 s and linear (≤ 6× the time of 10 000); 20 000 over 5000 hunks, or right after accepting or rejecting them, ≤ 0.5 s |
 | `lemma-review` `perf_undo_and_redo_of_a_replace_all` | the buffer's undo and redo of a replace_all of 5000 matches in an open buffer (10 000 changes, each recognized by its record), with their recomputes: ≤ 1 s each, every hunk back (measured 0.14 s and 0.21 s) |
 | `lemma-review` `perf_keystroke_after_a_jump_with_turn_records` | a User keystroke far from the last edit, with the newest turn's 32 768 records held (a replace_all of `$` in an open 10 000-line file: 30 000 matches over 5000 hunks, and 60 000 in one hunk): `on_edit` ≤ 2 ms median, and the records' part (against the same review without records, key by key) ≤ 0.2 ms (measured 45–60 µs and 0.33–0.5 ms, the records' part within the noise; 10–12 ms and 11–14 ms when each jump converted the record ends in between) |

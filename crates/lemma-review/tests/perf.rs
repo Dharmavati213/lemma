@@ -399,3 +399,120 @@ fn perf_unaccept_accept_all() {
     eprintln!("perf_unaccept_accept_all: {hunks} hunks: {took:?}");
     assert!(took < Duration::from_millis(100), "{took:?}");
 }
+
+/// `large.tex` with the first of every `every` lines changed by the agent of turn 1, not
+/// recomputed yet: a hunk for each (5001 with `every` 12, 20 001 with 3).
+fn large_with_hunks(every: usize) -> (FileReview, String) {
+    let mut text = large();
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    starts.retain(|&s| s < text.len());
+    let edits: Vec<TextEdit> = starts
+        .iter()
+        .step_by(every)
+        .rev()
+        .map(|&s| TextEdit::insert(s, "% x "))
+        .collect();
+    let mut review = FileReview::new(text.clone());
+    review.set_turn(1);
+    feed(&mut review, &mut text, &edits);
+    (review, text)
+}
+
+/// The median and maximum of five runs of `decide` on copies of `review`, the copies not counted.
+fn decision_times(review: &FileReview, decide: impl Fn(&mut FileReview)) -> (Duration, Duration) {
+    let mut times: Vec<Duration> = (0..5)
+        .map(|_| {
+            let mut copy = review.clone();
+            let t = Instant::now();
+            decide(&mut copy);
+            t.elapsed()
+        })
+        .collect();
+    times.sort();
+    (times[2], times[4])
+}
+
+/// Accept all, and Keep Turn of the turn that made every hunk, build the new baseline in one
+/// pass: with 5001 hunks in `large.tex` ≤ 50 ms, with 20 001 ≤ 200 ms (measured 7–21 and
+/// 35–54 ms, about what Reject all takes; 0.12–0.19 s and 0.50–0.67 s while each accept moved
+/// the baseline after it). An accept of every other hunk is printed: taking each out of the hunk
+/// list still moves those left after it.
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_accept_all_large_tex() {
+    for (every, budget) in [(12, 50), (3, 200)] {
+        let (mut review, text) = large_with_hunks(every);
+        review.recompute(&text);
+        let hunks = review.hunks().len();
+        let (all, all_max) = decision_times(&review, |r| r.accept_all(&text));
+        let (turn, turn_max) = decision_times(&review, |r| {
+            r.accept_turn(1, &text);
+        });
+        let (reject, reject_max) = decision_times(&review, |r| {
+            r.reject_all(&text);
+        });
+        let half: Vec<_> = review.hunks().iter().step_by(2).map(|h| h.id).collect();
+        let (some, some_max) = decision_times(&review, |r| {
+            r.accept_hunks(&half, &text);
+        });
+        let mut accepted = review.clone();
+        accepted.accept_all(&text);
+        assert_eq!(accepted.baseline(), text);
+        eprintln!(
+            "perf_accept_all_large_tex ({hunks} hunks): accept_all median {all:?} (max \
+             {all_max:?}), accept_turn {turn:?} (max {turn_max:?}); reject_all {reject:?} (max \
+             {reject_max:?}); accept_hunks of every other one {some:?} (max {some_max:?})"
+        );
+        let budget = Duration::from_millis(budget);
+        assert!(all < budget, "accept_all of {hunks} hunks: {all:?}");
+        assert!(turn < budget, "accept_turn of {hunks} hunks: {turn:?}");
+    }
+}
+
+/// The recompute after a keystroke outside the hunks of `large.tex`, with 5001 and 20 001 hunks:
+/// their texts are unchanged, so they keep their word spans, and it takes at most 80% of a
+/// recompute that refines them all (a new review of the same edits, timed in turn with it) and
+/// ≤ 0.25 s. Measured 18–31 ms and 55–88 ms; 37–52 ms and 115–171 ms while every recompute
+/// refined every hunk's spans.
+#[test]
+#[ignore = "performance test; run in release with --ignored perf"]
+fn perf_recompute_keeps_word_spans_large_tex() {
+    for every in [12, 3] {
+        let (mut review, mut text) = large_with_hunks(every);
+        // Until every hunk's spans were refined in time.
+        for _ in 0..3 {
+            review.recompute(&text);
+        }
+        let hunks = review.hunks().len();
+        let words: usize = review.hunks().iter().map(|h| h.words.len()).sum();
+        let (mut kept, mut refined) = (Vec::new(), Vec::new());
+        for i in 0..5 {
+            let (mut fresh, fresh_text) = large_with_hunks(every);
+            let t = Instant::now();
+            fresh.recompute(&fresh_text);
+            refined.push(t.elapsed());
+            // At the end of the second line, between the first two hunks.
+            let e = TextEdit::insert(line_end(&text, 1), ["y", "z"][i % 2]);
+            review.on_edit(&e, Origin::User);
+            e.apply(&mut text);
+            let t = Instant::now();
+            review.recompute(&text);
+            kept.push(t.elapsed());
+            assert_eq!(review.hunks().len(), hunks);
+        }
+        assert_eq!(
+            review.hunks().iter().map(|h| h.words.len()).sum::<usize>(),
+            words
+        );
+        kept.sort();
+        refined.sort();
+        let (median, max, all) = (kept[2], kept[4], refined[2]);
+        eprintln!(
+            "perf_recompute_keeps_word_spans_large_tex ({hunks} hunks, {words} word spans): \
+             median {median:?} (max {max:?}); refining every hunk's spans {all:?}"
+        );
+        assert!(median < all.mul_f64(0.8), "{median:?} against {all:?}");
+        assert!(median < Duration::from_millis(250), "{median:?}");
+    }
+}

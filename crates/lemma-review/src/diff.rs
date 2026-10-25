@@ -36,6 +36,8 @@ pub(crate) struct LineHunk {
     pub new_bytes: Range<usize>,
     /// Word spans; lines relative to the hunk's first line on each side.
     pub words: Vec<WordSpan>,
+    /// The hunk's ops in the diff, whose replacements get the word spans.
+    ops: Range<usize>,
 }
 
 /// The lines of one side's differing middle part.
@@ -110,7 +112,6 @@ impl<'a> LineDiff<'a> {
     /// The changed regions in text order. With `words`, replacements get intra-line word spans
     /// (refined for at most [`WORD_TIMEOUT`]).
     pub fn hunks(&self, words: bool) -> Vec<LineHunk> {
-        let deadline = Instant::now() + WORD_TIMEOUT;
         let ops = self.diff.ops();
         let mut out = Vec::new();
         let mut i = 0;
@@ -126,12 +127,6 @@ impl<'a> LineDiff<'a> {
             let group = &ops[i..j];
             let old = group[0].old_range().start..group[group.len() - 1].old_range().end;
             let new = group[0].new_range().start..group[group.len() - 1].new_range().end;
-            let mut spans = Vec::new();
-            if words {
-                for op in group.iter().filter(|op| op.tag() == DiffTag::Replace) {
-                    self.word_spans(op, old.start, new.start, deadline, &mut spans);
-                }
-            }
             let absolute = |r: &Range<usize>| {
                 to_u32(self.prefix_lines + r.start)..to_u32(self.prefix_lines + r.end)
             };
@@ -140,14 +135,49 @@ impl<'a> LineDiff<'a> {
                 new_lines: absolute(&new),
                 old_bytes: self.old.bytes(&old),
                 new_bytes: self.new.bytes(&new),
-                words: spans,
+                words: Vec::new(),
+                ops: i..j,
             });
             i = j;
+        }
+        if words {
+            self.refine_words(&mut out, Instant::now() + WORD_TIMEOUT, |_, _| None);
         }
         out
     }
 
+    /// Gives `hunks` (this diff's, without word spans) the word spans of their replacements:
+    /// those `known` returns for hunk `i`, else refined until `deadline` (then coarser, or
+    /// none). Returns which hunks' spans are those of their texts whatever the load (known,
+    /// refined before the deadline, or none to refine): only those are worth keeping for the
+    /// texts.
+    pub fn refine_words(
+        &self,
+        hunks: &mut [LineHunk],
+        deadline: Instant,
+        mut known: impl FnMut(usize, &LineHunk) -> Option<Vec<WordSpan>>,
+    ) -> Vec<bool> {
+        let ops = self.diff.ops();
+        let mut exact = Vec::with_capacity(hunks.len());
+        for (i, h) in hunks.iter_mut().enumerate() {
+            if let Some(words) = known(i, h) {
+                h.words = words;
+                exact.push(true);
+                continue;
+            }
+            let group = &ops[h.ops.clone()];
+            let (old0, new0) = (group[0].old_range().start, group[0].new_range().start);
+            let mut refined = false;
+            for op in group.iter().filter(|op| op.tag() == DiffTag::Replace) {
+                refined |= self.word_spans(op, old0, new0, deadline, &mut h.words);
+            }
+            exact.push(!refined || Instant::now() < deadline);
+        }
+        exact
+    }
+
     /// Appends the emphasized words of a replacement op; `old0`/`new0` are the hunk's first lines.
+    /// Returns whether it refined them (a replacement too big for word spans gets none).
     fn word_spans(
         &self,
         op: &DiffOp,
@@ -155,13 +185,13 @@ impl<'a> LineDiff<'a> {
         new0: usize,
         deadline: Instant,
         out: &mut Vec<WordSpan>,
-    ) {
+    ) -> bool {
         let (o, n) = (op.old_range(), op.new_range());
         let too_big = |lines: &Lines, r: &Range<usize>| {
             r.len() > MAX_WORD_LINES || lines.bytes(r).len() > MAX_WORD_BYTES
         };
         if too_big(&self.old, &o) || too_big(&self.new, &n) {
-            return;
+            return false;
         }
         let changes = self.diff.iter_inline_changes_with_options_deadline(
             op,
@@ -201,6 +231,7 @@ impl<'a> LineDiff<'a> {
                 bytes: to_u32(bytes.start)..to_u32(bytes.end),
             }));
         }
+        true
     }
 }
 
@@ -313,5 +344,35 @@ mod tests {
             bytes: 8..12
         }));
         assert_eq!(words.len(), 2);
+    }
+
+    /// Word spans refined before the deadline are those of the texts; past it they may be
+    /// coarser, so they are not, unless nothing needed refining (a pure insertion). Known spans
+    /// are taken as they are.
+    #[test]
+    fn word_spans_past_the_deadline_are_not_exact() {
+        let diff = LineDiff::new(
+            "a\nlet x = alpha + 1;\nb\n",
+            "a\nlet x = beta + 1;\nb\nnew\n",
+        );
+        // A deadline no load runs past, unlike the 8 ms of a recompute.
+        let mut in_time = diff.hunks(false);
+        let far = Instant::now() + Duration::from_secs(60);
+        let exact = diff.refine_words(&mut in_time, far, |_, _| None);
+        assert_eq!(exact, [true, true]);
+        assert_eq!(in_time[0].words.len(), 2);
+        assert!(in_time[1].words.is_empty());
+
+        let mut late = diff.hunks(false);
+        let exact = diff.refine_words(&mut late, Instant::now(), |_, _| None);
+        assert_eq!(exact, [false, true]);
+
+        let mut known = diff.hunks(false);
+        let words = in_time[0].words.clone();
+        let exact = diff.refine_words(&mut known, Instant::now(), |i, _| {
+            (i == 0).then(|| words.clone())
+        });
+        assert_eq!(exact, [true, true]);
+        assert_eq!(known, in_time);
     }
 }

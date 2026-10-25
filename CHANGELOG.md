@@ -192,6 +192,20 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   still takes back a Reject all or a Reject Turn in a closed file. In an open file, the records
   that let Ctrl+Z and Ctrl+Shift+Z of the agent's last turn keep it under review take at most
   about 16 MB: 200 changes of 100 KB each kept 60 MB of them.
+- Accept all, Keep Turn and Keep on a Replace in Project group of the Changes panel take
+  thousands of changes in a large file at once instead of rewriting the rest of the file after
+  each one: 5000 changes in a 60 000-line file take about 10 ms instead of 0.15 s, 20 000 about
+  50 ms instead of 0.5 s.
+- With thousands of changes under review in a large file, the review no longer works out again
+  which words changed in each change after every typing pause, decision or agent edit: a change
+  whose text is the same as before keeps its highlighted words. With 5000 changes in a
+  60 000-line file, the update after a pause takes about 20 ms instead of 40 ms, with 20 000
+  about 60 ms instead of 0.13 s. Once worked out in full, a change's highlighted words no longer
+  depend on how busy the machine is.
+- An agent edit in a large open file answers the agent sooner: the lines it quotes back are read
+  alone, instead of copying the whole text and finding its lines again (5–11 ms in a 60 000-line
+  file). Keeping a change, a file's or a turn's changes, or taking a keep back with Alt+U, copies
+  the text of an open file once instead of twice (3.5–7 ms less in such a file).
 
 ### Fixed
 
@@ -247,6 +261,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   recognized now, up to 16 384 replacements in an open file (fewer when they are long: the
   records of the last turn take at most about 16 MB). Keeping them adds a few microseconds to a
   keystroke wherever it is typed.
+- Redoing two agent edits that added the same text at one place, the second right after the
+  first (`\beta` added to the end of a line twice, say), keeps both under review. After Ctrl+Z of
+  both and Ctrl+Shift+Z (Vim `u` and Ctrl+R), the second was taken for your own typing: it was
+  no longer a change to review, and Reject could not take it back.
 - Reject all of thousands of changes, and its Ctrl+Z and Alt+U, no longer freeze the window:
   5000 changes take 0.05 s instead of 2.3 s, 0.07 s instead of 100 s and 0.18 s instead of
   1.1 s. Edits right after such a Reject all are no longer slowed down by it (a replace_all of

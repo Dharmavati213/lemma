@@ -370,7 +370,12 @@ proptest! {
         let s = agent_session(&base, &ops, 0);
         let p = s.review.to_persisted("chapters/x.tex".into(), &s.text);
         let restored = FileReview::from_persisted(&p, &s.text).expect("same disk text");
-        prop_assert_eq!(restored.hunks(), s.hunks());
+        // But the word spans: each side's recompute has 8 ms for them, which a loaded machine
+        // can run out of on one side only.
+        let without_words = |hunks: &[Hunk]| -> Vec<Hunk> {
+            hunks.iter().map(|h| Hunk { words: Vec::new(), ..h.clone() }).collect()
+        };
+        prop_assert_eq!(without_words(restored.hunks()), without_words(s.hunks()));
         prop_assert_eq!(restored.baseline(), s.review.baseline());
         let other = format!("{}{extra}", s.text);
         prop_assert!(FileReview::from_persisted(&p, &other).is_none());

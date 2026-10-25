@@ -23,7 +23,7 @@ mod segments;
 mod tests;
 mod turns;
 
-use crate::diff::LineDiff;
+use crate::diff::{LineDiff, LineHunk, WORD_TIMEOUT};
 use crate::edits::minimal_edits;
 use crate::text::{newlines, offset, shift_bytes, shift_lines, signed, trimmed_edit};
 use crate::{
@@ -37,7 +37,7 @@ use segments::{Parked, Segment, Segments};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use turns::Attribution;
 
 /// Bookkeeping kept next to each [`Hunk`] (same index in `FileReview::meta`).
@@ -56,6 +56,9 @@ struct Meta {
     undo_reported: Option<u64>,
     /// Set when undoing a reject re-opened this region.
     reopen: Option<Reopen>,
+    /// The hunk's word spans are those of its texts whatever the load (refined before the word
+    /// diff's deadline): the next recompute gives them to a hunk with the same texts.
+    exact_words: bool,
 }
 
 /// Identity of a rejected hunk, handed to the hunk that re-opens when the reject is undone: the
@@ -295,16 +298,7 @@ impl FileReview {
             return false;
         }
         self.generation += 1;
-        let mut regions = Vec::with_capacity(picked.len());
-        let mut events = Vec::with_capacity(picked.len());
-        for &k in picked.iter().rev() {
-            let (region, event) = self.accept_at(k);
-            regions.push(region);
-            events.push(event);
-        }
-        events.reverse();
-        self.events.extend(events);
-        self.journal.push(Entry::Accept(regions));
+        self.accept_many(picked, current);
         true
     }
 
@@ -681,7 +675,9 @@ impl FileReview {
     /// The line diff itself runs without a deadline (similar's Myers bounds its own work by the
     /// input size), so the hunks and their ids depend on the texts only, never on machine load;
     /// the 8 ms timeout applies to the word spans. A line whose changed words cover most of it gets
-    /// no word spans: the whole line is the change.
+    /// no word spans: the whole line is the change. A hunk whose texts a hunk had at the last
+    /// recompute keeps that hunk's word spans when they were refined in time: they depend on the
+    /// texts only, so only new texts take the word diff's time.
     ///
     /// Hunks keep their [`HunkId`] when their texts are unchanged, `user_touched` carries over to
     /// the hunks that overlap a touched one, and a hunk re-opened by undoing a reject gets its old
@@ -689,7 +685,8 @@ impl FileReview {
     /// (from `on_edit`, `accept`, `undo_review_action`) count as added when they remain.
     pub fn recompute(&mut self, current: &str) -> HunkDelta {
         self.generation += 1;
-        let raw = LineDiff::new(&self.baseline, current).hunks(true);
+        let diff = LineDiff::new(&self.baseline, current);
+        let mut raw = diff.hunks(false);
         let candidates: Vec<ids::Candidate> = raw
             .iter()
             .map(|h| ids::Candidate {
@@ -700,10 +697,12 @@ impl FileReview {
                 ),
             })
             .collect();
+        let exact = self.word_spans(&diff, &mut raw, &candidates, current);
         let inherited = ids::inherit(&self.hunks, &self.meta, current, &candidates);
         let mut hunks = Vec::with_capacity(raw.len());
         let mut meta = Vec::with_capacity(raw.len());
-        for ((h, c), inherited) in raw.into_iter().zip(candidates).zip(inherited) {
+        let all = raw.into_iter().zip(candidates).zip(inherited).zip(exact);
+        for (((h, c), inherited), exact_words) in all {
             let old_text = self.baseline[h.old_bytes.clone()].to_owned();
             let new_text = current[h.new_bytes.clone()].to_owned();
             hunks.push(Hunk {
@@ -724,6 +723,7 @@ impl FileReview {
                 edit_reported: inherited.edit_reported,
                 undo_reported: inherited.undo_reported,
                 reopen: None,
+                exact_words,
             });
         }
         for h in &mut hunks {
@@ -748,6 +748,31 @@ impl FileReview {
         self.current_len = current.len();
         self.forget_free_hints();
         delta
+    }
+
+    /// Gives the hunks `raw` of `diff` (with `candidates`, their pairs of texts) their word spans
+    /// (see [`LineDiff::refine_words`]): those of a hunk with the same texts, if they were refined
+    /// in time, else refined. Returns which are those of their texts whatever the load.
+    fn word_spans(
+        &self,
+        diff: &LineDiff,
+        raw: &mut [LineHunk],
+        candidates: &[ids::Candidate],
+        current: &str,
+    ) -> Vec<bool> {
+        let known: HashMap<u64, usize> = self
+            .meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.exact_words)
+            .filter_map(|(k, m)| Some((m.pair?, k)))
+            .collect();
+        diff.refine_words(raw, Instant::now() + WORD_TIMEOUT, |i, h| {
+            let k = *known.get(&candidates[i].pair)?;
+            let same = self.hunks[k].old_text == self.baseline[h.old_bytes.clone()]
+                && self.meta[k].new_text == current[h.new_bytes.clone()];
+            same.then(|| self.hunks[k].words.clone())
+        })
     }
 
     /// `baseline[base_lines] := current[cur_lines]`. No buffer change.
@@ -804,16 +829,8 @@ impl FileReview {
             self.forget_free_hints();
             return;
         }
-        let mut regions = Vec::with_capacity(self.hunks.len());
-        let mut events = Vec::with_capacity(self.hunks.len());
-        for k in (0..self.hunks.len()).rev() {
-            let (region, event) = self.accept_at(k);
-            regions.push(region);
-            events.push(event);
-        }
-        events.reverse();
-        self.events.extend(events);
-        self.journal.push(Entry::Accept(regions));
+        let all: Vec<usize> = (0..self.hunks.len()).collect();
+        self.accept_many(&all, current);
     }
 
     /// Edits in descending offset order.
@@ -1071,20 +1088,70 @@ impl FileReview {
 
     /// Moves hunk `k` into the baseline and removes it.
     fn accept_at(&mut self, k: usize) -> (Accepted, ReviewEvent) {
-        // What the turns changed around it is no change any more; Alt+U puts it back.
-        let anchor = self.hunks[k].cur_bytes.clone();
-        let parked = self.park_around(k, &anchor);
-        let hunk = self.hunks.remove(k);
-        let meta = self.meta.remove(k);
+        let base = self.hunks[k].base_bytes.clone();
+        let (region, event) = self.take_accepted(k, None);
         self.forget_free_hints();
-        self.baseline
-            .replace_range(hunk.base_bytes.clone(), &meta.new_text);
-        let delta = signed(meta.new_text.len()) - signed(hunk.old_text.len());
-        let lines = i64::from(newlines(&meta.new_text)) - i64::from(newlines(&hunk.old_text));
+        self.baseline.replace_range(base, &region.new_text);
+        let delta = signed(region.new_text.len()) - signed(region.old_text.len());
+        let lines = i64::from(newlines(&region.new_text)) - i64::from(newlines(&region.old_text));
         for h in &mut self.hunks[k..] {
             shift_bytes(&mut h.base_bytes, delta);
             shift_lines(&mut h.base_lines, lines);
         }
+        (region, event)
+    }
+
+    /// Accepts the hunks at `picked` (ascending) as one journalled decision, with the result of
+    /// `accept_at` for each from the last one down, but the baseline rebuilt once: one pass takes
+    /// the picked hunks' texts between its gaps and moves the baseline offsets and lines of the
+    /// other hunks by the growth of those picked before them. Then each picked hunk is taken out,
+    /// from the last one down, with its turns, segments and records; the text around it is read
+    /// from `current` (checked by the caller), since the baseline no longer matches the hunks
+    /// left. One by one, each accept moved the baseline after it: O(hunks × baseline), 0.1 s for
+    /// an Accept all of 5000 hunks in `large.tex` and 0.5 s for 20 000.
+    fn accept_many(&mut self, picked: &[usize], current: &str) {
+        debug_assert!(picked.windows(2).all(|w| w[0] < w[1]), "{picked:?}");
+        let growth: isize = picked.iter().map(|&k| model::growth(&self.hunks[k])).sum();
+        let mut baseline = String::with_capacity(offset(self.baseline.len(), growth));
+        let (mut pos, mut delta, mut lines) = (0, 0, 0);
+        let mut next = picked.iter().copied().peekable();
+        for (k, (h, m)) in self.hunks.iter_mut().zip(&self.meta).enumerate() {
+            if next.next_if_eq(&k).is_some() {
+                baseline.push_str(&self.baseline[pos..h.base_bytes.start]);
+                baseline.push_str(&m.new_text);
+                pos = h.base_bytes.end;
+                delta += signed(m.new_text.len()) - signed(h.old_text.len());
+                lines += i64::from(newlines(&m.new_text)) - i64::from(newlines(&h.old_text));
+            } else {
+                shift_bytes(&mut h.base_bytes, delta);
+                shift_lines(&mut h.base_lines, lines);
+            }
+        }
+        baseline.push_str(&self.baseline[pos..]);
+        self.baseline = baseline;
+        let mut regions = Vec::with_capacity(picked.len());
+        let mut events = Vec::with_capacity(picked.len());
+        for &k in picked.iter().rev() {
+            let (region, event) = self.take_accepted(k, Some(current));
+            regions.push(region);
+            events.push(event);
+        }
+        self.forget_free_hints();
+        events.reverse();
+        self.events.extend(events);
+        self.journal.push(Entry::Accept(regions));
+    }
+
+    /// Takes hunk `k` out for an accept, with what goes with it (its turns and the segments
+    /// around it, which Alt+U puts back with it, and the records of edits there), and returns its
+    /// region for the journal and its event. The baseline is left to the caller; `current`, when
+    /// given, is the text read around the hunk (see `park_around`).
+    fn take_accepted(&mut self, k: usize, current: Option<&str>) -> (Accepted, ReviewEvent) {
+        // What the turns changed around it is no change any more; Alt+U puts it back.
+        let anchor = self.hunks[k].cur_bytes.clone();
+        let parked = self.park_around(k, &anchor, current);
+        let hunk = self.hunks.remove(k);
+        let meta = self.meta.remove(k);
         // Undoing the agent's edits here is now the user's own change to the baseline.
         self.records.forget_touching(&hunk.cur_bytes);
         // The text is no change any more; Alt+U gives the turns back with the hunk.
@@ -1136,7 +1203,7 @@ impl FileReview {
         }
         // The region goes back to the baseline: what the turns changed around it waits for the
         // reject to be undone.
-        let parked = self.park_around(k, &edit.range);
+        let parked = self.park_around(k, &edit.range, None);
         if !parked.is_empty() {
             self.parked_segments.insert(record, parked);
         }
@@ -1202,6 +1269,7 @@ impl FileReview {
             edit_reported: None,
             undo_reported: None,
             reopen: None,
+            exact_words: false,
         };
         if let Some(batch) = &mut self.batch {
             batch.merged(i, &[], hunk.id, 0);

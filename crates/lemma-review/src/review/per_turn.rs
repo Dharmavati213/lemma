@@ -516,8 +516,15 @@ impl FileReview {
     /// to the start of the next) out, for a decision on it; positions relative to `anchor`. The
     /// unknown places touching those neighbours stay: they may be about them (an unknown place
     /// at the start of the next hunk keeps it from being decided per turn, whatever is decided
-    /// before it).
-    pub(super) fn park_around(&mut self, k: usize, anchor: &Range<usize>) -> Parked {
+    /// before it). The segments' texts are read from `current` when given (the text, checked
+    /// against the model), else from the model, which needs the baseline as the hunks describe
+    /// it: an accept of several hunks rebuilds it before it takes them out (`accept_many`).
+    pub(super) fn park_around(
+        &mut self,
+        k: usize,
+        anchor: &Range<usize>,
+        current: Option<&str>,
+    ) -> Parked {
         let lo = k.checked_sub(1).map_or(0, |p| self.hunks[p].cur_bytes.end);
         let hi = self
             .hunks
@@ -532,9 +539,12 @@ impl FileReview {
         let segments = within
             .into_iter()
             .map(|s| {
-                let hash = self
-                    .current_text(&s.range)
-                    .map_or(0, |t| segments::text_hash(&t));
+                let hash = match current {
+                    Some(current) => current.get(s.range.clone()).map_or(0, segments::text_hash),
+                    None => self
+                        .current_text(&s.range)
+                        .map_or(0, |t| segments::text_hash(&t)),
+                };
                 let (start, end) = (rel(s.range.start), rel(s.range.end));
                 (s, start, end, hash)
             })
