@@ -1166,7 +1166,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lemma-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
  "async-channel",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "cairo-rs",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-build"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "lemma-core",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-complete"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "frizbee",
  "lemma-snippets",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "toml",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-fake-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol-schema",
  "serde",
@@ -1275,11 +1275,11 @@ dependencies = [
 
 [[package]]
 name = "lemma-mcp"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "lemma-pdf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "cairo-rs",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-preview"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cairo-rs",
  "glib",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-review"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lemma-core",
  "proptest",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "memchr",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-snippets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lemma-syntax",
  "serde",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-synctex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "lemma-core",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lemma-syntax"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "lemma-core",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ruzstd",
 ]

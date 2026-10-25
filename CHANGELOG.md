@@ -4,7 +4,9 @@ Releases are named after Greek letters; the version number is in `Cargo.toml`. E
 notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 [releases page](https://github.com/dharmavati213/lemma/releases).
 
-## Unreleased
+## zeta (0.2.0), 2026-10-25
+
+The second release, and the first for Windows.
 
 ### Added
 

@@ -1,7 +1,7 @@
 # Lemma for Arch Linux, built from the local repository this file lives in (see README).
 pkgname=lemma
-pkgver=0.1.0
-pkgrel=2
+pkgver=0.2.0
+pkgrel=1
 pkgdesc="LaTeX editor that shows an AI agent's edits inline for review (GTK 4)"
 arch=('x86_64')
 # Rust crates such as ring compile C code; makepkg's GCC LTO flags would turn those objects into
