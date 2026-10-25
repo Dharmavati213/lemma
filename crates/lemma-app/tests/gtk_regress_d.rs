@@ -948,9 +948,13 @@ fn colon_e_reloads_only_when_clean() {
 /// Runs this binary with `LEMMA_REGRESS_D_CHILD=probe`. `Ok(code)` when it exited (`None` for a
 /// signal), `Err` when it was still running after `timeout` (it is killed).
 fn child(probe: &str, timeout: Duration) -> Result<Option<i32>, String> {
+    // The real app's interactive window (`scripted_prompts`) saves its session and keeps copies
+    // of unsaved text: in a temporary state directory, never the user's.
+    let state = common::temp_dir(&format!("child-{probe}-state"));
     let mut child = Command::new(std::env::current_exe().unwrap())
         .env(CHILD_ENV, probe)
         .env("LEMMA_CONFIG", "/dev/null")
+        .env("XDG_STATE_HOME", &state)
         .spawn()
         .expect("spawn the child");
     let deadline = Instant::now() + timeout;

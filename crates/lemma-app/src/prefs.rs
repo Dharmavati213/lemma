@@ -2,13 +2,13 @@
 //!
 //! `win.preferences` (Ctrl+,) shows an `adw::PreferencesDialog` over the most used settings
 //! ([`PAGES`]): the editor font, wrapping, inline equation numbers, the git gutter, the word
-//! count, auto-save, session restore, Vim, the typing helpers and replacements, completion while
-//! typing, spell checking and its language (the installed dictionaries); build on save and after
-//! agent turns, chktex, the PDF preview's dark pages, cursor following and thumbnail strip, hover
-//! popovers, the math preview and the hover delay, the outline following the cursor; agent
-//! notifications and the local history limits — plus the configuration file's path with an Open
-//! button (the system's handler for the file, through `gtk::FileLauncher`; a missing file is
-//! created first).
+//! count, auto-save, the recovery of unsaved changes, session restore, Vim, the typing helpers
+//! and replacements, completion while typing, spell checking and its language (the installed
+//! dictionaries); build on save and after agent turns, chktex, the PDF preview's dark pages,
+//! cursor following and thumbnail strip, hover popovers, the math preview and the hover delay,
+//! the outline following the cursor; agent notifications and the local history limits — plus
+//! the configuration file's path with an Open button (the system's handler for the file, through
+//! `gtk::FileLauncher`; a missing file is created first).
 //!
 //! # Writing `config.toml`
 //!
@@ -180,6 +180,13 @@ pub const PAGES: &[Page] = &[
                             options: AUTOSAVE,
                         },
                     },
+                    switch(
+                        "editor",
+                        "recovery",
+                        "Recover Unsaved Changes",
+                        "Keep a copy of unsaved text, offered again after a crash",
+                        |c| c.editor.recovery,
+                    ),
                     switch(
                         "session",
                         "restore",

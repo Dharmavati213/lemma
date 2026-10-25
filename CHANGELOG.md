@@ -75,6 +75,16 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   option key (`\includegraphics[widht=…]`, a TikZ key such as `colr=red`), an undefined color,
   Float(s) lost, Too many unprocessed floats and the output loop that follows it; and for bad
   vertical boxes (Overfull and Underfull `\vbox`), which had none.
+- Unsaved changes survive a crash, a shutdown, a closed terminal or a logout. Five seconds after
+  you stop typing (at the latest every 30 seconds while you type on), and whenever the window
+  loses the focus, Lemma keeps a copy of each edited document's text in
+  `~/.local/state/lemma/recovery/`; saving or discarding the changes removes it. When the
+  document next opens, a bar says "Unsaved changes to “main.tex” from 5 minutes ago were
+  recovered" (and whether the file changed on disk since): Review shows them as hunks of a
+  "Recovered changes" turn, to keep or reject one by one, and Discard throws them away. A New
+  File that was never saved gets its tab back with the session. On Linux and macOS, `SIGTERM`,
+  `SIGHUP` and Ctrl+C in the terminal no longer kill Lemma on the spot: it writes the copies and
+  closes its window without asking. `[editor] recovery = false` (or Preferences) turns it off.
 
 ### Changed
 

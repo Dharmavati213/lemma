@@ -493,10 +493,16 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
         let s = shared.clone();
         app.connect_open(move |app, files, _hint| open_handed_files(app, &s, files));
     }
+    #[cfg(unix)]
+    if !shared.options.quits_by_itself() {
+        quit_on_termination_signals(&app, &shared);
+    }
     let status = app.run_with_args(&["lemma"]);
     // The callbacks hold `shared`; drop the windows explicitly before reporting.
     shared.windows.borrow_mut().clear();
     shared.watcher.replace(None);
+    // Recovery files still queued for the jobs thread are written before the process ends.
+    crate::recovery::flush();
     // Only removed while empty.
     let _ = std::fs::remove_dir(no_project_dir());
     if shared.failed.get() {
@@ -504,6 +510,40 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
     } else {
         status.into()
     }
+}
+
+/// Ends the application on `SIGTERM` (a shutdown, `systemctl --user stop`), `SIGHUP` (the
+/// terminal closed) and `SIGINT` (Ctrl+C in it), each of which would otherwise kill the process
+/// with every unsaved change: every window writes the recovery files of its edited documents now
+/// ([`recovery::write_now`](crate::recovery::write_now)) and closes as Ctrl+Q closes it, but
+/// without asking about the changes, which the files keep. A second signal while the windows
+/// close ends the process at once.
+#[cfg(unix)]
+fn quit_on_termination_signals(app: &adw::Application, shared: &Rc<Shared>) {
+    let (app, weak) = (app.downgrade(), Rc::downgrade(shared));
+    let ending = Cell::new(false);
+    crate::recovery::connect_termination(move |signal| {
+        let windows = weak
+            .upgrade()
+            .map(|shared| shared.windows.borrow().clone())
+            .unwrap_or_default();
+        for state in &windows {
+            crate::recovery::write_now(state);
+        }
+        if ending.replace(true) {
+            tracing::warn!("signal {signal} again: ending now");
+            std::process::exit(128 + signal);
+        }
+        tracing::info!("signal {signal}: closing the windows");
+        if windows.is_empty()
+            && let Some(app) = app.upgrade()
+        {
+            app.quit();
+        }
+        for state in windows {
+            state.close_without_asking();
+        }
+    });
 }
 
 /// The environment variable GTK reads (once, when the first window is realized) to pick its
@@ -580,14 +620,14 @@ fn trim_heap_later() {
     glib::timeout_add_local_once(TRIM_AFTER, crate::heap::trim);
 }
 
-/// How long after the document is open the sessions directory is swept: well after the start-up
-/// work (and the heap trim) is done.
+/// How long after the document is open the sessions and recovery directories are swept: well
+/// after the start-up work (and the heap trim) is done.
 const PRUNE_AFTER: Duration = Duration::from_secs(10);
 
-/// Removes the session files of projects that are gone or were not opened for months, once per
-/// process ([`session::prune_once`], on the jobs thread). The projects of the open windows keep
-/// theirs.
-fn prune_sessions_later(shared: &Rc<Shared>) {
+/// Removes old recovery files ([`crate::recovery::prune_once`]) and, with `sessions`, the session
+/// files of projects that are gone or were not opened for months, once per process
+/// ([`session::prune_once`]), on the jobs thread. The projects of the open windows keep theirs.
+fn prune_later(shared: &Rc<Shared>, sessions: bool) {
     let weak = Rc::downgrade(shared);
     glib::timeout_add_local_once(PRUNE_AFTER, move || {
         let Some(shared) = weak.upgrade() else {
@@ -596,6 +636,10 @@ fn prune_sessions_later(shared: &Rc<Shared>) {
         let Some(paths) = shared.paths.as_ref() else {
             return;
         };
+        crate::recovery::prune_once(paths);
+        if !sessions {
+            return;
+        }
         let roots: Vec<PathBuf> = shared
             .windows
             .borrow()
@@ -837,8 +881,8 @@ async fn start(state: Rc<WindowState>, shared: Rc<Shared>, documents: Vec<FileAr
     // Every tab of the start is open, or failed to: "No Document Open" when there is none.
     state.set_opening(false);
     trim_heap_later();
-    if !scripted && state.session_saves_enabled() {
-        prune_sessions_later(&shared);
+    if !scripted {
+        prune_later(&shared, state.session_saves_enabled());
     }
     if let Err(e) = perf::run(&state, shared.started).await {
         eprintln!("lemma: {e}");

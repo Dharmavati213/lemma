@@ -79,8 +79,10 @@ that is a source.
 **State and settings in tests:** every test window gets `Paths` in a temporary directory (or
 none) and an in-memory `Config`; binary runs get `LEMMA_CONFIG=/dev/null` (or a temporary
 `config.toml`) and temporary `HOME`/`XDG_*` directories. Runs that quit by themselves never
-read or write a session, the palette's recent commands, local history or review state, and keep
-the math preview's formats in a temporary directory that goes with the window. Nothing reads or
+read or write a session, the palette's recent commands, local history, review state or the
+recovery copies of unsaved changes (test windows switch recovery on with
+`recovery::set_enabled` only with temporary `Paths`), and keep the math preview's formats in a
+temporary directory that goes with the window. Nothing reads or
 writes the user's `~/.config/lemma`, `~/.local/state/lemma`, `~/.local/share/lemma` or
 `~/.cache/lemma`.
 
@@ -282,6 +284,21 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   window size, maximized under Broadway too); `gtk_app`'s `several_files_and_lines` and
   `usage_errors_and_help` run the binary. The command line's parsing (with files on disk) and
   the sweep of old session files are unit tests in `cli.rs` and `session.rs`.
+- **Recovery of unsaved changes** (`recovery.rs`): unit tests for the file format, the
+  decision on a file found when a document opens, the bar's texts, the copy delays, the writer
+  (the newest operation per file wins, the process's lock), a running writer told by its lock,
+  and the sweep; `gtk_session`'s
+  `recovery_copies_unsaved_text_until_it_is_saved` (after the delay, while typing goes on, on
+  focus loss; removed by a save, `:q!` and turning `[editor] recovery` off; nothing in a test
+  window until switched on), `recovery_offers_reviews_and_discards` (the bar's texts, Review as
+  hunks of a "Recovered changes" turn that a reject undoes, Discard, a corrupt file ignored, a
+  matching one removed, another running Lemma's copy left alone until its lock goes),
+  `recovery_restores_tabs_never_saved` (the session brings back the tab of a New File whose
+  copy a crash left, only with recovery on) and `recovery_survives_sigterm_and_sigint`, which
+  runs the real app (`app::run`) in a child process (`LEMMA_RECOVERY_CHILD`) with temporary XDG
+  directories, types into it, sends `SIGTERM` (and `SIGINT`) and checks that the window closed,
+  the process ended successfully and the recovery file holds the typed text, which the next
+  window offers.
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
   `find_bar_*` tests (counts and wrapping, the options and invalid expressions, steps before
   the search has counted looked for in the background, the steps and Replaces after them
@@ -367,6 +384,7 @@ check the budgets only in release builds:
 | `regress2_d` `perf_reject_all_of_5000_hunks_and_its_undo` | Reject all of 5000 line hunks, its Ctrl+Z and its Alt+U, each with its recompute: ≤ 0.5 s each (measured 0.05 s, 0.07 s, 0.18 s; 2.3 s, 100 s and 1.1 s when each step re-checked every record) |
 | `lemma-core` `perf_line_index_replace_all_large_tex` | the line index through the 40 000 changes of a replace all of 20 000 matches in `large.tex`, from the end and from the start, ≤ 50 ms each |
 | `gtk_document` `perf_apply_edits_replace_all` | `apply_edits` of 20 000 matches in a file under review: ≤ 0.5 s closed, ≤ 1.5 s open |
+| `gtk_session` `perf_recovery_copy_large_tex` | the recovery copy's main-thread cost: ≤ 2 ms for 10k lines (a copy can come due while typing goes on), ≤ 8 ms for `large.tex` (measured 0.9 and 4.5 ms in a dev build: the copy is GTK's), and ≤ 100 µs of a keystroke |
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 | `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |

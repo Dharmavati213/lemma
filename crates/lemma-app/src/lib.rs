@@ -56,6 +56,9 @@ pub mod format;
 // M5 (WP5.4): timing measurements on the real display (`LEMMA_PERF`, scripts/perf-wayland.sh)
 pub mod perf;
 
+// Copies of unsaved text that a crash, a kill or a logout cannot take away
+pub mod recovery;
+
 #[cfg(windows)]
 pub mod windows;
 

@@ -415,6 +415,7 @@ impl WindowState {
         crate::templates::install(self);
         crate::bibimport::install(self);
         crate::autosave::install(self);
+        crate::recovery::install(self);
         // Editing commands (Toggle Comment, Bold, Italic, Emphasize).
         crate::editor::editing::install(self);
     }
@@ -432,10 +433,12 @@ impl WindowState {
         git_gutter::attach(self, editor);
         crate::paste::attach(self, editor);
         crate::autosave::attach(self, editor);
+        crate::recovery::attach(self, editor);
     }
 
     /// [`WindowState::attach_m3`] undone, in reverse order.
     fn detach_m3(self: &Rc<Self>, editor: &Rc<Editor>) {
+        crate::recovery::detach(self, editor);
         crate::autosave::detach(self, editor);
         git_gutter::detach(self, editor);
         crate::editor::envtools::detach(self, editor);
@@ -1431,6 +1434,10 @@ impl WindowState {
                 glib::idle_add_local_once(move || {
                     if let Some(state) = state.upgrade() {
                         if force {
+                            // `:qa!` throws the unsaved changes away, their copies too.
+                            for doc in state.workspace.dirty_documents() {
+                                crate::recovery::discard(&state, &doc);
+                            }
                             state.close_confirmed.set(true);
                         }
                         state.window.close();
@@ -2000,6 +2007,7 @@ impl WindowState {
             let confirm = match state.ask_save(std::slice::from_ref(&doc)).await {
                 SaveChoice::Cancel => false,
                 SaveChoice::Discard => {
+                    crate::recovery::discard(&state, &doc);
                     state.discard_changes(&doc).await;
                     true
                 }
@@ -2016,6 +2024,14 @@ impl WindowState {
         glib::Propagation::Stop
     }
 
+    /// Closes the window without asking about unsaved changes: the system is ending the process
+    /// (`SIGTERM`, `SIGHUP`, Ctrl+C), and the changes are kept in their recovery files, which the
+    /// caller writes first (`recovery::write_now`).
+    pub fn close_without_asking(self: &Rc<Self>) {
+        self.close_confirmed.set(true);
+        self.window.close();
+    }
+
     fn close_request(self: &Rc<Self>) -> glib::Propagation {
         // The session as the user left it: every tab is still there.
         self.save_session_now();
@@ -2030,7 +2046,12 @@ impl WindowState {
         glib::spawn_future_local(async move {
             let close = match state.ask_save(&dirty).await {
                 SaveChoice::Cancel => false,
-                SaveChoice::Discard => true,
+                SaveChoice::Discard => {
+                    for doc in &dirty {
+                        crate::recovery::discard(&state, doc);
+                    }
+                    true
+                }
                 SaveChoice::Save => match state.workspace.save_all_dirty().await {
                     Ok(()) => true,
                     Err(failures) => {

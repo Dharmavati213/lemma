@@ -99,6 +99,10 @@ pub struct EditorCfg {
     /// Save edited documents by themselves (M5, WP5.5): never, when the window loses the focus,
     /// or two seconds after the last change.
     pub autosave: Autosave,
+    /// Keep a copy of the unsaved text of each edited document in the state directory (a few
+    /// seconds after the last change, and when the window loses the focus), so that a crash, a
+    /// kill or a logout does not lose it: the document offers it again when it next opens.
+    pub recovery: bool,
 }
 
 /// `[editor] autosave` (WP5.5): when Lemma saves edited documents without being asked.
@@ -174,6 +178,7 @@ impl Default for EditorCfg {
             hover: true,
             renderer: Renderer::Auto,
             autosave: Autosave::Off,
+            recovery: true,
         }
     }
 }
@@ -976,6 +981,18 @@ mod tests {
             let text = format!("[editor]\nautosave = \"{}\"\n", autosave.as_str());
             assert_eq!(parse(&text).unwrap().editor.autosave, autosave);
         }
+    }
+
+    #[test]
+    fn recovery_is_on_by_default() {
+        assert!(Config::default().editor.recovery);
+        assert!(
+            !parse("[editor]\nrecovery = false\n")
+                .unwrap()
+                .editor
+                .recovery
+        );
+        assert!(parse("[editor]\nrecovery = \"off\"\n").is_err());
     }
 
     #[test]

@@ -1,15 +1,19 @@
 //! WP3.8: session restore (`session.rs`) and the local-history timeline (`history_ui.rs`),
 //! with the start-up around them: the command line's FILEs (`app::open_documents`), the blank
-//! editor area while they open, the window size `last.json` remembers.
+//! editor area while they open, the window size `last.json` remembers; and the recovery of
+//! unsaved changes after a crash or a kill (`recovery.rs`).
 //!
 //! Every window gets `Paths` in a temporary directory, and `XDG_DATA_HOME` (the trash) points
 //! into this test's temporary directory too: nothing reads or writes the user's state. The
 //! binary runs (`scripted_runs_restore_only_when_asked`) get temporary `HOME` and `XDG_*`
-//! directories and `LEMMA_CONFIG=/dev/null`.
+//! directories and `LEMMA_CONFIG=/dev/null`, and so do the child processes of
+//! `recovery_survives_sigterm_and_sigint` (this binary again, with `LEMMA_RECOVERY_CHILD=FILE`),
+//! which run the real app (`app::run`) on FILE, type into it and wait for the signal.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_session`.
-//! `LEMMA_TEST_SNAPSHOTS=dir` saves `history-timeline-light.png` and
-//! `history-timeline-dark.png` there.
+//! `LEMMA_TEST_SNAPSHOTS=dir` saves `history-timeline-light.png`, `history-timeline-dark.png`,
+//! `recovery-bar-light.png` and `recovery-bar-dark.png` there. The timing test
+//! `perf_recovery_copy_large_tex` runs with `--release … -- --ignored perf`.
 
 mod common;
 
@@ -21,6 +25,7 @@ use lemma_app::cli::FileArg;
 use lemma_app::editor::{Editor, spell};
 use lemma_app::history_ui;
 use lemma_app::pdf::pdf_view;
+use lemma_app::recovery;
 use lemma_app::review_ui::{self, Decision};
 use lemma_app::session::{
     self, LastSession, PaneState, PdfState, Reopen, SessionFile, SidebarState, TabState,
@@ -30,7 +35,7 @@ use lemma_app::testmode;
 use lemma_app::window::{PAGE_PROBLEMS, PAGE_SEARCH, WindowState};
 use lemma_app::workspace::{Workspace, normalize};
 use lemma_config::{Config, Paths};
-use lemma_core::ProjectRoot;
+use lemma_core::{ProjectRoot, fnv1a64};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,14 +43,20 @@ use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// Set in the child processes of `recovery_survives_sigterm_and_sigint` (to the file they edit).
+const RECOVERY_CHILD_ENV: &str = "LEMMA_RECOVERY_CHILD";
+
 fn main() -> ExitCode {
+    if let Some(file) = std::env::var_os(RECOVERY_CHILD_ENV) {
+        return recovery_child(file);
+    }
     // A restored file that is rejected goes to the trash: keep that out of the user's.
     let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("lemma-session-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         ("session_round_trip_tabs_positions_and_panes", round_trip),
         ("session_pdf_place_zoom_and_dark_mode", pdf_round_trip),
         (
@@ -66,7 +77,19 @@ fn main() -> ExitCode {
         ("timeline_lists_previews_and_restores", timeline_restore),
         ("timeline_reaches_deleted_files", timeline_deleted),
         ("timeline_empty_state_and_menu", timeline_empty),
-    ])
+        (
+            "recovery_copies_unsaved_text_until_it_is_saved",
+            recovery_copies,
+        ),
+        ("recovery_offers_reviews_and_discards", recovery_offers),
+        ("recovery_restores_tabs_never_saved", recovery_new_file),
+        #[cfg(unix)]
+        ("recovery_survives_sigterm_and_sigint", recovery_sigterm),
+    ];
+    if std::env::args().any(|a| a == "--ignored") {
+        tests.push(("perf_recovery_copy_large_tex", perf_recovery_copy));
+    }
+    common::run(&tests)
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -1505,4 +1528,670 @@ fn snapshot_dialog(state: &WindowState, name: &str) {
     }
     style.set_color_scheme(adw::ColorScheme::Default);
     assert!(block_on(testmode::wait_for_frames(&state.window, 1)));
+}
+
+// ----- recovery of unsaved changes -----
+
+/// The recovery file of `file` (a path under the project) in `paths`.
+fn recovery_file(paths: &Paths, file: &Path) -> PathBuf {
+    recovery::file_for(&paths.recovery_dir(), &normalize(file))
+}
+
+/// The recovery file `file` as written, if it is there.
+fn recovered(file: &Path) -> Option<recovery::RecoveryFile> {
+    std::fs::read(file)
+        .ok()
+        .map(|bytes| recovery::parse(&bytes).expect("a valid recovery file"))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Writes a recovery file of `file` holding `text`, copied `age` seconds ago from the file on
+/// disk that held `disk`.
+fn write_recovery(paths: &Paths, file: &Path, disk: &str, age: u64, text: &str) -> PathBuf {
+    let path = normalize(file);
+    let recovery_file = recovery_file(paths, &path);
+    std::fs::create_dir_all(recovery_file.parent().unwrap()).unwrap();
+    let hash = fnv1a64(&[disk.as_bytes()]);
+    let bytes = recovery::encode(&path, Some(hash), unix_now() - age, text).unwrap();
+    std::fs::write(&recovery_file, bytes).unwrap();
+    recovery_file
+}
+
+/// Edits are copied after the delay (and while typing goes on, after the maximum delay), on
+/// focus loss at once; saving, discarding (`:q!`, Discard in "Save changes?") and turning
+/// recovery off remove the copy. Windows that quit by themselves (as test windows do) write
+/// nothing unless switched on; the user's windows copy by default.
+fn recovery_copies() {
+    let base = common::temp_dir("recovery-copies");
+    let dir = base.join("proj");
+    write(&dir, &[("main.tex", "one\ntwo\n")]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let state = window(&dir, &paths, |_| {});
+    let editor = open(&state, &dir, "main.tex");
+    let doc = editor.document().clone();
+    let buffer = editor.buffer().clone();
+    let file = recovery_file(&paths, &dir.join("main.tex"));
+    let insert_at_start = |text: &str| buffer.insert(&mut buffer.start_iter(), text);
+    // A window that quits by itself (tests, snapshots) copies nothing.
+    insert_at_start("x");
+    assert!(!recovery::is_scheduled(&state));
+    recovery::copy_now(&state);
+    common::pump_for(Duration::from_millis(200));
+    assert!(!file.exists());
+
+    recovery::set_enabled(&state, Some(true));
+    recovery::set_delays(
+        &state,
+        Duration::from_millis(150),
+        Duration::from_millis(700),
+    );
+    insert_at_start("y");
+    assert!(recovery::is_scheduled(&state));
+    common::pump_until(TIMEOUT, || file.exists());
+    let copy = recovered(&file).unwrap();
+    assert_eq!(copy.text, "yxone\ntwo\n");
+    assert_eq!(copy.path, doc.path().to_string_lossy());
+    assert_eq!(copy.disk_hash, Some(fnv1a64(&[b"one\ntwo\n"])));
+    assert!(copy.saved_at.abs_diff(unix_now()) < 60);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = std::fs::metadata(paths.recovery_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+    }
+
+    // Typing without a pause as long as the delay is copied all the same, after the maximum
+    // delay.
+    let started = Instant::now();
+    let mut copied_while_typing = false;
+    while started.elapsed() < Duration::from_secs(3) {
+        buffer.insert(&mut buffer.end_iter(), "z");
+        common::pump_for(Duration::from_millis(40));
+        if recovered(&file).is_some_and(|c| c.text.contains('z')) {
+            copied_while_typing = true;
+            break;
+        }
+    }
+    assert!(copied_while_typing, "no copy while typing went on");
+
+    // Saving removes the copy.
+    assert_eq!(block_on(doc.save()), Ok(()));
+    common::pump_until(TIMEOUT, || !file.exists());
+    let saved = std::fs::read_to_string(dir.join("main.tex")).unwrap();
+    assert!(saved.starts_with("yxone\ntwo\nz"), "{saved}");
+
+    // Losing the focus copies at once.
+    recovery::set_delays(&state, Duration::from_secs(3600), Duration::from_secs(3600));
+    insert_at_start("w");
+    recovery::copy_now(&state);
+    common::pump_until(TIMEOUT, || {
+        recovered(&file).is_some_and(|c| c.text == format!("w{saved}"))
+    });
+    // An unchanged document is not written again.
+    let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+    common::pump_for(Duration::from_millis(20));
+    recovery::copy_now(&state);
+    common::pump_for(Duration::from_millis(200));
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        written
+    );
+
+    // Turning recovery off removes the window's copies; on again, the next copy comes back.
+    let mut config = (*state.config.get()).clone();
+    config.editor.recovery = false;
+    state.set_config(Rc::new(config.clone()));
+    common::pump_until(TIMEOUT, || !file.exists());
+    insert_at_start("v");
+    recovery::copy_now(&state);
+    common::pump_for(Duration::from_millis(200));
+    assert!(!file.exists());
+    config.editor.recovery = true;
+    state.set_config(Rc::new(config));
+    recovery::copy_now(&state);
+    common::pump_until(TIMEOUT, || file.exists());
+
+    // Closing the tab discarding the changes (`:q!`) removes the copy too.
+    state.close_editor(&editor, true);
+    common::pump_until(TIMEOUT, || !file.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.tex")).unwrap(),
+        saved,
+        "the file keeps what was saved"
+    );
+    close(state);
+
+    // A window that does not quit by itself copies without being asked to. Discard in "Save
+    // changes?" removes the copy, and the window losing the focus as it closes does not copy the
+    // discarded text again.
+    let state = interactive_window(&dir, &paths);
+    let editor = open(&state, &dir, "main.tex");
+    editor
+        .buffer()
+        .insert(&mut editor.buffer().start_iter(), "t");
+    recovery::copy_now(&state);
+    common::pump_until(TIMEOUT, || file.exists());
+    recovery::discard(&state, editor.document());
+    common::pump_until(TIMEOUT, || !file.exists());
+    recovery::copy_now(&state);
+    common::pump_for(Duration::from_millis(200));
+    assert!(!file.exists(), "a discarded text is not copied again");
+    // A later change is.
+    editor
+        .buffer()
+        .insert(&mut editor.buffer().start_iter(), "s");
+    recovery::copy_now(&state);
+    common::pump_until(TIMEOUT, || file.exists());
+    drop(editor);
+    state.window.close();
+    answer(&state, "discard");
+    common::pump_until(TIMEOUT, || !state.window.is_visible());
+    common::pump_for(Duration::from_millis(300));
+    assert!(!file.exists(), "Discard removes the copy");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.tex")).unwrap(),
+        saved
+    );
+    close(state);
+}
+
+/// A window on `root` as the app makes one for the user (it does not quit by itself, so it asks
+/// before discarding changes), with `paths` (temporary) for its state.
+fn interactive_window(root: &Path, paths: &Paths) -> Rc<WindowState> {
+    let mut config = Config::default();
+    config.build.on_save = false;
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    let ws = Workspace::new(ProjectRoot::new(root).unwrap());
+    let state = WindowState::new(
+        &common::application(),
+        Rc::new(config),
+        Some(paths.clone()),
+        ws,
+        false,
+    );
+    state.window.present();
+    common::pump_until(TIMEOUT, || state.window.is_mapped());
+    state
+}
+
+/// Answers the alert dialog the window shows with `response`.
+fn answer(state: &WindowState, response: &str) {
+    common::pump_until(TIMEOUT, || state.window.visible_dialog().is_some());
+    let alert = state
+        .window
+        .visible_dialog()
+        .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        .expect("an alert dialog");
+    alert.emit_by_name::<()>("response", &[&response]);
+    alert.force_close();
+    common::pump_for(Duration::from_millis(50));
+}
+
+/// A document that opens with a recovery file offers it: Review makes its changes hunks of a
+/// "Recovered changes" turn (and saves them, as an agent's edit is), Discard removes the file.
+/// A file the document matches already is removed, a corrupt one ignored, and the copy of
+/// another Lemma that still runs is left alone until that process ends.
+fn recovery_offers() {
+    let base = common::temp_dir("recovery-offers");
+    let dir = base.join("proj");
+    let files = [
+        ("main.tex", "one\ntwo\nthree\n"),
+        ("b.tex", "b\n"),
+        ("c.tex", "c\n"),
+        ("d.tex", "d\n"),
+        ("e.tex", "e\n"),
+        ("f.tex", "f\n"),
+        ("g.tex", "g\n"),
+    ];
+    write(&dir, &files);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let recovered_main = "one\nTWO\nthree\nfour\n";
+    let main_file = write_recovery(
+        &paths,
+        &dir.join("main.tex"),
+        "one\ntwo\nthree\n",
+        5 * 60 + 10,
+        recovered_main,
+    );
+    // b.tex changed on disk since its text was copied.
+    let b_file = write_recovery(&paths, &dir.join("b.tex"), "old b\n", 7200, "b and more\n");
+    let c_file = recovery_file(&paths, &dir.join("c.tex"));
+    std::fs::write(&c_file, "{not json").unwrap();
+    let d_file = write_recovery(&paths, &dir.join("d.tex"), "d\n", 0, "d\n");
+    let e_file = write_recovery(&paths, &dir.join("e.tex"), "e\n", 60, "e2\n");
+    let f_file = write_recovery(&paths, &dir.join("f.tex"), "f\n", 90, "f2\n");
+    // g.tex has unsaved changes in another Lemma, which holds its lock while it runs.
+    let g_file = write_recovery(&paths, &dir.join("g.tex"), "g\n", 30, "g2\n");
+    let other = std::process::id().wrapping_add(1);
+    let mut copy = recovered(&g_file).unwrap();
+    copy.pid = Some(other);
+    std::fs::write(&g_file, serde_json::to_vec(&copy).unwrap()).unwrap();
+    let other_lock = std::fs::File::create(recovery::lock_file(&paths.recovery_dir(), other))
+        .expect("the other process's lock file");
+    other_lock.lock().unwrap();
+
+    let state = window(&dir, &paths, |_| {});
+    recovery::set_enabled(&state, Some(true));
+    // Corrupt: left alone, nothing offered. Nothing to recover: removed. Another running
+    // Lemma's: left alone.
+    let before = common::logged_problems();
+    open(&state, &dir, "c.tex");
+    let g = open(&state, &dir, "g.tex");
+    open(&state, &dir, "d.tex");
+    common::pump_until(TIMEOUT, || !d_file.exists());
+    common::pump_for(Duration::from_millis(100));
+    assert!(c_file.exists() && g_file.exists());
+    assert_eq!(recovery::offered(&state), Vec::<PathBuf>::new());
+    assert_eq!(recovery::shown(&state), None);
+    common::assert_no_new_problems(before);
+
+    // A file changed on disk since: offered, worded so; Discard removes it.
+    let b = open(&state, &dir, "b.tex");
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    assert_eq!(recovery::offered(&state), [normalize(&dir.join("b.tex"))]);
+    assert_eq!(
+        recovery::shown(&state).unwrap(),
+        "Unsaved changes to “b.tex” from 2 hours ago were recovered; the file changed on disk \
+         since"
+    );
+    bar_button(&state, "Discard").emit_clicked();
+    assert_eq!(recovery::shown(&state), None);
+    common::pump_until(TIMEOUT, || !b_file.exists());
+    assert_eq!(b.document().text(), "b\n");
+    assert!(!b.document().is_dirty());
+
+    // Review: hunks of a "Recovered changes" turn against the text on disk, saved.
+    let editor = open(&state, &dir, "main.tex");
+    let doc = editor.document().clone();
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    assert_eq!(
+        recovery::shown(&state).unwrap(),
+        "Unsaved changes to “main.tex” from 5 minutes ago were recovered"
+    );
+    // Nothing is copied over the offered file meanwhile.
+    recovery::copy_now(&state);
+    snapshot_dialog(&state, "recovery-bar");
+    let hunks = block_on(recovery::review(&state));
+    assert!(hunks >= 1, "{hunks}");
+    assert_eq!(review_ui::hunk_count(&doc), hunks);
+    assert_eq!(doc.text(), recovered_main);
+    assert_eq!(recovery::shown(&state), None);
+    let turns: Vec<String> = doc
+        .review
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .hunks()
+        .iter()
+        .flat_map(|h| h.turns.clone())
+        .map(|t| review_ui::turn_label(&state, t))
+        .collect();
+    assert!(
+        !turns.is_empty() && turns.iter().all(|t| t == recovery::TURN_NAME),
+        "{turns:?}"
+    );
+    common::pump_until(TIMEOUT, || !doc.is_dirty() && !main_file.exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.tex")).unwrap(),
+        recovered_main
+    );
+    // Rejecting them gives the text on disk back.
+    review_ui::decide_document(&state, &doc, Decision::Reject);
+    assert_eq!(doc.text(), "one\ntwo\nthree\n");
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(dir.join("main.tex")).unwrap() == "one\ntwo\nthree\n"
+    });
+
+    // Several documents: one bar for all of them.
+    open(&state, &dir, "e.tex");
+    open(&state, &dir, "f.tex");
+    common::pump_until(TIMEOUT, || recovery::offered(&state).len() == 2);
+    let text = recovery::shown(&state).unwrap();
+    assert_eq!(
+        text,
+        "Unsaved changes to 2 documents from 1 minute ago were recovered: e.tex, f.tex"
+    );
+    // A tab closed while its file is offered leaves the bar, and the file for the next time.
+    let f = editor_of(&state, &dir, "f.tex");
+    state.close_editor(&f, false);
+    common::pump_until(TIMEOUT, || recovery::offered(&state).len() == 1);
+    assert!(f_file.exists());
+    let e = editor_of(&state, &dir, "e.tex");
+    bar_button(&state, "Review").emit_clicked();
+    common::pump_until(TIMEOUT, || {
+        review_ui::hunk_count(e.document()) == 1 && !e_file.exists()
+    });
+    assert_eq!(e.document().text(), "e2\n");
+    assert_eq!(recovery::shown(&state), None);
+    assert!(f_file.exists());
+
+    // The other Lemma ended without saving (its lock went with it): g.tex's copy is offered the
+    // next time the document opens.
+    drop(other_lock);
+    state.close_editor(&g, false);
+    drop(g);
+    open(&state, &dir, "g.tex");
+    common::pump_until(TIMEOUT, || recovery::shown(&state).is_some());
+    assert_eq!(recovery::offered(&state), [normalize(&dir.join("g.tex"))]);
+    bar_button(&state, "Discard").emit_clicked();
+    common::pump_until(TIMEOUT, || !g_file.exists());
+    close(state);
+}
+
+/// The tab of a file never saved (New File) comes back with the session when a crash left a copy
+/// of its text, and offers it; without a copy, or with recovery off, the session skips it as a
+/// file that is gone.
+fn recovery_new_file() {
+    let base = common::temp_dir("recovery-new-file");
+    let dir = base.join("proj");
+    write(&dir, &[("main.tex", "main\n")]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let new = dir.join("new.tex");
+    let file = recovery_file(&paths, &new);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let bytes = recovery::encode(&normalize(&new), None, unix_now() - 150, "never saved\n");
+    std::fs::write(&file, bytes.unwrap()).unwrap();
+    let tab = |path: &str| TabState {
+        path: path.into(),
+        line: 0,
+        column: 0,
+        top: 0,
+    };
+    let saved = SessionFile {
+        version: session::VERSION,
+        root: dir.to_string_lossy().into_owned(),
+        tabs: vec![tab("main.tex"), tab("new.tex"), tab("gone.tex")],
+        active: Some(0),
+        sidebar: SidebarState::default(),
+        agent: PaneState::default(),
+        pdf: PdfState::default(),
+    };
+    write_session(&paths, &dir, &saved);
+    let w = window(&dir, &paths, |_| {});
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex"], "recovery is off");
+    close(w);
+
+    // The closed window saved its session: the saved one again.
+    write_session(&paths, &dir, &saved);
+    let w = window(&dir, &paths, |_| {});
+    recovery::set_enabled(&w, Some(true));
+    block_on(session::restore(&w)).unwrap();
+    assert_eq!(tab_paths(&w, &dir), ["main.tex", "new.tex"]);
+    common::pump_until(TIMEOUT, || recovery::shown(&w).is_some());
+    assert_eq!(
+        recovery::shown(&w).unwrap(),
+        "Unsaved changes to “new.tex” from 2 minutes ago were recovered"
+    );
+    let doc = editor_of(&w, &dir, "new.tex").document().clone();
+    assert_eq!(block_on(recovery::review(&w)), 1);
+    // Saved, as a recovered text of a document without other changes is.
+    common::pump_until(TIMEOUT, || !doc.is_dirty() && !file.exists());
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "never saved\n");
+    close(w);
+}
+
+/// The recovery bar's button labelled `label`.
+fn bar_button(state: &WindowState, label: &str) -> gtk::Button {
+    fn find(widget: &gtk::Widget, label: &str, in_bar: bool) -> Option<gtk::Button> {
+        let in_bar = in_bar || widget.has_css_class("lemma-recovery");
+        if in_bar
+            && let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && button.label().as_deref() == Some(label)
+        {
+            return Some(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find(&c, label, in_bar) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+    find(state.window.upcast_ref(), label, false).expect("a button in the recovery bar")
+}
+
+/// `SIGTERM` (a shutdown) and `SIGINT` (Ctrl+C in the terminal) to a Lemma with unsaved
+/// changes (the real app, in a child process): the window closes without asking, the changes are
+/// in their recovery file, and the next window that opens the document offers them.
+#[cfg(unix)]
+fn recovery_sigterm() {
+    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
+        let base = common::temp_dir(&format!("recovery-{name}"));
+        let dir = base.join("proj");
+        write(&dir, &[("main.tex", "hello\n")]);
+        let dir = dir.canonicalize().unwrap();
+        let paths = paths_in(&base.join("xdg"));
+        let main = dir.join("main.tex");
+        let file = recovery_file(&paths, &main);
+        kill_editing_child(&main, &base.join("xdg"), signal, &file);
+        let copy = recovered(&file).expect("a recovery file");
+        assert_eq!(copy.text, "UNSAVED WORK hello\n", "{name}");
+        assert_eq!(copy.disk_hash, Some(fnv1a64(&[b"hello\n"])));
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "hello\n");
+        if signal == libc::SIGTERM {
+            let state = window(&dir, &paths, |_| {});
+            recovery::set_enabled(&state, Some(true));
+            open(&state, &dir, "main.tex");
+            common::pump_until(TIMEOUT, || !recovery::offered(&state).is_empty());
+            assert_eq!(recovery::offered(&state), [normalize(&main)]);
+            close(state);
+        }
+    }
+}
+
+/// Runs `recovery_child` on `main` with the XDG directories under `xdg`, waits until it typed,
+/// checks that nothing is copied yet (`file`), sends it `signal` and waits until the app closed
+/// its window and the process ended successfully.
+#[cfg(unix)]
+fn kill_editing_child(main: &Path, xdg: &Path, signal: i32, file: &Path) {
+    use std::io::{BufRead as _, BufReader};
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .env(RECOVERY_CHILD_ENV, main)
+        .env("LEMMA_CONFIG", "/dev/null")
+        .env("HOME", xdg.join("home"))
+        .env("XDG_CONFIG_HOME", xdg.join("config"))
+        .env("XDG_STATE_HOME", xdg.join("state"))
+        .env("XDG_DATA_HOME", xdg.join("data"))
+        .env("XDG_CACHE_HOME", xdg.join("cache"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the child");
+    let (lines, received) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let wait_for = |wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match received.recv_timeout(left) {
+                Ok(line) if line == wanted => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    };
+    if !wait_for("typed") {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the child did not type");
+    }
+    assert!(!file.exists(), "nothing is copied before the delay");
+    // SAFETY: kill(2) on our own child process, which has not been reaped yet.
+    unsafe {
+        libc::kill(i32::try_from(child.id()).unwrap(), signal);
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child is still running 20 s after signal {signal}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "signal {signal}: {status}");
+    assert!(wait_for("closed"), "the app did not close its window");
+}
+
+/// A child process of `recovery_survives_sigterm_and_sigint`: the real app (`app::run`, its
+/// signal handlers included) on `file`, interactive. Once the document has been open for a moment
+/// it types into it and prints `typed`; when the app returns (the signal closed the window), it
+/// prints `closed`.
+fn recovery_child(file: std::ffi::OsString) -> ExitCode {
+    use lemma_app::cli::{Options, Parsed};
+    use std::io::Write as _;
+    let Ok(Parsed::Run(options)) = Options::parse([file]) else {
+        panic!("options");
+    };
+    let started = Instant::now();
+    let opened = Cell::new(None::<Instant>);
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let view = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::ApplicationWindow>().ok())
+            .find(|w| w.is_visible())
+            .and_then(|w| find_view(w.upcast_ref()));
+        let Some(view) = view.filter(|v| v.buffer().char_count() > 0) else {
+            return glib::ControlFlow::Continue;
+        };
+        // The document's recovery file has been looked for by then.
+        let since = opened.get().unwrap_or_else(Instant::now);
+        opened.set(Some(since));
+        if since.elapsed() < Duration::from_millis(500) {
+            return glib::ControlFlow::Continue;
+        }
+        let buffer = view.buffer();
+        buffer.insert(&mut buffer.start_iter(), "UNSAVED WORK ");
+        println!("typed");
+        let _ = std::io::stdout().flush();
+        glib::ControlFlow::Break
+    });
+    let status = app::run(options, started);
+    println!("closed");
+    let _ = std::io::stdout().flush();
+    status
+}
+
+/// The first `sourceview5::View` under `widget`.
+fn find_view(widget: &gtk::Widget) -> Option<sourceview5::View> {
+    if let Ok(view) = widget.clone().downcast::<sourceview5::View>() {
+        return Some(view);
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(view) = find_view(&c) {
+            return Some(view);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// The main thread's cost of the keystrokes that lead to a copy, and of a copy: of `large.tex`
+/// (60k lines, 2.2 MB) and of its first 10k lines, where a copy that comes due while typing goes
+/// on (after [`recovery::MAX_DELAY`]) must fit the 2 ms budget of a keystroke (ARCHITECTURE §3).
+fn perf_recovery_copy() {
+    let base = common::temp_dir("recovery-perf");
+    let dir = base.join("proj");
+    let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
+    let ten: String = large.split_inclusive('\n').take(10_000).collect();
+    write(&dir, &[("large.tex", &large), ("ten.tex", &ten)]);
+    let dir = dir.canonicalize().unwrap();
+    let paths = paths_in(&base.join("xdg"));
+    let state = window(&dir, &paths, |_| {});
+    let editor = open(&state, &dir, "large.tex");
+    let buffer = editor.buffer().clone();
+    buffer.place_cursor(&buffer.iter_at_line(30_000).unwrap());
+    let type_keys = |n: usize| -> Vec<Duration> {
+        let mut times = Vec::new();
+        for _ in 0..n {
+            let started = Instant::now();
+            buffer.insert_at_cursor("x");
+            times.push(started.elapsed());
+            common::pump_for(Duration::from_millis(1));
+        }
+        times.sort();
+        times
+    };
+    let off = type_keys(300);
+    recovery::set_enabled(&state, Some(true));
+    recovery::set_delays(&state, Duration::from_secs(3600), Duration::from_secs(3600));
+    let on = type_keys(300);
+    // Only the edited document is copied each time.
+    let copies = |editor: &Editor| -> Vec<Duration> {
+        let buffer = editor.buffer();
+        let mut times = Vec::new();
+        for _ in 0..20 {
+            buffer.insert_at_cursor("y");
+            let started = Instant::now();
+            recovery::copy_now(&state);
+            times.push(started.elapsed());
+            common::pump_for(Duration::from_millis(30));
+        }
+        times.sort();
+        recovery::flush();
+        let file = recovery_file(&paths, editor.document().path());
+        assert_eq!(
+            recovered(&file).map(|c| c.text),
+            Some(editor.document().text())
+        );
+        times
+    };
+    let large_copies = copies(&editor);
+    assert_eq!(block_on(editor.document().save()), Ok(()));
+    let small = open(&state, &dir, "ten.tex");
+    let small_copies = copies(&small);
+    let median = |t: &[Duration]| t[t.len() / 2];
+    println!(
+        "  keystroke p50 {:?} with / {:?} without recovery; copy p50 {:?} (max {:?}) of \
+         large.tex, {:?} (max {:?}) of 10k lines",
+        median(&on),
+        median(&off),
+        median(&large_copies),
+        large_copies.last().unwrap(),
+        median(&small_copies),
+        small_copies.last().unwrap()
+    );
+    if !cfg!(debug_assertions) {
+        assert!(
+            median(&on).saturating_sub(median(&off)) < Duration::from_micros(100),
+            "recovery's share of a keystroke"
+        );
+        assert!(
+            median(&large_copies) < Duration::from_millis(8),
+            "main thread per copy of large.tex"
+        );
+        assert!(
+            median(&small_copies) < Duration::from_millis(2),
+            "main thread per copy of 10k lines"
+        );
+    }
+    close(state);
 }

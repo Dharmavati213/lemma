@@ -1429,6 +1429,61 @@ they conflict with the sections above, this section wins.
     the cache (`geometry::tiles_below`: the next band of the last visible page or, once its last
     band is in view, the first of the page after it), then for the whole pages ahead; tiled
     pages were never rendered ahead before. Pages under the threshold are one bitmap as before.
+- **Recovery of unsaved changes (§3, §7, 2026-10-25):** auto-save is off by default, and a
+  crash, `SIGTERM`, `SIGHUP` or a logout used to end the process without the "Save changes?"
+  dialog, losing every unsaved change (`recovery.rs`, `[editor] recovery`, default true).
+  - The file: `Paths::recovery_dir()/<fnv1a64(normalized path) as 16 hex>.json`
+    (`$XDG_STATE_HOME/lemma/recovery/`), 0600 in a 0700 directory, a `RecoveryFile`
+    `{version: 1, path, disk_hash, saved_at, pid, text}`: `disk_hash` is the saver's (`fnv1a64`
+    of the bytes the file held when the document last read or wrote it; `null` for a file that
+    did not exist), `saved_at` Unix seconds, `pid` the writing process, `text` the document's
+    text byte for byte (its line breaks; the charset is the file's, read again when the document
+    opens). Only `path` and `text` are required when it is read. A process that writes recovery
+    files holds an exclusive lock (`File::try_lock`: `flock`, `LockFileEx`) on `<pid>.lock` in
+    the directory until it ends (`recovery::lock_file`), so a file whose writer still holds its
+    lock is a copy of a document another Lemma (one process per window) has open, not one a
+    crash left (`recovery::is_running`); a reused pid does not hold the lock.
+  - Copies: 5 s (`recovery::DELAY`) after the last change to a document of the window, at the
+    latest 30 s (`MAX_DELAY`) after the first change not copied yet, and when the window loses
+    the focus, each edited document whose version changed since its last copy is copied on the
+    main thread (`document::buffer_text`, one copy: under 1 ms for 10k lines, about 4.5 ms for
+    `large.tex`; a keystroke only notes the time, §3 rule 1) and serialized and written on the
+    jobs thread through a temporary file that is `sync_data`'d and renamed. One writer per
+    process keeps the newest queued operation per file (a copy or a removal), so an older one
+    never runs after a newer one. The file goes when the document is clean again (its buffer's
+    `modified-changed`: saved, reloaded, undone, `:q!`), when the user picks Discard in the
+    "Save changes?" dialog (tab or window) or runs `:qa!` (`recovery::discard`, which also keeps
+    that version from being copied again, as the window losing the focus while it closes would),
+    and when `[editor] recovery` is turned off. A window's close (after the shell's close-request
+    handler proceeds), its destroy and the end of `app::run` do the queued operations
+    synchronously (like the session's close-time write, an exception to §3 rule 2). Nothing is
+    copied or read in windows without `Paths` or that quit by themselves (`state.scripted`;
+    `recovery::set_enabled` for tests with temporary directories).
+  - Offers: a document that gets a tab without unsaved changes reads its file on the jobs thread
+    (`recovery::decide`): another path (a hash collision), a text with U+0000 or a writer that
+    still runs is ignored, a text equal to the document's removes the file, any other is
+    offered; an unreadable or corrupt file is logged and left alone. The session restore opens
+    the tab of a file that is gone (a New File never saved) when such a copy of it is left
+    (`recovery::is_left`), as an empty document that offers it. While a document's file is read
+    or offered, no copy of it is written. One bar per window (a revealer under the conflict bar,
+    as the file monitor's) names the offered documents and how long ago they were copied, and
+    says when the file changed on disk since (`disk_hash` differs). Review (`recovery::review`)
+    applies every offered text with `minimal_edits` against the document's current text as
+    `Origin::Agent { call: 0 }` edits of one `review_ui::begin_named_turn` turn, "Recovered
+    changes", then saves the documents that had no unsaved changes (§4.5: disk holds the
+    proposal; quick fixes do the same); Discard removes the files. A tab closed while its file
+    is offered keeps the file for its next opening.
+  - Signals (Unix): for runs that do not quit by themselves, `app::run` attaches GLib Unix signal
+    sources (`g_unix_signal_add_full`, declared in `recovery.rs`: glib 0.22 no longer wraps it)
+    for `SIGTERM`, `SIGHUP` and `SIGINT` (Ctrl+C killed the process with its changes too). The
+    handler, on the main thread, writes every window's dirty documents synchronously
+    (`recovery::write_now`) and closes the windows with `WindowState::close_without_asking` (the
+    normal close: session, review state, the agent; no dialog); with no window yet, the app
+    quits. A second signal while they close exits at once with 128 + the signal. Windows has
+    no such signals: the timer and the copy on focus loss cover it.
+  - `recovery::prune_once`, with the session sweep (10 s after an interactive start, once per
+    process, on the jobs thread): removes `*.tmp` files older than 10 minutes, `*.lock` files
+    as old that no process holds, and recovery files not written for 180 days.
 
 ## 12. macOS (2026-10-19)
 

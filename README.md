@@ -280,8 +280,8 @@ PATH:
 
 #### Using Lemma on Windows
 
-- Settings are in `%APPDATA%\lemma\config.toml`; sessions, review state and local history in
-  `%LOCALAPPDATA%\lemma\state`.
+- Settings are in `%APPDATA%\lemma\config.toml`; sessions, review state, local history and the
+  copies of unsaved changes in `%LOCALAPPDATA%\lemma\state`.
 - From a terminal: `lemma path\to\main.tex` (with the installer's PATH option), or run
   `lemma.exe` from the app's `bin` folder with the options under [Usage](#usage); `--help`
   prints in the terminal.
@@ -334,7 +334,9 @@ The first FILE decides the project, and only the first can be a directory (`lemm
 make a new one with Ctrl+N.
 
 Lemma reopens a project's tabs, panes and PDF place, and the window at the size you left it
-(maximized, if it was).
+(maximized, if it was). Unsaved changes survive a crash, a shutdown or a logout: Lemma keeps a
+copy of each edited document a few seconds after you stop typing, and when the document next
+opens it offers the changes for review as hunks (`[editor] recovery = false` turns this off).
 
 Saving builds the document; Ctrl+Shift+S saves it under another name. F8 toggles the PDF pane,
 F9 the sidebar and F10 the agent pane. Ctrl+? lists every shortcut, and Ctrl+, opens
@@ -410,8 +412,9 @@ For example, to never flag the words in your own word lists:
 word_lists = ["~/.config/nvim/dictionaries/my-field.txt"]
 ```
 
-Sessions, review state and local history are stored under `~/.local/state/lemma/`; the
-sessions of projects that are gone, or were not opened for 180 days, are removed. Set
+Sessions, review state, local history and the copies of unsaved changes are stored under
+`~/.local/state/lemma/`; the sessions of projects that are gone, or were not opened for 180
+days, are removed, and so are copies not written for 180 days. Set
 `LEMMA_LOG=lemma_app=info` to turn on logging.
 
 ## Development

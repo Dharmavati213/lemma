@@ -37,13 +37,15 @@
 //!
 //! **Restoring.** The app calls [`restore`] once, after the FILE arguments were handled and
 //! before the scripted steps (not in scripted runs unless `--restore-session`, and not while
-//! `[session] restore` is false). Tabs whose files are gone are skipped; the others open in the
-//! background, the saved active tab first, and take their saved order (a tab the window already
-//! has, such as a FILE argument, moves to its saved place; one the session does not know stays
-//! first). No other tab is selected or drawn on the way, so a tab that is not shown loads its
-//! spell checking and completion only when it is first selected. Cursors are clamped to the text
-//! and each view scrolls to its first line once it has drawn, except in a tab whose cursor the
-//! command line put on a line ([`keep_position`]). The first FILE given on the command line
+//! `[session] restore` is false). Tabs whose files are gone are skipped, unless a crash left a
+//! copy of their unsaved text (a New File never saved, `recovery::is_left`): such a tab opens as
+//! an empty document that offers the text. The others open in the background, the saved active
+//! tab first, and take their saved order (a tab the window already has, such as a FILE argument,
+//! moves to its saved place; one the session does not know stays first). No other tab is
+//! selected or drawn on the way, so a tab that is not shown loads its spell checking and
+//! completion only when it is first selected. Cursors are clamped to the text and each view
+//! scrolls to its first line once it has drawn, except in a tab whose cursor the command line
+//! put on a line ([`keep_position`]). The first FILE given on the command line
 //! stays the active tab; otherwise the saved active tab is selected. Panes: the sidebar (and its
 //! page and width), the PDF pane (and the editor/PDF split, as a share of the width), the PDF
 //! strip and the agent pane are restored; a pane that is an overlay in a narrow window is left
@@ -1006,10 +1008,16 @@ impl Session {
             .map(|t| (absolute(root, &t.path), t))
             .collect();
         let paths: Vec<PathBuf> = wanted.iter().map(|(p, _)| p.clone()).collect();
+        let recovery_dir = crate::recovery::directory(state);
         let present = gio::spawn_blocking(move || {
             paths
                 .iter()
-                .map(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+                .map(|p| {
+                    std::fs::metadata(p).is_ok_and(|m| m.is_file())
+                        || recovery_dir
+                            .as_deref()
+                            .is_some_and(|dir| crate::recovery::is_left(dir, &normalize(p)))
+                })
                 .collect::<Vec<bool>>()
         })
         .await

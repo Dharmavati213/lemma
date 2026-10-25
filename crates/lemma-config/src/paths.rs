@@ -137,6 +137,12 @@ impl Paths {
         self.sessions_dir().join("last.json")
     }
 
+    /// `state_dir/recovery/` (one `<fnv(path)>.json` per document with unsaved changes: their
+    /// text, offered again after a crash).
+    pub fn recovery_dir(&self) -> PathBuf {
+        self.state_dir.join("recovery")
+    }
+
     /// `cache_dir/preview/` (M3: the math preview's preamble formats, one directory per
     /// project root).
     pub fn preview_cache_dir(&self) -> PathBuf {
@@ -212,6 +218,10 @@ mod tests {
         assert_eq!(
             p.last_session_file(),
             PathBuf::from("/home/u/.local/state/lemma/sessions/last.json")
+        );
+        assert_eq!(
+            p.recovery_dir(),
+            PathBuf::from("/home/u/.local/state/lemma/recovery")
         );
         assert_eq!(
             p.preview_cache_dir(),
