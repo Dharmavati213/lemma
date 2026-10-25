@@ -1031,6 +1031,11 @@ they conflict with the sections above, this section wins.
     snippet driver, an undo step of its own as an autosnippet is (`typing::replacement`).
   - Editing commands (`editor/editing.rs`): Toggle Comment, Bold, Italic and Emphasize, each one
     undo step on the active editor.
+  - Find and replace in the current file (`find_bar.rs`, GtkSourceView's search): its
+    replacements are `Origin::User` edits (a review treats them as typing), unlike the Search
+    page's Replace All, which is a named review turn; live environment rename stays out of them.
+    A new query selects its first match only once the search's idle scan has counted the
+    matches, so typing the query never scans the file in one go (§3 rule 1).
 - **Keys (§9.3):**
   - The key layer runs before VimIMContext (verified).
   - With Vim on and an editor focused, Ctrl+W and Ctrl+O go to Vim.
@@ -1038,6 +1043,11 @@ they conflict with the sections above, this section wins.
     (page up, jump forward), as `win.pdf-search` lets Ctrl+F through outside the PDF. Toggle
     Comment (Ctrl+/) works in every mode. With another text field focused (the agent's prompt,
     an entry), the editing commands' keys go to that field (verified on real keys).
+  - The find bar's Ctrl+F, Ctrl+H, F3 and Shift+F3 are enabled only while an editor or the find
+    bar has the focus and Vim is off, so Vim keeps Ctrl+F and Ctrl+H and the Search page its own
+    Ctrl+H. An accelerator may be shared by actions that are never enabled together
+    (`app::SHARED_ACCELS`), and GTK runs the enabled one: Ctrl+F is also `win.pdf-search`,
+    enabled only while the PDF has the focus.
 - **Memory (§7):**
   - The 60 s inactive cache trim is implemented, and closed tabs free their view and buffer.
   - Idle PSS depends on how many other GTK processes share the libraries. Under Broadway, idle measures about 92 MB RSS

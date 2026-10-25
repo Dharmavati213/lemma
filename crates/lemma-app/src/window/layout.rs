@@ -30,7 +30,9 @@ pub(super) struct Layout {
     pub pdf_sidebar: PdfSidebar,
     pub tab_view: adw::TabView,
     pub tab_bar: adw::TabBar,
-    /// "empty" (a status page) or "tabs" (tab bar and tab view).
+    /// Between the tab bar and the tab view; holds the find bar.
+    pub find_slot: adw::Bin,
+    /// "empty" (a status page) or "tabs" (tab bar, find bar and tab view).
     pub editor_stack: gtk::Stack,
     pub status: StatusBar,
 }
@@ -48,8 +50,10 @@ pub(super) fn build(app: &adw::Application) -> Layout {
         .view(&tab_view)
         .autohide(false)
         .build();
+    let find_slot = adw::Bin::new();
     let tabs = gtk::Box::new(gtk::Orientation::Vertical, 0);
     tabs.append(&tab_bar);
+    tabs.append(&find_slot);
     tabs.append(&tab_view);
     let open_button = gtk::Button::builder()
         .label("_Open…")
@@ -144,6 +148,7 @@ pub(super) fn build(app: &adw::Application) -> Layout {
         pdf_sidebar,
         tab_view,
         tab_bar,
+        find_slot,
         editor_stack,
         status,
     }

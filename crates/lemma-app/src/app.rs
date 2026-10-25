@@ -36,6 +36,11 @@ use std::time::{Duration, Instant};
 /// commands (`editor::editing`) take Ctrl+/ (GtkTextView's second Select All), and Ctrl+B and
 /// Ctrl+I only while Vim is off: with Vim on, Bold and Italic are disabled, so the keys are Vim's
 /// page up and jump forward.
+///
+/// The find bar's Ctrl+F, Ctrl+H, F3 and Shift+F3 are enabled only while an editor or the find
+/// bar has the focus and Vim is off, so with Vim on Ctrl+F and Ctrl+H stay Vim's own keys (page
+/// down; left, or Backspace in insert mode), and the Search page keeps its own Ctrl+H. Ctrl+F is
+/// shared with `win.pdf-search` (see [`SHARED_ACCELS`]).
 pub const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("app.open", &["<Control>o"]),
     ("app.quit", &["<Control>q"]),
@@ -61,7 +66,18 @@ pub const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("win.goto-back", &["<Alt>Left"]),
     ("win.goto-forward", &["<Alt>Right"]),
     ("win.show-hover", &["<Alt>k"]),
+    // Find and replace in the current file.
+    ("win.find", &["<Control>f"]),
+    ("win.find-replace", &["<Control>h"]),
+    ("win.find-next", &["F3"]),
+    ("win.find-prev", &["<Shift>F3"]),
 ];
+
+/// Accelerators that several actions share, because the shell never enables two of them at the
+/// same time: GTK runs the key's action that is enabled (a disabled one lets the key go on to
+/// the next). `win.pdf-search` is enabled only while the PDF has the focus, `win.find` only
+/// while an editor or the find bar has it.
+pub const SHARED_ACCELS: &[(&str, &[&str])] = &[("<Control>f", &["win.pdf-search", "win.find"])];
 
 /// How the shortcuts window and the command palette group actions and keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -122,6 +138,16 @@ const fn info(name: &'static str, label: &'static str, group: ShortcutGroup) -> 
     }
 }
 
+/// An action of the find bar, which works only while an editor has the focus and Vim is off.
+const fn find_info(name: &'static str, label: &'static str) -> ActionInfo {
+    ActionInfo {
+        name,
+        label,
+        group: ShortcutGroup::Navigation,
+        unavailable: Some("Click into the editor first; with Vim on, search with /"),
+    }
+}
+
 /// Every action of a window and of the application that the user can run from the command
 /// palette (actions with parameters, such as `win.review-keep-turn(u)`, and the quick actions
 /// `win.quick-<slug>`, which come from `prompts.toml`, are not listed). Actions added later at
@@ -154,6 +180,10 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.goto-forward", "Go Forward", Navigation),
         info("win.show-hover", "Show Hover", Navigation),
         info("win.jump-pair", "Jump to Matching Delimiter", Navigation),
+        find_info("win.find", "Find in File"),
+        find_info("win.find-replace", "Replace in File"),
+        find_info("win.find-next", "Find Next"),
+        find_info("win.find-prev", "Find Previous"),
         info("win.review-next", "Next Change", Review),
         info("win.review-prev", "Previous Change", Review),
         info("win.review-accept", "Accept Change", Review),
@@ -288,7 +318,8 @@ pub const KEY_LAYER_SHORTCUTS: &[(&str, &str, ShortcutGroup)] = &[
         "Show the source of that place",
         ShortcutGroup::BuildPdf,
     ),
-    // Keys of the PDF view and the Search page (not accelerators: they work only there).
+    // Keys of the PDF view, the Search page and the find bar (not accelerators: they work only
+    // there).
     (
         "/",
         "Search the PDF (in the PDF view)",
@@ -306,7 +337,7 @@ pub const KEY_LAYER_SHORTCUTS: &[(&str, &str, ShortcutGroup)] = &[
     ),
     (
         "Alt+C / Alt+W / Alt+R",
-        "Search page: Match Case / Whole Word / Regular Expression",
+        "Search page and find bar: Match Case / Whole Word / Regular Expression",
         ShortcutGroup::Navigation,
     ),
     (
@@ -987,14 +1018,27 @@ mod tests {
 
     #[test]
     fn default_accelerators_are_valid_names_and_unique() {
-        let mut seen = BTreeMap::new();
+        let mut seen: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for (action, accel) in all_defaults() {
             assert!(is_valid_action_name(action), "{action}");
             // Normalised so `<Control>P` and `<Control>p` would count as one.
-            let key = accel.to_ascii_lowercase();
-            if let Some(other) = seen.insert(key, action) {
-                panic!("{accel} is bound to both {other} and {action}");
+            seen.entry(accel.to_ascii_lowercase())
+                .or_default()
+                .push(action);
+        }
+        for (accel, actions) in &seen {
+            let shared = SHARED_ACCELS
+                .iter()
+                .find(|(a, _)| a.to_ascii_lowercase() == *accel);
+            match shared {
+                Some((_, owners)) => assert_eq!(actions.as_slice(), *owners, "{accel} is shared"),
+                None => assert_eq!(actions.len(), 1, "{accel} is bound to {actions:?}"),
             }
+        }
+        // Every shared key is a default of each of its actions.
+        for (accel, owners) in SHARED_ACCELS {
+            let actions = seen.get(&accel.to_ascii_lowercase());
+            assert_eq!(actions.map(Vec::as_slice), Some(*owners), "{accel}");
         }
         // Ones the other modules set (agent panel, inline edit, build, PDF, Problems, editing
         // commands).

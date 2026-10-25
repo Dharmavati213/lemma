@@ -411,7 +411,7 @@ pub fn line_markup(
 }
 
 /// `n` with thin spaces between groups of three digits ("20 000").
-fn digits(n: usize) -> String {
+pub(crate) fn digits(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -423,7 +423,8 @@ fn digits(n: usize) -> String {
     out
 }
 
-fn count(n: usize, one: &str, many: &str) -> String {
+/// `n` and the noun for it: "1 match", "20 000 matches" (see [`digits`]).
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", digits(n), if n == 1 { one } else { many })
 }
 
@@ -603,8 +604,9 @@ pub fn show(state: &Rc<WindowState>) {
     panel.query.select_region(0, -1);
 }
 
-/// The active editor's selection, if it is non-empty, on one line and not too long.
-fn selection_text(state: &WindowState) -> Option<String> {
+/// The active editor's selection, if it is non-empty, on one line and not too long (the find
+/// bar prefills with it too).
+pub(crate) fn selection_text(state: &WindowState) -> Option<String> {
     let editor = state.active_editor()?;
     let (start, end) = editor.buffer().selection_bounds()?;
     let text = editor.buffer().text(&start, &end, false).to_string();

@@ -8,6 +8,11 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Added
 
+- Find and replace in the current file: Ctrl+F opens a find bar above the editor (Ctrl+H with
+  its replace row) that highlights every match and counts them ("3 of 17"), with Match Case,
+  Whole Word and Regular Expression, F3 / Shift+F3 (or Enter / Shift+Enter) for the next and
+  previous match, Replace and Replace All (one undo step). With Vim on, Ctrl+F and Ctrl+H stay
+  Vim's keys; in the PDF, Ctrl+F still searches the PDF.
 - Windows support (Windows 10 1903+ and 11, x86_64): an installer and a portable zip, built
   locally with `packaging/windows/build.sh`, natively in MSYS2 or as a cross build from Linux.
   The API key is kept in the Windows Credential Manager, settings in `%APPDATA%\lemma`; TeX

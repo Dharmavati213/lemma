@@ -28,6 +28,7 @@ pub mod testmode;
 pub mod window;
 pub mod workspace;
 
+pub mod find_bar;
 pub mod git_gutter;
 pub mod history_ui;
 pub mod labels;

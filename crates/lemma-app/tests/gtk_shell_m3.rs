@@ -223,7 +223,7 @@ const CHAPTER: &str = "\\section{A}\n\\label{sec:a}\nText of chapter A.\n";
 
 // ----- actions, accelerators, menus, slots -----
 
-/// The M3 entries of `app::DEFAULT_ACCELS`.
+/// The entries of `app::DEFAULT_ACCELS` from M3 on (the find bar's came later).
 fn m3_accels() -> Vec<(&'static str, &'static [&'static str])> {
     let first = app::DEFAULT_ACCELS
         .iter()
@@ -254,6 +254,11 @@ fn actions() {
         ("win.goto-back", "<Alt>Left"),
         ("win.goto-forward", "<Alt>Right"),
         ("win.show-hover", "<Alt>k"),
+        // The find bar.
+        ("win.find", "<Control>f"),
+        ("win.find-replace", "<Control>h"),
+        ("win.find-next", "F3"),
+        ("win.find-prev", "<Shift>F3"),
     ];
     assert_eq!(m3_accels().len(), expected.len());
     for (action, accel) in expected {
@@ -279,6 +284,10 @@ fn actions() {
         "history",
         "word-count",
         "toggle-pdf-sidebar",
+        "find",
+        "find-replace",
+        "find-next",
+        "find-prev",
     ] {
         assert!(f.state.window.lookup_action(name).is_some(), "win.{name}");
         assert!(app::action_info(&format!("win.{name}")).is_some(), "{name}");
@@ -292,18 +301,24 @@ fn actions() {
         app::action_info("win.pdf-search").unwrap().group,
         ShortcutGroup::BuildPdf
     );
+    assert_eq!(
+        app::action_info("win.find").unwrap().group,
+        ShortcutGroup::Navigation
+    );
     // The Vim bindings of M3.
     let vim = f.state.config.vim.normal_bindings();
     assert_eq!(vim["gd"], "win.goto-definition");
     assert_eq!(vim["K"], "win.show-hover");
 }
 
-/// WP3.10: no key runs two actions; every accelerator has Ctrl or Alt or is a function key (a
-/// plain or Shift+ key would be taken from typing and from Vim); Ctrl+W and Ctrl+O stay Close Tab
-/// and Open (§11: in the editor they go to Vim); the keys the panes handle themselves (the Search
-/// page, the PDF view and its search bar, the pickers, context menus) are no accelerator, which
-/// would run first; and the `[vim.normal]` defaults neither shadow each other nor take the
-/// key-layer handlers' `%` and Ctrl+O.
+/// WP3.10: no key runs two actions (except the keys of `app::SHARED_ACCELS`, whose actions are
+/// never enabled together); every accelerator has Ctrl or Alt or is a function key (a plain or
+/// Shift+ key would be taken from typing and from Vim); Ctrl+W and Ctrl+O stay Close Tab and Open
+/// (§11: in the editor they go to Vim); the keys the panes handle themselves (the Search page, the
+/// PDF view and its search bar, the pickers, context menus) are no accelerator, which would run
+/// first, except the find bar's Ctrl+H, which is enabled only while an editor or the find bar has
+/// the focus; and the `[vim.normal]` defaults neither shadow each other nor take the key-layer
+/// handlers' `%` and Ctrl+O.
 fn accel_collisions() {
     let f = fixture("accel-collisions", &[("main.tex", DOC)]);
     let _editor = f.open("main.tex");
@@ -313,11 +328,21 @@ fn accel_collisions() {
     let actions = f.state.app.list_action_descriptions();
     // Every window action with a default key (39 when this was written).
     assert!(actions.len() > 30, "{actions:?}");
+    let shared = |key: (gdk::Key, gdk::ModifierType), a: &str, b: &str| {
+        app::SHARED_ACCELS.iter().any(|(accel, actions)| {
+            gtk::accelerator_parse(*accel).is_some_and(|(k, m)| (k.to_lower(), m) == key)
+                && actions.contains(&a)
+                && actions.contains(&b)
+        })
+    };
     for action in &actions {
         for accel in f.state.app.accels_for_action(action) {
             let (key, mods) = gtk::accelerator_parse(&accel)
                 .unwrap_or_else(|| panic!("{action}: {accel} does not parse"));
-            if let Some(other) = owners.insert((key.to_lower(), mods), action.to_string()) {
+            let id = (key.to_lower(), mods);
+            if let Some(other) = owners.insert(id, action.to_string())
+                && !shared(id, &other, action)
+            {
                 panic!("{accel} runs both {other} and {action}");
             }
             let function_key = key
@@ -337,12 +362,14 @@ fn accel_collisions() {
     };
     assert_eq!(owner("<Control>w").as_deref(), Some("win.close-tab"));
     assert_eq!(owner("<Control>o").as_deref(), Some("app.open"));
+    // Disabled while the Search page has the focus, which keeps its own Ctrl+H (on real keys in
+    // `real_keys`).
+    assert_eq!(owner("<Control>h").as_deref(), Some("win.find-replace"));
     for local in [
-        // The Search page.
+        // The Search page and the find bar.
         "<Alt>c",
         "<Alt>w",
         "<Alt>r",
-        "<Control>h",
         "<Control><Alt>Return",
         "<Control>Return",
         // The PDF view, its search bar and the detached PDF window's Ctrl+F (a window of its own).
@@ -1716,6 +1743,10 @@ mod real_keys {
             "toggle-comment",
             "bold",
             "italic",
+            "find",
+            "find-replace",
+            "find-next",
+            "find-prev",
         ] {
             let log = activated.clone();
             let action = f.state.window.lookup_action(name).unwrap();
@@ -1805,6 +1836,15 @@ mod real_keys {
         });
         common::pump_for(Duration::from_millis(50));
         assert!(take(&activated).is_empty(), "Ctrl+F ran an action");
+        // So are Ctrl+H (left) and F3: the find bar's keys are off while Vim is on.
+        for (key, mods) in [(gdk::Key::h, CONTROL), (gdk::Key::F3, 0)] {
+            reached.borrow_mut().clear();
+            browser.key(key, mods);
+            common::pump_until(TIMEOUT, || reached.borrow().iter().any(|(k, _)| *k == key));
+            common::pump_for(Duration::from_millis(50));
+            assert!(take(&activated).is_empty(), "{key:?} ran an action");
+        }
+        assert_eq!(editor.document().text(), long, "no key was typed");
 
         step!("K, gd, Ctrl+O");
         // `K` and `gd` in normal mode: the [vim.normal] bindings.
@@ -1926,5 +1966,81 @@ mod real_keys {
         browser.key(gdk::Key::f, CONTROL);
         common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
         assert_eq!(take(&activated), ["pdf-search"]);
+        // The bar opens (and takes the focus) once the key is handled.
+        let pdf_search_open =
+            || lemma_app::pdf::search::status(&f.state).is_some_and(|status| status.open);
+        common::pump_until(TIMEOUT, pdf_search_open);
+        lemma_app::pdf::search::close(&f.state);
+
+        step!("the find bar with Vim off");
+        f.state.set_vim_enabled(false);
+        // Ctrl+F in the PDF is still the PDF's search (`win.find` shares the key, but is off).
+        pdf.view().grab_focus();
+        common::pump_until(TIMEOUT, || pdf.view().has_focus());
+        browser.key(gdk::Key::f, CONTROL);
+        common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+        assert_eq!(take(&activated), ["pdf-search"]);
+        common::pump_until(TIMEOUT, pdf_search_open);
+        lemma_app::pdf::search::close(&f.state);
+
+        step!("Ctrl+F in the editor, Vim off");
+        // In the editor it opens the find bar with the focus in its entry.
+        let find = lemma_app::find_bar::bar(&f.state).unwrap();
+        let focused = |w: &gtk::Widget| w.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN);
+        focus_view();
+        set_cursor(&editor, 0);
+        browser.key(gdk::Key::f, CONTROL);
+        common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+        assert_eq!(take(&activated), ["find"]);
+        common::pump_until(TIMEOUT, || focused(find.entry().upcast_ref()));
+        browser.text("filler");
+        common::pump_until(TIMEOUT, || {
+            let status = find.status();
+            status.total == Some(150) && status.current == Some(1)
+        });
+
+        step!("Enter, Shift+Enter, F3, Shift+F3");
+        // Enter and Shift+Enter in the entry, F3 and Shift+F3 (actions) go on, wrapping around.
+        browser.key(gdk::Key::Return, 0);
+        common::pump_until(TIMEOUT, || find.status().current == Some(2));
+        browser.key(gdk::Key::Return, SHIFT);
+        common::pump_until(TIMEOUT, || find.status().current == Some(1));
+        browser.key(gdk::Key::F3, SHIFT);
+        common::pump_until(TIMEOUT, || find.status().current == Some(150));
+        assert_eq!(take(&activated), ["find-prev"]);
+        browser.key(gdk::Key::F3, 0);
+        common::pump_until(TIMEOUT, || find.status().current == Some(1));
+        assert_eq!(take(&activated), ["find-next"]);
+        // Alt+C, Alt+W and Alt+R are the bar's toggles.
+        browser.key(gdk::Key::c, ALT);
+        common::pump_until(TIMEOUT, || find.options() == (true, false, false));
+        browser.key(gdk::Key::c, ALT);
+        common::pump_until(TIMEOUT, || find.options() == (false, false, false));
+
+        step!("Escape, Ctrl+H");
+        // Escape closes the bar and gives the focus back to the editor.
+        browser.key(gdk::Key::Escape, 0);
+        common::pump_until(TIMEOUT, || !find.status().open && view.has_focus());
+        // Ctrl+H opens it with the replace row, the focus in the replace entry (the query is
+        // kept); Escape there closes it too.
+        browser.key(gdk::Key::h, CONTROL);
+        common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+        assert_eq!(take(&activated), ["find-replace"]);
+        common::pump_until(TIMEOUT, || focused(find.replace_entry().upcast_ref()));
+        assert!(find.status().replace_shown);
+        browser.key(gdk::Key::Escape, 0);
+        common::pump_until(TIMEOUT, || !find.status().open && view.has_focus());
+
+        step!("Ctrl+H on the Search page");
+        // On the Search page Ctrl+H is the page's own Replace toggle.
+        let panel = lemma_app::search_panel::ensure(&f.state);
+        f.state.sidebar.show_page(PAGE_SEARCH);
+        panel.query_entry().grab_focus();
+        common::pump_until(TIMEOUT, || focused(panel.query_entry().upcast_ref()));
+        browser.key(gdk::Key::h, CONTROL);
+        common::pump_until(TIMEOUT, || focused(panel.replace_entry().upcast_ref()));
+        assert!(take(&activated).is_empty(), "Ctrl+H ran an action");
+        assert!(!find.status().open);
+        assert_eq!(editor.document().text(), long, "no key was typed");
     }
 }

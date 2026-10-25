@@ -221,6 +221,14 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   without it. Keys are tested on real key events (private Broadway daemons) in `gtk_shell_m3`,
   `gtk_palette`, `gtk_pairs`, `gtk_outline` and `gtk_pdf_m3`; pointer hovers through the modules'
   `pointer_moved` functions (GTK cannot inject pointer events).
+- **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
+  `find_bar_*` tests (counts and wrapping, the options and invalid expressions, the actions
+  following the focus and Vim, the prefill and the query a match keeps, Replace and Replace All
+  as one undo step, replacements as user edits under review and without live environment rename,
+  tab switches and closing tabs and windows freeing the search), and its keys on real key events
+  in `gtk_shell_m3` (Ctrl+F shared with the PDF's search, Vim's Ctrl+F and Ctrl+H, the Search
+  page's own Ctrl+H). `LEMMA_TEST_SNAPSHOTS` adds `find-bar.png` and `find-bar-narrow.png` (the
+  rows wrapped).
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep

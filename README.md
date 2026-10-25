@@ -39,9 +39,11 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   (`\emph`) is in the command palette. In Vim mode, Ctrl+B and Ctrl+I stay Vim's keys.
   Optionally, `...` typed in text becomes `\dots`.
 - **Navigation.** Project outline, command palette (Ctrl+Shift+P), quick open (Ctrl+P),
-  project search and replace (Ctrl+Shift+F), go to definition (F12), session restore, local
-  history and a git gutter.
-- **Optional Vim mode** (Ctrl+Alt+V), off by default.
+  find and replace in the current file (Ctrl+F, Ctrl+H; F3 and Shift+F3 for the next and
+  previous match), project search and replace (Ctrl+Shift+F), go to definition (F12), session
+  restore, local history and a git gutter.
+- **Optional Vim mode** (Ctrl+Alt+V), off by default. Vim keeps its own Ctrl+F and Ctrl+H; search
+  with `/`.
 
 ## Requirements
 

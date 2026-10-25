@@ -1,13 +1,16 @@
-//! WP3.6: project search and replace (`search_panel.rs`, `lemma-search`).
+//! WP3.6: project search and replace (`search_panel.rs`, `lemma-search`), and find and replace
+//! in the current file (`find_bar.rs`; its keys on real key events are in `gtk_shell_m3`).
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_search`.
-//! `LEMMA_TEST_SNAPSHOTS=dir` saves `search-light.png` and `search-dark.png` there.
+//! `LEMMA_TEST_SNAPSHOTS=dir` saves `search-light.png`, `search-dark.png` and `find-bar.png`
+//! there.
 
 mod common;
 
 use adw::prelude::*;
 use lemma_app::editor::Editor;
 use lemma_app::editor::goto;
+use lemma_app::find_bar::{self, FindBar};
 use lemma_app::review_ui::{self, Decision, GroupKind};
 use lemma_app::search_panel::{self, Panel};
 use lemma_app::testmode;
@@ -47,6 +50,27 @@ fn main() -> ExitCode {
         ("ten_thousand_matches_stream_in_small_steps", streaming_10k),
         ("highlights_follow_the_dark_style", dark_style),
         ("demo_search_snapshot", demo_snapshot),
+        // Find and replace in the current file.
+        ("find_bar_highlights_counts_and_wraps", find_counts),
+        ("find_bar_options_and_invalid_expressions", find_options),
+        (
+            "find_bar_actions_follow_the_focus_and_vim",
+            find_focus_and_vim,
+        ),
+        ("find_bar_prefills_and_shows_replace", find_prefill),
+        (
+            "find_bar_replace_and_replace_all_in_one_undo_step",
+            find_replace,
+        ),
+        (
+            "find_bar_replacements_are_user_edits_for_a_review",
+            find_replace_review,
+        ),
+        (
+            "find_bar_replaces_environment_names_without_live_rename",
+            find_replace_env_names,
+        ),
+        ("find_bar_follows_tabs_and_frees_its_search", find_lifetime),
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_search_10k_frame_budget", perf_10k));
@@ -874,4 +898,464 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+// ----- find and replace in the current file -----
+
+/// "sheaf" four times without Match Case (twice on line 2, in "presheaf" too), three times with
+/// it, three times as a whole word.
+const FIND_DOC: &str = "\\section{Sheaves}\nA sheaf is a presheaf.\nEvery Sheaf glues; sheaves \
+                        glue.\n\\emph{sheaf} and \\emph{stalk}.\n";
+
+/// `main.tex` with [`FIND_DOC`] open and focused, the cursor at the start.
+fn find_fixture(name: &str) -> (Fixture, Rc<Editor>, Rc<FindBar>) {
+    let fx = fixture(name, &[("main.tex", FIND_DOC), ("other.tex", "sheaf\n")]);
+    let editor = fx.open("main.tex");
+    focus(&editor);
+    editor.place_cursor_at(0);
+    let find = find_bar::bar(&fx.state).expect("a find bar");
+    (fx, editor, find)
+}
+
+fn focus(editor: &Editor) {
+    editor.view().grab_focus();
+    common::pump_until(TIMEOUT, || editor.view().has_focus());
+}
+
+fn action_enabled(fx: &Fixture, name: &str) -> bool {
+    fx.state.window.lookup_action(name).unwrap().is_enabled()
+}
+
+fn run(fx: &Fixture, action: &str) {
+    WidgetExt::activate_action(&fx.state.window, action, None).unwrap();
+}
+
+/// The selection's byte offset and text.
+fn selected(editor: &Editor) -> Option<(usize, String)> {
+    let (start, end) = editor.buffer().selection_bounds()?;
+    let text = editor.buffer().text(&start, &end, false).to_string();
+    Some((editor.document().byte_offset(&start), text))
+}
+
+fn has_focus_within(widget: &impl IsA<gtk::Widget>) -> bool {
+    widget.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN)
+}
+
+/// Waits until every match is counted and the label says so, and returns the status.
+fn counted(find: &FindBar) -> find_bar::Status {
+    common::pump_until(TIMEOUT, || {
+        let status = find.status();
+        status.total.is_some() && !status.label.is_empty()
+    });
+    find.status()
+}
+
+fn find_counts() {
+    let (fx, editor, find) = find_fixture("find-counts");
+    assert!(action_enabled(&fx, "find"), "an editor has the focus");
+    run(&fx, "win.find");
+    assert!(find.status().open);
+    common::pump_until(TIMEOUT, || has_focus_within(find.entry()));
+    find.search_now("sheaf");
+    // The search scans the file in idle steps, and the first match after the cursor is selected
+    // when it has counted (not by a scan of the whole file at once); every match is highlighted.
+    assert_eq!(selected(&editor), None);
+    let status = counted(&find);
+    let first = FIND_DOC.find("sheaf").unwrap();
+    assert_eq!(selected(&editor), Some((first, "sheaf".into())));
+    assert_eq!(
+        (status.total, status.current, status.label.as_str()),
+        (Some(4), Some(1), "1 of 4")
+    );
+    let context = find.search_context().unwrap();
+    assert!(context.is_highlight());
+    let scheme = sourceview5::prelude::BufferExt::style_scheme(editor.buffer()).unwrap();
+    assert!(
+        scheme.style("search-match").is_some(),
+        "the style scheme highlights matches"
+    );
+    assert_eq!(context.buffer(), *editor.buffer());
+    drop(context);
+    // F3 and Shift+F3 go on, wrapping around.
+    let presheaf = FIND_DOC.find("presheaf").unwrap() + 3;
+    run(&fx, "win.find-next");
+    assert_eq!(selected(&editor), Some((presheaf, "sheaf".into())));
+    assert_eq!(find.status().label, "2 of 4");
+    run(&fx, "win.find-next");
+    run(&fx, "win.find-next");
+    assert_eq!(find.status().label, "4 of 4");
+    run(&fx, "win.find-next");
+    assert_eq!(selected(&editor), Some((first, "sheaf".into())), "wrapped");
+    run(&fx, "win.find-prev");
+    assert_eq!(find.status().label, "4 of 4", "wrapped back");
+    // Enter in the entry is the next match too.
+    find.entry().emit_activate();
+    assert_eq!(find.status().label, "1 of 4");
+    // A selection that is no match: "4 matches".
+    editor.place_cursor_at(0);
+    common::pump_until(TIMEOUT, || find.status().label == "4 matches");
+    snapshot(&fx, "find-bar.png");
+    // The bar wraps instead of making the editor wider than its minimum (320 px, `layout.rs`).
+    find.set_replacement(Some("faisceau"));
+    let min_width = || {
+        fx.state
+            .find_slot
+            .measure(gtk::Orientation::Horizontal, -1)
+            .0
+    };
+    assert!(min_width() <= 320, "the find bar needs {} px", min_width());
+    fx.state.paned.set_position(330);
+    snapshot(&fx, "find-bar-narrow.png");
+    find.set_replacement(None);
+    // The matches follow edits.
+    editor
+        .buffer()
+        .insert(&mut editor.buffer().start_iter(), "sheaf ");
+    common::pump_until(TIMEOUT, || find.status().total == Some(5));
+    // Escape closes the bar: the highlights go and the focus is the editor's again.
+    let weak = find.search_context().unwrap().downgrade();
+    find.entry().emit_stop_search();
+    assert!(!find.status().open);
+    assert!(find.search_context().is_none());
+    assert!(weak.upgrade().is_none(), "the search context is gone");
+    common::pump_until(TIMEOUT, || editor.view().has_focus());
+    // F3 with the bar closed opens it on the same query, leaving the focus in the editor.
+    editor.place_cursor_at(0);
+    run(&fx, "win.find-next");
+    let status = find.status();
+    assert!(status.open);
+    assert_eq!(status.query.as_deref(), Some("sheaf"));
+    assert_eq!(selected(&editor), Some((0, "sheaf".into())));
+    common::pump_for(Duration::from_millis(30));
+    assert!(editor.view().has_focus());
+}
+
+fn find_options() {
+    let (fx, editor, find) = find_fixture("find-options");
+    run(&fx, "win.find");
+    find.search_now("sheaf");
+    assert_eq!(counted(&find).total, Some(4));
+    for (case, word, total) in [(true, false, 3), (false, true, 3), (true, true, 2)] {
+        find.set_options(case, word, false);
+        common::pump_until(TIMEOUT, || find.status().total == Some(total));
+    }
+    // A regular expression (GLib's).
+    find.set_options(false, false, true);
+    editor.place_cursor_at(0);
+    find.search_now(r"\\emph\{(\w+)\}");
+    let status = counted(&find);
+    assert_eq!((status.total, status.error), (Some(2), false));
+    assert_eq!(selected(&editor).unwrap().1, r"\emph{sheaf}");
+    // An invalid one says so; nothing can be stepped to or replaced.
+    find.search_now(r"\emph{(");
+    common::pump_until(TIMEOUT, || find.status().label == "Invalid expression");
+    assert!(find.status().error);
+    assert!(find.entry().tooltip_text().is_some(), "GLib's message");
+    find.set_replacement(Some("x"));
+    find.replace_every();
+    find.replace();
+    assert_eq!(editor.document().text(), FIND_DOC);
+    // No match: the entry is marked and F3 only rings the bell.
+    find.set_options(false, false, false);
+    find.search_now("zzz");
+    common::pump_until(TIMEOUT, || find.status().label == "No matches");
+    assert!(find.status().error);
+    assert!(find.entry().tooltip_text().is_none());
+    run(&fx, "win.find-next");
+    assert_eq!(editor.document().text(), FIND_DOC);
+}
+
+fn find_focus_and_vim() {
+    let (fx, editor, find) = find_fixture("find-focus");
+    let all = ["find", "find-replace", "find-next", "find-prev"];
+    assert!(all.iter().all(|a| action_enabled(&fx, a)));
+    // Elsewhere (the Search page's entry) Ctrl+F, Ctrl+H and F3 are not the find bar's.
+    let panel = fx.panel();
+    fx.state.sidebar.show_page(PAGE_SEARCH);
+    panel.query_entry().grab_focus();
+    common::pump_until(TIMEOUT, || !action_enabled(&fx, "find"));
+    assert!(all.iter().all(|a| !action_enabled(&fx, a)));
+    // The bar itself counts as the editor. (The window is narrow: the sidebar covers it.)
+    fx.state.sidebar.split.set_show_sidebar(false);
+    focus(&editor);
+    run(&fx, "win.find");
+    common::pump_until(TIMEOUT, || has_focus_within(find.entry()));
+    assert!(all.iter().all(|a| action_enabled(&fx, a)));
+    // With Vim on they are Vim's keys (page down, Backspace), wherever the focus is.
+    fx.state.set_vim_enabled(true);
+    assert!(all.iter().all(|a| !action_enabled(&fx, a)));
+    focus(&editor);
+    assert!(!action_enabled(&fx, "find"));
+    fx.state.set_vim_enabled(false);
+    assert!(all.iter().all(|a| action_enabled(&fx, a)));
+    // A popover taking the focus (the command palette) leaves them as they were.
+    let entry = gtk::Entry::new();
+    let popover = gtk::Popover::builder().child(&entry).build();
+    popover.set_parent(editor.view());
+    popover.popup();
+    entry.grab_focus();
+    common::pump_for(Duration::from_millis(50));
+    assert!(action_enabled(&fx, "find"));
+    popover.popdown();
+    popover.unparent();
+    // The palette lists them under Navigation, with the reason when they are off.
+    let info = lemma_app::app::action_info("win.find").unwrap();
+    assert_eq!(info.group, lemma_app::app::ShortcutGroup::Navigation);
+    assert!(info.unavailable.unwrap().contains("Vim"));
+}
+
+fn find_prefill() {
+    let (fx, editor, find) = find_fixture("find-prefill");
+    let doc = editor.document();
+    let at = FIND_DOC.find("presheaf").unwrap();
+    let (a, b) = (
+        doc.iter_at_byte(at).unwrap(),
+        doc.iter_at_byte(at + "presheaf".len()).unwrap(),
+    );
+    editor.buffer().select_range(&a, &b);
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), "presheaf");
+    // The entry's text is selected for typing over, which takes the editor's selection away
+    // (one primary selection): the match still counts as the one selected.
+    assert_eq!(find.entry().selection_bounds(), Some((0, 8)));
+    assert_eq!(counted(&find).label, "1 of 1");
+    // A selection over several lines does not prefill.
+    focus(&editor);
+    let end = doc.iter_at_byte(FIND_DOC.len()).unwrap();
+    editor.buffer().select_range(&a, &end);
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), "presheaf");
+    // With Regular Expression on, the selection is escaped.
+    find.set_options(false, false, true);
+    focus(&editor);
+    let emph = FIND_DOC.find("\\emph{sheaf}").unwrap();
+    let (a, b) = (
+        doc.iter_at_byte(emph).unwrap(),
+        doc.iter_at_byte(emph + "\\emph{sheaf}".len()).unwrap(),
+    );
+    editor.buffer().select_range(&a, &b);
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), r"\\emph\{sheaf\}");
+    assert_eq!(counted(&find).label, "1 of 1");
+    // The query stays the text typed, selected for typing over, while the match is selected.
+    assert_eq!(find.entry().selection_bounds(), Some((0, 15)));
+    // A match the bar selected keeps a regular expression, in the editor and in the bar.
+    find.search_now(r"\\emph\{\w+\}");
+    counted(&find);
+    focus(&editor);
+    run(&fx, "win.find-next");
+    assert_eq!(selected(&editor).unwrap().1, r"\emph{stalk}");
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), r"\\emph\{\w+\}");
+    find.entry().emit_activate();
+    assert_eq!(selected(&editor).unwrap().1, r"\emph{sheaf}");
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), r"\\emph\{\w+\}");
+    // A selection the user made prefills, even one the expression matches.
+    focus(&editor);
+    let stalk = FIND_DOC.find("\\emph{stalk}").unwrap();
+    let (a, b) = (
+        doc.iter_at_byte(stalk).unwrap(),
+        doc.iter_at_byte(stalk + "\\emph{stalk}".len()).unwrap(),
+    );
+    editor.buffer().select_range(&a, &b);
+    run(&fx, "win.find");
+    assert_eq!(find.entry().text(), r"\\emph\{stalk\}");
+    // Ctrl+H shows the replace row with the focus in it; in the bar it hides the row again.
+    assert!(!find.status().replace_shown);
+    run(&fx, "win.find-replace");
+    assert!(find.status().replace_shown);
+    common::pump_until(TIMEOUT, || has_focus_within(find.replace_entry()));
+    run(&fx, "win.find-replace");
+    assert!(!find.status().replace_shown);
+    common::pump_until(TIMEOUT, || has_focus_within(find.entry()));
+    // Ctrl+F in the bar selects the query for typing over.
+    run(&fx, "win.find");
+    let chars = find.entry().text().chars().count() as i32;
+    assert_eq!(find.entry().selection_bounds(), Some((0, chars)));
+}
+
+fn find_replace() {
+    let (fx, editor, find) = find_fixture("find-replace");
+    let buffer = editor.buffer().clone();
+    run(&fx, "win.find");
+    find.search_now("sheaf");
+    counted(&find);
+    find.set_replacement(Some("faisceau"));
+    // Replace: the selected match, then the next one is selected.
+    find.replace();
+    let text = editor.document().text();
+    assert!(text.starts_with("\\section{Sheaves}\nA faisceau is a presheaf."));
+    assert_eq!(
+        selected(&editor),
+        Some((text.find("presheaf").unwrap() + 3, "sheaf".into()))
+    );
+    common::pump_until(TIMEOUT, || find.status().label == "1 of 3");
+    // With no match selected, Replace only goes to the next one.
+    editor.place_cursor_at(0);
+    find.replace();
+    assert_eq!(editor.document().text(), text);
+    assert!(selected(&editor).is_some());
+    // Replace All is one undo step; backslashes are literal without a regular expression.
+    find.set_replacement(Some(r"\textbf{x}\n"));
+    find.replace_every();
+    assert_eq!(
+        editor.document().text(),
+        "\\section{Sheaves}\nA faisceau is a pre\\textbf{x}\\n.\nEvery \\textbf{x}\\n glues; \
+         sheaves glue.\n\\emph{\\textbf{x}\\n} and \\emph{stalk}.\n"
+    );
+    common::pump_until(TIMEOUT, || find.status().label == "No matches");
+    assert!(buffer.can_undo());
+    buffer.undo();
+    assert_eq!(editor.document().text(), text, "one undo step");
+    // A regular expression: `$1` and `${name}` are groups, backslashes stay LaTeX, `$x$` stays.
+    find.set_options(false, false, true);
+    find.search_now(r"\\emph\{(?<word>\w+)\}");
+    counted(&find);
+    find.set_replacement(Some(r"\textit{${word}} $$x$ \1 $1"));
+    find.replace_every();
+    assert_eq!(
+        editor.document().text(),
+        text.replace(
+            r"\emph{sheaf} and \emph{stalk}",
+            r"\textit{sheaf} $x$ \1 sheaf and \textit{stalk} $x$ \1 stalk"
+        )
+    );
+    // Nothing to replace: no change, no panic.
+    find.search_now("nowhere");
+    common::pump_until(TIMEOUT, || find.status().label == "No matches");
+    let before = editor.document().text();
+    find.replace_every();
+    find.replace();
+    assert_eq!(editor.document().text(), before);
+}
+
+fn find_replace_review() {
+    let (fx, editor, find) = find_fixture("find-review");
+    let doc = editor.document().clone();
+    // The agent changed "stalk" (line 4).
+    review_ui::on_turn_started(&fx.state, 1);
+    review_ui::start_review(&doc, false);
+    let at = doc.text().find("stalk").unwrap();
+    doc.apply_edits(
+        &[lemma_core::TextEdit {
+            range: at..at + 5,
+            text: "germ".into(),
+        }],
+        lemma_core::Origin::Agent { call: 1 },
+    )
+    .unwrap();
+    review_ui::recompute(&doc);
+    review_ui::on_turn_ended(&fx.state, 1);
+    assert_eq!(review_ui::hunk_count(&doc), 1);
+    focus(&editor);
+    run(&fx, "win.find");
+    find.search_now("sheaf");
+    counted(&find);
+    find.set_replacement(Some("faisceau"));
+    find.replace_every();
+    review_ui::recompute(&doc);
+    // The user's replacements outside the hunk go into the baseline (no new hunk); the one in
+    // the agent's line joins the proposal and marks it as touched.
+    let review = doc.review.borrow();
+    let review = review.as_ref().unwrap();
+    assert_eq!(review.hunks().len(), 1);
+    assert!(review.hunks()[0].user_touched);
+    assert!(
+        review
+            .baseline()
+            .contains("A faisceau is a prefaisceau.\nEvery faisceau glues")
+    );
+    assert!(
+        review
+            .baseline()
+            .contains("\\emph{sheaf} and \\emph{stalk}")
+    );
+    assert!(doc.text().contains("\\emph{faisceau} and \\emph{germ}"));
+}
+
+/// Replace and Replace All change the matches only: live environment rename (`envtools`) stays
+/// out of them.
+fn find_replace_env_names() {
+    let doc = "\\begin{theorem}\nA.\n\\end{theorem}\n\\begin{theorem}\nB.\n\\end{theorem}\n";
+    let fx = fixture("find-env", &[("main.tex", doc)]);
+    let editor = fx.open("main.tex");
+    focus(&editor);
+    editor.place_cursor_at(0);
+    let find = find_bar::bar(&fx.state).unwrap();
+    run(&fx, "win.find");
+    find.search_now("theorem");
+    counted(&find);
+    find.set_replacement(Some("lemma"));
+    find.replace();
+    assert_eq!(
+        editor.document().text(),
+        doc.replacen("theorem", "lemma", 1)
+    );
+    // The next match is the `\end`'s name, still "theorem".
+    let end_name = doc.find("\\end{").unwrap() + "\\end{".len() - 2;
+    assert_eq!(selected(&editor), Some((end_name, "theorem".into())));
+    editor.buffer().undo();
+    assert_eq!(editor.document().text(), doc);
+    // Only the `\begin`s change; every `\end` stays, the last one's too.
+    find.set_options(false, false, true);
+    find.search_now(r"(?<=\\begin\{)theorem");
+    assert_eq!(counted(&find).total, Some(2));
+    find.replace_every();
+    assert_eq!(
+        editor.document().text(),
+        doc.replace("begin{theorem}", "begin{lemma}")
+    );
+}
+
+fn find_lifetime() {
+    let (fx, editor, find) = find_fixture("find-lifetime");
+    let other = fx.open("other.tex");
+    fx.state.select_editor(&editor);
+    focus(&editor);
+    let tags = |e: &Editor| e.buffer().tag_table().size();
+    let (main_tags, other_tags) = (tags(&editor), tags(&other));
+    run(&fx, "win.find");
+    find.search_now("sheaf");
+    assert_eq!(counted(&find).total, Some(4));
+    assert_eq!(tags(&editor), main_tags + 1, "the highlight tag");
+    let first = find.search_context().unwrap().downgrade();
+    // Switching tabs moves the search to the tab shown; the other buffer loses its highlights.
+    fx.state.select_editor(&other);
+    common::pump_until(TIMEOUT, || find.status().total == Some(1));
+    assert_eq!(find.search_context().unwrap().buffer(), *other.buffer());
+    assert!(first.upgrade().is_none());
+    assert_eq!(tags(&editor), main_tags);
+    assert_eq!(tags(&other), other_tags + 1);
+    // Closing the tab searched moves the search on; the closed tab's view and buffer are freed.
+    let (view_weak, buffer_weak) = (other.view().downgrade(), other.buffer().downgrade());
+    let second = find.search_context().unwrap().downgrade();
+    fx.state.close_editor(&other, true);
+    drop(other);
+    common::pump_for(Duration::from_millis(500));
+    assert!(second.upgrade().is_none());
+    assert!(
+        buffer_weak.upgrade().is_none() && view_weak.upgrade().is_none(),
+        "the closed tab's view and buffer were freed"
+    );
+    assert_eq!(find.search_context().unwrap().buffer(), *editor.buffer());
+    assert!(find.status().open);
+    // Closing the last tab closes the bar.
+    let third = find.search_context().unwrap().downgrade();
+    fx.state.close_editor(&editor, true);
+    drop(editor);
+    common::pump_for(Duration::from_millis(100));
+    assert!(!find.status().open);
+    assert!(third.upgrade().is_none());
+    // Closing the window drops the bar and its search.
+    let editor = fx.open("main.tex");
+    focus(&editor);
+    run(&fx, "win.find");
+    let fourth = find.search_context().unwrap().downgrade();
+    let (bar, state) = (Rc::downgrade(&find), Rc::downgrade(&fx.state));
+    drop((find, editor));
+    drop(fx);
+    common::pump_until(TIMEOUT, || state.upgrade().is_none());
+    assert!(bar.upgrade().is_none(), "the find bar was freed");
+    assert!(fourth.upgrade().is_none());
 }

@@ -5,6 +5,10 @@
 //! `$1`…`$99`, `$name` and `${name}` insert a capture group (`$0` the whole match) and `$$` a
 //! dollar sign; a reference to a group the expression does not have stays as typed, so the
 //! LaTeX in `$x$` survives. Backslashes are never escapes (`\textbf` stays `\textbf`).
+//!
+//! The editor's find bar uses the same syntax with GLib's regular expressions (GtkSourceView's
+//! search): [`Template::for_groups`] parses for another engine's groups, and
+//! [`Template::to_glib`] writes the template in `g_regex_replace`'s syntax.
 
 use crate::query::Matcher;
 use std::ops::{ControlFlow, Range};
@@ -29,15 +33,24 @@ impl Template {
             return Self::literal(template);
         }
         let regex = matcher.regex();
-        let groups = regex.captures_len();
+        Self::for_groups(template, regex.captures_len(), |name| {
+            regex.capture_names().position(|n| n == Some(name))
+        })
+    }
+
+    /// Parses `template` (see the module docs) for a regular expression of any engine with
+    /// `groups` capture groups, the whole match included (so at least 1), and the named group
+    /// that `named` gives the index of.
+    pub fn for_groups(
+        template: &str,
+        groups: usize,
+        named: impl Fn(&str) -> Option<usize>,
+    ) -> Self {
         let name = |name: &str| -> Option<usize> {
             if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
                 return name.parse::<usize>().ok().filter(|i| *i < groups);
             }
-            regex
-                .capture_names()
-                .position(|n| n == Some(name))
-                .filter(|_| !name.is_empty())
+            named(name).filter(|i| !name.is_empty() && *i < groups)
         };
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut text = String::new();
@@ -116,6 +129,19 @@ impl Template {
     /// True when no capture group is used: every match is replaced by the same text.
     pub fn is_literal(&self) -> bool {
         self.chunks.iter().all(|c| matches!(c, Chunk::Text(_)))
+    }
+
+    /// The template in GLib's replacement syntax (`g_regex_replace`, which GtkSourceView's
+    /// search replaces with): each group as `\g<N>`, backslashes doubled, other text as it is.
+    pub fn to_glib(&self) -> String {
+        let mut out = String::new();
+        for chunk in &self.chunks {
+            match chunk {
+                Chunk::Text(t) => out.push_str(&t.replace('\\', "\\\\")),
+                Chunk::Group(i) => out.push_str(&format!("\\g<{i}>")),
+            }
+        }
+        out
     }
 
     /// The text every match is replaced with, when [`Template::is_literal`].
@@ -360,6 +386,26 @@ mod tests {
         assert_eq!(preview(&m, &t, line, &ranges), ["1a", "2b"]);
         assert!(!t.is_literal());
         assert!(Template::new(&m, "x$9").is_literal());
+    }
+
+    #[test]
+    fn templates_for_other_engines_in_glib_syntax() {
+        // Two groups besides the whole match; `b` is group 2.
+        let named = |name: &str| (name == "b").then_some(2);
+        let glib = |template: &str| Template::for_groups(template, 3, named).to_glib();
+        assert_eq!(glib(r"\textbf{$1}"), r"\\textbf{\g<1>}");
+        assert_eq!(glib("$b-${b}-$0-$$"), r"\g<2>-\g<2>-\g<0>-$");
+        // References to groups the expression does not have stay as typed, as with `new`.
+        assert_eq!(glib("$x$ ${c} $3 $12"), r"$x$ ${c} $3 \g<1>2");
+        assert_eq!(glib(r"a\nb"), r"a\\nb");
+        // A resolver that names a group past the count is not trusted.
+        let wrong = Template::for_groups("$z", 1, |_| Some(4));
+        assert_eq!(wrong.to_glib(), "$z");
+        assert_eq!(Template::literal(r"\x").to_glib(), r"\\x");
+        // `new` parses the same way.
+        let q = Query::regex(r"(?P<a>\w+)=(?P<b>\w+)");
+        let m = q.matcher().unwrap();
+        assert_eq!(Template::new(&m, "$b=$a$c").to_glib(), r"\g<2>=\g<1>$c");
     }
 
     #[test]

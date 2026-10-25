@@ -4,8 +4,8 @@
 //! ┌ header: [sidebar][open][save]   main.tex — ~/proj   [review][state][build][pdf][agent][menu] ┐
 //! ├ banner (hidden) ─────────────────────────────────────────────────────────────────────────────┤
 //! │ sidebar        │ tab bar                          │ PDF pane          │ agent pane (hidden)  │
-//! │ Outline        │ editor (TexView)                 │ [strip] PDF view  │                      │
-//! │ Changes        │                                  │                   │                      │
+//! │ Outline        │ find bar (hidden)                │ [strip] PDF view  │                      │
+//! │ Changes        │ editor (TexView)                 │                   │                      │
 //! │ Problems       │                                  │                   │                      │
 //! │ Search         │                                  │                   │                      │
 //! ├ status: file · vim command · mode · [words] · Ln, Col · build ───────────────────────────────┤
@@ -20,6 +20,9 @@
 //! bar, the M3 actions (each runs its module's function; defaults in `app::DEFAULT_ACCELS`),
 //! the session hooks ([`WindowState::session_changed`], `session::save` on close) and
 //! [`WindowState::edit_config_file`] for Preferences.
+//!
+//! The find bar of the active editor (`find_bar`) sits in [`WindowState::find_slot`], between the
+//! tab bar and the editors.
 
 mod layout;
 
@@ -39,8 +42,8 @@ use crate::settings::{self, ConfigFile, LiveConfig, Settings, SettingsFiles};
 use crate::workspace::{Workspace, normalize};
 use crate::{changes_panel, diagnostics_panel, review_persist};
 use crate::{
-    git_gutter, history_ui, labels, lint, outline_panel, palette, pdf, prefs, quick_open, quickfix,
-    search_panel, session, shortcuts, wordcount,
+    find_bar, git_gutter, history_ui, labels, lint, outline_panel, palette, pdf, prefs, quick_open,
+    quickfix, search_panel, session, shortcuts, wordcount,
 };
 use adw::prelude::*;
 use lemma_config::{Config, Paths, PromptTemplate};
@@ -185,6 +188,8 @@ pub struct WindowState {
     pub pdf_sidebar: PdfSidebar,
     pub tab_view: adw::TabView,
     pub tab_bar: adw::TabBar,
+    /// Slot for the find bar (`find_bar::install` fills it), between the tab bar and the editors.
+    pub find_slot: adw::Bin,
     pub status: StatusBar,
     /// True for runs that quit by themselves (`--quit-after-ms`) and for tests: nobody can answer
     /// a dialog, so none is shown (unsaved changes are not asked about).
@@ -201,6 +206,8 @@ pub struct WindowState {
     editors: RefCell<Vec<Rc<Editor>>>,
     editor_stack: gtk::Stack,
     vim_enabled: Cell<bool>,
+    /// The keyboard focus is in an editor or the find bar (see [`WindowState::focus_moved`]).
+    editor_focused: Cell<bool>,
     close_confirmed: Cell<bool>,
     /// `None` until set: the defaults.
     snippets: RefCell<Option<Rc<SnippetSet>>>,
@@ -306,6 +313,7 @@ impl WindowState {
             pdf_sidebar,
             tab_view,
             tab_bar,
+            find_slot,
             editor_stack,
             status,
         } = layout::build(app);
@@ -327,6 +335,7 @@ impl WindowState {
             pdf_sidebar,
             tab_view,
             tab_bar,
+            find_slot,
             status,
             scripted,
             build: OnceCell::new(),
@@ -335,6 +344,7 @@ impl WindowState {
             editor_menu: gio::Menu::new(),
             editors: RefCell::new(Vec::new()),
             editor_stack,
+            editor_focused: Cell::new(false),
             close_confirmed: Cell::new(false),
             snippets: RefCell::new(settings.map(|s| s.snippets.clone())),
             prompts: RefCell::new(settings.map(|s| s.prompts.clone())),
@@ -387,6 +397,7 @@ impl WindowState {
         pdf::sidebar::install(self);
         pdf::detach::install(self);
         search_panel::install(self);
+        find_bar::install(self);
         lint::install(self);
         quickfix::install(self);
         wordcount::install(self);
@@ -625,6 +636,7 @@ impl WindowState {
             index.map(|i| editors.remove(i))
         };
         if let Some(editor) = editor {
+            find_bar::detach(self, &editor);
             self.detach_m3(&editor);
             spell::detach(self, &editor);
             keys::detach(self, &editor);
@@ -1110,6 +1122,7 @@ impl WindowState {
             }
         }
         self.refresh_vim_status();
+        self.refresh_find_actions();
     }
 
     fn enable_vim_on(self: &Rc<Self>, editor: &Rc<Editor>) {
@@ -1528,6 +1541,11 @@ impl WindowState {
         simple("jump-pair", pairs::jump);
         simple("history", history_ui::show);
         simple("word-count", wordcount::show);
+        // Find and replace in the current file.
+        simple("find", find_bar::show);
+        simple("find-replace", find_bar::show_replace);
+        simple("find-next", |s| find_bar::step(s, true));
+        simple("find-prev", |s| find_bar::step(s, false));
 
         let detach = gio::SimpleAction::new_stateful("pdf-detach", None, &false.into());
         let state = Rc::downgrade(self);
@@ -1547,9 +1565,11 @@ impl WindowState {
             &self.pdf_sidebar.split,
             "show-sidebar",
         ));
-        // Ctrl+F searches the PDF only while it has the focus; elsewhere the key stays the
-        // focused widget's (Vim's page down).
+        // Ctrl+F searches the PDF only while it has the focus, and finds in the file only while
+        // an editor or the find bar has it and Vim is off; elsewhere the key stays the focused
+        // widget's (Vim's page down).
         self.set_action_enabled(PDF_SEARCH_ACTION, false);
+        self.refresh_find_actions();
         let state = Rc::downgrade(self);
         window.connect_focus_widget_notify(move |window| {
             if let Some(state) = state.upgrade() {
@@ -1570,8 +1590,10 @@ impl WindowState {
     }
 
     /// The keyboard focus moved to `focus`: `win.pdf-search` is enabled while it is inside the
-    /// PDF pane. Focus moving into a popover or a dialog (the command palette) leaves it as it
-    /// was, so the palette sees the state of the window behind it.
+    /// PDF pane, the find actions while it is in an editor or the find bar (and Vim is off, see
+    /// [`WindowState::refresh_find_actions`]). Focus moving into a popover or a dialog (the
+    /// command palette) leaves them as they were, so the palette sees the state of the window
+    /// behind it.
     fn focus_moved(&self, focus: Option<&gtk::Widget>) {
         let Some(focus) = focus else {
             return;
@@ -1584,6 +1606,18 @@ impl WindowState {
         let in_pdf =
             focus == self.pdf_pane.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&self.pdf_pane);
         self.set_action_enabled(PDF_SEARCH_ACTION, in_pdf);
+        self.editor_focused
+            .set(focus.is_ancestor(&self.tab_view) || focus.is_ancestor(&self.find_slot));
+        self.refresh_find_actions();
+    }
+
+    /// Enables the find actions while an editor or the find bar has the focus and Vim is off:
+    /// with Vim on, Ctrl+F and Ctrl+H are Vim's own keys, and Vim searches with `/`.
+    fn refresh_find_actions(&self) {
+        let enabled = self.editor_focused.get() && !self.vim_enabled();
+        for name in FIND_ACTIONS {
+            self.set_action_enabled(name, enabled);
+        }
     }
 
     // ----- session (M3) -----
@@ -1918,6 +1952,10 @@ impl WindowState {
 
 /// The action enabled only while the PDF pane has the focus.
 const PDF_SEARCH_ACTION: &str = "pdf-search";
+
+/// The actions of the find bar, enabled only while an editor or the find bar has the focus and
+/// Vim is off (Ctrl+F is also `win.pdf-search`'s).
+const FIND_ACTIONS: [&str; 4] = ["find", "find-replace", "find-next", "find-prev"];
 
 /// Where an edit of the configuration file `path` is written: `path`, or what it points to when
 /// it is a symbolic link. Refuses a path that exists and is not a regular file (`/dev/null`).
