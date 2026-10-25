@@ -240,6 +240,23 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   alone, instead of copying the whole text and finding its lines again (5–11 ms in a 60 000-line
   file). Keeping a change, a file's or a turn's changes, or taking a keep back with Alt+U, copies
   the text of an open file once instead of twice (3.5–7 ms less in such a file).
+- The check for undefined references and citations no longer goes through the whole project
+  after every pause in typing, only through what changed: nothing after prose, and after an
+  edit the file edited plus the references elsewhere to a label it added or removed. In a book
+  of 300 chapters with 20 000 labels, 30 000 references and 40 000 citations, each pause cost
+  the main thread 22–34 ms; now under 0.1 ms after prose and 0.5–3 ms after other edits. The
+  inline equation numbers no longer go through the build's numbers for every open editor at
+  each pause.
+- With the Outline shown, an edit of one chapter computes only that chapter's rows again, and
+  the outline's update leaves the other chapters' rows alone: in that book a new section took
+  about 34 ms, now under 4 ms. A line break, a `\ref` or a `\label` typed in a paragraph (or a
+  line break at the end of a heading's line), which moves rows or changes the chapter's entry
+  in the project index without changing its rows, now costs under 0.3 ms instead of 34–40 ms.
+- The inline equation numbers move with lines inserted or deleted above them just before the
+  next frame, once for all the changes made until then (a paste over a selection, a replacement
+  of several lines, Vim's `.`), instead of inside each change: with 5000 numbers, ten line
+  changes at once cost 26 ms, now 3 ms, and a key that adds a line no longer spends 2.6 ms in
+  its handler (the numbers move after it, before the frame).
 
 ### Fixed
 
@@ -346,6 +363,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   shown before the session was saved came back at that line next time, but scrolled to where
   the session before had left it, with the cursor out of view. It now comes back showing its
   line.
+- In a project that includes more files than Lemma reads from disk (300), a reference to a
+  label in one of the files it did not read was underlined and listed on the Problems page as
+  undefined: a 1000-chapter book got thousands of them before its first build. References are
+  not checked in such a project now (citations still are), and the log says so.
 
 ## epsilon (0.1.0), 2026-10-20
 

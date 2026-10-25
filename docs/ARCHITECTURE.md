@@ -1229,6 +1229,65 @@ they conflict with the sections above, this section wins.
     through the link). After a build the distribution packages, retried on the jobs thread,
     cost the main thread no `normalize` (52 with 40 packages before;
     `workspace::normalizations` counts them per thread).
+  - The index replaces its parts and never changes one in place: §10.3's
+    `ProjectIndex::aux` is an `Arc<AuxInfo>` (2026-10-25), replaced only when a build changed
+    the numbers (`completion::merge_discovered` compares them). What is computed from the index
+    tells what changed by the `Arc`s, holding a `Weak` (or the `Arc`) so that an address is not
+    reused, without comparing contents:
+    - The label checks keep `labels::scan::UndefinedCheck` from one check to the next: the
+      entries they read (held, so that a replaced entry's labels come out of the counts), the
+      bibliographies and the `.aux` (weakly), how many files define each label, the
+      bibliographies' keys and each file's findings. A check that finds nothing replaced (prose
+      typed) looks at nothing (`labels::checks_skipped`; the equation numbers still refresh,
+      which costs nothing when their inputs are the same); otherwise it looks again at the
+      references and citations of the files with new entries, at the references elsewhere to a
+      label whose definition came or went, at every reference after a new `.aux` and at every
+      citation after a bibliography was read again (`labels::files_checked`). Its findings are
+      `scan::undefined`'s after every change (a differential unit test).
+    - The equation numbers hash the `.aux` numbers once per `Arc` (`annotations::aux_hash`).
+    - The Outline keeps what it computed for each file (`outline_panel::OutlineCache`, by path
+      and whether the file is the root): its rows from its entry alone (`FileRows`, the entry
+      held weakly), the numbers of their labels per `.aux`, the files its includes name while
+      the index has the same files, and the rows assembled under it with what they were
+      assembled from. The numbers from the contents lines, which follow the order of the whole
+      project, are matched again for every outline over prepared keys (`AuxKeys`), and what
+      they give is kept per file as overrides. A file whose rows, numbers and included files are
+      as before keeps the same `Rc` of rows under it, and the patch skips the nodes under a node
+      that shows the same `Rc` (`Node::shown`); only the row lists of the files whose rows came,
+      went or moved are made again (`index_rows_of`). When the entries the index replaced give
+      the rows they gave but for their lines (Enter typed, a `\ref` or a `\label` added to a
+      paragraph) and the same includes, and the rows are on the new lines (`rows_followed`:
+      they followed the line changes in a tab; not after another program changed a file that is
+      not open, or after a patch put them back on the index's lines before it caught up),
+      nothing is computed or patched (`OutlineStats::line_shifts`). `drifted` lists the files
+      with rows on the lines a change replaced, moved at a guess (Enter at the end of a
+      heading's line), not those whose rows only moved after a change, which is exact; once
+      the index has caught up their rows are compared with its lines too, and only rows off
+      them make the next outline look at every row. When only rows changed, the root is not
+      looked for again.
+    - Measured on a generated book (`tests/common/big_project.rs`: 300 chapters, 142k lines,
+      20k labels, 30k references, 40k citations, a 10k-entry bibliography and an `.aux` that
+      numbers every label; release, on the CPU, the median of five runs' medians at load 1–9):
+      the check after a pause took 28.5 ms after prose, 34.4 after Enter, 22.3 after a `\ref`
+      and 22.2 after a `\label`, now 0.08, 0.73, 0.51 and 0.80 ms; the Outline's look at the
+      index once the chapter was indexed again took 40.2 ms after Enter and 33.6 after a new
+      `\section`, now 0.16 and 3.7 ms (`perf_undefined_check_big_project`,
+      `perf_outline_big_project`). Keeping what it computed makes the first outline of that
+      book a little slower (median 77 ms instead of 67, wall time).
+  - A window reads at most `completion::MAX_DISK_FILES` (300) files from disk. When the last
+    discovery pass left files the project includes unread (`completion::index_capped`), the
+    index lacks part of the project, so a reference to a label it does not have may well be
+    defined: the label checks then report no undefined reference (`Undefined::labels_checked`,
+    `labels::labels_checked`; citations are still checked), and the log says so once per
+    window. The cap stays: completion, F12 and the Outline see only the files read.
+  - The equation numbers follow line changes at `HIGH_IDLE`, which runs before GTK lays out and
+    draws the next frame, instead of inside each change: the changes of one main-loop
+    iteration (a paste, a replacement of several lines, Vim's `.`) add them again once, and
+    nothing moves when the changes are below the last number. With 5000 numbers
+    (`perf_equation_numbers_follow_lines`, release, on the CPU, five runs at load 1.5–2.4) a
+    line break above them spends 0.07 ms in the change instead of 2.6 ms, and ten line changes
+    at once cost 3.0 ms instead of 26; one line break with what runs before the next frame
+    still costs about 2.6 ms (every number is added again).
 - **Batched review feed (§4.1, §10.3, 2026-10-25):**
   - `FileReview::on_edits(edits, origin)` takes the changes of one action at once (in the
     order they are applied, each ending at or before the start of the one before, with the

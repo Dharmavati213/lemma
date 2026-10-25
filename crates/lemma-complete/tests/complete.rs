@@ -25,7 +25,7 @@ fn proj_index() -> ProjectIndex {
         PathBuf::from("/p/refs.bib"),
         Arc::new(scan_bib(&fixture("proj/refs.bib"))),
     );
-    idx.aux = parse_aux(&fixture("proj/main.aux"));
+    idx.aux = Arc::new(parse_aux(&fixture("proj/main.aux")));
     idx
 }
 

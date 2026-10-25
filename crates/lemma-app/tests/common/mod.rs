@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod big_project;
+
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};

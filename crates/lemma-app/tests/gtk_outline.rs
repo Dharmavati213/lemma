@@ -66,6 +66,7 @@ fn main() -> ExitCode {
             "prose_typed_recomputes_nothing_a_caption_its_row",
             prose_and_captions,
         ),
+        ("edits_of_one_chapter_leave_the_others_alone", chapter_edits),
         (
             "clicks_on_rows_and_arrows_with_a_real_pointer",
             real_clicks::parent,
@@ -74,6 +75,7 @@ fn main() -> ExitCode {
     if ignored {
         tests.push(("perf_outline_keystroke", perf_keystroke));
         tests.push(("perf_outline_large_tex", perf_large));
+        tests.push(("perf_outline_big_project", perf_big_project));
     }
     common::run(&tests)
 }
@@ -980,7 +982,7 @@ fn a_chapter_changed_on_disk() {
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
     let chapter = f.path("chapters/yoneda.tex");
     let text = std::fs::read_to_string(&chapter).unwrap() + "\\section{Written elsewhere}\n";
-    std::fs::write(&chapter, text).unwrap();
+    std::fs::write(&chapter, &text).unwrap();
     let deadline = Instant::now() + TIMEOUT;
     while !outline::tree_text(&f.state).contains("  Written elsewhere\n") {
         assert!(
@@ -990,6 +992,24 @@ fn a_chapter_changed_on_disk() {
         );
         common::pump_for(Duration::from_millis(20));
     }
+    // Lines written above its rows: the outline is the same but for lines, which no edit in a
+    // tab moved, and its rows go to the new lines.
+    let lemma = f.line_of("chapters/yoneda.tex", "\\begin{lemma}");
+    assert_eq!(
+        outline::row_line(&f.state, "Lemma 2.1 (Yoneda)"),
+        Some(lemma)
+    );
+    std::fs::write(&chapter, format!("% moved\n% down\n{text}")).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while outline::row_line(&f.state, "Lemma 2.1 (Yoneda)") != Some(lemma + 2) {
+        assert!(
+            Instant::now() < deadline,
+            "the lemma's row on its new line: {:?}",
+            outline::row_line(&f.state, "Lemma 2.1 (Yoneda)")
+        );
+        common::pump_for(Duration::from_millis(20));
+    }
+    assert_eq!(outline::row_line(&f.state, "2 The Yoneda lemma"), Some(2));
 }
 
 const PROSE_MAIN: &str = "\\documentclass{article}\n\\begin{document}\n\\section{Plots}\n\
@@ -1062,6 +1082,89 @@ fn prose_and_captions() {
     f.wait_tree("the long form", |tree| {
         tree.ends_with("  Figure A long caption\n")
     });
+}
+
+const BOOK_CHAPTER_B: &str = "\\chapter{B}\nSome prose.\n\\section{Two}\nMore prose.\n\
+\\section{Three}\n\\begin{lemma}\nx\n\\end{lemma}\n";
+
+/// Edits in one chapter of a book: a line break in its prose moves its rows, and the outline is
+/// the same but for lines, so nothing is recomputed or patched; a new section in it is one row
+/// more, the rows of the other chapters are left alone, and the cursor in it is followed (the
+/// chapter's rows are listed again).
+fn chapter_edits() {
+    let main = "\\documentclass{book}\n\\newtheorem{lemma}{Lemma}\n\\begin{document}\n\
+                \\input{a}\n\\input{b}\n\\input{c}\n\\end{document}\n";
+    let f = fixture(
+        "chapters",
+        None,
+        &[
+            ("main.tex", main),
+            ("a.tex", "\\chapter{A}\n\\section{One}\n"),
+            ("b.tex", BOOK_CHAPTER_B),
+            ("c.tex", "\\chapter{C}\n\\section{Four}\n"),
+        ],
+    );
+    let main = f.open("main.tex");
+    let b = f.open("b.tex");
+    f.show_outline();
+    let book = "[a.tex]\n  A\n    One\n[b.tex]\n  B\n    Two\n    Three\n      Lemma\n\
+                [c.tex]\n  C\n    Four\n";
+    f.wait_tree("the book", |tree| tree == book);
+    let state = f.state.clone();
+    let indexed = || !completion::index_busy(&state) && outline::is_settled(&state);
+    let before = f.stats();
+    insert_at_line(&b, 1, "\n");
+    common::pump_until(TIMEOUT, || completion::index_busy(&state));
+    common::pump_until(TIMEOUT, indexed);
+    let shifted = f.stats();
+    assert_eq!(shifted.syncs, before.syncs, "{shifted:?}");
+    assert_eq!(shifted.line_shifts, before.line_shifts + 1);
+    assert_eq!(outline::row_line(&f.state, "Two"), Some(3));
+    assert_eq!(outline::row_line(&f.state, "Lemma"), Some(6));
+    // A new section: one row more, the others as they were.
+    insert_at_line(&b, 4, "\\section{New}\n");
+    f.wait_tree("the new section", |tree| {
+        tree == book.replace("    Three\n", "    New\n    Three\n")
+    });
+    let added = f.stats();
+    assert_eq!(added.syncs, shifted.syncs + 1);
+    assert_eq!(added.nodes_created, shifted.nodes_created + 1);
+    assert_eq!(added.nodes_updated, shifted.nodes_updated);
+    assert_eq!(outline::row_line(&f.state, "Three"), Some(6));
+    assert_eq!(outline::row_line(&f.state, "One"), Some(1));
+    // The new section's rows are known: the cursor in it is followed.
+    f.put_cursor(&b, 5, 0);
+    assert_eq!(outline::selected_row(&f.state).as_deref(), Some("New"));
+    f.put_cursor(&b, 8, 0);
+    assert_eq!(outline::selected_row(&f.state).as_deref(), Some("Lemma"));
+    // A line break at the start of a heading's line leaves its row there, at a guess; a look at
+    // the index before it has the chapter again (another tab selected) puts the row back on the
+    // index's line; once it has, the row is on its new line, though the outline is the same
+    // but for lines.
+    assert_eq!(outline::row_line(&f.state, "Two"), Some(3));
+    insert_at_line(&b, 3, "\n");
+    assert_eq!(outline::row_line(&f.state, "Lemma"), Some(8));
+    f.state.select_editor(&main);
+    outline::refresh(&f.state);
+    assert!(completion::index_busy(&state));
+    assert_eq!(outline::row_line(&f.state, "Lemma"), Some(7));
+    common::pump_until(TIMEOUT, indexed);
+    assert_eq!(outline::row_line(&f.state, "Two"), Some(4));
+    assert_eq!(outline::row_line(&f.state, "Lemma"), Some(8));
+    // A line break at the end of a heading's line: the guess is right, so the index catching up
+    // computes nothing either.
+    f.state.select_editor(&b);
+    f.settle();
+    let before = f.stats();
+    let end = b.document().line_index().line_range(4).end;
+    b.buffer().insert(&mut b.iter_near(end).unwrap(), "\n");
+    common::pump_until(TIMEOUT, || completion::index_busy(&state));
+    common::pump_until(TIMEOUT, indexed);
+    let after = f.stats();
+    assert_eq!(after.syncs, before.syncs, "{after:?}");
+    assert_eq!(after.line_shifts, before.line_shifts + 1);
+    assert_eq!(outline::row_line(&f.state, "Two"), Some(4));
+    assert_eq!(outline::row_line(&f.state, "Lemma"), Some(9));
 }
 
 fn which(program: &str) -> Option<PathBuf> {
@@ -1215,6 +1318,82 @@ fn perf_large() {
         first.max_sync, first.last_build, floats.0, floats.1
     );
     assert_eq!((prose.0, floats.0), (0, 0));
+}
+
+/// The Outline of a generated book (`common::big_project`: 300 chapters, 16 500 rows, a `.aux`
+/// that numbers them) with a chapter open: what the page's look at the project index costs the
+/// main thread (the time it waited for a CPU left out) once the chapter was indexed again after
+/// Enter on a line of prose (its rows move down a line), a new `\label` and a new `\ref` in
+/// prose (no row changes) and a new `\section` (a row more), 7 of each at different places, and
+/// how many times the outline was recomputed.
+fn perf_big_project() {
+    let f = fixture("perf-big", None, &[]);
+    let big = common::big_project::write(&f.dir, 300, 66, 10_000, 1);
+    let _main = f.open("main.tex");
+    let chapter = f.open("c/c0150.tex");
+    f.state.sidebar.show_page(PAGE_OUTLINE);
+    completion::refresh_project(&f.state);
+    let state = f.state.clone();
+    common::pump_until(Duration::from_secs(300), || {
+        outline::is_settled(&state) && outline::tree_text(&state).contains("[c/c0299.tex]\n  300 ")
+    });
+    let rows = outline::tree_text(&f.state).lines().count();
+    println!(
+        "    {big:?}: {rows} rows, first outline {:?}",
+        f.stats().max_sync
+    );
+    let settled = || !completion::index_busy(&state) && outline::is_settled(&state);
+    // How many times the page looked at a changed index.
+    let looked = || {
+        let s = f.stats();
+        s.syncs + s.line_shifts
+    };
+    let mut line = 40;
+    let mut report = Vec::new();
+    for (kind, insert) in [
+        ("Enter", "\n"),
+        ("\\label", "\\label{perf:new:#}"),
+        ("\\ref", " \\ref{ch:3}"),
+        ("\\section", "\n\\section{Perf section #}"),
+    ] {
+        let (mut times, mut syncs, mut attempts) = (Vec::new(), 0, 0);
+        while times.len() < 7 {
+            attempts += 1;
+            assert!(attempts < 30, "the page kept looking first");
+            line = common::big_project::prose_line(&chapter.document().text(), line as usize + 3);
+            let end = chapter.document().line_index().line_range(line).end;
+            let buffer = chapter.buffer();
+            let mut at = chapter.iter_near(end).unwrap();
+            buffer.insert(&mut at, &insert.replace('#', &times.len().to_string()));
+            let before = looked();
+            // The chapter is indexed again 300 ms after the change; the page looks every 100 ms.
+            common::pump_until(TIMEOUT, || !completion::index_busy(&state));
+            if looked() != before {
+                common::pump_until(TIMEOUT, settled);
+                continue;
+            }
+            let before = f.stats().syncs;
+            times.push(common::big_project::on_cpu(|| outline::refresh(&f.state)));
+            syncs += f.stats().syncs - before;
+            common::pump_until(TIMEOUT, settled);
+        }
+        let shown = common::big_project::median_max(&mut times);
+        report.push((kind, syncs, shown, times));
+    }
+    for (kind, syncs, shown, _) in &report {
+        println!("    after {kind}: {syncs} recomputations, median/max {shown}");
+    }
+    println!("    load {}", common::big_project::load());
+    assert!(outline::tree_text(&f.state).contains("Perf section 6"));
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budgets are checked in release)");
+        return;
+    }
+    for (kind, _, _, times) in &report {
+        let median = times[times.len() / 2];
+        let budget = Duration::from_millis(if *kind == "\\section" { 10 } else { 1 });
+        assert!(median <= budget, "{kind}: median {median:?}");
+    }
 }
 
 /// Types three words before the first `needle` in `main`, each after the project index and the

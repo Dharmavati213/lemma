@@ -16,9 +16,13 @@
 //! (the `.aux` numbers and what each label labels); the label tools call it after their
 //! checks: after typing stops, after every build (new numbers) and when the project index
 //! changes; it reads the text only when the `.aux` numbers or the file's labels in the project
-//! index (with their lines) changed. Between two refreshes the numbers follow the edits: lines
-//! inserted or removed above a label move its number with it at once, without reading
-//! anything. Nothing is added again when nothing changed. Off with `[editor] equation_numbers = false` (read at use time; a configuration
+//! index (with their lines) changed, and hashes the `.aux` numbers only when the project index
+//! has new ones (told by their `Arc`; 20k numbers take about 4 ms). Between two refreshes the
+//! numbers follow the edits: lines inserted or removed above a label move its number with it,
+//! without reading anything, before the next frame (the moves of one main-loop iteration, as
+//! several changes of a paste, a replacement or Vim's `.` make, add the numbers again once, at
+//! `HIGH_IDLE`, which runs before GTK lays out and draws). Nothing is added again when nothing
+//! changed. Off with `[editor] equation_numbers = false` (read at use time; a configuration
 //! reload refreshes every view).
 //!
 //! Hooks: [`attach`] / [`detach`] per editor tab (the view is held weakly; disconnect in
@@ -28,12 +32,13 @@ use super::Editor;
 use crate::document::ObserverId;
 use crate::labels::scan;
 use crate::window::WindowState;
-use lemma_syntax::{FileIndex, Label, ProjectIndex};
+use lemma_syntax::{AuxInfo, FileIndex, Label, ProjectIndex};
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 /// What follows each number: keeps the pill's text off the text area's edge.
 const PADDING: &str = "\u{2002}";
@@ -46,16 +51,46 @@ struct Numbers {
     /// What is shown: (0-based line, text), by line.
     shown: RefCell<Vec<(u32, String)>>,
     lines_changed: RefCell<Option<ObserverId>>,
+    /// Line changes not followed yet ((first, removed, added), in order), and the idle that
+    /// follows them before the next frame.
+    moves: RefCell<Vec<(u32, u32, u32)>>,
+    moves_idle: RefCell<Option<glib::SourceId>>,
     /// The next [`refresh`] reads the text whatever it was computed from (a new view).
     dirty: Cell<bool>,
     /// What the numbers were computed from — the `.aux` numbers, and the file's labels with
     /// their lines in the project index (which changes when a label is added, removed, renamed
     /// or moves) — so a [`refresh`] with nothing new does not read the text.
     source: Cell<u64>,
+    /// How many times the annotations were added again (tests).
+    rebuilds: Cell<u64>,
 }
 
 thread_local! {
     static VIEWS: RefCell<Vec<Rc<Numbers>>> = const { RefCell::new(Vec::new()) };
+    /// The hashes of the `.aux` numbers the project indexes have (one per window), with the
+    /// `Arc`s they are in (held weakly, so an address is not reused while it is listed): an
+    /// index replaces them only when a build changed them.
+    static AUX_HASHES: RefCell<Vec<(std::sync::Weak<AuxInfo>, u64)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The hash of `aux`'s numbers, computed once per `.aux` a project index has.
+fn aux_hash(aux: &Arc<AuxInfo>) -> u64 {
+    AUX_HASHES.with_borrow_mut(|hashes| {
+        if let Some((_, hash)) = hashes
+            .iter()
+            .find(|(hashed, _)| std::ptr::eq(hashed.as_ptr(), Arc::as_ptr(aux)))
+        {
+            return *hash;
+        }
+        // Those no index has any more go.
+        hashes.retain(|(hashed, _)| hashed.strong_count() > 0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        aux.labels.hash(&mut hasher);
+        let hash = hasher.finish();
+        hashes.push((Arc::downgrade(aux), hash));
+        hash
+    })
 }
 
 fn lookup(editor: &Editor) -> Option<Rc<Numbers>> {
@@ -80,16 +115,19 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         provider,
         shown: RefCell::new(Vec::new()),
         lines_changed: RefCell::new(None),
+        moves: RefCell::new(Vec::new()),
+        moves_idle: RefCell::new(None),
         dirty: Cell::new(true),
         source: Cell::new(0),
+        rebuilds: Cell::new(0),
     });
-    // Inside the change, nothing is read: the numbers only move.
+    // Inside the change, nothing is read: the numbers only move, before the next frame.
     let weak = Rc::downgrade(&numbers);
     let id = editor
         .document()
         .connect_lines_changed(move |first, removed, added| {
             if let Some(numbers) = weak.upgrade() {
-                follow(&numbers, first, removed, added);
+                follow_soon(&numbers, first, removed, added);
             }
         });
     numbers.lines_changed.replace(Some(id));
@@ -109,6 +147,9 @@ pub fn detach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
     if let Some(id) = numbers.lines_changed.take() {
         editor.document().disconnect(id);
     }
+    if let Some(idle) = numbers.moves_idle.take() {
+        idle.remove();
+    }
     numbers.provider.remove_all();
     editor
         .view()
@@ -116,28 +157,60 @@ pub fn detach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
         .remove_provider(&numbers.provider);
 }
 
-/// Moves the numbers with lines `first..first + removed` replaced by `added` lines (inside the
-/// buffer's change: only the annotations change).
-fn follow(numbers: &Numbers, first: u32, removed: u32, added: u32) {
+/// Lines `first..first + removed` were replaced by `added` lines (inside the buffer's change):
+/// the numbers move at `HIGH_IDLE`, before the next frame, with the other changes made until
+/// then.
+fn follow_soon(numbers: &Rc<Numbers>, first: u32, removed: u32, added: u32) {
     if removed == added {
         return;
     }
-    let moved: Vec<(u32, String)> = numbers
-        .shown
-        .borrow()
-        .iter()
-        .filter_map(|(line, text)| {
-            let line = *line;
-            if line < first {
-                Some((line, text.clone()))
-            } else if line < first + removed {
+    let mut moves = numbers.moves.borrow_mut();
+    // Nothing shown moves unless a change before reaches it (the last number is the lowest).
+    if moves.is_empty()
+        && numbers
+            .shown
+            .borrow()
+            .last()
+            .is_none_or(|(line, _)| *line < first)
+    {
+        return;
+    }
+    moves.push((first, removed, added));
+    if numbers.moves_idle.borrow().is_some() {
+        return;
+    }
+    let weak = Rc::downgrade(numbers);
+    let idle = glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
+        if let Some(numbers) = weak.upgrade() {
+            numbers.moves_idle.take();
+            follow(&numbers);
+        }
+        glib::ControlFlow::Break
+    });
+    numbers.moves_idle.replace(Some(idle));
+}
+
+/// Moves the numbers with the line changes made since the last time, in order: each
+/// `(first, removed, added)` replaced lines `first..first + removed` by `added` lines.
+fn follow(numbers: &Numbers) {
+    let moves = numbers.moves.take();
+    if moves.is_empty() {
+        return;
+    }
+    let mut moved: Vec<(u32, String)> = numbers.shown.borrow().clone();
+    for (first, removed, added) in moves {
+        moved.retain_mut(|(line, _)| {
+            if *line < first {
+                true
+            } else if *line < first + removed {
                 // A changed line keeps its number while it still exists.
-                (line - first < added).then(|| (line, text.clone()))
+                *line - first < added
             } else {
-                Some((line + added - removed, text.clone()))
+                *line = *line + added - removed;
+                true
             }
-        })
-        .collect();
+        });
+    }
     show(numbers, moved);
 }
 
@@ -147,6 +220,7 @@ fn show(numbers: &Numbers, wanted: Vec<(u32, String)>) {
         return;
     }
     numbers.provider.remove_all();
+    numbers.rebuilds.set(numbers.rebuilds.get() + 1);
     for (line, text) in &wanted {
         let Ok(line) = i32::try_from(*line) else {
             continue;
@@ -173,6 +247,7 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
         return;
     }
     if !state.config.editor.equation_numbers {
+        numbers.moves.borrow_mut().clear();
         show(&numbers, Vec::new());
         numbers.source.set(0);
         return;
@@ -183,11 +258,12 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
     }
     let index = state.workspace.index.borrow();
     if index.aux.labels.is_empty() {
+        numbers.moves.borrow_mut().clear();
         show(&numbers, Vec::new());
         numbers.source.set(0);
         return;
     }
-    // Nothing new since the last time: the numbers followed the edits already.
+    // Nothing new since the last time: the numbers follow the edits already.
     let path = doc.path();
     let file = index
         .files
@@ -196,7 +272,7 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
         .cloned();
     let source = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        index.aux.labels.hash(&mut hasher);
+        aux_hash(&index.aux).hash(&mut hasher);
         if let Some(file) = &file {
             for label in &file.labels {
                 (&label.name, &label.env, label.line).hash(&mut hasher);
@@ -209,6 +285,8 @@ pub fn refresh(state: &WindowState, editor: &Editor) {
     }
     numbers.dirty.set(false);
     numbers.source.set(source);
+    // The live text has the line changes not followed yet.
+    numbers.moves.borrow_mut().clear();
     // The labels of the live text, by line.
     let labels: Vec<(u32, String)> = doc.with_text(|text| {
         let states = doc.line_states.borrow();
@@ -297,6 +375,11 @@ pub fn shown(editor: &Editor) -> Vec<(u32, String)> {
     lookup(editor).map_or_else(Vec::new, |n| n.shown.borrow().clone())
 }
 
+/// How many times `editor`'s numbers were added again (tests).
+pub fn rebuilds(editor: &Editor) -> u64 {
+    lookup(editor).map_or(0, |n| n.rebuilds.get())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,10 +400,10 @@ mod tests {
             PathBuf::from("/p/ch.tex"),
             Arc::new(index_file("\\section{Chapter}\\label{sec:ch}\n")),
         );
-        index.aux = lemma_syntax::parse_aux(
+        index.aux = Arc::new(lemma_syntax::parse_aux(
             "\\newlabel{sec:intro}{{1}{1}}\n\\newlabel{thm:main}{{1.1}{1}}\n\
              \\newlabel{eq:a}{{1}{1}}\n\\newlabel{eq:b}{{2}{1}}\n\\newlabel{sec:ch}{{2}{2}}\n",
-        );
+        ));
         let file = index.files[&PathBuf::from("/p/main.tex")].clone();
         // The live text: the labels of the index plus one only the project knows (`sec:ch`
         // moved here since the last indexing) and one the build did not number.

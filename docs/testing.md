@@ -422,7 +422,34 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   of a float without a label (only the structure pass records it, `EnvPair::caption`) and an
   emptied short form update their rows. `lemma-syntax` `structure_index` `float_captions`
   checks what the structure pass records (subfigures, `\caption*`, an empty short form,
-  verbatim).
+  verbatim). `edits_of_one_chapter_leave_the_others_alone` edits one chapter of a book: a line
+  break in its prose leaves the outline the same but for lines, so it is neither recomputed
+  nor patched (`OutlineStats::line_shifts`) while the rows move; a new section is one node
+  more and no other node is updated, and the cursor in it is followed; a line break at the start
+  of a heading's line, with another tab selected before the index catches up (which puts the
+  rows back on the index's lines), still ends with the rows on their new lines, and one at the
+  end of a heading's line, where the row stays, is not recomputed either.
+  `a_chapter_changed_on_disk_updates_the_tree` also writes lines above a closed chapter's rows:
+  the same outline but for lines, which no tab moved, goes to the new lines. The cache behind it is
+  tested GUI-free (`outline_panel::tests::the_cache_recomputes_only_what_changed`): every
+  outline equals the one `build_outline` makes from scratch, and the rows under the files that
+  did not change are the same `Rc` as before.
+- **The label checks and what changed:** `labels::scan::tests::
+  undefined_check_is_undefined_after_every_change` compares the incremental check
+  (`UndefinedCheck`) with `undefined` after every step of 40 random sessions (files edited,
+  indexed again unchanged, added and removed; the `.aux` and the bibliographies replaced,
+  emptied or gone; the index incomplete and complete again), and that a second look after a
+  step finds nothing to do; `undefined_check_looks_again_only_at_what_changed` counts the files
+  each change makes it look at. `gtk_labels` `undefined_checks_look_again_only_at_what_changed`
+  does the same in a window (`labels::checks_skipped`, `labels::files_checked`: prose typed
+  looks at nothing, a `\ref` at its file, a `\label` at its file and the file that refers to
+  it), and `undefined_references_wait_for_every_file_past_the_cap` opens a book of 305
+  chapters, more than a window reads from disk (`completion::MAX_DISK_FILES`): no reference is
+  checked then (`completion::index_capped`, `labels::labels_checked`), citations are, and with
+  ten chapters fewer the five past the cap are read and the references checked again.
+  `equation_numbers_from_aux_and_following_edits` records the equation numbers when the frame
+  clock lays out the next frame after two line changes: they are on the new lines already,
+  added again once (`annotations::rebuilds`).
 - Some GTK tests need real key events and start their own private Broadway daemon in a child
   process (`tests/broadway_input/`); others create second windows to make a window inactive
   (`gtk_regress2_f`). A test that loops on a GLib warning can write gigabytes of output: keep
@@ -490,6 +517,10 @@ check the budgets only in release builds:
 | `gtk_labels` `perf_equation_numbers_large_tex` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`: a refresh ≤ 15 ms median (measured 8 ms; 49 ms with a search per label), and the main loop's work after a new undefined reference is underlined ≤ 50 ms |
 | `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms, Alt+Y and Alt+N on the middle hunk (`decide_and_advance`) ≤ 50 ms median and the recompute after typing in a hunk ≤ 40 ms (measured 20 ms and 18 ms; 0.43 s and 0.37 s while the overlay re-tagged every added line and changed word, with a tag per hunk that moved for every hunk after a decided one); prints a line break above the hunks and accepting the last one (with the main loop's work after it) |
 | `gtk_review` `perf_review_5000_hunks` | 5000 one-line hunks of agent turns in a 15 000-line file: a keystroke outside them ≤ 2 ms p99 (measured 0.25 ms, 0.46 ms with a tag per hunk; the same keys with no review are printed, 0.05 ms), Accept all in the file and Keep Turn ≤ 300 ms, Reject all and Reject Turn ≤ 300 ms more than the same 10 000 buffer changes cost without a review (measured 0.10 s, 0.10 s, 0.40 s and 0.38 s, the buffer changes alone 0.20 s; 0.67 s, 0.64 s, 1.3 s and 2.2 s with a tag per hunk); prints the agent's write and the main loop's work after each |
+| `gtk_labels` `perf_equation_numbers_follow_lines` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`, on the CPU: a line break above them ≤ 1 ms median inside the change (measured 0.07 ms; 2.6 ms while the numbers were added again there), and ten line changes made at once, with what is ready to run after them, ≤ 10 ms median (measured 3.0 ms, once; 26 ms, once per change). The line break with what runs after it, before the next frame, is printed (2.6–2.7 ms either way) |
+| `gtk_labels` `perf_undefined_check_big_project` | the undefined-reference check on a generated book (`tests/common/big_project.rs`: 300 chapters, 20k labels, 30k references, 40k citations, a 10k-entry bibliography and an `.aux`), once a chapter was indexed again, on the CPU (the time spent waiting for one left out): ≤ 1 ms median after prose, ≤ 8 ms after Enter, a `\ref`, a `\label` and a reference to nothing (measured 0.08 ms after prose and 0.5–3 ms after the others; 22–34 ms before, when every check went through the whole project) |
+| `gtk_outline` `perf_outline_big_project` | the Outline of that book (16 500 rows) looking at the index once the chapter was indexed again, on the CPU: ≤ 1 ms median after Enter, a `\label` or a `\ref` in prose (the same but for lines: nothing recomputed), ≤ 10 ms after a new `\section` (measured 0.16–0.26 ms and 3.7 ms; 34–40 ms before, when every change recomputed and patched the whole outline) |
+| `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms; prints a line break above the hunks and accepting one (with the main loop's work after it) |
 
 `perf_completion_keystroke` lays the document out before it measures and reports the window
 frames Broadway renders meanwhile separately (about 40–50 ms each in software, about once a

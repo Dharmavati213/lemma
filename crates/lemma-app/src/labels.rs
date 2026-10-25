@@ -31,7 +31,12 @@
 //!   moment after typing stops (once the project index has caught up; the project's words,
 //!   rebuilt later, are not waited for), and after another program changed a file the index
 //!   has (a re-exported `.bib`, a chapter changed by `git checkout`). Citations are checked
-//!   only when every bibliography the project names could be read.
+//!   only when every bibliography the project names could be read, references only when the
+//!   index has every file the project includes (not in a project with more files than a window
+//!   reads from disk, `completion::MAX_DISK_FILES`; the log says so once). A check looks again
+//!   only at what the project index replaced since the last one ([`scan::UndefinedCheck`]):
+//!   after prose typed, nothing; after an edit of a chapter, that chapter and the references
+//!   to a label it added or removed.
 //! - **Unused** labels and bibliography entries ([`unused`]) are listed on demand, never
 //!   underlined: `win.unused-labels` ("Unused Labels and Entries…" in the main menu's Go
 //!   section, the command palette, and the actions of every row of the Problems page's
@@ -97,12 +102,19 @@ struct Labels {
     state: Weak<WindowState>,
     /// The undefined names of the last check, by path.
     undefined: RefCell<BTreeMap<PathBuf, Vec<Finding>>>,
+    /// What they are computed from, kept between checks (see [`scan::UndefinedCheck`]).
+    scan: RefCell<scan::UndefinedCheck>,
     /// Citations were checked by the last check.
     cites_checked: Cell<bool>,
+    /// The log said that references are not checked (the project has more files than the
+    /// index reads from disk).
+    said_capped: Cell<bool>,
     /// The checks run once the timer fires and the project index is idle.
     timer: RefCell<Option<glib::SourceId>>,
-    /// Checks done (tests wait for them).
+    /// Checks done (tests wait for them), and those that found nothing changed since the last
+    /// one.
     checks: Cell<u64>,
+    skipped: Cell<u64>,
     editors: RefCell<Vec<Attached>>,
 }
 
@@ -135,9 +147,12 @@ pub fn install(state: &Rc<WindowState>) {
     let labels = Rc::new(Labels {
         state: Rc::downgrade(state),
         undefined: RefCell::new(BTreeMap::new()),
+        scan: RefCell::new(scan::UndefinedCheck::default()),
         cites_checked: Cell::new(false),
+        said_capped: Cell::new(false),
         timer: RefCell::new(None),
         checks: Cell::new(0),
+        skipped: Cell::new(0),
         editors: RefCell::new(Vec::new()),
     });
     WINDOWS.with_borrow_mut(|windows| {
@@ -328,22 +343,51 @@ pub fn check_pending(state: &WindowState) -> bool {
     labels_of(state).is_some_and(|l| l.timer.borrow().is_some())
 }
 
-/// How many checks ran in `state`'s window (tests).
+/// How many checks ran in `state`'s window (tests), skipped ones too.
 pub fn checks_done(state: &WindowState) -> u64 {
     labels_of(state).map_or(0, |l| l.checks.get())
 }
 
+/// How many of the checks found nothing their findings come from changed since the one before
+/// (prose typed), so they looked at nothing again (tests).
+pub fn checks_skipped(state: &WindowState) -> u64 {
+    labels_of(state).map_or(0, |l| l.skipped.get())
+}
+
+/// How many times the checks looked at the references or citations of a file, in all (tests).
+pub fn files_checked(state: &WindowState) -> u64 {
+    labels_of(state).map_or(0, |l| l.scan.borrow().files_checked())
+}
+
 fn check(state: &Rc<WindowState>, labels: &Rc<Labels>) {
     labels.checks.set(labels.checks.get() + 1);
-    let found = scan::undefined(&state.workspace.index.borrow());
-    let mut by_path: BTreeMap<PathBuf, Vec<Finding>> = BTreeMap::new();
-    for finding in found.findings {
-        by_path
-            .entry(finding.path.clone())
-            .or_default()
-            .push(finding);
+    // Files the project includes past the cap of files read from disk are not indexed: a
+    // reference to a label in one of them would look undefined.
+    let complete = !completion::index_capped(state);
+    if !complete && !labels.said_capped.replace(true) {
+        tracing::info!(
+            "the project has more files than the {} read from disk: undefined references are \
+             not checked",
+            completion::MAX_DISK_FILES
+        );
     }
-    labels.cites_checked.set(found.cites_checked);
+    if !labels
+        .scan
+        .borrow_mut()
+        .update(&state.workspace.index.borrow(), complete)
+    {
+        // Nothing the findings come from changed (prose typed): the underlines and the
+        // Problems page stand. The equation numbers look at their own inputs.
+        labels.skipped.set(labels.skipped.get() + 1);
+        for editor in state.editors() {
+            annotations::refresh(state, &editor);
+        }
+        return;
+    }
+    let by_path = labels.scan.borrow().by_path();
+    labels
+        .cites_checked
+        .set(labels.scan.borrow().cites_checked());
     let changed_paths: BTreeSet<PathBuf> = {
         let old = labels.undefined.borrow();
         old.keys()
@@ -383,6 +427,12 @@ pub fn undefined(state: &WindowState) -> Vec<Finding> {
 /// Whether the last check looked at citations (every bibliography could be read).
 pub fn cites_checked(state: &WindowState) -> bool {
     labels_of(state).is_some_and(|l| l.cites_checked.get())
+}
+
+/// Whether the last check looked at references (the project index has every file of the
+/// project, see `completion::index_capped`).
+pub fn labels_checked(state: &WindowState) -> bool {
+    labels_of(state).is_some_and(|l| l.scan.borrow().labels_checked())
 }
 
 /// The findings of `path` (the index keys paths as the workspace does, or lexically).

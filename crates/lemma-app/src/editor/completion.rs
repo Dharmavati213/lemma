@@ -117,7 +117,7 @@ const REINDEX_DELAY: Duration = Duration::from_millis(300);
 /// Rebuild the project words this long after the last change.
 const WORDS_DELAY: Duration = Duration::from_millis(1500);
 /// At most this many files are indexed from disk per window.
-const MAX_DISK_FILES: usize = 300;
+pub const MAX_DISK_FILES: usize = 300;
 /// Files larger than this are not read.
 const MAX_FILE_BYTES: u64 = 4 << 20;
 /// Directories above an open document searched for its root (as the build does).
@@ -1734,6 +1734,14 @@ pub fn project_busy(state: &WindowState) -> bool {
     shared_of(state).is_some_and(|s| s.feed.busy())
 }
 
+/// True when the last discovery pass left files the project includes unread because a window
+/// reads at most [`MAX_DISK_FILES`] files from disk: the index lacks part of the project (its
+/// labels, macros and citations), so a reference to a label it does not have may well be
+/// defined (the label checks report none then).
+pub fn index_capped(state: &WindowState) -> bool {
+    shared_of(state).is_some_and(|s| s.feed.capped.get())
+}
+
 /// True while the project index itself has work queued or running: documents waiting to be
 /// re-indexed or being re-indexed, and files being read from disk. What waits for the index
 /// (the label checks, the Outline) waits for this, not for the words, the dictionary or the
@@ -1826,6 +1834,9 @@ struct Feed {
     searched: RefCell<HashSet<PathBuf>>,
     /// Files indexed from disk.
     disk_files: RefCell<HashSet<PathBuf>>,
+    /// The last discovery pass left files the project includes unread, the cap of files read
+    /// from disk reached ([`index_capped`]).
+    capped: Cell<bool>,
     /// `.tex` files found next to the open documents that are not (yet) known to belong to the
     /// project: they join the index once they include one of its files (a root of an open
     /// chapter), so unrelated documents never add their labels and macros.
@@ -1978,6 +1989,8 @@ struct Wanted {
     open_stems: Vec<String>,
     theorems: Theorems,
     budget: usize,
+    /// Files the project includes are left out: they are past the budget.
+    capped: bool,
 }
 
 impl Wanted {
@@ -2312,6 +2325,7 @@ impl Shared {
             return;
         };
         let wanted = self.wanted(&state);
+        self.feed.capped.set(wanted.capped);
         if wanted.is_empty() {
             return;
         }
@@ -2367,6 +2381,8 @@ impl Shared {
                 want_file(root, &mut wanted);
             }
         }
+        // What the project includes (the files added below are read again or local packages).
+        let included: HashSet<PathBuf> = wanted.files.iter().cloned().collect();
         for path in stale.iter() {
             if index.files.contains_key(path) && path.extension().is_some_and(|e| e == "tex") {
                 want_file(path.clone(), &mut wanted);
@@ -2394,6 +2410,11 @@ impl Shared {
             .take_while(|p| disk_files.contains(*p))
             .count();
         drop(disk_files);
+        wanted.capped = wanted
+            .files
+            .iter()
+            .skip(wanted.budget)
+            .any(|p| included.contains(p));
         // Bibliographies.
         let mut bib_seen = HashSet::new();
         for (path, file) in &index.files {
@@ -2547,8 +2568,12 @@ impl Shared {
         }
         if let Some((root, aux)) = found.aux {
             self.feed.stale.borrow_mut().remove(&root);
-            let new = state.workspace.index.borrow().aux != aux;
-            state.workspace.index.borrow_mut().aux = aux;
+            // Replaced only when the numbers changed: what is computed from them tells a new
+            // `.aux` by its `Arc` (a build that changed no label leaves the checks nothing).
+            let new = *state.workspace.index.borrow().aux != aux;
+            if new {
+                state.workspace.index.borrow_mut().aux = Arc::new(aux);
+            }
             self.feed.aux_root.replace(Some(root));
             changed |= new;
         }
@@ -2680,7 +2705,7 @@ impl Shared {
             .as_ref()
             .is_none_or(|aux| keep.contains(aux) || root.as_ref() == Some(aux));
         if !aux_kept {
-            state.workspace.index.borrow_mut().aux = AuxInfo::default();
+            state.workspace.index.borrow_mut().aux = Arc::default();
             self.feed.aux_root.replace(None);
         }
         self.feed

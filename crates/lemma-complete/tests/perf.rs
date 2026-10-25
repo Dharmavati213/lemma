@@ -76,7 +76,7 @@ fn project() -> (ProjectIndex, Vec<String>) {
     }
     idx.bibs
         .insert(PathBuf::from("/p/refs.bib"), Arc::new(scan_bib(&bib)));
-    idx.aux = parse_aux(&fixture("proj/main.aux"));
+    idx.aux = Arc::new(parse_aux(&fixture("proj/main.aux")));
     (idx, texts)
 }
 

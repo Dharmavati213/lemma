@@ -17,11 +17,17 @@ const MAX_DEPTH: usize = 64;
 const INCLUDER_ANCESTORS: usize = 6;
 
 /// Lives on the main thread; workers send new [`FileIndex`]es and bib entries to merge in.
+///
+/// Every part is shared and replaced, never changed in place: a new entry for a file whose
+/// structure changed, the entries of a bibliography read again, the `.aux` numbers of a build
+/// that changed them. So what is computed from the index can tell what changed since by the
+/// `Arc`s (`Arc::ptr_eq`, or a `Weak` held to keep an address from being reused), without
+/// comparing contents.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectIndex {
     pub files: BTreeMap<PathBuf, Arc<FileIndex>>,
     pub bibs: BTreeMap<PathBuf, Arc<Vec<BibEntry>>>,
-    pub aux: AuxInfo,
+    pub aux: Arc<AuxInfo>,
 }
 
 impl ProjectIndex {

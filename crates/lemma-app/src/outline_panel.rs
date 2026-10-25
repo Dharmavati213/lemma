@@ -56,9 +56,9 @@
 //! page): the page is brought up to date when it is mapped. While it is shown:
 //! - a keystroke costs a few microseconds: a document change only (re)arms a 100 ms watch, a
 //!   change of the line count shifts the lines of that file's rows (so a click lands on the right
-//!   line before the project index catches up; once it has, the rows that moved take its lines
-//!   again, even when its entries came back the same), and a cursor move queues one idle
-//!   `follow`;
+//!   line before the project index catches up; once it has, rows that were on the lines a change
+//!   replaced, moved at a guess, take its lines again, even when its entries came back the
+//!   same), and a cursor move queues one idle `follow`;
 //! - the watch compares the project index's per-file `Arc`s (`state.workspace.index`, kept by
 //!   completion's project feed on the jobs thread 300 ms after typing stops; a file whose index
 //!   comes out the same, as after typing prose, keeps its `Arc`) and the `.aux` generation with
@@ -67,7 +67,13 @@
 //!   so their expanded state and selection), changed rows are updated in place, and only rows
 //!   that appeared are created. The watch stops when the project index is idle
 //!   (`completion::index_busy`: the word list rebuilt later does not count) and nothing changed
-//!   for two ticks.
+//!   for two ticks;
+//! - what the outline is computed from in each file is kept (`OutlineCache`), so a change of
+//!   one file computes that file's rows again, and the patch skips the rows under the files
+//!   that did not change; a change that leaves the file's rows as they were but for their lines
+//!   (Enter typed in a paragraph, a `\ref` or `\label` added to it) is neither recomputed nor
+//!   patched when the rows are on the new lines already (they followed the edits in a tab; not
+//!   after another program changed the file).
 //!
 //! The project index has no change signal, so the watch is armed by the events that change it:
 //! document changes, tabs opened, closed and selected, the project root moving, finished
@@ -770,10 +776,10 @@ fn norm_words(title: &str) -> String {
 }
 
 /// A row or contents line as [`align`] compares them.
-#[derive(Clone, Debug)]
-struct AlignKey {
+#[derive(Clone, Copy, Debug)]
+struct AlignKey<'a> {
     level: u8,
-    words: String,
+    words: &'a str,
     /// Rows: unnumbered. Contents lines: without a number.
     unnumbered: bool,
 }
@@ -810,53 +816,118 @@ fn align(rows: &[AlignKey], lines: &[AlignKey]) -> Vec<Option<usize>> {
     out
 }
 
-/// One step of the document-order walk that [`build_outline`] makes.
-enum Ev {
-    Item(Entry),
-    /// An included file: its row and the lowest heading level inside it.
-    Enter(Entry, u8),
-    Leave,
-}
-
 /// Builds the outline of `root`'s project from the project index and the `.aux` of the last
 /// build.
 pub fn build_outline(index: &ProjectIndex, root: &Path, aux: &AuxData) -> Vec<Entry> {
-    let root_dir = root.parent().map(lexical_normalize).unwrap_or_default();
-    let mut builder = Builder {
-        index,
-        aux,
-        theorem_names: theorem_names(index),
-        root_dir: root_dir.clone(),
-        seen: HashSet::from([root.to_path_buf(), lexical_normalize(root)]),
-    };
-    let mut evs = builder.file_events(root, &root_dir, true, true, 0);
-    number_events(&mut evs, aux);
-    assemble(evs)
+    let outline = OutlineCache::default().build(index, root, &Rc::new(aux.clone()), false);
+    outline.rows.iter().map(Row::to_entry).collect()
 }
 
-struct Builder<'a> {
-    index: &'a ProjectIndex,
-    aux: &'a AuxData,
-    theorem_names: HashMap<String, String>,
-    root_dir: PathBuf,
-    seen: HashSet<PathBuf>,
+/// A row of the outline as the page computes it, and the rows under it. The rows under an
+/// included file are shared from one outline to the next while nothing they come from changed
+/// (see [`OutlineCache`]), so the page's patch skips them.
+#[derive(Debug)]
+struct Row {
+    shown: Shown,
+    children: Rc<Vec<Row>>,
 }
 
-impl Builder<'_> {
-    /// The events of `path`'s rows and those of the files it includes. `base` is the directory
-    /// its includes are relative to; `in_body`: the file is read inside the document body.
-    fn file_events(
-        &mut self,
+/// What a [`Row`] shows.
+#[derive(Debug)]
+enum Shown {
+    /// A row of a file (its `row`-th), with the number the `.aux` gives it and, for a float
+    /// without a caption, the title of its line in the list of figures or tables.
+    Part {
+        rows: Rc<FileRows>,
+        row: usize,
+        number: Option<Rc<str>>,
+        title: Option<Rc<str>>,
+    },
+    /// An included file.
+    File(Box<Entry>),
+}
+
+impl Row {
+    /// The entry shown, but for the number and the title of [`Row::number`] and [`Row::title`]
+    /// (and without children).
+    fn entry(&self) -> &Entry {
+        match &self.shown {
+            Shown::Part { rows, row, .. } => &rows.rows[*row].entry,
+            Shown::File(entry) => entry,
+        }
+    }
+
+    fn number(&self) -> Option<&str> {
+        match &self.shown {
+            Shown::Part { number, .. } => number.as_deref(),
+            Shown::File(_) => None,
+        }
+    }
+
+    fn title(&self) -> &str {
+        match &self.shown {
+            Shown::Part {
+                title: Some(title), ..
+            } => title,
+            _ => &self.entry().title,
+        }
+    }
+
+    /// The row as an [`Entry`] with its children, as [`build_outline`] returns it.
+    fn to_entry(&self) -> Entry {
+        Entry {
+            number: self.number().map(str::to_owned),
+            title: self.title().to_owned(),
+            children: self.children.iter().map(Row::to_entry).collect(),
+            ..self.entry().clone()
+        }
+    }
+}
+
+/// What a file gives the outline, computed from its index entry alone: its rows (without their
+/// numbers) and its TeX includes, and their document order.
+#[derive(Debug)]
+struct FileRows {
+    order: Vec<Part>,
+    rows: Vec<FileRow>,
+    /// Each include, and whether the file reads it in the document body (not in the root's
+    /// preamble, not inside a float).
+    includes: Vec<(Include, bool)>,
+    /// The file is a document of its own (`\documentclass` and `\begin{document}`), which may
+    /// be the outline's root.
+    document: bool,
+}
+
+/// A place in [`FileRows::order`]: a row or an include, by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    Row(usize),
+    Include(usize),
+}
+
+/// A heading, theorem or float of a file.
+#[derive(Debug)]
+struct FileRow {
+    /// Without its number.
+    entry: Entry,
+    /// The label whose `.aux` number it shows.
+    label: Option<String>,
+    /// A heading's or a float's title as contents lines are compared with it
+    /// ([`norm_words`]).
+    words: String,
+    /// A float: the list it is in.
+    list: Option<FloatList>,
+}
+
+impl FileRows {
+    /// The rows of the file at `path` (indexed as `idx`; `is_root`: the project's root, whose
+    /// preamble has no rows), with the theorem environments called `names`.
+    fn new(
+        names: &HashMap<String, String>,
         path: &Path,
-        base: &Path,
-        in_body: bool,
+        idx: &FileIndex,
         is_root: bool,
-        depth: usize,
-    ) -> Vec<Ev> {
-        let Some(idx) = self.index.files.get(path) else {
-            return Vec::new();
-        };
-        let idx = idx.clone();
+    ) -> FileRows {
         let body_from = if is_root {
             idx.envs
                 .iter()
@@ -867,21 +938,20 @@ impl Builder<'_> {
         };
         let in_preamble = |line: u32| body_from.is_some_and(|b| line < b);
         // Three runs in line order, merged at the end: headings and theorems, floats, files.
-        let mut items: Vec<(u32, Ev)> = Vec::with_capacity(idx.outline.len());
-        let mut float_items: Vec<(u32, Ev)> = Vec::new();
-        let mut files: Vec<(u32, Vec<Ev>)> = Vec::new();
+        let mut items: Vec<(u32, FileRow)> = Vec::with_capacity(idx.outline.len());
+        let mut float_items: Vec<(u32, FileRow)> = Vec::new();
         // Headings and theorems.
         for (k, item) in idx.outline.iter().enumerate() {
             if in_preamble(item.line) {
                 continue;
             }
             let next_line = idx.outline.get(k + 1).map_or(u32::MAX, |n| n.line);
-            let entry = if item.level <= 6 {
-                self.heading(path, &idx, item, next_line)
+            let row = if item.level <= 6 {
+                heading(path, idx, item, next_line)
             } else {
-                self.theorem(path, &idx, item)
+                theorem(names, path, idx, item)
             };
-            items.push((item.line, Ev::Item(entry)));
+            items.push((item.line, row));
         }
         // Floats.
         let floats: Vec<(u32, Option<u32>)> = idx
@@ -897,108 +967,113 @@ impl Builder<'_> {
             if in_preamble(env.begin_line) {
                 continue;
             }
-            let entry = self.float(path, &idx, env, name);
-            float_items.push((env.begin_line, Ev::Item(entry)));
+            float_items.push((env.begin_line, float(path, idx, env, name)));
         }
         // Included files.
-        if depth < 64 {
-            let root_dir = self.root_dir.clone();
-            for inc in idx.includes.iter().filter(|i| is_tex_include(i.kind)) {
-                let child = self.resolve(inc, &[base, &root_dir]);
-                if !self.seen.insert(child.clone()) {
-                    continue;
-                }
+        let includes: Vec<(Include, bool)> = idx
+            .includes
+            .iter()
+            .filter(|i| is_tex_include(i.kind))
+            .map(|inc| {
                 let in_float = floats
                     .iter()
                     .any(|&(b, e)| inc.line >= b && e.is_none_or(|e| inc.line <= e));
-                let child_in_body = in_body && !in_preamble(inc.line) && !in_float;
-                let child_base = match inc.kind {
-                    IncludeKind::Subfile | IncludeKind::Import => {
-                        child.parent().map(Path::to_path_buf).unwrap_or_default()
-                    }
-                    _ => base.to_path_buf(),
-                };
-                let indexed = self.index.files.contains_key(&child);
-                let inner = self.file_events(&child, &child_base, child_in_body, false, depth + 1);
-                let has_rows = inner.iter().any(|e| matches!(e, Ev::Item(_)));
-                if !has_rows && !child_in_body {
-                    continue;
-                }
-                let min_level = inner
-                    .iter()
-                    .filter_map(|e| match e {
-                        Ev::Item(x) if x.kind == EntryKind::Heading => Some(x.level),
-                        _ => None,
-                    })
-                    .min()
-                    .unwrap_or(u8::MAX);
-                let title = child
-                    .strip_prefix(&self.root_dir)
-                    .unwrap_or(&child)
-                    .display()
-                    .to_string();
-                let file = Entry {
-                    kind: EntryKind::File,
-                    level: LEVEL_FILE,
-                    number: None,
-                    name: None,
-                    title,
-                    starred: false,
-                    path: child.clone(),
-                    line: 0,
-                    end_line: None,
-                    find: None,
-                    indexed,
-                    children: Vec::new(),
-                };
-                let mut events = Vec::with_capacity(inner.len() + 2);
-                events.push(Ev::Enter(file, min_level));
-                events.extend(inner);
-                events.push(Ev::Leave);
-                files.push((inc.line, events));
-            }
-        }
+                (inc.clone(), !in_preamble(inc.line) && !in_float)
+            })
+            .collect();
         // Each run is in line order already; on the same line, headings come first, then
         // floats, then files.
-        let mut out = Vec::with_capacity(items.len() + float_items.len() + files.len());
+        let mut rows = Vec::with_capacity(items.len() + float_items.len());
+        let mut order = Vec::with_capacity(items.len() + float_items.len() + includes.len());
         let mut items = items.into_iter().peekable();
         let mut float_items = float_items.into_iter().peekable();
-        let mut files = files.into_iter().peekable();
+        let mut files = includes
+            .iter()
+            .map(|(inc, _)| inc.line)
+            .enumerate()
+            .peekable();
         loop {
             let next = [
                 items.peek().map(|(l, _)| (*l, 0)),
                 float_items.peek().map(|(l, _)| (*l, 1)),
-                files.peek().map(|(l, _)| (*l, 2)),
+                files.peek().map(|(_, l)| (*l, 2)),
             ]
             .into_iter()
             .flatten()
             .min();
-            match next {
-                Some((_, 0)) => out.extend(items.next().map(|(_, e)| e)),
-                Some((_, 1)) => out.extend(float_items.next().map(|(_, e)| e)),
-                Some(_) => out.extend(files.next().into_iter().flat_map(|(_, e)| e)),
-                None => return out,
+            let row = match next {
+                Some((_, 0)) => items.next(),
+                Some((_, 1)) => float_items.next(),
+                Some(_) => {
+                    order.extend(files.next().map(|(k, _)| Part::Include(k)));
+                    continue;
+                }
+                None => break,
+            };
+            if let Some((_, row)) = row {
+                order.push(Part::Row(rows.len()));
+                rows.push(row);
             }
+        }
+        FileRows {
+            order,
+            rows,
+            includes,
+            document: idx.has_documentclass && idx.has_begin_document,
         }
     }
 
-    fn heading(&self, path: &Path, idx: &FileIndex, item: &OutlineItem, next_line: u32) -> Entry {
-        // A label right after the heading (its line or the next, before the next row).
-        let number = if item.starred {
-            None
-        } else {
-            let from = idx.labels.partition_point(|l| l.line < item.line);
-            let last = (item.line + 1).min(next_line.saturating_sub(1).max(item.line));
-            idx.labels[from..]
+    /// The same includes as `other` (lines aside), and both documents of their own or not:
+    /// what the files in the outline and its root depend on.
+    fn same_includes(&self, other: &FileRows) -> bool {
+        self.document == other.document
+            && self.includes.len() == other.includes.len()
+            && self
+                .includes
                 .iter()
-                .take_while(|l| l.line <= last)
-                .find(|l| l.env.is_none() && l.title.as_deref() == Some(item.title.as_str()))
-                .and_then(|l| self.label_number(&l.name))
-        };
+                .zip(&other.includes)
+                .all(|((a, a_body), (b, b_body))| {
+                    a_body == b_body && a.kind == b.kind && a.target == b.target
+                })
+    }
+
+    /// Equal to `other` but for the lines of rows and includes.
+    fn same_but_lines(&self, other: &FileRows) -> bool {
+        self.same_includes(other)
+            && self.order == other.order
+            && self.rows.iter().zip(&other.rows).all(|(a, b)| {
+                let (x, y) = (&a.entry, &b.entry);
+                a.label == b.label
+                    && x.kind == y.kind
+                    && x.level == y.level
+                    && x.name == y.name
+                    && x.title == y.title
+                    && x.starred == y.starred
+                    && x.path == y.path
+                    && x.find == y.find
+            })
+    }
+}
+
+/// A heading's row, and the label right after it (on its line or the next, before the next
+/// row), whose number it shows.
+fn heading(path: &Path, idx: &FileIndex, item: &OutlineItem, next_line: u32) -> FileRow {
+    let label = if item.starred {
+        None
+    } else {
+        let from = idx.labels.partition_point(|l| l.line < item.line);
+        let last = (item.line + 1).min(next_line.saturating_sub(1).max(item.line));
+        idx.labels[from..]
+            .iter()
+            .take_while(|l| l.line <= last)
+            .find(|l| l.env.is_none() && l.title.as_deref() == Some(item.title.as_str()))
+            .map(|l| l.name.clone())
+    };
+    file_row(
         Entry {
             kind: EntryKind::Heading,
             level: item.level,
-            number,
+            number: None,
             name: None,
             title: pretty_title(&item.title),
             starred: item.starred,
@@ -1008,27 +1083,36 @@ impl Builder<'_> {
             find: Some(HEADING_COMMANDS[usize::from(item.level.min(6))].to_owned()),
             indexed: true,
             children: Vec::new(),
-        }
-    }
+        },
+        label,
+    )
+}
 
-    fn theorem(&self, path: &Path, idx: &FileIndex, item: &OutlineItem) -> Entry {
-        let env = item.env.clone().unwrap_or_default();
-        let end_line = env_end(idx, &env, item.line);
-        let from = idx.labels.partition_point(|l| l.line < item.line);
-        let number = (!item.starred)
-            .then(|| {
-                idx.labels[from..]
-                    .iter()
-                    .take_while(|l| end_line.is_none_or(|e| l.line <= e))
-                    .find(|l| l.env.as_deref() == Some(env.as_str()))
-                    .and_then(|l| self.label_number(&l.name))
-            })
-            .flatten();
+/// A theorem's row (its environment called as `names` says), and the label inside it.
+fn theorem(
+    names: &HashMap<String, String>,
+    path: &Path,
+    idx: &FileIndex,
+    item: &OutlineItem,
+) -> FileRow {
+    let env = item.env.clone().unwrap_or_default();
+    let end_line = env_end(idx, &env, item.line);
+    let from = idx.labels.partition_point(|l| l.line < item.line);
+    let label = (!item.starred)
+        .then(|| {
+            idx.labels[from..]
+                .iter()
+                .take_while(|l| end_line.is_none_or(|e| l.line <= e))
+                .find(|l| l.env.as_deref() == Some(env.as_str()))
+                .map(|l| l.name.clone())
+        })
+        .flatten();
+    file_row(
         Entry {
             kind: EntryKind::Theorem,
             level: LEVEL_THEOREM,
-            number,
-            name: Some(theorem_name(&self.theorem_names, &env)),
+            number: None,
+            name: Some(theorem_name(names, &env)),
             title: pretty_title(&item.title),
             starred: item.starred,
             path: path.to_path_buf(),
@@ -1037,41 +1121,44 @@ impl Builder<'_> {
             find: Some(format!("\\begin{{{env}}}")),
             indexed: true,
             children: Vec::new(),
-        }
-    }
+        },
+        label,
+    )
+}
 
-    fn float(&self, path: &Path, idx: &FileIndex, pair: &EnvPair, name: &str) -> Entry {
-        let (env, begin, end) = (pair.name.as_str(), pair.begin_line, pair.end_line);
-        let from = idx.labels.partition_point(|l| l.line < begin);
-        let label = idx.labels[from..]
-            .iter()
-            .take_while(|l| end.is_none_or(|e| l.line <= e))
-            .find(|l| {
-                l.env.as_deref().is_some_and(|e| {
-                    e == env
-                        || matches!(
-                            e,
-                            "center" | "centering" | "flushleft" | "flushright" | "minipage"
-                        )
-                })
-            });
-        let number = label.and_then(|l| self.label_number(&l.name));
-        let title = pair
-            .caption
-            .as_deref()
-            .map(pretty_title)
-            .filter(|title| !title.is_empty())
-            .or_else(|| {
-                // A label's title is the caption when the caption came first.
-                let title = label?.title.as_deref()?;
-                let heading = idx.outline.iter().any(|o| o.title == title);
-                (!heading).then(|| pretty_title(title))
+/// A float's row (a figure, table or algorithm: `name`), and the label inside it.
+fn float(path: &Path, idx: &FileIndex, pair: &EnvPair, name: &str) -> FileRow {
+    let (env, begin, end) = (pair.name.as_str(), pair.begin_line, pair.end_line);
+    let from = idx.labels.partition_point(|l| l.line < begin);
+    let label = idx.labels[from..]
+        .iter()
+        .take_while(|l| end.is_none_or(|e| l.line <= e))
+        .find(|l| {
+            l.env.as_deref().is_some_and(|e| {
+                e == env
+                    || matches!(
+                        e,
+                        "center" | "centering" | "flushleft" | "flushright" | "minipage"
+                    )
             })
-            .unwrap_or_default();
+        });
+    let title = pair
+        .caption
+        .as_deref()
+        .map(pretty_title)
+        .filter(|title| !title.is_empty())
+        .or_else(|| {
+            // A label's title is the caption when the caption came first.
+            let title = label?.title.as_deref()?;
+            let heading = idx.outline.iter().any(|o| o.title == title);
+            (!heading).then(|| pretty_title(title))
+        })
+        .unwrap_or_default();
+    file_row(
         Entry {
             kind: EntryKind::Float,
             level: LEVEL_FLOAT,
-            number,
+            number: None,
             name: Some(name.to_owned()),
             title,
             starred: false,
@@ -1081,33 +1168,720 @@ impl Builder<'_> {
             find: Some(format!("\\begin{{{env}}}")),
             indexed: true,
             children: Vec::new(),
+        },
+        label.map(|l| l.name.clone()),
+    )
+}
+
+fn file_row(entry: Entry, label: Option<String>) -> FileRow {
+    let contents = matches!(entry.kind, EntryKind::Heading | EntryKind::Float);
+    FileRow {
+        words: if contents {
+            norm_words(&entry.title)
+        } else {
+            String::new()
+        },
+        list: (entry.kind == EntryKind::Float).then(|| list_of(entry.name.as_deref())),
+        entry,
+        label,
+    }
+}
+
+/// What [`build_outline`] computes, kept from one outline to the next. A file's rows are
+/// computed again only when the project index has a new entry for it (it keeps a file's entry,
+/// its `Arc`, while the file's structure is the same) or the project's theorem environments
+/// changed, the numbers of their labels when the `.aux` changed, and the files its includes
+/// name when the index's files changed. The numbers from the contents lines (which follow the
+/// order of the whole project) are matched with the rows again for every outline, a pass over
+/// prepared keys. The rows under a file are assembled again only when its rows, their numbers
+/// or the files it includes changed, and are otherwise the same `Rc` as before.
+#[derive(Default)]
+struct OutlineCache {
+    /// The root and the display names of the theorem-like environments the rows were computed
+    /// for.
+    root: Option<PathBuf>,
+    theorem_names: HashMap<String, String>,
+    /// By path and whether the file was the root (whose preamble has no rows).
+    files: HashMap<(PathBuf, bool), CachedFile>,
+    /// The contents lines of the `.aux` the numbers come from, prepared for [`align`].
+    aux: Option<(Weak<AuxData>, Rc<AuxKeys>)>,
+    /// Counts the outlines built: a file the last one did not walk to goes.
+    generation: u64,
+    /// The rows under a file that is not indexed (shared, so it compares as the same).
+    empty: Rc<Vec<Row>>,
+}
+
+/// What [`OutlineCache`] keeps of a file.
+struct CachedFile {
+    /// The index entry the rows were computed from (held weakly: an entry the index replaced
+    /// has another address, which the weak reference keeps from being reused).
+    from: std::sync::Weak<FileIndex>,
+    rows: Rc<FileRows>,
+    /// The numbers of the rows' labels (by row) in an `.aux`.
+    numbers: Option<(Weak<AuxData>, Numbers)>,
+    /// The file each include names, and the directory they were looked for in.
+    resolved: Option<(PathBuf, Rc<Vec<PathBuf>>)>,
+    /// The rows under the file as last assembled, and what from.
+    tree: Option<(TreeInputs, Rc<Vec<Row>>)>,
+    /// The last outline that walked to the file.
+    generation: u64,
+}
+
+/// The contents lines of an `.aux` as rows are matched with them.
+struct AuxKeys {
+    toc: Vec<ContentsKey>,
+    figures: Vec<ContentsKey>,
+    tables: Vec<ContentsKey>,
+}
+
+struct ContentsKey {
+    level: u8,
+    words: String,
+    number: Option<Rc<str>>,
+    /// The line's title as the `.aux` has it (lists of figures and tables only: a float
+    /// without a caption shows it).
+    title: String,
+}
+
+impl AuxKeys {
+    fn new(aux: &AuxData) -> AuxKeys {
+        let toc = aux
+            .toc
+            .iter()
+            .filter_map(|c| {
+                let level = TOC_KINDS.iter().position(|k| *k == c.kind)?;
+                Some(ContentsKey {
+                    level: u8::try_from(level).ok()?,
+                    words: norm_words(&c.title),
+                    number: c.number.as_deref().map(Rc::from),
+                    title: String::new(),
+                })
+            })
+            .collect();
+        let list = |lines: &[ContentsLine]| {
+            lines
+                .iter()
+                .filter(|c| matches!(c.kind.as_str(), "figure" | "table"))
+                .map(|c| ContentsKey {
+                    level: 0,
+                    words: norm_words(&c.title),
+                    number: c.number.as_deref().map(Rc::from),
+                    title: c.title.clone(),
+                })
+                .collect()
+        };
+        AuxKeys {
+            toc,
+            figures: list(&aux.lof),
+            tables: list(&aux.lot),
         }
     }
+}
 
-    fn label_number(&self, label: &str) -> Option<String> {
-        self.aux
-            .labels
-            .get(label)
-            .map(|(number, _)| number.trim().to_owned())
-            .filter(|n| !n.is_empty())
+fn align_keys(lines: &[ContentsKey]) -> Vec<AlignKey<'_>> {
+    lines
+        .iter()
+        .map(|c| AlignKey {
+            level: c.level,
+            words: &c.words,
+            unnumbered: c.number.is_none(),
+        })
+        .collect()
+}
+
+/// The numbers of the labels of a file's rows (by row).
+type Numbers = Rc<Vec<Option<Rc<str>>>>;
+
+/// An include that gives a file row: its index among the file's includes, the file, whether
+/// it is indexed, the lowest heading level under it, and what is under it.
+#[derive(Debug)]
+struct Included<T> {
+    include: usize,
+    path: PathBuf,
+    indexed: bool,
+    min_level: u8,
+    under: T,
+}
+
+/// A number or title a row takes from a contents line (its label has no number, or a float has
+/// no caption): (row, number, title).
+type Override = (usize, Option<Rc<str>>, Option<Rc<str>>);
+
+/// What the rows under a file were assembled from.
+struct TreeInputs {
+    rows: Rc<FileRows>,
+    /// The numbers of the rows' labels, and what the contents lines give rows (by row).
+    labels: Numbers,
+    overrides: Vec<Override>,
+    /// The includes that give a file row, and the rows under each.
+    files: Vec<Included<Rc<Vec<Row>>>>,
+}
+
+impl TreeInputs {
+    fn same(&self, other: &TreeInputs) -> bool {
+        Rc::ptr_eq(&self.rows, &other.rows)
+            && Rc::ptr_eq(&self.labels, &other.labels)
+            && self.overrides == other.overrides
+            && self.files.len() == other.files.len()
+            && self.files.iter().zip(&other.files).all(|(a, b)| {
+                a.include == b.include
+                    && a.path == b.path
+                    && a.indexed == b.indexed
+                    && a.min_level == b.min_level
+                    && Rc::ptr_eq(&a.under, &b.under)
+            })
     }
+}
 
-    /// The file `inc` names: the first candidate that is indexed in one of `dirs`, else the
-    /// first candidate in the first directory (as `ProjectIndex::project_files` resolves).
-    fn resolve(&self, inc: &Include, dirs: &[&Path]) -> PathBuf {
-        let names = candidate_names(inc);
-        let mut first = None;
-        for dir in dirs {
-            for name in &names {
-                let path = lexical_join(dir, name);
-                if self.index.files.contains_key(&path) {
-                    return path;
-                }
-                first.get_or_insert(path);
+/// A file of the outline as the walk through the includes found it.
+struct Occurrence {
+    key: (PathBuf, bool),
+    rows: Rc<FileRows>,
+    labels: Numbers,
+    /// The includes that give a file row, and the occurrence of each (none: not indexed).
+    files: Vec<Included<Option<usize>>>,
+    /// It has rows, or a file under it has.
+    has_rows: bool,
+    /// The lowest heading level in it and under it.
+    min_level: u8,
+    /// What the contents lines give its rows, once numbered (by row).
+    overrides: Vec<Override>,
+}
+
+/// An outline [`OutlineCache::build`] computed: its top rows, and the highest (smallest)
+/// heading level in it (2, a section, when there is none).
+struct Outline {
+    rows: Rc<Vec<Row>>,
+    top_level: u8,
+}
+
+/// How the entries the project index replaced change the outline (see
+/// [`OutlineCache::replaced`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// It is the same but for lines.
+    Lines,
+    /// Its root and its files are the same, rows changed.
+    Rows,
+    /// Anything may have changed.
+    Files,
+}
+
+impl OutlineCache {
+    /// The outline of `root`'s project, as [`build_outline`] makes it. `same_files`: the index
+    /// has the files it had for the last one, so the files includes name are known still.
+    fn build(
+        &mut self,
+        index: &ProjectIndex,
+        root: &Path,
+        aux: &Rc<AuxData>,
+        same_files: bool,
+    ) -> Outline {
+        let names = theorem_names(index);
+        if names != self.theorem_names || self.root.as_deref() != Some(root) {
+            self.files.clear();
+            self.theorem_names = names;
+            self.root = Some(root.to_path_buf());
+        }
+        if !same_files {
+            for cached in self.files.values_mut() {
+                cached.resolved = None;
             }
         }
-        first.unwrap_or_default()
+        let keys = match &self.aux {
+            Some((from, keys)) if std::ptr::eq(from.as_ptr(), Rc::as_ptr(aux)) => keys.clone(),
+            _ => {
+                let keys = Rc::new(AuxKeys::new(aux));
+                self.aux = Some((Rc::downgrade(aux), keys.clone()));
+                keys
+            }
+        };
+        self.generation += 1;
+        let root_dir = root.parent().map(lexical_normalize).unwrap_or_default();
+        let mut walk = Walk {
+            index,
+            aux,
+            cache: self,
+            occurrences: Vec::new(),
+            root_dir: root_dir.clone(),
+            seen: HashSet::from([root.to_path_buf(), lexical_normalize(root)]),
+        };
+        let top = index
+            .files
+            .get(root)
+            .and_then(|idx| walk.file(root, idx, &root_dir, true, true, 0));
+        let mut occurrences = walk.occurrences;
+        // The files that are no longer in the outline go.
+        let generation = self.generation;
+        self.files
+            .retain(|_, cached| cached.generation == generation);
+        let Some(top) = top else {
+            return Outline {
+                rows: self.empty.clone(),
+                top_level: 2,
+            };
+        };
+        number_rows(&mut occurrences, top, &keys);
+        let level = occurrences[top].min_level;
+        Outline {
+            rows: self.tree(&mut occurrences, top, &root_dir),
+            top_level: if level == u8::MAX { 2 } else { level },
+        }
     }
+
+    /// The rows under occurrence `at`: as before when nothing they come from changed.
+    fn tree(&mut self, occurrences: &mut [Occurrence], at: usize, root_dir: &Path) -> Rc<Vec<Row>> {
+        let mut files = Vec::with_capacity(occurrences[at].files.len());
+        for file in std::mem::take(&mut occurrences[at].files) {
+            let under = match file.under {
+                Some(child) => self.tree(occurrences, child, root_dir),
+                None => self.empty.clone(),
+            };
+            files.push(Included {
+                include: file.include,
+                path: file.path,
+                indexed: file.indexed,
+                min_level: file.min_level,
+                under,
+            });
+        }
+        let occurrence = &mut occurrences[at];
+        let inputs = TreeInputs {
+            rows: occurrence.rows.clone(),
+            labels: occurrence.labels.clone(),
+            overrides: std::mem::take(&mut occurrence.overrides),
+            files,
+        };
+        let Some(cached) = self.files.get_mut(&occurrence.key) else {
+            return Rc::new(assemble(&inputs, root_dir, &self.empty));
+        };
+        if let Some((before, rows)) = &cached.tree
+            && before.same(&inputs)
+        {
+            return rows.clone();
+        }
+        let rows = Rc::new(assemble(&inputs, root_dir, &self.empty));
+        cached.tree = Some((inputs, rows.clone()));
+        rows
+    }
+
+    /// Takes in the entries the project index has for `paths` in place of the ones the last
+    /// outline was computed from (the index has the same files, `.aux`, active document and
+    /// build root): how that changes the outline. Each file must be in the outline: the rows
+    /// they give are compared with the ones they gave it. Then the outline is the same but for
+    /// lines (Enter typed above rows, a `\ref` or a `\label` added to a paragraph), or its root
+    /// and its files are the same (the files' includes are, and whether each is a document of
+    /// its own), as long as the theorem environments are the same too.
+    fn replaced(&mut self, index: &ProjectIndex, paths: &[PathBuf]) -> Change {
+        if theorem_names(index) != self.theorem_names {
+            return Change::Files;
+        }
+        let mut change = Change::Lines;
+        for path in paths {
+            let Some(idx) = index.files.get(path) else {
+                return Change::Files;
+            };
+            let keys = [(path.clone(), false), (path.clone(), true)];
+            if !keys.iter().any(|key| self.files.contains_key(key)) {
+                return Change::Files;
+            }
+            for key in keys {
+                let is_root = key.1;
+                let Some(cached) = self.files.get_mut(&key) else {
+                    continue;
+                };
+                let rows = FileRows::new(&self.theorem_names, path, idx, is_root);
+                if !rows.same_includes(&cached.rows) {
+                    return Change::Files;
+                }
+                if !rows.same_but_lines(&cached.rows) {
+                    change = Change::Rows;
+                }
+                cached.from = Arc::downgrade(idx);
+                cached.rows = Rc::new(rows);
+                cached.numbers = None;
+            }
+        }
+        change
+    }
+
+    /// The lines of the rows of the file at `path` (line and end line, sorted), as last
+    /// computed.
+    fn row_lines(&self, path: &Path) -> Vec<(u32, Option<u32>)> {
+        let mut lines: Vec<(u32, Option<u32>)> = [false, true]
+            .into_iter()
+            .filter_map(|is_root| self.files.get(&(path.to_path_buf(), is_root)))
+            .flat_map(|cached| cached.rows.rows.iter())
+            .map(|row| (row.entry.line, row.entry.end_line))
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+}
+
+/// The walk through the includes from the root that [`OutlineCache::build`] makes.
+struct Walk<'a> {
+    index: &'a ProjectIndex,
+    aux: &'a Rc<AuxData>,
+    cache: &'a mut OutlineCache,
+    occurrences: Vec<Occurrence>,
+    root_dir: PathBuf,
+    seen: HashSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    /// The occurrence of `path` (indexed as `idx`) and of the files it includes. `base` is the
+    /// directory its includes are relative to; `in_body`: the file is read inside the document
+    /// body.
+    fn file(
+        &mut self,
+        path: &Path,
+        idx: &Arc<FileIndex>,
+        base: &Path,
+        in_body: bool,
+        is_root: bool,
+        depth: usize,
+    ) -> Option<usize> {
+        let key = (path.to_path_buf(), is_root);
+        let (rows, labels, resolved) = self.rows(&key, idx, base);
+        let mut has_rows = !rows.rows.is_empty();
+        let mut min_level = rows
+            .rows
+            .iter()
+            .filter(|r| r.entry.kind == EntryKind::Heading)
+            .map(|r| r.entry.level)
+            .min()
+            .unwrap_or(u8::MAX);
+        let mut files = Vec::new();
+        for (k, ((inc, body), child)) in rows.includes.iter().zip(resolved.iter()).enumerate() {
+            if depth >= 64 {
+                break;
+            }
+            if !self.seen.insert(child.clone()) {
+                continue;
+            }
+            let child_in_body = in_body && *body;
+            let child_base = match inc.kind {
+                IncludeKind::Subfile | IncludeKind::Import => {
+                    child.parent().map(Path::to_path_buf).unwrap_or_default()
+                }
+                _ => base.to_path_buf(),
+            };
+            let child_idx = self.index.files.get(child);
+            let occurrence = child_idx.and_then(|idx| {
+                self.file(child, idx, &child_base, child_in_body, false, depth + 1)
+            });
+            let (child_rows, child_level) = occurrence.map_or((false, u8::MAX), |o| {
+                (self.occurrences[o].has_rows, self.occurrences[o].min_level)
+            });
+            if !child_rows && !child_in_body {
+                continue;
+            }
+            has_rows |= child_rows;
+            min_level = min_level.min(child_level);
+            files.push(Included {
+                include: k,
+                path: child.clone(),
+                indexed: child_idx.is_some(),
+                min_level: child_level,
+                under: occurrence,
+            });
+        }
+        self.occurrences.push(Occurrence {
+            key,
+            rows,
+            labels,
+            files,
+            has_rows,
+            min_level,
+            overrides: Vec::new(),
+        });
+        Some(self.occurrences.len() - 1)
+    }
+
+    /// The rows of `key`'s file (indexed as `idx`), computed again only when the index has a
+    /// new entry for it, the numbers of their labels, and the files its includes name (looked
+    /// for in `base`).
+    fn rows(
+        &mut self,
+        key: &(PathBuf, bool),
+        idx: &Arc<FileIndex>,
+        base: &Path,
+    ) -> (Rc<FileRows>, Numbers, Rc<Vec<PathBuf>>) {
+        use std::collections::hash_map::Entry as Slot;
+        let cache = &mut *self.cache;
+        let cached = match cache.files.entry(key.clone()) {
+            Slot::Occupied(slot) => {
+                let cached = slot.into_mut();
+                if !std::ptr::eq(cached.from.as_ptr(), Arc::as_ptr(idx)) {
+                    let rows = FileRows::new(&cache.theorem_names, &key.0, idx, key.1);
+                    if !rows.same_includes(&cached.rows) {
+                        cached.resolved = None;
+                    }
+                    cached.from = Arc::downgrade(idx);
+                    cached.rows = Rc::new(rows);
+                    cached.numbers = None;
+                }
+                cached
+            }
+            Slot::Vacant(slot) => slot.insert(CachedFile {
+                from: Arc::downgrade(idx),
+                rows: Rc::new(FileRows::new(&cache.theorem_names, &key.0, idx, key.1)),
+                numbers: None,
+                resolved: None,
+                tree: None,
+                generation: 0,
+            }),
+        };
+        cached.generation = cache.generation;
+        let numbers = match &cached.numbers {
+            Some((from, numbers)) if std::ptr::eq(from.as_ptr(), Rc::as_ptr(self.aux)) => {
+                numbers.clone()
+            }
+            _ => {
+                let numbers: Numbers = Rc::new(
+                    cached
+                        .rows
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            let (number, _) = self.aux.labels.get(row.label.as_deref()?)?;
+                            Some(number.trim()).filter(|n| !n.is_empty()).map(Rc::from)
+                        })
+                        .collect(),
+                );
+                cached.numbers = Some((Rc::downgrade(self.aux), numbers.clone()));
+                numbers
+            }
+        };
+        let resolved = match &cached.resolved {
+            Some((from, files)) if from == base => files.clone(),
+            _ => {
+                let files: Rc<Vec<PathBuf>> = Rc::new(
+                    cached
+                        .rows
+                        .includes
+                        .iter()
+                        .map(|(inc, _)| resolve(self.index, inc, &[base, &self.root_dir]))
+                        .collect(),
+                );
+                cached.resolved = Some((base.to_path_buf(), files.clone()));
+                files
+            }
+        };
+        (cached.rows.clone(), numbers, resolved)
+    }
+}
+
+/// The file `inc` names: the first candidate that `index` has in one of `dirs`, else the first
+/// candidate in the first directory (as `ProjectIndex::project_files` resolves).
+fn resolve(index: &ProjectIndex, inc: &Include, dirs: &[&Path]) -> PathBuf {
+    let names = candidate_names(inc);
+    let mut first = None;
+    for dir in dirs {
+        for name in &names {
+            let path = lexical_join(dir, name);
+            if index.files.contains_key(&path) {
+                return path;
+            }
+            first.get_or_insert(path);
+        }
+    }
+    first.unwrap_or_default()
+}
+
+/// Numbers the rows: each takes the number of its label, else a heading or a float takes the
+/// number of its contents line (matched in the order of the whole project), and a float
+/// without a caption the title of its line. What the contents lines give goes into each
+/// occurrence's `overrides`.
+fn number_rows(occurrences: &mut [Occurrence], top: usize, keys: &AuxKeys) {
+    /// The headings, figures and tables under occurrence `at`, in document order.
+    fn collect(occurrences: &[Occurrence], at: usize, lists: &mut [Vec<(usize, usize)>; 3]) {
+        let occurrence = &occurrences[at];
+        let mut files = occurrence.files.iter().peekable();
+        for part in &occurrence.rows.order {
+            match *part {
+                Part::Row(row) => {
+                    let file_row = &occurrence.rows.rows[row];
+                    let list = match (file_row.entry.kind, file_row.list) {
+                        (EntryKind::Heading, _) => 0,
+                        (_, Some(FloatList::Figures)) => 1,
+                        (_, Some(FloatList::Tables)) => 2,
+                        _ => continue,
+                    };
+                    lists[list].push((at, row));
+                }
+                Part::Include(k) => {
+                    if let Some(file) = files.next_if(|file| file.include == k)
+                        && let Some(child) = file.under
+                    {
+                        collect(occurrences, child, lists);
+                    }
+                }
+            }
+        }
+    }
+    let mut lists: [Vec<(usize, usize)>; 3] = Default::default();
+    collect(occurrences, top, &mut lists);
+    let [heads, figures, tables] = lists;
+    let mut overrides: Vec<(usize, Override)> = Vec::new();
+    // Headings.
+    let matched = {
+        let rows: Vec<AlignKey> = heads
+            .iter()
+            .map(|&(at, row)| {
+                let row = &occurrences[at].rows.rows[row];
+                AlignKey {
+                    level: row.entry.level,
+                    words: &row.words,
+                    unnumbered: row.entry.starred,
+                }
+            })
+            .collect();
+        align(&rows, &align_keys(&keys.toc))
+    };
+    for (&(at, row), matched) in heads.iter().zip(matched) {
+        let occurrence = &occurrences[at];
+        if let Some(m) = matched
+            && occurrence.labels[row].is_none()
+            && !occurrence.rows.rows[row].entry.starred
+            && keys.toc[m].number.is_some()
+        {
+            overrides.push((at, (row, keys.toc[m].number.clone(), None)));
+        }
+    }
+    // Floats, per list.
+    for (floats, lines) in [(figures, &keys.figures), (tables, &keys.tables)] {
+        if floats.is_empty() {
+            continue;
+        }
+        let matched = {
+            let rows: Vec<AlignKey> = floats
+                .iter()
+                .map(|&(at, row)| AlignKey {
+                    level: 0,
+                    words: &occurrences[at].rows.rows[row].words,
+                    unnumbered: false,
+                })
+                .collect();
+            align(&rows, &align_keys(lines))
+        };
+        for (&(at, row), matched) in floats.iter().zip(matched) {
+            let Some(m) = matched else {
+                continue;
+            };
+            let occurrence = &occurrences[at];
+            let number = lines[m]
+                .number
+                .clone()
+                .filter(|_| occurrence.labels[row].is_none());
+            let title = occurrence.rows.rows[row]
+                .entry
+                .title
+                .is_empty()
+                .then(|| Rc::from(pretty_title(&lines[m].title)));
+            if number.is_some() || title.is_some() {
+                overrides.push((at, (row, number, title)));
+            }
+        }
+    }
+    for (at, change) in overrides {
+        occurrences[at].overrides.push(change);
+    }
+    for occurrence in occurrences.iter_mut() {
+        occurrence.overrides.sort_by_key(|(row, ..)| *row);
+    }
+}
+
+/// Nests a file's rows into a tree: headings by level, theorems and floats under the open
+/// heading, included files under the deepest open heading above their own headings (with the
+/// rows under them already nested). File rows are titled by their path from `root_dir`.
+fn assemble(inputs: &TreeInputs, root_dir: &Path, empty: &Rc<Vec<Row>>) -> Vec<Row> {
+    /// Takes the top heading off the stack and puts it under the one below, or at the top.
+    fn pop(stack: &mut Vec<(u8, Shown, Vec<Row>)>, roots: &mut Vec<Row>) {
+        if let Some((_, shown, children)) = stack.pop() {
+            let row = Row {
+                shown,
+                children: Rc::new(children),
+            };
+            match stack.last_mut() {
+                Some((_, _, parent)) => parent.push(row),
+                None => roots.push(row),
+            }
+        }
+    }
+    let mut roots = Vec::new();
+    let mut stack: Vec<(u8, Shown, Vec<Row>)> = Vec::new();
+    let mut files = inputs.files.iter().peekable();
+    let mut overrides = inputs.overrides.iter().peekable();
+    for part in &inputs.rows.order {
+        let row = match *part {
+            Part::Row(row) => {
+                let (number, title) = match overrides.next_if(|(r, ..)| *r == row) {
+                    Some((_, number, title)) => (number.clone(), title.clone()),
+                    None => (None, None),
+                };
+                let shown = Shown::Part {
+                    rows: inputs.rows.clone(),
+                    row,
+                    number: number.or_else(|| inputs.labels[row].clone()),
+                    title,
+                };
+                let entry = &inputs.rows.rows[row].entry;
+                if entry.kind == EntryKind::Heading {
+                    while stack.last().is_some_and(|(l, ..)| *l >= entry.level) {
+                        pop(&mut stack, &mut roots);
+                    }
+                    stack.push((entry.level, shown, Vec::new()));
+                    continue;
+                }
+                Row {
+                    shown,
+                    children: empty.clone(),
+                }
+            }
+            Part::Include(k) => {
+                let Some(file) = files.next_if(|f| f.include == k) else {
+                    continue;
+                };
+                while stack.last().is_some_and(|(l, ..)| *l >= file.min_level) {
+                    pop(&mut stack, &mut roots);
+                }
+                let title = file
+                    .path
+                    .strip_prefix(root_dir)
+                    .unwrap_or(&file.path)
+                    .display()
+                    .to_string();
+                let entry = Entry {
+                    kind: EntryKind::File,
+                    level: LEVEL_FILE,
+                    number: None,
+                    name: None,
+                    title,
+                    starred: false,
+                    path: file.path.clone(),
+                    line: 0,
+                    end_line: None,
+                    find: None,
+                    indexed: file.indexed,
+                    children: Vec::new(),
+                };
+                Row {
+                    shown: Shown::File(Box::new(entry)),
+                    children: file.under.clone(),
+                }
+            }
+        };
+        match stack.last_mut() {
+            Some((_, _, parent)) => parent.push(row),
+            None => roots.push(row),
+        }
+    }
+    while !stack.is_empty() {
+        pop(&mut stack, &mut roots);
+    }
+    roots
 }
 
 /// The `\end` line of the environment `env` that begins on `line`.
@@ -1176,155 +1950,6 @@ fn default_theorem_name(env: &str) -> String {
         }
     };
     name.to_owned()
-}
-
-/// Gives the headings and floats without a label number the number of their contents line.
-fn number_events(evs: &mut [Ev], aux: &AuxData) {
-    let toc_level = |kind: &str| TOC_KINDS.iter().position(|k| *k == kind);
-    // Headings.
-    let heads: Vec<usize> = (0..evs.len())
-        .filter(|&i| matches!(&evs[i], Ev::Item(e) if e.kind == EntryKind::Heading))
-        .collect();
-    fn item(ev: &Ev) -> Option<&Entry> {
-        match ev {
-            Ev::Item(e) => Some(e),
-            _ => None,
-        }
-    }
-    let rows: Vec<AlignKey> = heads
-        .iter()
-        .filter_map(|&i| item(&evs[i]))
-        .map(|e| AlignKey {
-            level: e.level,
-            words: norm_words(&e.title),
-            unnumbered: e.starred,
-        })
-        .collect();
-    let lines: Vec<(AlignKey, &ContentsLine)> = aux
-        .toc
-        .iter()
-        .filter_map(|c| {
-            let level = toc_level(&c.kind)?;
-            Some((
-                AlignKey {
-                    level: u8::try_from(level).ok()?,
-                    words: norm_words(&c.title),
-                    unnumbered: c.number.is_none(),
-                },
-                c,
-            ))
-        })
-        .collect();
-    let keys: Vec<AlignKey> = lines.iter().map(|(k, _)| k.clone()).collect();
-    for (row, matched) in align(&rows, &keys).into_iter().enumerate() {
-        if let Some(m) = matched
-            && let Ev::Item(e) = &mut evs[heads[row]]
-            && e.number.is_none()
-            && !e.starred
-        {
-            e.number.clone_from(&lines[m].1.number);
-        }
-    }
-    // Floats, per list.
-    for (list, contents) in [
-        (FloatList::Figures, &aux.lof),
-        (FloatList::Tables, &aux.lot),
-    ] {
-        let floats: Vec<usize> = (0..evs.len())
-            .filter(|&i| {
-                matches!(&evs[i], Ev::Item(e) if e.kind == EntryKind::Float
-                    && list_of(e.name.as_deref()) == list)
-            })
-            .collect();
-        if floats.is_empty() {
-            continue;
-        }
-        let rows: Vec<AlignKey> = floats
-            .iter()
-            .filter_map(|&i| item(&evs[i]))
-            .map(|e| AlignKey {
-                level: 0,
-                words: norm_words(&e.title),
-                unnumbered: false,
-            })
-            .collect();
-        let entries: Vec<&ContentsLine> = contents
-            .iter()
-            .filter(|c| matches!(c.kind.as_str(), "figure" | "table"))
-            .collect();
-        let keys: Vec<AlignKey> = entries
-            .iter()
-            .map(|c| AlignKey {
-                level: 0,
-                words: norm_words(&c.title),
-                unnumbered: c.number.is_none(),
-            })
-            .collect();
-        for (row, matched) in align(&rows, &keys).into_iter().enumerate() {
-            if let Some(m) = matched
-                && let Ev::Item(e) = &mut evs[floats[row]]
-            {
-                if e.number.is_none() {
-                    e.number.clone_from(&entries[m].number);
-                }
-                if e.title.is_empty() {
-                    e.title = pretty_title(&entries[m].title);
-                }
-            }
-        }
-    }
-}
-
-/// Nests the events into a tree: headings by level, theorems and floats under the open
-/// heading, files under the deepest open heading above their own headings.
-fn assemble(evs: Vec<Ev>) -> Vec<Entry> {
-    enum Frame {
-        Heading(u8),
-        File,
-    }
-    fn pop(stack: &mut Vec<(Frame, Entry)>, roots: &mut Vec<Entry>) {
-        if let Some((_, entry)) = stack.pop() {
-            match stack.last_mut() {
-                Some((_, parent)) => parent.children.push(entry),
-                None => roots.push(entry),
-            }
-        }
-    }
-    let mut roots = Vec::new();
-    let mut stack: Vec<(Frame, Entry)> = Vec::new();
-    for ev in evs {
-        match ev {
-            Ev::Item(entry) if entry.kind == EntryKind::Heading => {
-                while matches!(stack.last(), Some((Frame::Heading(l), _)) if *l >= entry.level) {
-                    pop(&mut stack, &mut roots);
-                }
-                stack.push((Frame::Heading(entry.level), entry));
-            }
-            Ev::Item(entry) => match stack.last_mut() {
-                Some((_, parent)) => parent.children.push(entry),
-                None => roots.push(entry),
-            },
-            Ev::Enter(file, min_level) => {
-                while matches!(stack.last(), Some((Frame::Heading(l), _)) if *l >= min_level) {
-                    pop(&mut stack, &mut roots);
-                }
-                stack.push((Frame::File, file));
-            }
-            Ev::Leave => {
-                while let Some((frame, _)) = stack.last() {
-                    let file = matches!(frame, Frame::File);
-                    pop(&mut stack, &mut roots);
-                    if file {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    while !stack.is_empty() {
-        pop(&mut stack, &mut roots);
-    }
-    roots
 }
 
 fn is_tex_include(kind: IncludeKind) -> bool {
@@ -1455,6 +2080,8 @@ struct Node {
     /// Headings and files: the tree's child model (`BoxedAnyObject`s of `Rc<Node>`).
     children: Option<gio::ListStore>,
     child_nodes: RefCell<Vec<Rc<Node>>>,
+    /// The rows the children show (a patch skips them while the outline has the same).
+    shown: RefCell<Option<Rc<Vec<Row>>>>,
     parent: RefCell<Weak<Node>>,
     /// The row widgets showing this node (refreshed when it changes).
     rows: RefCell<Vec<Weak<RowWidgets>>>,
@@ -1480,29 +2107,34 @@ struct NodeKey {
 }
 
 impl Node {
-    fn new(entry: &mut Entry, parent: Weak<Node>, created: &mut Vec<Rc<Node>>) -> Rc<Node> {
+    /// The node of `row` and the nodes under it (all of them in `created`).
+    fn new(row: &Row, parent: Weak<Node>, created: &mut Vec<Rc<Node>>) -> Rc<Node> {
+        let entry = row.entry();
         let has_children = matches!(entry.kind, EntryKind::Heading | EntryKind::File);
         let node = Rc::new(Node {
             kind: entry.kind,
             level: entry.level,
             path: entry.path.clone(),
-            data: RefCell::new(NodeData::of(entry)),
+            data: RefCell::new(NodeData::of(row)),
             line: Cell::new(entry.line),
             end_line: Cell::new(entry.end_line),
             children: has_children.then(gio::ListStore::new::<glib::BoxedAnyObject>),
             child_nodes: RefCell::new(Vec::new()),
+            shown: RefCell::new(None),
             parent: RefCell::new(parent),
             rows: RefCell::new(Vec::new()),
         });
         created.push(node.clone());
         if let Some(store) = &node.children {
-            let kids: Vec<Rc<Node>> = std::mem::take(&mut entry.children)
-                .iter_mut()
+            let kids: Vec<Rc<Node>> = row
+                .children
+                .iter()
                 .map(|child| Node::new(child, Rc::downgrade(&node), created))
                 .collect();
             let objects: Vec<glib::BoxedAnyObject> = kids.iter().map(Node::object).collect();
             store.splice(0, 0, &objects);
             node.child_nodes.replace(kids);
+            node.shown.replace(Some(row.children.clone()));
         }
         node
     }
@@ -1521,12 +2153,13 @@ impl Node {
     }
 
     /// Same row: kind, level, file and title.
-    fn same(&self, entry: &Entry) -> bool {
-        self.same_shape(entry) && self.data.borrow().title == entry.title
+    fn same(&self, row: &Row) -> bool {
+        self.same_shape(row) && self.data.borrow().title == row.title()
     }
 
     /// Same kind of row in the same file (an edited title).
-    fn same_shape(&self, entry: &Entry) -> bool {
+    fn same_shape(&self, row: &Row) -> bool {
+        let entry = row.entry();
         self.kind == entry.kind && self.level == entry.level && self.path == entry.path
     }
 
@@ -1575,21 +2208,23 @@ impl Node {
 }
 
 impl NodeData {
-    /// Whether this is what `entry` shows (without copying it).
-    fn equals(&self, entry: &Entry) -> bool {
-        self.number == entry.number
+    /// Whether this is what `row` shows (without copying it).
+    fn equals(&self, row: &Row) -> bool {
+        let entry = row.entry();
+        self.number.as_deref() == row.number()
             && self.name == entry.name
-            && self.title == entry.title
+            && self.title == row.title()
             && self.starred == entry.starred
             && self.indexed == entry.indexed
             && self.find == entry.find
     }
 
-    fn of(entry: &Entry) -> Self {
+    fn of(row: &Row) -> Self {
+        let entry = row.entry();
         Self {
-            number: entry.number.clone(),
+            number: row.number().map(str::to_owned),
             name: entry.name.clone(),
-            title: entry.title.clone(),
+            title: row.title().to_owned(),
             starred: entry.starred,
             indexed: entry.indexed,
             find: entry.find.clone(),
@@ -1869,6 +2504,9 @@ fn highlight(text: &str, offset: usize, marks: &[usize], color: &str) -> String 
 pub struct OutlineStats {
     /// Outline recomputations (each followed by a patch of the models).
     pub syncs: u64,
+    /// Changes of the project index that left the outline the same but for lines, which the
+    /// rows had followed already: neither recomputed nor patched.
+    pub line_shifts: u64,
     /// Row objects created in total, and updated in place.
     pub nodes_created: u64,
     pub nodes_updated: u64,
@@ -1912,6 +2550,10 @@ struct Panel {
     /// The project root shown, and what the shown outline was computed from.
     root: RefCell<Option<PathBuf>>,
     inputs: RefCell<Option<Inputs>>,
+    /// What the outline shown was computed from in each file, kept for the next one, and the
+    /// top rows it shows.
+    cache: RefCell<OutlineCache>,
+    top_rows: RefCell<Option<Rc<Vec<Row>>>>,
     /// The `.aux` of the root (`aux_root`), bumped `aux_generation` at every read.
     aux: RefCell<Rc<AuxData>>,
     aux_root: RefCell<Option<PathBuf>>,
@@ -1921,10 +2563,11 @@ struct Panel {
     aux_hint: RefCell<Option<PathBuf>>,
     /// Rows per file in line order (headings, theorems, floats), and file rows by path.
     by_file: RefCell<HashMap<PathBuf, Vec<Rc<Node>>>>,
-    /// Rows were moved by `shift_lines` since the last sync. When the project index catches up
-    /// with the same entries (the lines were put back as they were: a deletion undone), the
-    /// outline is computed again anyway, so the rows go back to the index's lines.
-    drifted: Cell<bool>,
+    /// The files with rows on lines that a change replaced, moved by `shift_lines` since the
+    /// last sync to where the lines went at a guess (the rows after the change move exactly).
+    /// When the project index has caught up, even with the same entries (the lines were put
+    /// back as they were: a deletion undone), rows that are not on its lines go back to them.
+    drifted: RefCell<HashSet<PathBuf>>,
     file_nodes: RefCell<HashMap<PathBuf, Rc<Node>>>,
     collapsed: RefCell<HashSet<NodeKey>>,
     /// The watch timer and its quiet ticks.
@@ -1944,6 +2587,22 @@ struct Panel {
 
 /// An open document the page observes: the document, its path and the observers.
 type Observed = (Weak<crate::document::Document>, PathBuf, Vec<ObserverId>);
+
+/// What a patch of the models did.
+#[derive(Default)]
+struct Patch {
+    /// Every row is looked at, also under rows that show what they showed (rows moved at a
+    /// guess go back to the index's lines).
+    force: bool,
+    /// The nodes created.
+    created: Vec<Rc<Node>>,
+    /// How many nodes were updated in place.
+    updated: u64,
+    /// The files whose rows came, went or moved to other lines, and whether the row of an
+    /// included file came or went.
+    moved: HashSet<PathBuf>,
+    files_changed: bool,
+}
 
 /// What the shown outline was computed from.
 struct Inputs {
@@ -1972,6 +2631,28 @@ impl Inputs {
                 .iter()
                 .zip(&index.files)
                 .all(|((p, a), (q, b))| p == q && std::ptr::eq(a.as_ptr(), Arc::as_ptr(b)))
+    }
+
+    /// The paths whose entries `new` has in place of these, when all else is the same: the
+    /// files, the `.aux`, the active document and the build's root (`None` otherwise).
+    fn replaced(&self, new: &Inputs) -> Option<Vec<PathBuf>> {
+        if self.aux_generation != new.aux_generation
+            || self.active != new.active
+            || self.build_root != new.build_root
+            || self.files.len() != new.files.len()
+        {
+            return None;
+        }
+        let mut paths = Vec::new();
+        for ((p, a), (q, b)) in self.files.iter().zip(&new.files) {
+            if p != q {
+                return None;
+            }
+            if !a.ptr_eq(b) {
+                paths.push(q.clone());
+            }
+        }
+        Some(paths)
     }
 }
 
@@ -2106,6 +2787,8 @@ impl Panel {
                 match_color: RefCell::new(String::new()),
                 root: RefCell::new(None),
                 inputs: RefCell::new(None),
+                cache: RefCell::new(OutlineCache::default()),
+                top_rows: RefCell::new(None),
                 aux: RefCell::new(Rc::new(AuxData::default())),
                 aux_root: RefCell::new(None),
                 aux_generation: Cell::new(0),
@@ -2113,7 +2796,7 @@ impl Panel {
                 aux_stale: Cell::new(false),
                 aux_hint: RefCell::new(None),
                 by_file: RefCell::new(HashMap::new()),
-                drifted: Cell::new(false),
+                drifted: RefCell::new(HashSet::new()),
                 file_nodes: RefCell::new(HashMap::new()),
                 collapsed: RefCell::new(HashSet::new()),
                 watch: RefCell::new(None),
@@ -2444,6 +3127,9 @@ impl Panel {
         let Some(nodes) = by_file.get(path) else {
             return;
         };
+        // Lines before and after the change move exactly; a row on a line it replaced stays
+        // on a line it left, at a guess.
+        let replaced = |line: u32| line >= first && line < first + removed;
         let shift = |line: u32| -> u32 {
             if line < first {
                 line
@@ -2453,14 +3139,35 @@ impl Panel {
                 line.min(first + added.saturating_sub(1))
             }
         };
+        let mut drifted = false;
         for node in nodes {
             let (line, end_line) = (node.line.get(), node.end_line.get());
             node.line.set(shift(line));
             node.end_line.set(end_line.map(shift));
-            if node.line.get() != line || node.end_line.get() != end_line {
-                self.drifted.set(true);
-            }
+            drifted |= replaced(line) || end_line.is_some_and(replaced);
         }
+        if drifted && !self.drifted.borrow().contains(path) {
+            self.drifted.borrow_mut().insert(path.to_path_buf());
+        }
+    }
+
+    /// Whether the rows of the files at `paths` are on the lines the outline computed last has
+    /// for them. Not when no tab moved them there: a file that is not open changed by another
+    /// program, a tab closed without saving, rows a patch put back on the index's lines before
+    /// it caught up with an edit.
+    fn rows_followed(&self, paths: &[PathBuf]) -> bool {
+        let by_file = self.by_file.borrow();
+        let cache = self.cache.borrow();
+        paths.iter().all(|path| {
+            let mut shown: Vec<(u32, Option<u32>)> = by_file
+                .get(path)
+                .into_iter()
+                .flatten()
+                .map(|node| (node.line.get(), node.end_line.get()))
+                .collect();
+            shown.sort_unstable();
+            shown == cache.row_lines(path)
+        })
     }
 
     // ----- the watch -----
@@ -2529,28 +3236,61 @@ impl Panel {
                 self.aux_generation.get(),
             )
         });
-        // Rows moved ahead of the index go back to its lines once it has caught up.
-        let drifted = self.drifted.get() && !completion::index_busy(&state);
+        // Rows moved at a guess go back to the index's lines once it has caught up.
+        let drifted = !self.drifted.borrow().is_empty() && !completion::index_busy(&state);
         if unchanged && !drifted {
             return false;
         }
         let index = state.workspace.index.borrow();
-        let current = self.root.borrow().clone();
-        let root = find_root(
-            &index,
-            active.as_deref(),
-            build_root.as_deref(),
-            current.as_deref(),
-        );
         let inputs = Inputs {
             files: index
                 .files
                 .iter()
                 .map(|(p, f)| (p.clone(), Arc::downgrade(f)))
                 .collect(),
-            active,
-            build_root,
+            active: active.clone(),
+            build_root: build_root.clone(),
             aux_generation: self.aux_generation.get(),
+        };
+        // Entries of files in the outline replaced, the index's files as they were: when they
+        // give the rows they gave but for their lines (Enter typed, a `\ref` or a `\label`
+        // added to a paragraph) and the rows are on those lines (they followed the edits in a
+        // tab; not those of a file another program changed), there is nothing to compute or
+        // patch, once the rows moved at a guess are on the index's lines too (or it has not
+        // caught up with them yet); when their includes are the same, so are the root and the
+        // files of the outline.
+        let replaced = self
+            .inputs
+            .borrow()
+            .as_ref()
+            .and_then(|old| old.replaced(&inputs));
+        let change = replaced
+            .as_ref()
+            .map(|paths| self.cache.borrow_mut().replaced(&index, paths));
+        if change == Some(Change::Lines)
+            && replaced
+                .as_deref()
+                .is_some_and(|paths| self.rows_followed(paths))
+        {
+            self.drifted
+                .borrow_mut()
+                .retain(|path| !self.rows_followed(std::slice::from_ref(path)));
+            if self.drifted.borrow().is_empty() || completion::index_busy(&state) {
+                drop(index);
+                self.inputs.replace(Some(inputs));
+                self.update_stats(|s| s.line_shifts += 1);
+                return false;
+            }
+        }
+        let current = self.root.borrow().clone();
+        let root = match change {
+            Some(Change::Lines | Change::Rows) => current,
+            _ => find_root(
+                &index,
+                active.as_deref(),
+                build_root.as_deref(),
+                current.as_deref(),
+            ),
         };
         drop(index);
         self.inputs.replace(Some(inputs));
@@ -2560,7 +3300,7 @@ impl Panel {
             self.read_aux_now();
         }
         self.root.replace(root);
-        self.sync(&state);
+        self.sync(&state, replaced.is_some());
         true
     }
 
@@ -2609,53 +3349,73 @@ impl Panel {
 
     // ----- patching the models -----
 
-    fn sync(self: &Rc<Self>, state: &Rc<WindowState>) {
+    /// Recomputes the outline and patches the models (`same_files`: the project index has the
+    /// files it had for the last outline).
+    fn sync(self: &Rc<Self>, state: &Rc<WindowState>, same_files: bool) {
         let started = Instant::now();
-        self.drifted.set(false);
-        let entries = match self.root.borrow().clone() {
+        // Rows moved at a guess go back to the index's lines: every row is looked at.
+        let force = !self.drifted.take().is_empty();
+        let (rows, top) = match self.root.borrow().clone() {
             Some(root) => {
                 let aux = self.aux.borrow().clone();
-                build_outline(&state.workspace.index.borrow(), &root, &aux)
+                let outline = self.cache.borrow_mut().build(
+                    &state.workspace.index.borrow(),
+                    &root,
+                    &aux,
+                    same_files,
+                );
+                (outline.rows, outline.top_level)
             }
-            None => Vec::new(),
+            None => {
+                // No outline: what the cache has is not what the next one is compared with
+                // (the index changes meanwhile, and `same_files` follows the last inputs).
+                *self.cache.borrow_mut() = OutlineCache::default();
+                (Rc::new(Vec::new()), 2)
+            }
         };
         let built = started.elapsed();
-        let top = top_heading_level(&entries);
-        let top_changed = top != self.top_level.replace(top);
-        let mut created = Vec::new();
-        let mut updated = 0u64;
-        self.sync_children(
-            None,
-            &self.root_store,
-            &self.root_nodes,
-            entries,
-            &mut created,
-            &mut updated,
-        );
-        self.index_nodes();
-        if top_changed {
-            let mut all = Vec::new();
-            for node in self.root_nodes.borrow().iter() {
-                node.descendants(&mut all);
+        let mut patch = Patch {
+            force,
+            ..Patch::default()
+        };
+        let same = self
+            .top_rows
+            .borrow()
+            .as_ref()
+            .is_some_and(|shown| Rc::ptr_eq(shown, &rows));
+        if !same || force {
+            let top_changed = top != self.top_level.replace(top);
+            self.sync_children(None, &self.root_store, &self.root_nodes, &rows, &mut patch);
+            self.top_rows.replace(Some(rows));
+            if force || patch.files_changed {
+                self.index_nodes();
+            } else {
+                self.index_rows_of(&patch.moved);
             }
-            for node in all {
-                node.refresh_rows();
+            if top_changed {
+                let mut all = Vec::new();
+                for node in self.root_nodes.borrow().iter() {
+                    node.descendants(&mut all);
+                }
+                for node in all {
+                    node.refresh_rows();
+                }
             }
-        }
-        // Rows that appear collapsed as they were before.
-        self.collapse_remembered(&created);
-        let empty = self.root_nodes.borrow().is_empty();
-        if self.entry.text().trim().is_empty() {
-            self.stack
-                .set_visible_child_name(if empty { "empty" } else { "tree" });
-        } else {
-            self.refilter();
+            // Rows that appear collapsed as they were before.
+            self.collapse_remembered(&patch.created);
+            let empty = self.root_nodes.borrow().is_empty();
+            if self.entry.text().trim().is_empty() {
+                self.stack
+                    .set_visible_child_name(if empty { "empty" } else { "tree" });
+            } else {
+                self.refilter();
+            }
         }
         let spent = started.elapsed();
         self.update_stats(|s| {
             s.syncs += 1;
-            s.nodes_created += created.len() as u64;
-            s.nodes_updated += updated;
+            s.nodes_created += patch.created.len() as u64;
+            s.nodes_updated += patch.updated;
             s.last_sync = spent;
             s.last_build = built;
             s.max_sync = s.max_sync.max(spent);
@@ -2665,15 +3425,16 @@ impl Panel {
 
     /// Makes `nodes` (the children of `parent`, mirrored in `store`) show `new`: rows equal at
     /// both ends are kept, a middle of rows of the same shape is updated in place (edited
-    /// titles), anything else in the middle is replaced.
+    /// titles), anything else in the middle is replaced. Under a kept row that shows the rows
+    /// it showed before (the same `Rc`: an included file in which nothing changed), nothing is
+    /// looked at.
     fn sync_children(
         &self,
         parent: Option<&Rc<Node>>,
         store: &gio::ListStore,
         nodes: &RefCell<Vec<Rc<Node>>>,
-        mut new: Vec<Entry>,
-        created: &mut Vec<Rc<Node>>,
-        updated: &mut u64,
+        new: &[Row],
+        patch: &mut Patch,
     ) {
         let old = nodes.borrow().clone();
         let mut prefix = 0;
@@ -2695,27 +3456,32 @@ impl Panel {
                 .zip(&new[new_mid.clone()])
                 .all(|(o, n)| o.same_shape(n));
         // Kept and updated rows.
-        let mut kept: Vec<(Rc<Node>, Entry)> = Vec::new();
-        let mut fresh: Vec<Rc<Node>> = Vec::new();
-        let tail = new.split_off(new_mid.end);
-        let middle = new.split_off(prefix);
-        for (node, entry) in old[..prefix].iter().zip(new) {
-            kept.push((node.clone(), entry));
+        let mut kept: Vec<(Rc<Node>, &Row)> = Vec::new();
+        for (node, row) in old[..prefix].iter().zip(&new[..prefix]) {
+            kept.push((node.clone(), row));
         }
         if in_place {
-            for (node, entry) in old[old_mid.clone()].iter().zip(middle) {
-                kept.push((node.clone(), entry));
+            for (node, row) in old[old_mid.clone()].iter().zip(&new[new_mid.clone()]) {
+                kept.push((node.clone(), row));
             }
         } else {
             let weak_parent = parent.map_or_else(Weak::new, Rc::downgrade);
-            for mut entry in middle {
-                fresh.push(Node::new(&mut entry, weak_parent.clone(), created));
+            let created = patch.created.len();
+            let fresh: Vec<Rc<Node>> = new[new_mid.clone()]
+                .iter()
+                .map(|row| Node::new(row, weak_parent.clone(), &mut patch.created))
+                .collect();
+            // The files whose rows came or went.
+            let mut gone = Vec::new();
+            for node in &old[old_mid.clone()] {
+                node.descendants(&mut gone);
             }
-        }
-        for (node, entry) in old[old.len() - suffix..].iter().zip(tail) {
-            kept.push((node.clone(), entry));
-        }
-        if !in_place {
+            for node in gone.iter().chain(&patch.created[created..]) {
+                patch.files_changed |= node.kind == EntryKind::File;
+                if !patch.moved.contains(&node.path) {
+                    patch.moved.insert(node.path.clone());
+                }
+            }
             let mut list = old[..prefix].to_vec();
             list.extend(fresh.iter().cloned());
             list.extend(old[old.len() - suffix..].iter().cloned());
@@ -2727,31 +3493,43 @@ impl Panel {
                 &objects,
             );
         }
-        for (node, mut entry) in kept {
-            self.update_node(&node, &mut entry, updated);
+        for (node, row) in old[old.len() - suffix..]
+            .iter()
+            .zip(&new[new.len() - suffix..])
+        {
+            kept.push((node.clone(), row));
+        }
+        for (node, row) in kept {
+            self.update_node(&node, row, patch);
             if let Some(store) = &node.children {
-                let children = std::mem::take(&mut entry.children);
-                self.sync_children(
-                    Some(&node),
-                    store,
-                    &node.child_nodes,
-                    children,
-                    created,
-                    updated,
-                );
+                let shown = node
+                    .shown
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|shown| Rc::ptr_eq(shown, &row.children));
+                if !shown || patch.force {
+                    self.sync_children(Some(&node), store, &node.child_nodes, &row.children, patch);
+                    node.shown.replace(Some(row.children.clone()));
+                }
             }
         }
     }
 
-    fn update_node(&self, node: &Rc<Node>, entry: &mut Entry, updated: &mut u64) {
-        node.line.set(entry.line);
-        node.end_line.set(entry.end_line);
-        if node.data.borrow().equals(entry) {
+    fn update_node(&self, node: &Rc<Node>, row: &Row, patch: &mut Patch) {
+        let entry = row.entry();
+        if node.line.get() != entry.line || node.end_line.get() != entry.end_line {
+            node.line.set(entry.line);
+            node.end_line.set(entry.end_line);
+            if !patch.moved.contains(&node.path) {
+                patch.moved.insert(node.path.clone());
+            }
+        }
+        if node.data.borrow().equals(row) {
             return;
         }
         let old_key = node.key();
-        node.data.replace(NodeData::of(entry));
-        *updated += 1;
+        node.data.replace(NodeData::of(row));
+        patch.updated += 1;
         let new_key = node.key();
         if old_key != new_key {
             let mut collapsed = self.collapsed.borrow_mut();
@@ -2786,6 +3564,36 @@ impl Panel {
         }
         self.by_file.replace(by_file);
         self.file_nodes.replace(files);
+    }
+
+    /// Rebuilds the row lists of the files at `paths` only (no file row came or went): a
+    /// file's rows are under its file row (the root's at the top), outside the file rows there.
+    fn index_rows_of(&self, paths: &HashSet<PathBuf>) {
+        fn rows_of(nodes: &[Rc<Node>], path: &Path, out: &mut Vec<Rc<Node>>) {
+            for node in nodes.iter().filter(|n| n.kind != EntryKind::File) {
+                if node.path == path {
+                    out.push(node.clone());
+                }
+                rows_of(&node.child_nodes.borrow(), path, out);
+            }
+        }
+        let root = self.root.borrow().clone();
+        let file_nodes = self.file_nodes.borrow();
+        let mut by_file = self.by_file.borrow_mut();
+        for path in paths {
+            let mut nodes = Vec::new();
+            if root.as_deref() == Some(path.as_path()) {
+                rows_of(&self.root_nodes.borrow(), path, &mut nodes);
+            } else if let Some(file) = file_nodes.get(path) {
+                rows_of(&file.child_nodes.borrow(), path, &mut nodes);
+            }
+            nodes.sort_by_key(|n| n.line.get());
+            if nodes.is_empty() {
+                by_file.remove(path);
+            } else {
+                by_file.insert(path.clone(), nodes);
+            }
+        }
     }
 
     // ----- expansion -----
@@ -3287,21 +4095,6 @@ fn row_factory(panel: Weak<Panel>, results: bool) -> gtk::SignalListItemFactory 
     factory
 }
 
-/// The highest (smallest) heading level in `entries`, 2 (section) when there is none.
-fn top_heading_level(entries: &[Entry]) -> u8 {
-    fn walk(entries: &[Entry], top: &mut u8) {
-        for e in entries {
-            if e.kind == EntryKind::Heading {
-                *top = (*top).min(e.level);
-            }
-            walk(&e.children, top);
-        }
-    }
-    let mut top = u8::MAX;
-    walk(entries, &mut top);
-    if top == u8::MAX { 2 } else { top }
-}
-
 /// The root of the active document's project: the build's root when its project holds the
 /// document, else the outermost indexed root that does, else the LaTeX document itself (a
 /// chapter whose root is not known yet, a document of its own). For another kind of file (a
@@ -3593,7 +4386,7 @@ pub fn is_settled(state: &WindowState) -> bool {
             panel.aux_generation.get(),
         )
     });
-    if !current || panel.drifted.get() {
+    if !current || !panel.drifted.borrow().is_empty() {
         // Something changed the index without an event the page watches (a test's
         // `completion::refresh_project`), or rows moved ahead of it: look again.
         panel.poke();
@@ -3746,10 +4539,10 @@ mod tests {
         assert_eq!(norm_words("Filler subsection 1"), "filler subsection 1");
     }
 
-    fn key(level: u8, words: &str, unnumbered: bool) -> AlignKey {
+    fn key(level: u8, words: &str, unnumbered: bool) -> AlignKey<'_> {
         AlignKey {
             level,
-            words: words.to_owned(),
+            words,
             unnumbered,
         }
     }
@@ -3867,6 +4660,123 @@ mod tests {
         );
     }
 
+    /// The rows under each file row of `rows`, by the file's title.
+    fn file_trees(rows: &[Row]) -> HashMap<String, Rc<Vec<Row>>> {
+        let mut out = HashMap::new();
+        for row in rows {
+            if row.entry().kind == EntryKind::File {
+                out.insert(row.title().to_owned(), row.children.clone());
+            }
+            out.extend(file_trees(&row.children));
+        }
+        out
+    }
+
+    #[test]
+    fn the_cache_recomputes_only_what_changed() {
+        let main = "\\documentclass{book}\n\\newtheorem{thm}{Theorem}\n\\begin{document}\n\
+                    \\input{a}\n\\input{b}\n\\input{c}\n\\end{document}\n";
+        let a = "\\chapter{A}\\label{ch:a}\n\\section{One}\n\\begin{thm}\\label{t}\\end{thm}\n";
+        let b = "\\chapter{B}\n\\section{Two}\n\\begin{figure}\\caption{F}\\end{figure}\n";
+        let c = "\\chapter{C}\n\\section{Three}\\label{s3}\n";
+        let (mut index, root) = project(&[
+            ("/p/main.tex", main),
+            ("/p/a.tex", a),
+            ("/p/b.tex", b),
+            ("/p/c.tex", c),
+        ]);
+        let mut aux = aux_of(
+            r"\newlabel{ch:a}{{1}{1}}\newlabel{t}{{1.1}{1}}\newlabel{s3}{{3.1}{5}}
+\@writefile{toc}{\contentsline {chapter}{\numberline {1}A}{1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {1.1}One}{1}{}}
+\@writefile{toc}{\contentsline {chapter}{\numberline {2}B}{3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2.1}Two}{3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2.1}{\ignorespaces F}}{3}{}}
+",
+        );
+        let shared = Rc::new(aux.clone());
+        let mut cache = OutlineCache::default();
+        let text =
+            |rows: &Rc<Vec<Row>>| tree_text_of(&rows.iter().map(Row::to_entry).collect::<Vec<_>>());
+        let first = cache.build(&index, &root, &shared, false);
+        assert_eq!(
+            text(&first.rows),
+            "[a.tex]\n  1 A\n    1.1 One\n      Theorem 1.1\n[b.tex]\n  2 B\n    2.1 Two\n      \
+             Figure 2.1 F\n[c.tex]\n  C\n    3.1 Three\n"
+        );
+        assert_eq!(first.top_level, 1);
+        assert_eq!(
+            text(&first.rows),
+            tree_text_of(&build_outline(&index, &root, &aux))
+        );
+        // Nothing changed: the same rows.
+        let again = cache.build(&index, &root, &shared, true);
+        assert!(Rc::ptr_eq(&first.rows, &again.rows));
+        // `b` gains a section: only its rows are assembled again.
+        let b_path = PathBuf::from("/p/b.tex");
+        let b_more = format!("{b}\\section{{Four}}\n");
+        index.update_file(b_path.clone(), Arc::new(index_file(&b_more)));
+        assert_eq!(
+            cache.replaced(&index, std::slice::from_ref(&b_path)),
+            Change::Rows
+        );
+        let second = cache.build(&index, &root, &shared, true);
+        assert_eq!(
+            text(&second.rows),
+            tree_text_of(&build_outline(&index, &root, &aux))
+        );
+        let (before, after) = (file_trees(&first.rows), file_trees(&second.rows));
+        assert!(Rc::ptr_eq(&before["a.tex"], &after["a.tex"]));
+        assert!(Rc::ptr_eq(&before["c.tex"], &after["c.tex"]));
+        assert!(!Rc::ptr_eq(&before["b.tex"], &after["b.tex"]));
+        assert!(text(&second.rows).contains("    Four\n"));
+        // Lines moved in `c`: the same rows but for lines; a new section is not; an include
+        // in it may change the files.
+        let c_path = PathBuf::from("/p/c.tex");
+        let shifted = Arc::new(index_file(&format!("\n\n{c}")));
+        index.update_file(c_path.clone(), shifted);
+        assert_eq!(
+            cache.replaced(&index, std::slice::from_ref(&c_path)),
+            Change::Lines
+        );
+        let third = cache.build(&index, &root, &shared, true);
+        assert_eq!(text(&third.rows), text(&second.rows));
+        let c_more = Arc::new(index_file(&format!("{c}\\section{{Five}}\n")));
+        index.update_file(c_path.clone(), c_more);
+        assert_eq!(
+            cache.replaced(&index, std::slice::from_ref(&c_path)),
+            Change::Rows
+        );
+        let c_input = Arc::new(index_file(&format!("{c}\\input{{d}}\n")));
+        index.update_file(c_path.clone(), c_input);
+        assert_eq!(
+            cache.replaced(&index, std::slice::from_ref(&c_path)),
+            Change::Files
+        );
+        // A file the outline does not have changes the files too.
+        assert_eq!(
+            cache.replaced(&index, &[PathBuf::from("/p/other.tex")]),
+            Change::Files
+        );
+        // A new `.aux`: new numbers everywhere.
+        aux.labels.insert("ch:a".into(), ("7".into(), "1".into()));
+        let fourth = cache.build(&index, &root, &Rc::new(aux.clone()), true);
+        assert_eq!(
+            text(&fourth.rows),
+            tree_text_of(&build_outline(&index, &root, &aux))
+        );
+        assert!(text(&fourth.rows).contains("[a.tex]\n  7 A\n"));
+        assert!(text(&fourth.rows).contains("      [d.tex]\n"));
+        // A theorem environment renamed in the root: every file's rows again.
+        let renamed = main.replace("{Theorem}", "{Satz}");
+        index.update_file(root.clone(), Arc::new(index_file(&renamed)));
+        let fifth = cache.build(&index, &root, &shared, true);
+        assert!(text(&fifth.rows).contains("Satz 1.1"));
+        assert_eq!(
+            text(&fifth.rows),
+            tree_text_of(&build_outline(&index, &root, &shared))
+        );
+    }
     #[test]
     fn aux_candidates_order() {
         let c = aux_candidates(Path::new("/p/main.tex"), ".build", None);

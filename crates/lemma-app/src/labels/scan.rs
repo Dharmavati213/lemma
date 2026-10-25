@@ -5,14 +5,15 @@
 
 use lemma_core::{LineIndex, TextEdit};
 use lemma_syntax::{
-    BibEntry, FileIndex, IncludeKind, Label, LineStates, MacroDef, ProjectIndex, ScanConfig,
-    StrLines, Token, TokenKind,
+    AuxInfo, BibEntry, FileIndex, IncludeKind, Label, LineStates, MacroDef, ProjectIndex,
+    ScanConfig, StrLines, Token, TokenKind,
 };
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, Weak};
 
 /// What a name in an argument stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -236,6 +237,9 @@ pub struct Undefined {
     /// Citations were checked: the project names bibliographies and every one was read (else a
     /// key may live in a file Lemma could not read, and none is reported).
     pub cites_checked: bool,
+    /// References were checked: the index has every file of the project (else a label may
+    /// live in a file it did not read, and none is reported).
+    pub labels_checked: bool,
 }
 
 /// `dir` joined with `rel`, with `.` and `..` folded without touching the file system (as the
@@ -288,9 +292,10 @@ pub fn cites_checkable(index: &ProjectIndex) -> bool {
     !named.is_empty() && named.iter().all(|bib| index.bibs.contains_key(bib))
 }
 
-/// The references to labels that neither the project nor the `.aux` file define, and (when
-/// [`cites_checkable`]) the citations of keys no bibliography entry has.
-pub fn undefined(index: &ProjectIndex) -> Undefined {
+/// The references to labels that neither the project nor the `.aux` file define (only when the
+/// index is `complete`: it has every file of the project), and (when [`cites_checkable`]) the
+/// citations of keys no bibliography entry has. [`UndefinedCheck`] keeps the same up to date.
+pub fn undefined(index: &ProjectIndex, complete: bool) -> Undefined {
     let labels: HashSet<&str> = index
         .files
         .values()
@@ -309,33 +314,11 @@ pub fn undefined(index: &ProjectIndex) -> Undefined {
     };
     let mut findings = Vec::new();
     for (path, file) in &index.files {
-        for reference in &file.refs {
-            for name in &reference.names {
-                let name = name.trim();
-                if is_literal(name) && !labels.contains(name) {
-                    findings.push(Finding {
-                        path: path.clone(),
-                        line: reference.line,
-                        name: name.to_owned(),
-                        kind: NameKind::Label,
-                    });
-                }
-            }
+        if complete {
+            findings.extend(undefined_refs(path, file, |name| labels.contains(name)));
         }
         if cites_checked {
-            for citation in &file.cites {
-                for key in &citation.keys {
-                    let key = key.trim();
-                    if is_literal(key) && key != "*" && !keys.contains(key) {
-                        findings.push(Finding {
-                            path: path.clone(),
-                            line: citation.line,
-                            name: key.to_owned(),
-                            kind: NameKind::Cite,
-                        });
-                    }
-                }
-            }
+            findings.extend(undefined_cites(path, file, |key| keys.contains(key)));
         }
     }
     findings.sort();
@@ -343,6 +326,318 @@ pub fn undefined(index: &ProjectIndex) -> Undefined {
     Undefined {
         findings,
         cites_checked,
+        labels_checked: complete,
+    }
+}
+
+/// The references of `file` (at `path`) to labels that are not `defined`, in line order.
+fn undefined_refs(path: &Path, file: &FileIndex, defined: impl Fn(&str) -> bool) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for reference in &file.refs {
+        for name in &reference.names {
+            let name = name.trim();
+            if is_literal(name) && !defined(name) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: reference.line,
+                    name: name.to_owned(),
+                    kind: NameKind::Label,
+                });
+            }
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+/// The citations of `file` (at `path`) of keys that are not `known`, in line order.
+fn undefined_cites(path: &Path, file: &FileIndex, known: impl Fn(&str) -> bool) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for citation in &file.cites {
+        for key in &citation.keys {
+            let key = key.trim();
+            if is_literal(key) && key != "*" && !known(key) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: citation.line,
+                    name: key.to_owned(),
+                    kind: NameKind::Cite,
+                });
+            }
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+/// [`undefined`] kept up to date from one look at the project index to the next. An
+/// [`update`](Self::update) looks again only at what the index replaced since the last one (a
+/// file's entry when the file's structure changed, a bibliography's entries when it was read
+/// again, the `.aux` numbers when a build changed them; see `ProjectIndex`), which it tells by
+/// the `Arc`s. So prose typed costs nothing, and an edit of one file rechecks that file's
+/// references and citations, plus the references elsewhere to a label it added or removed:
+/// the labels are counted by name across the files, and the files that refer to each name are
+/// known, so neither is gathered again. A new `.aux` rechecks every reference, a bibliography
+/// read again every citation.
+#[derive(Debug, Default)]
+pub struct UndefinedCheck {
+    /// The index's entries the findings are from (held: an entry the index replaced since has
+    /// another address, and its labels and references come out of the counts).
+    files: BTreeMap<PathBuf, Arc<FileIndex>>,
+    /// The bibliographies and the `.aux` the findings are from, told by address only (a weak
+    /// reference keeps the address from being reused).
+    bibs: Vec<(PathBuf, Weak<Vec<BibEntry>>)>,
+    aux: Weak<AuxInfo>,
+    /// How many of the files define each label.
+    labels: HashMap<String, u32>,
+    /// The files that refer to each label name.
+    referrers: HashMap<String, Vec<Rc<Path>>>,
+    /// The bibliographies' keys, while citations are checked.
+    keys: HashSet<String>,
+    cites_checked: bool,
+    labels_checked: bool,
+    /// The undefined references and citations of each file, each in line order (files with
+    /// none are left out).
+    findings: BTreeMap<PathBuf, (Vec<Finding>, Vec<Finding>)>,
+    /// An update ran (the first one checks everything).
+    started: bool,
+    /// How many times the references or citations of a file were looked at, in all.
+    files_checked: u64,
+}
+
+/// The label names `file` refers to, once each.
+fn referred(file: &FileIndex) -> BTreeSet<&str> {
+    file.refs
+        .iter()
+        .flat_map(|r| &r.names)
+        .map(|name| name.trim())
+        .filter(|name| is_literal(name))
+        .collect()
+}
+
+impl UndefinedCheck {
+    /// Brings the findings up to date with `index` (`complete`: it has every file of the
+    /// project, see [`undefined`]). False when nothing they come from changed since the last
+    /// update, and the findings stand.
+    pub fn update(&mut self, index: &ProjectIndex, complete: bool) -> bool {
+        let aux_changed = !std::ptr::eq(self.aux.as_ptr(), Arc::as_ptr(&index.aux));
+        let bibs_changed = self.bibs.len() != index.bibs.len()
+            || self
+                .bibs
+                .iter()
+                .zip(&index.bibs)
+                .any(|((p, a), (q, b))| p != q || !std::ptr::eq(a.as_ptr(), Arc::as_ptr(b)));
+        // The files whose entry the index replaced, added or dropped: their path, and their
+        // entry before and now (in path order).
+        type Change = (PathBuf, Option<Arc<FileIndex>>, Option<Arc<FileIndex>>);
+        let mut changed: Vec<Change> = Vec::new();
+        let mut old = self.files.iter().peekable();
+        let mut new = index.files.iter().peekable();
+        loop {
+            let change = match (old.peek().copied(), new.peek().copied()) {
+                (None, None) => break,
+                (Some((p, a)), Some((q, b))) if p == q => {
+                    old.next();
+                    new.next();
+                    if Arc::ptr_eq(a, b) {
+                        continue;
+                    }
+                    (q.clone(), Some(a.clone()), Some(b.clone()))
+                }
+                (Some((p, _)), Some((q, b))) if p > q => {
+                    new.next();
+                    (q.clone(), None, Some(b.clone()))
+                }
+                (None, Some((q, b))) => {
+                    new.next();
+                    (q.clone(), None, Some(b.clone()))
+                }
+                (Some((p, a)), _) => {
+                    old.next();
+                    (p.clone(), Some(a.clone()), None)
+                }
+            };
+            changed.push(change);
+        }
+        if self.started
+            && !aux_changed
+            && !bibs_changed
+            && complete == self.labels_checked
+            && changed.is_empty()
+        {
+            return false;
+        }
+        // The label counts, and the names whose definition came or went.
+        let aux = &index.aux;
+        let defined = |labels: &HashMap<String, u32>, name: &str| {
+            labels.contains_key(name) || aux.labels.contains_key(name)
+        };
+        let mut before: HashMap<&str, bool> = HashMap::new();
+        for (_, old, new) in &changed {
+            for label in old.iter().chain(new).flat_map(|f| &f.labels) {
+                let name = label.name.as_str();
+                if !before.contains_key(name) {
+                    before.insert(name, defined(&self.labels, name));
+                }
+            }
+        }
+        for (path, old, new) in &changed {
+            if let Some(old) = old {
+                for label in &old.labels {
+                    if let Some(count) = self.labels.get_mut(&label.name) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.labels.remove(&label.name);
+                        }
+                    }
+                }
+                for name in referred(old) {
+                    if let Some(files) = self.referrers.get_mut(name) {
+                        files.retain(|file| **file != **path);
+                        if files.is_empty() {
+                            self.referrers.remove(name);
+                        }
+                    }
+                }
+            }
+            if let Some(new) = new {
+                for label in &new.labels {
+                    match self.labels.get_mut(&label.name) {
+                        Some(count) => *count += 1,
+                        None => {
+                            self.labels.insert(label.name.clone(), 1);
+                        }
+                    }
+                }
+                let file: Rc<Path> = Rc::from(path.as_path());
+                for name in referred(new) {
+                    match self.referrers.get_mut(name) {
+                        Some(files) => files.push(file.clone()),
+                        None => {
+                            self.referrers.insert(name.to_owned(), vec![file.clone()]);
+                        }
+                    }
+                }
+            }
+        }
+        // The files that refer to a label whose definition came or went.
+        let referring: BTreeSet<Rc<Path>> = before
+            .into_iter()
+            .filter(|(name, was)| *was != defined(&self.labels, name))
+            .flat_map(|(name, _)| self.referrers.get(name).into_iter().flatten().cloned())
+            .collect();
+        // What is checked, and against which keys.
+        let cites_checked = cites_checkable(index);
+        let all_refs = !self.started || aux_changed || complete != self.labels_checked;
+        let all_cites = !self.started || bibs_changed || cites_checked != self.cites_checked;
+        if all_cites {
+            self.keys = if cites_checked {
+                index
+                    .bibs
+                    .values()
+                    .flat_map(|entries| entries.iter().map(|e| e.key.clone()))
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+        }
+        // The findings: of the files changed, those that refer to such a label, or all.
+        let fresh: BTreeSet<&Path> = changed
+            .iter()
+            .filter(|(_, _, new)| new.is_some())
+            .map(|(path, ..)| path.as_path())
+            .collect();
+        for (path, _, new) in &changed {
+            if new.is_none() {
+                self.findings.remove(path);
+            }
+        }
+        let look: Vec<&Path> = if all_refs || all_cites {
+            index.files.keys().map(PathBuf::as_path).collect()
+        } else {
+            let mut look: Vec<&Path> = fresh.iter().copied().collect();
+            look.extend(referring.iter().map(|path| &**path));
+            look.sort();
+            look.dedup();
+            look
+        };
+        for path in look {
+            let Some((path, file)) = index.files.get_key_value(path) else {
+                continue;
+            };
+            let is_fresh = fresh.contains(path.as_path());
+            let refs = is_fresh || all_refs || referring.contains(path.as_path());
+            let cites = is_fresh || all_cites;
+            if !refs && !cites {
+                continue;
+            }
+            self.files_checked += 1;
+            let (mut ref_findings, mut cite_findings) =
+                self.findings.remove(path).unwrap_or_default();
+            if refs {
+                ref_findings = if complete {
+                    undefined_refs(path, file, |name| defined(&self.labels, name))
+                } else {
+                    Vec::new()
+                };
+            }
+            if cites {
+                cite_findings = if cites_checked {
+                    undefined_cites(path, file, |key| self.keys.contains(key))
+                } else {
+                    Vec::new()
+                };
+            }
+            if !ref_findings.is_empty() || !cite_findings.is_empty() {
+                self.findings
+                    .insert(path.clone(), (ref_findings, cite_findings));
+            }
+        }
+        for (path, _, new) in changed {
+            match new {
+                Some(new) => self.files.insert(path, new),
+                None => self.files.remove(&path),
+            };
+        }
+        self.bibs = index
+            .bibs
+            .iter()
+            .map(|(path, entries)| (path.clone(), Arc::downgrade(entries)))
+            .collect();
+        self.aux = Arc::downgrade(&index.aux);
+        self.cites_checked = cites_checked;
+        self.labels_checked = complete;
+        self.started = true;
+        true
+    }
+
+    /// The undefined references and citations by path, each file's in line order.
+    pub fn by_path(&self) -> BTreeMap<PathBuf, Vec<Finding>> {
+        self.findings
+            .iter()
+            .map(|(path, (refs, cites))| {
+                let mut all: Vec<Finding> = refs.iter().chain(cites).cloned().collect();
+                all.sort();
+                (path.clone(), all)
+            })
+            .collect()
+    }
+
+    /// Whether the last update checked citations ([`Undefined::cites_checked`]).
+    pub fn cites_checked(&self) -> bool {
+        self.cites_checked
+    }
+
+    /// Whether the last update checked references ([`Undefined::labels_checked`]).
+    pub fn labels_checked(&self) -> bool {
+        self.labels_checked
+    }
+
+    /// How many times the references or citations of a file were looked at, in all.
+    pub fn files_checked(&self) -> u64 {
+        self.files_checked
     }
 }
 
@@ -1205,7 +1500,7 @@ mod tests {
                 .bibs
                 .insert(PathBuf::from(path), Arc::new(lemma_syntax::scan_bib(text)));
         }
-        index.aux = lemma_syntax::parse_aux(aux);
+        index.aux = Arc::new(lemma_syntax::parse_aux(aux));
         index
     }
 
@@ -1222,8 +1517,8 @@ mod tests {
             &[("/p/refs.bib", bib)],
             aux,
         );
-        let undefined = undefined(&index);
-        assert!(undefined.cites_checked);
+        let undefined = undefined(&index, true);
+        assert!(undefined.cites_checked && undefined.labels_checked);
         let found: Vec<(&str, u32, &str, NameKind)> = undefined
             .findings
             .iter()
@@ -1240,9 +1535,13 @@ mod tests {
         // A bibliography Lemma could not read: no citation is reported.
         let mut unread = index.clone();
         unread.bibs.clear();
-        let undefined = super::undefined(&unread);
+        let undefined = super::undefined(&unread, true);
         assert!(!undefined.cites_checked);
         assert!(undefined.findings.iter().all(|f| f.kind == NameKind::Label));
+        // An index without every file of the project: no reference is reported.
+        let undefined = super::undefined(&index, false);
+        assert!(!undefined.labels_checked && undefined.cites_checked);
+        assert!(undefined.findings.iter().all(|f| f.kind == NameKind::Cite));
         // Unused.
         let labels: Vec<String> = unused_labels(&index).into_iter().map(|f| f.name).collect();
         assert!(labels.is_empty(), "{labels:?}");
@@ -1252,6 +1551,201 @@ mod tests {
             .collect();
         assert_eq!(entries, ["spare"]);
         assert!(unused_entries(&index, true).is_empty());
+    }
+
+    /// The findings of `check` as [`undefined`] lists them.
+    fn flat(check: &UndefinedCheck) -> Vec<Finding> {
+        check.by_path().into_values().flatten().collect()
+    }
+
+    /// The names of the findings of `check`, in order.
+    fn names_of(check: &UndefinedCheck) -> Vec<String> {
+        flat(check).into_iter().map(|f| f.name).collect()
+    }
+
+    #[test]
+    fn undefined_check_looks_again_only_at_what_changed() {
+        let main = "\\documentclass{book}\n\\addbibresource{refs.bib}\n\\begin{document}\n\
+                    \\input{a}\n\\input{b}\n\\input{c}\n\\end{document}\n";
+        let a = "\\chapter{A}\\label{ch:a}\nSee \\ref{ch:b} and \\ref{late}.\n";
+        let b = "\\chapter{B}\\label{ch:b}\n\\cite{known} \\cite{unknown}\n";
+        let c = "\\chapter{C}\\label{ch:c}\nOnly \\ref{ch:a}.\n";
+        let mut index = project(
+            &[
+                ("/p/main.tex", main),
+                ("/p/a.tex", a),
+                ("/p/b.tex", b),
+                ("/p/c.tex", c),
+            ],
+            &[("/p/refs.bib", "@book{known, title={T}}\n")],
+            "",
+        );
+        let mut check = UndefinedCheck::default();
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 4);
+        assert_eq!(flat(&check), undefined(&index, true).findings);
+        assert_eq!(names_of(&check), ["late", "unknown"]);
+        // Nothing replaced (prose typed): nothing to do.
+        assert!(!check.update(&index, true));
+        assert_eq!(check.files_checked(), 4);
+        // `c` indexed again, equal (a new entry): only `c` is looked at.
+        index.update_file(PathBuf::from("/p/c.tex"), Arc::new(index_file(c)));
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 5);
+        // `c` defines `late`: `c`, and `a`, which refers to it.
+        let c_late = format!("{c}\\section{{Late}}\\label{{late}}\n");
+        index.update_file(PathBuf::from("/p/c.tex"), Arc::new(index_file(&c_late)));
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 7);
+        assert_eq!(flat(&check), undefined(&index, true).findings);
+        // `a` moved a line down (its labels are the same): only `a`.
+        index.update_file(
+            PathBuf::from("/p/a.tex"),
+            Arc::new(index_file(&format!("\n{a}"))),
+        );
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 8);
+        assert_eq!(flat(&check), undefined(&index, true).findings);
+        // `b` goes: `c`'s `\ref{ch:a}` is fine, `a`'s `\ref{ch:b}` is not.
+        index.files.remove(Path::new("/p/b.tex"));
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 9);
+        assert_eq!(names_of(&check), ["ch:b"]);
+        // A new `.aux` defines it: every reference is looked at.
+        index.aux = Arc::new(lemma_syntax::parse_aux("\\newlabel{ch:b}{{2}{1}}\n"));
+        assert!(check.update(&index, true));
+        assert_eq!(check.files_checked(), 12);
+        assert!(flat(&check).is_empty());
+        // The index lacks files of the project: no reference is checked.
+        index.update_file(
+            PathBuf::from("/p/c.tex"),
+            Arc::new(index_file("\\ref{nowhere}\n")),
+        );
+        assert!(check.update(&index, false));
+        assert!(!check.labels_checked() && check.cites_checked());
+        assert!(flat(&check).is_empty());
+        assert!(check.update(&index, true));
+        assert_eq!(flat(&check), undefined(&index, true).findings);
+        assert_eq!(names_of(&check), ["late", "nowhere"]);
+    }
+
+    /// [`UndefinedCheck`] against [`undefined`] over random sessions: files edited (labels,
+    /// references and citations added, removed and moved), indexed again unchanged, added and
+    /// removed; the `.aux` and the bibliographies replaced, emptied or gone; the index found
+    /// incomplete and complete again.
+    #[test]
+    fn undefined_check_is_undefined_after_every_change() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            (rng.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as usize % n
+        };
+        let file_text = |next: &mut dyn FnMut(usize) -> usize| {
+            let mut text = String::new();
+            for _ in 0..next(6) {
+                match next(5) {
+                    0 | 1 => text += &format!("\\section{{S}}\\label{{l{}}}\n", next(10)),
+                    2 => text += &format!("\\ref{{l{}}} \\eqref{{x{}}}\n", next(12), next(3)),
+                    3 => text += &format!("\\cref{{l{}, l{}}}\n", next(12), next(12)),
+                    _ => text += &format!("\\cite{{k{}, k{}}}\n\n", next(8), next(8)),
+                }
+            }
+            if next(8) == 0 {
+                text += "\\addbibresource{other.bib}\n";
+            }
+            text
+        };
+        let bib_text = |next: &mut dyn FnMut(usize) -> usize| {
+            (0..next(6))
+                .map(|_| format!("@book{{k{}, title={{T}}}}\n", next(8)))
+                .collect::<String>()
+        };
+        let (mut with_refs, mut with_cites) = (0, 0);
+        for session in 0..40 {
+            let mut index = ProjectIndex::default();
+            index.update_file(
+                PathBuf::from("/p/main.tex"),
+                Arc::new(index_file("\\addbibresource{refs.bib}\n\\ref{l1}\n")),
+            );
+            let mut check = UndefinedCheck::default();
+            let mut complete = true;
+            let mut texts: BTreeMap<usize, String> = BTreeMap::new();
+            for step in 0..60 {
+                let what = next(10);
+                let changed = match what {
+                    0..=3 => {
+                        let file = next(6);
+                        let text = file_text(&mut next);
+                        index.update_file(
+                            PathBuf::from(format!("/p/f{file}.tex")),
+                            Arc::new(index_file(&text)),
+                        );
+                        texts.insert(file, text);
+                        true
+                    }
+                    4 => match texts.keys().nth(next(texts.len().max(1))).copied() {
+                        Some(file) => {
+                            index.update_file(
+                                PathBuf::from(format!("/p/f{file}.tex")),
+                                Arc::new(index_file(&texts[&file])),
+                            );
+                            true
+                        }
+                        None => false,
+                    },
+                    5 => match texts.keys().nth(next(texts.len().max(1))).copied() {
+                        Some(file) => {
+                            texts.remove(&file);
+                            index.files.remove(Path::new(&format!("/p/f{file}.tex")));
+                            true
+                        }
+                        None => false,
+                    },
+                    6 => {
+                        let aux: String = (0..next(5))
+                            .map(|_| format!("\\newlabel{{l{}}}{{{{1}}{{1}}}}\n", next(12)))
+                            .collect();
+                        index.aux = Arc::new(lemma_syntax::parse_aux(&aux));
+                        true
+                    }
+                    7 => {
+                        let name = if next(2) == 0 { "refs" } else { "other" };
+                        let path = PathBuf::from(format!("/p/{name}.bib"));
+                        if next(4) == 0 {
+                            index.bibs.remove(&path).is_some()
+                        } else {
+                            let entries = lemma_syntax::scan_bib(&bib_text(&mut next));
+                            index.bibs.insert(path, Arc::new(entries));
+                            true
+                        }
+                    }
+                    8 => {
+                        complete = !complete;
+                        true
+                    }
+                    _ => false,
+                };
+                let looked = check.update(&index, complete);
+                let expected = undefined(&index, complete);
+                let context = format!("session {session}, step {step} ({what})");
+                assert_eq!(looked, changed || step == 0, "{context}: looked again");
+                assert_eq!(flat(&check), expected.findings, "{context}");
+                with_refs +=
+                    usize::from(expected.findings.iter().any(|f| f.kind == NameKind::Label));
+                with_cites +=
+                    usize::from(expected.findings.iter().any(|f| f.kind == NameKind::Cite));
+                assert_eq!(check.cites_checked(), expected.cites_checked, "{context}");
+                assert_eq!(check.labels_checked(), expected.labels_checked, "{context}");
+                assert!(!check.update(&index, complete), "{context}: looked twice");
+            }
+        }
+        // The sessions had undefined references and citations to follow.
+        assert!(
+            with_refs > 400 && with_cites > 200,
+            "{with_refs} {with_cites}"
+        );
     }
 
     #[test]

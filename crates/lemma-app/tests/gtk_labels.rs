@@ -38,6 +38,14 @@ fn main() -> ExitCode {
             "undefined_follows_files_changed_on_disk",
             undefined_follows_files_on_disk,
         ),
+        (
+            "undefined_checks_look_again_only_at_what_changed",
+            undefined_checks_what_changed,
+        ),
+        (
+            "undefined_references_wait_for_every_file_past_the_cap",
+            undefined_past_the_cap,
+        ),
         ("problems_page_references_section_and_fix", problems_page),
         ("unused_labels_and_entries_on_demand", unused),
         ("find_references_lists_uses_across_the_project", references),
@@ -56,6 +64,8 @@ fn main() -> ExitCode {
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_equation_numbers_large_tex", perf_equation_numbers));
+        tests.push(("perf_undefined_check_big_project", perf_check_big_project));
+        tests.push(("perf_equation_numbers_follow_lines", perf_numbers_follow));
     }
     common::run(&tests)
 }
@@ -305,6 +315,126 @@ fn undefined_follows_files_on_disk() {
     common::pump_until(TIMEOUT, || !labels::cites_checked(&f.state));
     block_on(bib.document().save()).unwrap();
     common::pump_until(TIMEOUT, || labels::cites_checked(&f.state));
+}
+
+/// A check looks again only at what the project index replaced since the last one: after prose
+/// typed (the index keeps the file's entry) at nothing, after a reference added at its file,
+/// after a label added at its file and at the files that refer to it.
+fn undefined_checks_what_changed() {
+    let f = fixture("labels-undefined-incremental");
+    let editor = f.open("main.tex");
+    let chapter = f.open("chapters/ch1.tex");
+    f.wait_index();
+    f.wait_checks();
+    let state = f.state.clone();
+    // Waits for the check an edit scheduled: (checks skipped, files looked at) since `before`.
+    let after = |before: (u64, u64)| {
+        let checks = labels::checks_done(&state);
+        common::pump_until(TIMEOUT, || labels::checks_done(&state) > checks);
+        f.wait_checks();
+        (
+            labels::checks_skipped(&state) - before.0,
+            labels::files_checked(&state) - before.1,
+        )
+    };
+    let counts = || {
+        (
+            labels::checks_skipped(&state),
+            labels::files_checked(&state),
+        )
+    };
+    let before = counts();
+    insert_before(&editor, "Statement $", "A claim. ");
+    assert_eq!(after(before), (1, 0), "prose typed");
+    let before = counts();
+    let end = chapter.document().text().len();
+    chapter
+        .buffer()
+        .insert(&mut chapter.iter_near(end).unwrap(), "\\ref{sec:later}\n");
+    assert_eq!(after(before), (0, 1), "a reference");
+    assert!(
+        labels::undefined(&f.state)
+            .iter()
+            .any(|u| u.name == "sec:later")
+    );
+    let before = counts();
+    insert_before(
+        &editor,
+        "\\end{document}",
+        "\\section{Later}\\label{sec:later}\n",
+    );
+    assert_eq!(
+        after(before),
+        (0, 2),
+        "a label, and the file referring to it"
+    );
+    assert_eq!(
+        names(&labels::undefined(&f.state)),
+        vec![
+            ("missing".to_owned(), 10, NameKind::Cite),
+            ("sec:undefined".to_owned(), 23, NameKind::Label),
+        ]
+    );
+}
+
+/// A project that includes more files than a window reads from disk (`completion::
+/// MAX_DISK_FILES`): a reference to a label in a file past the cap would look undefined, so
+/// no reference is checked (citations still are) until the project fits again.
+fn undefined_past_the_cap() {
+    let f = fixture("labels-undefined-cap");
+    std::fs::remove_file(f.dir.join("main.aux")).unwrap();
+    let chapters = completion::MAX_DISK_FILES + 5;
+    std::fs::create_dir_all(f.dir.join("c")).unwrap();
+    let mut main =
+        String::from("\\documentclass{book}\n\\addbibresource{refs.bib}\n\\begin{document}\n");
+    for i in 0..chapters {
+        main += &format!("\\input{{c/c{i:03}}}\n");
+        // Each chapter refers to the next one (the last one to one that stays below).
+        let next = if i + 1 < chapters { i + 1 } else { 20 };
+        let text = format!("\\chapter{{C{i}}}\\label{{ch:{i}}}\nSee \\ref{{ch:{next}}}.\n");
+        std::fs::write(f.dir.join(format!("c/c{i:03}.tex")), text).unwrap();
+    }
+    main += "\\ref{nowhere} \\cite{knuth, missing}\n\\end{document}\n";
+    std::fs::write(f.dir.join("main.tex"), &main).unwrap();
+    let last = u32::try_from(3 + chapters).unwrap();
+    let editor = f.open("main.tex");
+    completion::refresh_project(&f.state);
+    let state = f.state.clone();
+    common::pump_until(Duration::from_secs(120), || {
+        !completion::project_busy(&state)
+            && state.workspace.index.borrow().files.len() > completion::MAX_DISK_FILES
+    });
+    labels::check_now(&f.state);
+    assert!(completion::index_capped(&f.state));
+    assert!(!labels::labels_checked(&f.state) && labels::cites_checked(&f.state));
+    assert_eq!(
+        names(&labels::undefined(&f.state)),
+        vec![("missing".to_owned(), last, NameKind::Cite)]
+    );
+    // Ten chapters fewer: they leave the index, the five past the cap are read, and the
+    // references are checked again.
+    let start = offset_of(&editor, "\\input{c/c000}", 0);
+    let end = offset_of(&editor, "\\input{c/c010}", 0);
+    editor.buffer().delete(
+        &mut editor.iter_near(start).unwrap(),
+        &mut editor.iter_near(end).unwrap(),
+    );
+    common::pump_until(Duration::from_secs(120), || {
+        let index = state.workspace.index.borrow();
+        !completion::project_busy(&state)
+            && index.find_label("ch:304").is_some()
+            && index.find_label("ch:0").is_none()
+    });
+    f.wait_checks();
+    assert!(!completion::index_capped(&f.state));
+    assert!(labels::labels_checked(&f.state));
+    assert_eq!(
+        names(&labels::undefined(&f.state)),
+        vec![
+            ("missing".to_owned(), last - 10, NameKind::Cite),
+            ("nowhere".to_owned(), last - 10, NameKind::Label),
+        ]
+    );
 }
 
 fn problems_page() {
@@ -775,16 +905,37 @@ fn equation_numbers() {
     let chapter = f.open("chapters/ch1.tex");
     assert_eq!(annotations::shown(&chapter), vec![(0, "§2".to_owned())]);
     f.state.select_editor(&editor);
-    // Lines inserted above move the numbers at once (before any check).
-    let buffer = editor.buffer();
-    buffer.insert(&mut buffer.start_iter(), "% a\n% b\n");
-    assert_eq!(
-        annotations::shown(&editor)
+    // Lines inserted above move the numbers before the next frame is laid out (before any
+    // check): the line changes until then (two inserts here) add them again once.
+    let lines = |editor: &Editor| {
+        annotations::shown(editor)
             .iter()
             .map(|(l, _)| *l)
-            .collect::<Vec<_>>(),
-        vec![10, 13, 16, 20]
-    );
+            .collect::<Vec<_>>()
+    };
+    let rebuilds = annotations::rebuilds(&editor);
+    let buffer = editor.buffer();
+    buffer.insert(&mut buffer.start_iter(), "% a\n");
+    buffer.insert(&mut buffer.start_iter(), "% b\n");
+    assert_eq!(lines(&editor), vec![8, 11, 14, 18], "not inside the change");
+    let clock = f.state.window.frame_clock().unwrap();
+    let at_layout: Rc<std::cell::RefCell<Option<Vec<u32>>>> = Rc::default();
+    let (seen, laid_out) = (at_layout.clone(), editor.clone());
+    let id = clock.connect_layout(move |_| {
+        seen.borrow_mut().get_or_insert_with(|| lines(&laid_out));
+    });
+    editor.view().queue_draw();
+    common::pump_until(TIMEOUT, || at_layout.borrow().is_some());
+    clock.disconnect(id);
+    assert_eq!(at_layout.take(), Some(vec![10, 13, 16, 20]));
+    assert_eq!(annotations::rebuilds(&editor), rebuilds + 1);
+    // Lines inserted below every number move none.
+    let end = offset_of(&editor, "\\end{document}", 0);
+    editor
+        .buffer()
+        .insert(&mut editor.iter_near(end).unwrap(), "% c\n");
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(annotations::rebuilds(&editor), rebuilds + 1);
     // Typing on a labelled line keeps its number.
     insert_before(&editor, "\\label{eq:one}", " ");
     assert_eq!(annotations::shown(&editor)[2], (16, "(1)".to_owned()));
@@ -830,12 +981,11 @@ fn equation_numbers() {
     assert_eq!(annotations::shown(&chapter).len(), 1);
 }
 
-/// The inline equation numbers of `tests/fixtures/large.tex` (60k lines) with a label in each of
-/// its 2500 theorems besides the 2500 of its sections, a preamble defining the theorems, and an
-/// `.aux` that numbers all 5000: what one refresh costs when the numbers changed (the text read
-/// again, every label looked up and named), and the main loop's work after a new undefined
-/// reference is underlined.
-fn perf_equation_numbers() {
+/// `tests/fixtures/large.tex` with a label in each of its 2500 theorems besides the 2500 of its
+/// sections, a preamble defining the theorems, and an `.aux` that numbers all 5000, open in a
+/// window of the fixture `name` and indexed, with its numbers shown: the fixture, the editor and
+/// the count of numbers.
+fn numbered_large_tex(name: &str) -> (Fixture, Rc<Editor>, usize) {
     let large = std::fs::read_to_string(common::fixtures().join("large.tex")).unwrap();
     let mut text = String::with_capacity(large.len() + (64 << 10));
     let mut theorems = 0;
@@ -855,7 +1005,7 @@ fn perf_equation_numbers() {
         aux.push_str(&format!("\\newlabel{{{name}}}{{{{{numbered}}}{{1}}}}\n"));
         numbered += 1;
     }
-    let f = fixture("labels-perf-numbers");
+    let f = fixture(name);
     std::fs::write(f.path("main.tex"), &text).unwrap();
     std::fs::write(f.path("main.aux"), &aux).unwrap();
     let editor = f.open("main.tex");
@@ -877,16 +1027,24 @@ fn perf_equation_numbers() {
         numbered,
         "{theorems} theorems"
     );
+    (f, editor, numbered)
+}
+
+/// The inline equation numbers of `tests/fixtures/large.tex` (60k lines) numbered as
+/// [`numbered_large_tex`] does: what one refresh costs when the numbers changed (the text read
+/// again, every label looked up and named), and the main loop's work after a new undefined
+/// reference is underlined.
+fn perf_equation_numbers() {
+    let (f, editor, numbered) = numbered_large_tex("labels-perf-numbers");
+    let state = f.state.clone();
     let mut times = Vec::new();
     for i in 0..9 {
         // A number that is new to the refresh: everything is computed again.
-        f.state
-            .workspace
-            .index
-            .borrow_mut()
-            .aux
+        let mut index = f.state.workspace.index.borrow_mut();
+        std::sync::Arc::make_mut(&mut index.aux)
             .labels
             .insert(format!("perf:{i}"), ("1".to_owned(), "1".to_owned()));
+        drop(index);
         let started = Instant::now();
         annotations::refresh(&f.state, &editor);
         times.push(started.elapsed());
@@ -928,5 +1086,142 @@ fn perf_equation_numbers() {
     } else {
         assert!(median <= Duration::from_millis(15), "{median:?}");
         assert!(underlined <= Duration::from_millis(50), "{underlined:?}");
+    }
+}
+
+/// The 5000 equation numbers of [`numbered_large_tex`] following line changes above them: what
+/// a line break costs the main thread inside the change (as in a key's handler), and with what
+/// is ready to run after it (the numbers have moved then), and ten line changes made at once (a
+/// replacement, Vim's `.`) with what is ready to run after them; 9 of each, on the CPU.
+fn perf_numbers_follow() {
+    let (_f, editor, numbered) = numbered_large_tex("labels-perf-follow");
+    let context = glib::MainContext::default();
+    let drain = || {
+        while context.pending() {
+            context.iteration(false);
+        }
+    };
+    let first_number = || annotations::shown(&editor)[0].0;
+    let buffer = editor.buffer();
+    let (mut handler, mut frame, mut many) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..9 {
+        drain();
+        // A line break at the end of the first line, above every number.
+        let at = editor.document().line_index().line_range(0).end;
+        let before = first_number();
+        let mut work = Duration::ZERO;
+        handler.push(common::big_project::on_cpu(|| {
+            buffer.insert(&mut editor.iter_near(at).unwrap(), "\n");
+        }));
+        work += handler[handler.len() - 1];
+        work += common::big_project::on_cpu(drain);
+        assert_eq!(first_number(), before + 1);
+        frame.push(work);
+        // Ten lines added one by one in one action.
+        let before = first_number();
+        let start = editor.document().line_index().line_start(1);
+        many.push(common::big_project::on_cpu(|| {
+            buffer.begin_user_action();
+            for _ in 0..10 {
+                buffer.insert(&mut editor.iter_near(start).unwrap(), "% a line\n");
+            }
+            buffer.end_user_action();
+            drain();
+        }));
+        assert_eq!(first_number(), before + 10);
+    }
+    let [handler, frame, many] = [handler, frame, many].map(|mut times| {
+        let shown = common::big_project::median_max(&mut times);
+        (times[times.len() / 2], shown)
+    });
+    println!(
+        "    {numbered} numbers: a line break {} in the change, {} until the next frame; ten \
+         line changes at once {}; load {}",
+        handler.1,
+        frame.1,
+        many.1,
+        common::big_project::load()
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budgets are checked in release)");
+        return;
+    }
+    assert!(handler.0 <= Duration::from_millis(1), "{:?}", handler.0);
+    assert!(many.0 <= Duration::from_millis(10), "{:?}", many.0);
+}
+
+/// The label checks on a generated book (`common::big_project`: 300 chapters, 20k labels, 30k
+/// references, 40k citations, a 10k-entry bibliography and a `.aux` that numbers every label),
+/// with the root and a chapter open: what the check that runs once typing stopped and the
+/// chapter was indexed again costs the main thread (with the equation numbers of both editors;
+/// the time it waited for a CPU left out), for prose (its index entry comes back the same),
+/// Enter (the chapter's labels move down a line), a new `\ref`, a new `\label` and a reference
+/// to nothing (underlined and published), 7 of each at different places.
+fn perf_check_big_project() {
+    let f = fixture("labels-perf-big");
+    std::fs::remove_file(f.path("main.aux")).unwrap();
+    let big = common::big_project::write(&f.dir, 300, 66, 10_000, 1);
+    let _main = f.open("main.tex");
+    let chapter = f.open("c/c0150.tex");
+    completion::refresh_project(&f.state);
+    let state = f.state.clone();
+    common::pump_until(Duration::from_secs(300), || {
+        let index = state.workspace.index.borrow();
+        !completion::project_busy(&state)
+            && index.files.len() > big.chapters
+            && !index.bibs.is_empty()
+            && index.aux.labels.len() >= big.labels
+    });
+    labels::check_now(&f.state);
+    f.wait_checks();
+    assert!(labels::undefined(&f.state).is_empty());
+    println!("    {big:?}");
+    let mut line = 40;
+    let mut report = Vec::new();
+    for (kind, insert) in [
+        ("prose", " word"),
+        ("Enter", "\n"),
+        ("\\ref", " \\ref{ch:3}"),
+        ("\\label", "\\label{perf:new:#}"),
+        ("undefined \\ref", " \\ref{perf:nowhere:#}"),
+    ] {
+        let mut times = Vec::new();
+        let mut attempts = 0;
+        while times.len() < 7 {
+            attempts += 1;
+            assert!(attempts < 30, "the scheduled check kept running first");
+            line = common::big_project::prose_line(&chapter.document().text(), line as usize + 3);
+            let doc = chapter.document();
+            let end = doc.line_index().line_range(line).end;
+            let buffer = chapter.buffer();
+            let mut at = chapter.iter_near(end).unwrap();
+            buffer.insert(&mut at, &insert.replace('#', &attempts.to_string()));
+            let checks = labels::checks_done(&f.state);
+            // The chapter is indexed again 300 ms after the change; the check would run 450 ms
+            // after it.
+            common::pump_until(TIMEOUT, || !completion::index_busy(&state));
+            if labels::checks_done(&f.state) != checks {
+                f.wait_checks();
+                continue;
+            }
+            times.push(common::big_project::on_cpu(|| labels::check_now(&f.state)));
+            f.wait_checks();
+        }
+        report.push((kind, common::big_project::median_max(&mut times), times));
+    }
+    let undefined = labels::undefined(&f.state).len();
+    assert!(undefined >= 7, "the references to nothing: {undefined}");
+    for (kind, times, _) in &report {
+        println!("    check after {kind}: median/max {times}");
+    }
+    println!("    load {}", common::big_project::load());
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budgets are checked in release)");
+        return;
+    }
+    for (kind, _, times) in &report {
+        let median = times[times.len() / 2];
+        let budget = Duration::from_millis(if *kind == "prose" { 1 } else { 8 });
+        assert!(median <= budget, "{kind}: median {median:?}");
     }
 }
