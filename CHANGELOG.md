@@ -17,6 +17,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - F4 and Shift+F4 go to the next and previous build problem from the cursor, in the Problems
   page's order and across files, opening them at their current line; `]e` and `[e` in Vim
   normal mode. Both are in the command palette and the shortcuts window.
+- Toggle Comment (Ctrl+/): comments out the selected lines, or the cursor's line, and back in,
+  as one undo step. Blank lines are left alone; `\%` is not a comment.
+- Bold (Ctrl+B), Italic (Ctrl+I) and Emphasize (command palette) put the selection in
+  `\textbf{…}`, `\textit{…}` or `\emph{…}` (`\mathbf`, `\mathit` in math), or insert the command
+  with the cursor inside; on a selection that already has the command they remove it. With Vim
+  mode on, Ctrl+B and Ctrl+I stay Vim's keys and Bold and Italic are off.
+- Preferences: auto-save (off, when the window loses the focus, or two seconds after a change),
+  session restore, the git gutter, the word count, chktex and typing replacements.
 
 ### Changed
 
@@ -47,6 +55,9 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   reading. The current match stays current; only a search you start scrolls to its match.
 - The PDF strip no longer renders its thumbnails over and over when the rows on screen need
   more than their share of the cache (HiDPI screens, a small `[pdf] cache_mib`).
+- `[typing] replacements` was accepted but did nothing. It now replaces `...` typed in text with
+  `\dots` (not in math, comments or verbatim text, and not after `\.`); one undo gives back the
+  dots. It stays off by default.
 
 ## epsilon (0.1.0), 2026-10-20
 

@@ -400,6 +400,8 @@ impl WindowState {
         crate::templates::install(self);
         crate::bibimport::install(self);
         crate::autosave::install(self);
+        // Editing commands (Toggle Comment, Bold, Italic, Emphasize).
+        crate::editor::editing::install(self);
     }
 
     /// The M3 per-editor hooks, after the M2 ones: the hover and goto registries first, so the

@@ -14,7 +14,7 @@
 //! font = "JetBrains Mono 12"
 //!
 //! [keys]
-//! "win.build" = "<Control>b"
+//! "win.build" = "<Control><Shift>b"
 //! ```
 //!
 //! Besides `config.toml`, the user's `prompts.toml` (agent quick actions, [`parse_prompts`]) and
@@ -112,6 +112,20 @@ pub enum Autosave {
     Focus,
     /// Two seconds after the last change.
     Idle,
+}
+
+impl Autosave {
+    /// Every value, in the order Preferences lists them.
+    pub const ALL: [Autosave; 3] = [Self::Off, Self::Focus, Self::Idle];
+
+    /// The value in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Focus => "focus",
+            Self::Idle => "idle",
+        }
+    }
 }
 
 /// `[editor] renderer`: how GTK draws the windows (read at start-up only).
@@ -474,7 +488,9 @@ pub struct TypingCfg {
     pub item_on_enter: bool,
     /// Expand automatic snippets (`ff` → `\frac{}{}` in math, …) as they are typed.
     pub autosnippets: bool,
-    /// Typing replacements such as `...` → `\dots` (QoL P2).
+    /// Typing replacements: `...` typed in text becomes `\dots` (not in math, arguments,
+    /// comments or verbatim text, and not after a backslash: `\.` is the dot accent). One undo
+    /// gives back the three dots.
     pub replacements: bool,
 }
 
@@ -949,6 +965,11 @@ mod tests {
         }
         assert!(parse("[editor]\nautosave = true\n").is_err());
         assert!(parse("[editor]\nautosave = \"always\"\n").is_err());
+        // `as_str` is what the file says.
+        for autosave in Autosave::ALL {
+            let text = format!("[editor]\nautosave = \"{}\"\n", autosave.as_str());
+            assert_eq!(parse(&text).unwrap().editor.autosave, autosave);
+        }
     }
 
     #[test]

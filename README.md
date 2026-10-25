@@ -34,6 +34,10 @@ build diagnostics in plain English, completion, snippets, a project outline and 
 - **Writing help.** Completion for commands, environments, labels, citations and Unicode math
   glyphs from per-package word lists. Snippets and autosnippets, bracket pairing, spell
   checking, hover previews of `\ref`, `\cite` and rendered math, and label rename/references.
+  Ctrl+/ comments lines out and back in; Ctrl+B and Ctrl+I put the selection in `\textbf{…}`
+  and `\textit{…}` (`\mathbf`, `\mathit` in math) and take it out again, and Emphasize
+  (`\emph`) is in the command palette. In Vim mode, Ctrl+B and Ctrl+I stay Vim's keys.
+  Optionally, `...` typed in text becomes `\dots`.
 - **Navigation.** Project outline, command palette (Ctrl+Shift+P), quick open (Ctrl+P),
   project search and replace (Ctrl+Shift+F), go to definition (F12), session restore, local
   history and a git gutter.
@@ -366,9 +370,10 @@ args = ["acp"]
 ### Configuration
 
 Settings live in `~/.config/lemma/config.toml`, with `snippets.toml` and `prompts.toml` next to
-it. All three reload live. Preferences (Ctrl+,) writes the same file and keeps your comments.
-The built-in defaults (`data/snippets.default.toml`, `data/prompts.default.toml`) are good
-starting points.
+it. All three reload live. Preferences (Ctrl+,) writes the same file and keeps your comments;
+among other things it turns on auto-save (`[editor] autosave`: when the window loses the focus,
+or two seconds after a change). The built-in defaults (`data/snippets.default.toml`,
+`data/prompts.default.toml`) are good starting points.
 
 For example, to never flag the words in your own word lists:
 

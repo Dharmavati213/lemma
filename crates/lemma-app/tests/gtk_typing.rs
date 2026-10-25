@@ -4,11 +4,13 @@
 //!   (`keys::dispatch`, then Vim, then the text view's insertion, as in `gtk_autosnippets`), the
 //!   cases that must not fire (after `\`, in comments and verbatim, on paste, undo and redo,
 //!   agent edits, in Vim normal mode, after `detach`), each `[typing]` switch with a live config
-//!   reload, and Enter while the completion popup is open. `perf_typing_keys` (with
-//!   `--ignored`) measures the main-thread cost of the helper keys on a 5k-line document.
+//!   reload, the `...` → `\dots` replacement and its undo, and Enter while the completion popup
+//!   is open. `perf_typing_keys` (with `--ignored`) measures the main-thread cost of the helper
+//!   keys on a 5k-line document.
 //! - **Real input** (`typing_helpers_on_real_key_events`, see `broadway_input`): pairs, `$`,
-//!   Backspace, `\end`, `\item` and leaving a list, a paste, and Enter with the completion
-//!   popup open, on real key events in plain editing and in Vim insert mode.
+//!   Backspace, `\end`, `\item` and leaving a list, replacements (in a snippet's stop too), a
+//!   paste, and Enter with the completion popup open, on real key events in plain editing and
+//!   in Vim insert mode.
 //!
 //! In the tables `‸` marks the cursor, and the typed keys use `\n` for Enter and `⌫` for
 //! Backspace.
@@ -53,6 +55,10 @@ fn main() -> ExitCode {
             never_on_other_edits,
         ),
         ("each_typing_switch_turns_its_helper_off", switches),
+        (
+            "replacements_dots_and_one_undo_gives_them_back",
+            replacements,
+        ),
         (
             "enter_while_the_completion_popup_is_open",
             enter_with_the_popup,
@@ -621,6 +627,75 @@ fn switches() {
     typist.escape(&f);
 }
 
+/// `[typing] replacements` (off by default): `...` typed in text becomes `\dots`, in plain
+/// editing and in Vim insert mode; one undo (Ctrl+Z, or `u` after `<Esc>`) gives back the
+/// three dots, and typing on adds dots.
+fn replacements() {
+    for vim in [false, true] {
+        let label = if vim { "vim" } else { "plain" };
+        let f = fixture(&format!("replacements-{label}"), vim);
+        let mut typist = Emulated;
+        let check = |typist: &mut Emulated, doc: &str, typed: &str, expected: &str| {
+            typist.start(&f, doc);
+            typist.text(&f, typed);
+            assert_eq!(
+                f.shown(),
+                expected,
+                "{label}: typing {typed:?} into {doc:?}"
+            );
+        };
+        check(&mut typist, "Wait‸", "...", "Wait...‸");
+        f.config(|c| c.typing.replacements = true);
+        check(&mut typist, "Wait‸", "...", "Wait\\dots‸");
+        check(&mut typist, "and so on‸.", "...", "and so on\\dots‸.");
+        // Not in math, comments or verbatim, and not after `\.` (the dot accent).
+        check(&mut typist, "$x_1, ‸$", "...", "$x_1, ...‸$");
+        check(&mut typist, "% ‸", "...", "% ...‸");
+        check(
+            &mut typist,
+            "\\begin{verbatim}\n‸\n\\end{verbatim}",
+            "...",
+            "\\begin{verbatim}\n...‸\n\\end{verbatim}",
+        );
+        check(&mut typist, "\\‸", "...", "\\...‸");
+        // In a snippet's stop (`\text{…}` in math is text) the session stays (Tab moving on is
+        // checked on real keys, in `REAL_REPLACEMENT_ROWS`).
+        for (typed, expected) in [
+            ("x tta...", "$x \\text{a\\dots‸}$"),
+            ("x tt...", "$x \\text{\\dots‸}$"),
+        ] {
+            typist.start(&f, "$‸$");
+            typist.text(&f, typed);
+            assert_eq!(f.shown(), expected, "{label}: {typed:?}");
+            assert!(
+                completion::snippet_active(&f.state, &f.editor),
+                "{label}: {typed:?} keeps the session"
+            );
+        }
+        // One undo gives back the dots; a fourth dot then is a dot.
+        typist.start(&f, "Wait‸");
+        typist.text(&f, "...");
+        assert_eq!(f.shown(), "Wait\\dots‸");
+        if vim {
+            typist.escape(&f);
+            typist.text(&f, "u");
+            f.wait("the undo", || !f.shown().contains("\\dots"));
+            assert_eq!(
+                f.buffer()
+                    .text(&f.buffer().start_iter(), &f.buffer().end_iter(), true),
+                "Wait..."
+            );
+        } else {
+            f.buffer().undo();
+            common::pump_for(Duration::from_millis(5));
+            assert_eq!(f.shown(), "Wait...‸", "{label}: undo gives back the dots");
+            typist.text(&f, ".");
+            assert_eq!(f.shown(), "Wait....‸", "{label}: a fourth dot");
+        }
+        typist.escape(&f);
+    }
+}
+
 // ───────────── Enter and the completion popup ─────────────
 
 /// While the popup is open Enter is the popup's: accepting a proposal adds nothing; a plain
@@ -842,6 +917,15 @@ const REAL_ROWS: &[Row] = &[
     ),
 ];
 
+/// Rows checked on real key events with `[typing] replacements` on: `...` becomes `\dots`, also
+/// in a snippet's stop, whose session goes on (Tab to the snippet's exit).
+const REAL_REPLACEMENT_ROWS: &[Row] = &[
+    row("Wait‸", "...", "Wait\\dots‸"),
+    row("$‸$", "x tta...\tb", "$x \\text{a\\dots}b‸$"),
+    row("$‸$", "x tt...\tb", "$x \\text{\\dots}b‸$"),
+    row("$x‸$", "...", "$x...‸$"),
+];
+
 fn real_child() {
     let mut config = config(false);
     config.completion.auto = true;
@@ -852,6 +936,9 @@ fn real_child() {
         common::pump_for(Duration::from_millis(30));
         let label = if vim { "real vim insert" } else { "real plain" };
         run_rows(&f, &mut typist, REAL_ROWS, label);
+        f.config(|c| c.typing.replacements = true);
+        run_rows(&f, &mut typist, REAL_REPLACEMENT_ROWS, label);
+        f.config(|c| c.typing.replacements = false);
         // A paste is not typing: Ctrl+V in plain editing (in Vim insert mode Ctrl+V inserts the
         // next key literally, so the clipboard is pasted as the context menu does).
         f.editor.view().clipboard().set_text("{$");

@@ -1,13 +1,14 @@
 //! The Preferences dialog.
 //!
 //! `win.preferences` (Ctrl+,) shows an `adw::PreferencesDialog` over the most used settings
-//! ([`PAGES`]): the editor font, wrapping, inline equation numbers, Vim, the typing helpers,
-//! completion while typing, spell checking and its language (the installed dictionaries); build
-//! on save and after agent turns, the PDF preview's dark pages, cursor following and thumbnail
-//! strip, hover popovers, the math preview and the hover delay, the outline following the
-//! cursor; agent notifications and the local history limits — plus the configuration file's
-//! path with an Open button (the system's handler for the file, through `gtk::FileLauncher`;
-//! a missing file is created first).
+//! ([`PAGES`]): the editor font, wrapping, inline equation numbers, the git gutter, the word
+//! count, auto-save, session restore, Vim, the typing helpers and replacements, completion while
+//! typing, spell checking and its language (the installed dictionaries); build on save and after
+//! agent turns, chktex, the PDF preview's dark pages, cursor following and thumbnail strip, hover
+//! popovers, the math preview and the hover delay, the outline following the cursor; agent
+//! notifications and the local history limits — plus the configuration file's path with an Open
+//! button (the system's handler for the file, through `gtk::FileLauncher`; a missing file is
+//! created first).
 //!
 //! # Writing `config.toml`
 //!
@@ -29,15 +30,16 @@
 //! The controls follow the configuration: `connect_config_changed` updates them when the file
 //! is edited elsewhere while the dialog is open (without writing anything back).
 //!
-//! The pages are Editor (font, wrapping, equation numbers, Vim, typing, spelling and the
-//! configuration file), Preview (build, PDF, hovers, outline) and Agent & History; the
-//! dialog's search finds every row by its title.
+//! The pages are Editor (text, saving, Vim, typing, spelling and the configuration file),
+//! Preview (build, PDF, hovers, outline) and Agent & History; the dialog's search finds every
+//! row by its title. Settings with a few named values (`[editor] autosave`) are combo rows
+//! ([`Kind::Choice`]) that write the value as a string.
 //!
 //! Hooks: [`show`] is the action; [`run_demo`] is `--demo prefs` (resolves when the dialog is
 //! open and drawn, for `m-prefs.png`). Tests use [`PAGES`], [`dialog`], [`set_bool`],
-//! [`set_number`], [`set_font`], [`set_language`], [`bool_value`], [`number_value`],
-//! [`font_value`], [`language_value`], [`flush`], [`is_writable`],
-//! [`set_keeping_comments`] and [`set_open_hook`].
+//! [`set_number`], [`set_choice`], [`set_font`], [`set_language`], [`bool_value`],
+//! [`number_value`], [`choice_value`], [`font_value`], [`language_value`], [`flush`],
+//! [`is_writable`], [`set_keeping_comments`] and [`set_open_hook`].
 
 use crate::hooks::HookId;
 use crate::settings::ConfigFile;
@@ -66,6 +68,12 @@ pub enum Kind {
         min: i64,
         max: i64,
         step: i64,
+    },
+    /// A combo row of named values: `options` are the values written and their labels, `get`
+    /// the configured one.
+    Choice {
+        get: fn(&Config) -> &'static str,
+        options: &'static [(&'static str, &'static str)],
     },
     /// A font button (`editor.font`).
     Font,
@@ -112,6 +120,13 @@ const fn switch(
     }
 }
 
+/// The values of `[editor] autosave` ([`lemma_config::Autosave::as_str`]) and their labels.
+const AUTOSAVE: &[(&str, &str)] = &[
+    ("off", "Off"),
+    ("focus", "When the Window Loses Focus"),
+    ("idle", "Two Seconds After a Change"),
+];
+
 /// Every page, group and setting of the dialog, in order.
 pub const PAGES: &[Page] = &[
     Page {
@@ -135,6 +150,42 @@ pub const PAGES: &[Page] = &[
                         "Equation Numbers",
                         "Show (3.2) after each label, from the last build",
                         |c| c.editor.equation_numbers,
+                    ),
+                    switch(
+                        "git",
+                        "gutter",
+                        "Git Changes",
+                        "Mark the lines changed since the last commit",
+                        |c| c.git.gutter,
+                    ),
+                    switch(
+                        "status",
+                        "word_count",
+                        "Word Count",
+                        "The document's words in the status bar (texcount)",
+                        |c| c.status.word_count,
+                    ),
+                ],
+            },
+            Group {
+                title: "Saving",
+                settings: &[
+                    Setting {
+                        section: "editor",
+                        key: "autosave",
+                        title: "Save Automatically",
+                        subtitle: "",
+                        kind: Kind::Choice {
+                            get: |c| c.editor.autosave.as_str(),
+                            options: AUTOSAVE,
+                        },
+                    },
+                    switch(
+                        "session",
+                        "restore",
+                        "Restore Sessions",
+                        "Reopen a project's tabs, and the last file when started without one",
+                        |c| c.session.restore,
                     ),
                 ],
             },
@@ -187,6 +238,13 @@ pub const PAGES: &[Page] = &[
                         |c| c.typing.autosnippets,
                     ),
                     switch(
+                        "typing",
+                        "replacements",
+                        "Typing Replacements",
+                        "... typed in text becomes \\dots",
+                        |c| c.typing.replacements,
+                    ),
+                    switch(
                         "completion",
                         "auto",
                         "Complete Words While Typing",
@@ -226,6 +284,13 @@ pub const PAGES: &[Page] = &[
                         "Build After Agent Turns",
                         "When a turn of the agent changed files",
                         |c| c.build.on_agent_turn_end,
+                    ),
+                    switch(
+                        "lint",
+                        "chktex",
+                        "Check with chktex",
+                        "Its warnings in the Problems page after each save",
+                        |c| c.lint.chktex,
                     ),
                 ],
             },
@@ -458,6 +523,8 @@ pub fn is_writable(state: &WindowState) -> bool {
 enum Control {
     Switch(adw::SwitchRow),
     Spin(adw::SpinRow),
+    /// The combo row of a [`Kind::Choice`] (its items in the order of `options`).
+    Choice(adw::ComboRow),
     Font(gtk::FontDialogButton),
     /// The combo row and the language codes of its items.
     Language(adw::ComboRow, Rc<RefCell<Vec<String>>>),
@@ -609,6 +676,26 @@ impl Prefs {
                 });
                 (row.clone().upcast(), Control::Spin(row))
             }
+            Kind::Choice { options, .. } => {
+                let labels: Vec<&str> = options.iter().map(|(_, label)| *label).collect();
+                let row = adw::ComboRow::builder()
+                    .title(setting.title)
+                    .use_underline(false)
+                    .model(&gtk::StringList::new(&labels))
+                    .build();
+                if !setting.subtitle.is_empty() {
+                    row.set_subtitle(setting.subtitle);
+                }
+                let weak = Rc::downgrade(self);
+                row.connect_selected_notify(move |row| {
+                    if let (Some(prefs), Some((value, _))) =
+                        (weak.upgrade(), options.get(row.selected() as usize))
+                    {
+                        prefs.write(setting, ConfigValue::Str(value));
+                    }
+                });
+                (row.clone().upcast(), Control::Choice(row))
+            }
             Kind::Font => {
                 let dialog = gtk::FontDialog::builder()
                     .title("Editor Font")
@@ -749,6 +836,14 @@ impl Prefs {
                     let value = get(&config) as f64;
                     if row.value() != value {
                         row.set_value(value);
+                    }
+                }
+                (Kind::Choice { get, options }, Control::Choice(row)) => {
+                    let wanted = get(&config);
+                    if let Some(i) = options.iter().position(|(value, _)| *value == wanted)
+                        && row.selected() as usize != i
+                    {
+                        row.set_selected(i as u32);
                     }
                 }
                 (Kind::Font, Control::Font(button)) => {
@@ -984,6 +1079,41 @@ pub fn set_number(state: &WindowState, section: &str, key: &str, value: i64) -> 
     }
 }
 
+/// Chooses `value` in the combo row of `[section] key` as the user would (it writes the file);
+/// false when the dialog is not open or the row has no such value.
+pub fn set_choice(state: &WindowState, section: &str, key: &str, value: &str) -> bool {
+    let Some(prefs) = current(state) else {
+        return false;
+    };
+    let options = settings().find_map(|s| match s.kind {
+        Kind::Choice { options, .. } if (s.section, s.key) == (section, key) => Some(options),
+        _ => None,
+    });
+    match (prefs.find(section, key), options) {
+        (Some(Control::Choice(row)), Some(options)) => options
+            .iter()
+            .position(|(v, _)| *v == value)
+            .is_some_and(|i| {
+                row.set_selected(i as u32);
+                true
+            }),
+        _ => false,
+    }
+}
+
+/// The value the combo row of `[section] key` shows.
+pub fn choice_value(state: &WindowState, section: &str, key: &str) -> Option<&'static str> {
+    let Control::Choice(row) = current(state)?.find(section, key)? else {
+        return None;
+    };
+    settings().find_map(|s| match s.kind {
+        Kind::Choice { options, .. } if (s.section, s.key) == (section, key) => {
+            options.get(row.selected() as usize).map(|(v, _)| *v)
+        }
+        _ => None,
+    })
+}
+
 /// Chooses the editor font `desc` ("Monospace 13") in the font button.
 pub fn set_font(state: &WindowState, desc: &str) -> bool {
     match current(state).and_then(|p| p.find("editor", "font")) {
@@ -1135,6 +1265,26 @@ mod tests {
                     );
                     ConfigValue::Int(if v == max { min } else { v + 1 })
                 }
+                Kind::Choice { get, options } => {
+                    let current = get(&defaults);
+                    assert!(
+                        options.iter().any(|(v, _)| *v == current),
+                        "{}.{} default {current}",
+                        s.section,
+                        s.key
+                    );
+                    // Every value is one the configuration takes.
+                    for &(value, label) in options {
+                        assert!(!label.is_empty());
+                        let text =
+                            set_keeping_comments("", s.section, s.key, ConfigValue::Str(value))
+                                .unwrap();
+                        let config = lemma_config::parse(&text).unwrap();
+                        assert_eq!(get(&config), value, "{}.{}", s.section, s.key);
+                    }
+                    let other = options.iter().find(|(v, _)| *v != current).unwrap();
+                    ConfigValue::Str(other.0)
+                }
                 Kind::Font => ConfigValue::Str("Mono 12"),
                 Kind::Language => ConfigValue::Str("de_DE"),
             };
@@ -1151,8 +1301,18 @@ mod tests {
             if let Kind::Number { get, .. } = s.kind {
                 assert_ne!(get(&config), get(&defaults), "{}.{}", s.section, s.key);
             }
+            if let Kind::Choice { get, .. } = s.kind {
+                assert_ne!(get(&config), get(&defaults), "{}.{}", s.section, s.key);
+            }
         }
         assert_eq!(PAGES.len(), 3);
-        assert!(seen.len() >= 22, "{}", seen.len());
+        assert!(seen.len() >= 33, "{}", seen.len());
+        // Preferences lists every auto-save value.
+        let autosave: Vec<&str> = AUTOSAVE.iter().map(|(v, _)| *v).collect();
+        let all: Vec<&str> = lemma_config::Autosave::ALL
+            .iter()
+            .map(|a| a.as_str())
+            .collect();
+        assert_eq!(autosave, all);
     }
 }

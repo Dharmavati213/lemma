@@ -1,7 +1,9 @@
 //! M5 WP5.3: environment tools (`editor/envtools.rs`), the align helper (`editor/align.rs`)
 //! and latexindent formatting (`format.rs`) in a window: live rename (one undo step with the
 //! typing), the actions and their keys, the Change Environment popover, and Format Document
-//! applied as reviewable hunks that reject cleanly, with a fake latexindent.
+//! applied as reviewable hunks that reject cleanly, with a fake latexindent. Also the editing
+//! commands (`editor/editing.rs`): Toggle Comment, Bold, Italic and Emphasize, each one undo
+//! step, and Bold and Italic disabled while Vim is on.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_envtools`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `envtools-change-env.png` (the popover) and
@@ -10,6 +12,7 @@
 mod common;
 
 use adw::prelude::*;
+use lemma_app::editor::editing::{self, Style};
 use lemma_app::editor::{Editor, align, completion, envtools};
 use lemma_app::format;
 use lemma_app::review_ui::{self, Decision};
@@ -35,6 +38,13 @@ fn main() -> ExitCode {
         ("format_document_as_reviewable_hunks", format_document),
         ("format_selection", format_selection),
         ("missing_latexindent_hides_format", missing_latexindent),
+        ("toggle_comment_lines_in_one_undo_step", toggle_comment),
+        ("bold_italic_emphasize_wrap_and_unwrap", styles),
+        ("bold_and_italic_are_off_while_vim_is_on", styles_follow_vim),
+        (
+            "editing_commands_only_in_latex_documents",
+            editing_other_files,
+        ),
         // Final review (M5)
         (
             "regress5_live_rename_then_environment_completion",
@@ -399,6 +409,10 @@ fn palette_entries() {
     keys("win.change-environment", "<Control><Shift>e");
     keys("win.toggle-environment-star", "<Control>asterisk");
     keys("win.align-columns", "<Control><Shift>a");
+    keys("win.toggle-comment", "<Control>slash");
+    keys("win.bold", "<Control>b");
+    keys("win.italic", "<Control>i");
+    assert!(find("win.emphasize").accels.is_empty());
     for name in [
         "win.delete-environment",
         "win.insert-row-below",
@@ -406,6 +420,161 @@ fn palette_entries() {
     ] {
         find(name);
     }
+    for (name, label) in [
+        ("win.toggle-comment", "Toggle Comment"),
+        ("win.bold", "Bold"),
+        ("win.italic", "Italic"),
+        ("win.emphasize", "Emphasize"),
+    ] {
+        assert_eq!(find(name).label, label);
+        assert_eq!(find(name).group, lemma_app::app::ShortcutGroup::Editing);
+    }
+}
+
+/// Selects `from..to` of `editor`'s document, the cursor at `to`.
+fn select(editor: &Editor, from: usize, to: usize) {
+    let doc = editor.document();
+    let (a, b) = (
+        doc.iter_at_byte(from).unwrap(),
+        doc.iter_at_byte(to).unwrap(),
+    );
+    editor.buffer().select_range(&b, &a);
+}
+
+/// The selected text (empty without a selection).
+fn selected(editor: &Editor) -> String {
+    let buffer = editor.buffer();
+    buffer
+        .selection_bounds()
+        .map(|(a, b)| buffer.slice(&a, &b, true).to_string())
+        .unwrap_or_default()
+}
+
+const COMMENT_DOC: &str =
+    "\\begin{document}\n  First line.\n\n  50\\% of it.\n% Already.\n\\end{document}\n";
+
+fn toggle_comment() {
+    let f = fixture("toggle-comment", COMMENT_DOC, None);
+    let editor = f.open();
+    let doc = editor.document().clone();
+    editor.view().grab_focus();
+    // The selected lines, the blank one left alone; the selection ends at the start of the
+    // `% Already.` line, which it does not take.
+    select(
+        &editor,
+        offset_of(&editor, "First", 2),
+        offset_of(&editor, "% Already", 0),
+    );
+    f.run("win.toggle-comment");
+    let commented =
+        "\\begin{document}\n  % First line.\n\n  % 50\\% of it.\n% Already.\n\\end{document}\n";
+    assert_eq!(doc.text(), commented);
+    // Again: every line is a comment now, so they are uncommented.
+    f.run("win.toggle-comment");
+    assert_eq!(doc.text(), COMMENT_DOC);
+    // Each toggle is one undo step.
+    f.run("win.toggle-comment");
+    assert_eq!(doc.text(), commented);
+    undo(&editor);
+    assert_eq!(doc.text(), COMMENT_DOC);
+    // Without a selection: the cursor's line.
+    editor.place_cursor_at(offset_of(&editor, "% Already", 3));
+    let uncommented = COMMENT_DOC.replace("% Already.", "Already.");
+    f.run("win.toggle-comment");
+    assert_eq!(doc.text(), uncommented);
+    f.run("win.toggle-comment");
+    assert_eq!(doc.text(), COMMENT_DOC);
+    undo(&editor);
+    assert_eq!(doc.text(), uncommented);
+    undo(&editor);
+    assert_eq!(doc.text(), COMMENT_DOC);
+    // A blank line: nothing.
+    editor.place_cursor_at(offset_of(&editor, ".\n\n", 2));
+    f.run("win.toggle-comment");
+    assert_eq!(doc.text(), COMMENT_DOC);
+}
+
+const STYLE_DOC: &str = "\\begin{document}\nSome word here, and $x + y$.\n\\end{document}\n";
+
+fn styles() {
+    let f = fixture("styles", STYLE_DOC, None);
+    let editor = f.open();
+    let doc = editor.document().clone();
+    editor.view().grab_focus();
+    let word = offset_of(&editor, "word", 0);
+    select(&editor, word, word + 4);
+    f.run("win.bold");
+    assert_eq!(doc.text(), STYLE_DOC.replace("word", "\\textbf{word}"));
+    assert_eq!(selected(&editor), "word");
+    // Again: the selection is the command's argument, so the command goes.
+    f.run("win.bold");
+    assert_eq!(doc.text(), STYLE_DOC);
+    assert_eq!(selected(&editor), "word");
+    // Italic, then one undo step back.
+    f.run("win.italic");
+    assert_eq!(doc.text(), STYLE_DOC.replace("word", "\\textit{word}"));
+    undo(&editor);
+    assert_eq!(doc.text(), STYLE_DOC);
+    // Without a selection: the command, the cursor between its braces; again, and it goes.
+    editor.place_cursor_at(offset_of(&editor, " here", 0));
+    f.run("win.emphasize");
+    assert_eq!(
+        doc.text(),
+        STYLE_DOC.replace("word here", "word\\emph{} here")
+    );
+    assert_eq!(editor.cursor_offset(), offset_of(&editor, "\\emph{}", 6));
+    f.run("win.emphasize");
+    assert_eq!(doc.text(), STYLE_DOC);
+    // In math: `\mathbf`.
+    let y = offset_of(&editor, "y$", 0);
+    select(&editor, y, y + 1);
+    f.run("win.bold");
+    assert_eq!(doc.text(), STYLE_DOC.replace("+ y$", "+ \\mathbf{y}$"));
+    undo(&editor);
+    assert_eq!(doc.text(), STYLE_DOC);
+    // Unmatched braces: refused, nothing changes.
+    let open = offset_of(&editor, "{document}", 0);
+    select(&editor, open, open + "{document".len());
+    assert!(editing::style_in(&editor, Style::Bold).is_err());
+    assert_eq!(doc.text(), STYLE_DOC);
+}
+
+fn styles_follow_vim() {
+    let f = fixture("styles-vim", STYLE_DOC, None);
+    let _editor = f.open();
+    let enabled = |name: &str| f.state.window.lookup_action(name).unwrap().is_enabled();
+    for name in ["toggle-comment", "bold", "italic", "emphasize"] {
+        assert!(enabled(name), "{name} with Vim off");
+    }
+    // With Vim on, Ctrl+B and Ctrl+I are Vim's: Bold and Italic are off (the palette says why).
+    f.state.set_vim_enabled(true);
+    assert!(!enabled("bold") && !enabled("italic"));
+    assert!(enabled("toggle-comment") && enabled("emphasize"));
+    let commands = lemma_app::palette::commands(&f.state);
+    let bold = commands.iter().find(|c| c.name == "win.bold").unwrap();
+    assert!(!bold.enabled);
+    assert_eq!(bold.reason.as_deref(), Some("Turn off Vim mode first"));
+    f.state.set_vim_enabled(false);
+    assert!(enabled("bold") && enabled("italic"));
+}
+
+fn editing_other_files() {
+    let f = fixture("editing-other", STYLE_DOC, None);
+    let _main = f.open();
+    let notes = f.dir.join("notes.md");
+    std::fs::write(&notes, "Some notes\n").unwrap();
+    let editor = block_on(f.state.open_file(&notes)).expect("open");
+    let doc = editor.document().clone();
+    assert!(editing::toggle_comment_in(&editor).is_err());
+    assert!(editing::style_in(&editor, Style::Bold).is_err());
+    assert_eq!(doc.text(), "Some notes\n");
+    // BibTeX files have `%` comments too.
+    let bib = f.dir.join("refs.bib");
+    std::fs::write(&bib, "@misc{a, title = {A}}\n").unwrap();
+    let editor = block_on(f.state.open_file(&bib)).expect("open");
+    editing::toggle_comment_in(&editor).unwrap();
+    assert_eq!(editor.document().text(), "% @misc{a, title = {A}}\n");
+    assert!(editing::style_in(&editor, Style::Bold).is_err());
 }
 
 /// A fake latexindent: `--version` succeeds; formatting indents `\item` lines and strips

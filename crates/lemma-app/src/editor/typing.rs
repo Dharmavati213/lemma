@@ -21,6 +21,7 @@
 //! | Enter after `\begin{x}…` | `auto_end` | an indented body line (the `document` body is not indented), and `\end{x}` below it when the environment is unclosed |
 //! | Enter in itemize, enumerate, description | `item_on_enter` | a new line with `\item ` (at the indentation of the item above); right after `\begin{itemize}` too |
 //! | Enter on an empty `\item` line | `item_on_enter` | removes the line and leaves the list: the cursor goes to a new line after `\end{itemize}` when only blank lines are left in the list, else the item line is just emptied |
+//! | `.` completing `...` | `replacements` (off by default) | in text, the three dots become `\dots`; not in math or arguments, not after a backslash (`\.` is the dot accent), not after a fourth dot |
 //!
 //! Shift+Enter always inserts a plain line break. While the completion popup is open, Enter
 //! belongs to it (it may accept a proposal): the helper lets the key through and, if the view
@@ -36,6 +37,11 @@
 //! mode, Vim's `.` after an insert repeats only what was typed after the last helper moved the
 //! cursor (probed on real keys: `a{b<Esc>.` adds `b`).
 //!
+//! A replacement works like an autosnippet instead (`completion::type_and_replace`, through the
+//! snippet driver): the typed `.` goes in first, then the replacement as an undo step of its
+//! own, so one undo gives back `...` (in Vim, `u` after `<Esc>`), and an active snippet keeps
+//! its session.
+//!
 //! **Counting brackets.** A group or a formula can span lines but not paragraphs (`\par` ends
 //! inline math and the arguments of ordinary commands), so whether a closer is new, or an opener
 //! already has its closer, is decided by the bracket count of the cursor's paragraph (blank lines
@@ -48,9 +54,9 @@
 //! `EnvIndex`, which keeps them parsed (and which lines have none) in step with every change,
 //! so these keys cost about the same in a 500-line and in a 60k-line document.
 //!
-//! The rules themselves are pure functions ([`on_char`], [`on_backspace`], [`on_enter`],
-//! [`on_enter_lines`]) over the text ([`TextLines`]), tested in this module; [`detach`] removes
-//! the handler when the tab closes.
+//! The rules themselves are pure functions ([`on_char`], [`replacement`], [`on_backspace`],
+//! [`on_enter`], [`on_enter_lines`]) over the text ([`TextLines`]), tested in this module;
+//! [`detach`] removes the handler when the tab closes.
 
 use super::{Editor, TexView, VimMode, completion, keys, snippets};
 use crate::document::Document;
@@ -294,6 +300,26 @@ pub fn on_char(
         '$' => cfg.smart_dollar.then(|| dollar(at)).flatten(),
         _ => None,
     }
+}
+
+/// The typing replacement (`[typing] replacements`) that typing `c` on the line `at` completes:
+/// the trigger as it then ends before the cursor (`c` included) and its replacement. Only
+/// `...` → `\dots`, in text: never in math, arguments, comments or verbatim text, after a
+/// backslash (`\.` is the dot accent) or after a fourth dot (one undo gives back `...`, and
+/// typing on must not replace again).
+pub fn replacement(
+    c: char,
+    at: &Typed<'_>,
+    cfg: &TypingCfg,
+) -> Option<(&'static str, &'static str)> {
+    if !cfg.replacements || c != '.' || at.mode != Mode::Text {
+        return None;
+    }
+    let head = at.before.strip_suffix("..")?;
+    if head.ends_with('.') || ends_with_unescaped_backslash(head) {
+        return None;
+    }
+    Some(("...", "\\dots"))
 }
 
 /// `{`, `[`, `(` and `|` (only after `\left`).
@@ -1287,7 +1313,7 @@ enum HelperKey {
     Backspace,
     /// Enter without Shift.
     Enter,
-    /// A typed `{ [ ( | } ] ) $`.
+    /// A typed `{ [ ( | } ] ) $`, or `.` (replacements).
     Char(char),
 }
 
@@ -1302,7 +1328,9 @@ impl HelperKey {
                 Some(Self::Enter)
             }
             _ => match snippets::typed_char(event.keyval, event.state) {
-                Some(c @ ('{' | '[' | '(' | '|' | '}' | ']' | ')' | '$')) => Some(Self::Char(c)),
+                Some(c @ ('{' | '[' | '(' | '|' | '}' | ']' | ')' | '$' | '.')) => {
+                    Some(Self::Char(c))
+                }
                 _ => None,
             },
         }
@@ -1468,6 +1496,10 @@ impl Attached {
             return false;
         }
         let cfg = state.config.typing.clone();
+        // `.` only ever completes a replacement.
+        if key == HelperKey::Char('.') && !cfg.replacements {
+            return false;
+        }
         match key {
             HelperKey::Backspace => self.backspace(&state, &editor, &doc, &cfg),
             HelperKey::Enter => self.enter(&editor, &view, &doc, &cfg),
@@ -1534,6 +1566,9 @@ impl Attached {
             next_auto,
             paragraph: &paragraph,
         };
+        if let Some((trigger, with)) = replacement(c, &typed, cfg) {
+            return completion::type_and_replace(state, editor, c, trigger, with);
+        }
         let nl = if at.crlf { "\r\n" } else { "\n" };
         let mut unclosed = |name: &str, from: usize| {
             // The scan starts after the `}` only when it was typed over: then the `\begin{name}`
@@ -2532,6 +2567,56 @@ mod tests {
             ..cfg()
         };
         assert_eq!(type_char_with("a |", '$', &off, false), None);
+    }
+
+    /// The replacement that typing `c` at `|` in `doc` completes, with `cfg`.
+    fn replaced(doc: &str, c: char, cfg: &TypingCfg) -> Option<(&'static str, &'static str)> {
+        let cursor = doc.find('|').expect("a cursor");
+        let text = doc.replacen('|', "", 1);
+        let mode_at = modes(&text);
+        let lines = StrText::new(&text);
+        let (line, col) = lines.position(cursor);
+        let at_line = LineAt::new(&lines, line, col).unwrap();
+        let paragraph = Paragraph::none();
+        let at = Typed {
+            before: &at_line.text[..col],
+            after: &at_line.text[col..at_line.len],
+            mode: mode_at(cursor),
+            next_auto: false,
+            paragraph: &paragraph,
+        };
+        replacement(c, &at, cfg)
+    }
+
+    #[test]
+    fn replacements() {
+        let on = TypingCfg {
+            replacements: true,
+            ..cfg()
+        };
+        let dots = Some(("...", "\\dots"));
+        assert_eq!(replaced("Wait..|", '.', &on), dots);
+        assert_eq!(replaced("..|", '.', &on), dots);
+        assert_eq!(
+            replaced("a\\\\..|", '.', &on),
+            dots,
+            "after a line break `\\\\`"
+        );
+        assert_eq!(replaced("$\\text{and so on..|}$", '.', &on), dots);
+        // Off by default, and only for the third dot.
+        assert_eq!(replaced("Wait..|", '.', &cfg()), None);
+        assert_eq!(replaced("Wait.|", '.', &on), None);
+        assert_eq!(replaced("Wait..|", ',', &on), None);
+        // Never in math, arguments, comments or verbatim, after `\.` or after a fourth dot.
+        assert_eq!(replaced("$x_1, ..|$", '.', &on), None);
+        assert_eq!(replaced("\\input{..|}", '.', &on), None);
+        assert_eq!(replaced("% and so on..|", '.', &on), None);
+        assert_eq!(
+            replaced("\\begin{verbatim}\n..|\n\\end{verbatim}", '.', &on),
+            None
+        );
+        assert_eq!(replaced("\\..|", '.', &on), None);
+        assert_eq!(replaced("Wait...|", '.', &on), None);
     }
 
     #[test]

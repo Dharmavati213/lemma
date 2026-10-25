@@ -1713,6 +1713,9 @@ mod real_keys {
             "agent-inline-edit",
             "problem-next",
             "problem-prev",
+            "toggle-comment",
+            "bold",
+            "italic",
         ] {
             let log = activated.clone();
             let action = f.state.window.lookup_action(name).unwrap();
@@ -1823,6 +1826,90 @@ mod real_keys {
         browser.key(gdk::Key::o, CONTROL);
         wait_cursor(&f, "main.tex", label);
         assert_eq!(editor.document().text(), long);
+
+        step!("Ctrl+B, Ctrl+I and Ctrl+/ with Vim on");
+        // With Vim on, Ctrl+B and Ctrl+I are Vim's (page up, jump forward): Bold and Italic are
+        // disabled, so the keys reach the editor.
+        focus_view();
+        let ctrl = |key: gdk::Key| {
+            move |(k, s): &(gdk::Key, gdk::ModifierType)| {
+                *k == key && s.contains(gdk::ModifierType::CONTROL_MASK)
+            }
+        };
+        for key in [gdk::Key::b, gdk::Key::i] {
+            reached.borrow_mut().clear();
+            browser.key(key, CONTROL);
+            common::pump_until(TIMEOUT, || reached.borrow().iter().any(ctrl(key)));
+            common::pump_for(Duration::from_millis(50));
+            assert!(take(&activated).is_empty(), "Ctrl+{key:?} ran an action");
+        }
+        assert_eq!(
+            editor.document().text(),
+            long,
+            "Ctrl+B and Ctrl+I typed nothing"
+        );
+        // Ctrl+/ is no Vim key: it toggles the comment in Vim mode too, as one undo step.
+        set_cursor(&editor, label);
+        browser.key(gdk::Key::slash, CONTROL);
+        common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+        assert_eq!(take(&activated), ["toggle-comment"]);
+        assert_eq!(editor.vim_status().unwrap().mode, VimMode::Normal);
+        assert_eq!(
+            editor.document().text(),
+            long.replacen("See \\cref", "% See \\cref", 1)
+        );
+        editor.buffer().undo();
+        assert_eq!(editor.document().text(), long);
+
+        step!("Ctrl+B and Ctrl+I with Vim off");
+        // With Vim off they are Bold and Italic. (On a filler line: on the `\cref` line, which
+        // does not wrap, GTK warns that it snapshots the editor's overlay scrollbar before
+        // allocating it when the edit comes from an accelerator, a frame-ordering quirk of its
+        // own; typing there, or running `editing::style_in` directly, does not.)
+        f.state.set_vim_enabled(false);
+        focus_view();
+        set_cursor(&editor, offset_of(&editor, "filler line", 0));
+        for (key, action, command) in [
+            (gdk::Key::b, "bold", "\\textbf{"),
+            (gdk::Key::i, "italic", "\\textit{"),
+        ] {
+            reached.borrow_mut().clear();
+            browser.key(key, CONTROL);
+            common::pump_until(TIMEOUT, || !activated.borrow().is_empty());
+            assert_eq!(take(&activated), [action]);
+            assert!(
+                !reached.borrow().iter().any(ctrl(key)),
+                "{action}'s key reached the editor"
+            );
+            assert!(editor.document().text().contains(command), "{action}");
+        }
+
+        step!("Ctrl+B, Ctrl+I and Ctrl+/ in the agent's prompt");
+        // In another text field the keys are the field's: they do not change the document out
+        // of sight, and Ctrl+/ is GtkTextView's Select All again.
+        let text = editor.document().text();
+        let prompt = lemma_app::agent::panel::get(&f.state)
+            .expect("the agent panel")
+            .prompt_view();
+        f.state.agent.split.set_show_sidebar(true);
+        prompt.buffer().set_text("Shorter");
+        common::pump_until(TIMEOUT, || prompt.is_mapped());
+        prompt.grab_focus();
+        common::pump_until(TIMEOUT, || prompt.has_focus());
+        for key in [gdk::Key::b, gdk::Key::i, gdk::Key::slash] {
+            browser.key(key, CONTROL);
+        }
+        common::pump_until(TIMEOUT, || prompt.buffer().has_selection());
+        common::pump_for(Duration::from_millis(50));
+        assert!(take(&activated).is_empty(), "a command ran in the prompt");
+        assert_eq!(editor.document().text(), text);
+        let buffer = prompt.buffer();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            "Shorter"
+        );
+        buffer.set_text("");
+        f.state.agent.split.set_show_sidebar(false);
 
         step!("Ctrl+F in the PDF");
         // With the PDF focused, Ctrl+F searches it.

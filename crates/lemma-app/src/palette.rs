@@ -1025,7 +1025,7 @@ impl Picker {
 }
 
 /// True when the key press `key` + `mods` is one of the accelerators of `action` right now.
-fn accel_matches(
+pub(crate) fn accel_matches(
     state: &WindowState,
     action: &str,
     key: gdk::Key,

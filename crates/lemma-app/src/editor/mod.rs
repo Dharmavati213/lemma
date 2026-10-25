@@ -15,6 +15,7 @@
 pub mod align;
 pub mod annotations;
 pub mod completion;
+pub mod editing;
 pub mod envtools;
 pub mod goto;
 pub mod highlight;

@@ -1027,9 +1027,17 @@ they conflict with the sections above, this section wins.
   - Nested snippets merge into one session.
   - In math, text-leaning commands rank lower (`data/completion/math-ok.txt`).
   - `MacroDef` gains `optional_args` / `optional_default`.
+  - `[typing] replacements` (off by default): `...` typed in text becomes `\dots` through the
+    snippet driver, an undo step of its own as an autosnippet is (`typing::replacement`).
+  - Editing commands (`editor/editing.rs`): Toggle Comment, Bold, Italic and Emphasize, each one
+    undo step on the active editor.
 - **Keys (§9.3):**
   - The key layer runs before VimIMContext (verified).
   - With Vim on and an editor focused, Ctrl+W and Ctrl+O go to Vim.
+  - Bold (Ctrl+B) and Italic (Ctrl+I) are disabled while Vim is on, so those keys are Vim's
+    (page up, jump forward), as `win.pdf-search` lets Ctrl+F through outside the PDF. Toggle
+    Comment (Ctrl+/) works in every mode. With another text field focused (the agent's prompt,
+    an entry), the editing commands' keys go to that field (verified on real keys).
 - **Memory (§7):**
   - The 60 s inactive cache trim is implemented, and closed tabs free their view and buffer.
   - Idle PSS depends on how many other GTK processes share the libraries. Under Broadway, idle measures about 92 MB RSS

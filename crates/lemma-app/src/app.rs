@@ -32,7 +32,10 @@ use std::time::{Duration, Instant};
 /// takes Vim's rarely used Ctrl+P (line up; insert-mode completion), as ctrlp.vim does; Alt+Left
 /// and Alt+Right take GtkSourceView's word swap; Ctrl+% takes GtkSourceView's matching-bracket
 /// jump and extends it. Ctrl+K Ctrl+I (hover) cannot be an accelerator — Ctrl+K is the agent's
-/// inline edit and GTK has no chords — so the hover key outside Vim is Alt+K.
+/// inline edit and GTK has no chords — so the hover key outside Vim is Alt+K. The editing
+/// commands (`editor::editing`) take Ctrl+/ (GtkTextView's second Select All), and Ctrl+B and
+/// Ctrl+I only while Vim is off: with Vim on, Bold and Italic are disabled, so the keys are Vim's
+/// page up and jump forward.
 pub const DEFAULT_ACCELS: &[(&str, &[&str])] = &[
     ("app.open", &["<Control>o"]),
     ("app.quit", &["<Control>q"]),
@@ -993,7 +996,8 @@ mod tests {
                 panic!("{accel} is bound to both {other} and {action}");
             }
         }
-        // Ones the other modules set (agent panel, inline edit, build, PDF, Problems).
+        // Ones the other modules set (agent panel, inline edit, build, PDF, Problems, editing
+        // commands).
         for accel in [
             "<control>l",
             "<control><shift>backspace",
@@ -1003,6 +1007,9 @@ mod tests {
             "<control><shift>i",
             "f4",
             "<shift>f4",
+            "<control>slash",
+            "<control>b",
+            "<control>i",
         ] {
             assert!(!seen.contains_key(accel), "{accel} is taken");
         }

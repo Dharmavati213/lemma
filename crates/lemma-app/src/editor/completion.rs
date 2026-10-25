@@ -1629,6 +1629,24 @@ pub fn snippet_active(state: &WindowState, editor: &Editor) -> bool {
     attached_of(state, editor).is_some_and(|a| a.driver.is_active())
 }
 
+/// A typing replacement (`typing::replacement`) through the driver of `editor`: types `c`, then
+/// replaces `typed` before the cursor with `with` as an undo step of its own
+/// (`snippets::Driver::type_and_replace`), and closes the popup. False when `editor` has no
+/// driver (nothing was typed).
+pub fn type_and_replace(
+    state: &WindowState,
+    editor: &Editor,
+    c: char,
+    typed: &str,
+    with: &str,
+) -> bool {
+    let Some(attached) = attached_of(state, editor) else {
+        return false;
+    };
+    attached.hide();
+    attached.driver.type_and_replace(c, typed, with)
+}
+
 /// Whether the project defines the macro `name`, as the `if_undefined` snippet bodies see it.
 pub fn macro_defined(state: &WindowState, name: &str) -> bool {
     index_defines(&state.workspace.index.borrow(), name)

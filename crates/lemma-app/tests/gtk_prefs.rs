@@ -1,6 +1,7 @@
-//! WP3.5: the Preferences dialog (`prefs.rs`): every control round-trips to `config.toml`
-//! without losing comments (also through a symbolic link), takes effect at once, follows edits
-//! made elsewhere, and refuses what it cannot write.
+//! WP3.5: the Preferences dialog (`prefs.rs`): every control (switches, spin buttons, the
+//! auto-save combo row, the font and the language) round-trips to `config.toml` without losing
+//! comments (also through a symbolic link), takes effect at once (auto-save then saves an edit
+//! by itself), follows edits made elsewhere, and refuses what it cannot write.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_prefs`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `prefs-light.png` and `prefs-dark.png` there.
@@ -14,7 +15,7 @@ use lemma_app::settings::SettingsFiles;
 use lemma_app::testmode;
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
-use lemma_config::Config;
+use lemma_config::{Autosave, Config};
 use lemma_core::ProjectRoot;
 use std::cell::RefCell;
 use std::future::Future;
@@ -218,12 +219,20 @@ fn layout() {
         }
     }
     // The spec's list: font, Vim, wrap, build on save, dark PDF, spelling and its language,
-    // typing helpers, completion, history limits, notifications, outline, math preview.
+    // typing helpers, completion, history limits, notifications, outline, math preview; and
+    // the documented switches added later (auto-save, replacements, chktex, the git gutter, the
+    // word count, session restore).
     let keys: Vec<(&str, &str)> = prefs::settings().map(|s| (s.section, s.key)).collect();
     for key in [
         ("editor", "font"),
         ("editor", "vim"),
         ("editor", "wrap"),
+        ("editor", "autosave"),
+        ("typing", "replacements"),
+        ("lint", "chktex"),
+        ("git", "gutter"),
+        ("status", "word_count"),
+        ("session", "restore"),
         ("build", "on_save"),
         ("pdf", "dark_invert"),
         ("spell", "enabled"),
@@ -242,6 +251,18 @@ fn layout() {
     ] {
         assert!(keys.contains(&key), "{key:?}");
     }
+    // Auto-save is a combo row of its three values, showing the configured one.
+    let autosave = descendants(pages[0].upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ComboRow>().ok())
+        .find(|r| r.title() == "Save Automatically")
+        .expect("the auto-save row");
+    assert_eq!(autosave.model().map(|m| m.n_items()), Some(3));
+    assert_eq!(autosave.selected(), 0, "off");
+    assert_eq!(
+        prefs::choice_value(&f.state, "editor", "autosave"),
+        Some("off")
+    );
     // The configuration file row, with its path and Open button, on the first page.
     let first = descendants(pages[0].upcast_ref());
     let path_row = first
@@ -300,6 +321,20 @@ fn round_trip() {
                 prefs::flush(&f.state);
                 assert_eq!(get(&f.file_config()), wanted, "{section}.{key} in the file");
                 assert_eq!(get(&f.state.config), wanted, "{section}.{key} applied");
+            }
+            Kind::Choice { get, options } => {
+                let old = get(&before);
+                assert_eq!(prefs::choice_value(&f.state, section, key), Some(old));
+                // Every other value, then back.
+                for &(value, _) in options.iter().filter(|(v, _)| *v != old) {
+                    assert!(prefs::set_choice(&f.state, section, key, value));
+                    assert_eq!(get(&f.file_config()), value, "{section}.{key} in the file");
+                    assert_eq!(get(&f.state.config), value, "{section}.{key} applied");
+                    assert_eq!(prefs::choice_value(&f.state, section, key), Some(value));
+                }
+                assert!(prefs::set_choice(&f.state, section, key, old));
+                assert_eq!(get(&f.file_config()), old, "{section}.{key} back");
+                assert!(!prefs::set_choice(&f.state, section, key, "no such value"));
             }
             Kind::Font => {
                 assert_eq!(
@@ -395,10 +430,25 @@ fn live() {
     // The font: the editor CSS follows (the configuration has it; the shell installs it).
     assert!(prefs::set_font(&f.state, "Monospace 14"));
     assert_eq!(f.state.config.editor.font, "Monospace 14");
+    // Auto-save after a change: the user's next edit is saved by itself.
+    lemma_app::autosave::set_idle_delay(&f.state, Duration::from_millis(50));
+    assert!(prefs::set_choice(&f.state, "editor", "autosave", "idle"));
+    assert_eq!(f.state.config.editor.autosave, Autosave::Idle);
+    let buffer = editor.buffer();
+    buffer.begin_user_action();
+    buffer.insert(&mut buffer.end_iter(), "% saved by itself\n");
+    buffer.end_user_action();
+    assert!(lemma_app::autosave::is_scheduled(&f.state));
+    let main = f.dir.join("main.tex");
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(&main).is_ok_and(|t| t.ends_with("% saved by itself\n"))
+    });
     // The new keys went into their sections.
     let text = f.text();
     assert!(text.starts_with("[build]\non_save = false\n"), "{text}");
     assert!(text.contains("[pdf]\nthumbnails = true\n"), "{text}");
+    assert!(text.contains("autosave = \"idle\"\n"), "{text}");
+    assert_eq!(f.file_config().editor.autosave, Autosave::Idle);
     f.close();
 }
 
@@ -412,7 +462,7 @@ fn follow() {
     );
     // Another program changes the file; the live reload applies it.
     let edited = COMMENTED
-        .replace("wrap = true", "wrap = false")
+        .replace("wrap = true", "wrap = false\nautosave = \"focus\"")
         .replace("max_days = 30", "max_days = 7")
         .replace("font = \"Monospace 11\"", "font = \"Monospace 9\"");
     std::fs::write(&f.target, &edited).unwrap();
@@ -424,6 +474,10 @@ fn follow() {
         Some(7)
     );
     assert_eq!(prefs::font_value(&f.state).as_deref(), Some("Monospace 9"));
+    assert_eq!(
+        prefs::choice_value(&f.state, "editor", "autosave"),
+        Some("focus")
+    );
     common::pump_for(prefs::NUMBER_DEBOUNCE + Duration::from_millis(100));
     prefs::flush(&f.state);
     assert_eq!(f.text(), edited, "following the file writes nothing back");

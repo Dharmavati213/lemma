@@ -633,6 +633,34 @@ impl Driver {
         m: &SnippetMatch<'_>,
         macro_defined: impl FnOnce(&str) -> bool,
     ) -> bool {
+        self.type_char(c) && self.expand_match(m, macro_defined)
+    }
+
+    /// Types `c` at the cursor and replaces `typed`, which then ends before the cursor, with the
+    /// text `with`, as an undo step of its own: a typing replacement (`...` → `\dots`, see
+    /// `typing::replacement`), which works like an autosnippet without stops. Returns false when
+    /// the view is gone and nothing was typed; once `c` is typed the key is handled, replaced or
+    /// not.
+    pub fn type_and_replace(&self, c: char, typed: &str, with: &str) -> bool {
+        if !self.type_char(c) {
+            return false;
+        }
+        // As a parsed body would be: the text, then the exit.
+        let chunks = [
+            Chunk::Text(with.to_owned()),
+            Chunk::Stop {
+                n: 0,
+                default: String::new(),
+            },
+        ];
+        if let Err(e) = self.expand_chunks(&chunks, typed) {
+            tracing::debug!("replacement not made: {e}");
+        }
+        true
+    }
+
+    /// Types `c` at the cursor as the text view would; false when the view is gone.
+    fn type_char(&self, c: char) -> bool {
         let Some(view) = self.view.upgrade() else {
             return false;
         };
@@ -648,7 +676,7 @@ impl Driver {
                 .insert_interactive_at_cursor(text, view.is_editable());
             self.buffer.end_user_action();
         }
-        self.expand_match(m, macro_defined)
+        true
     }
 
     /// Expands the match `m` (see [`expand`]) through [`Driver::expand_chunks`]; false when
