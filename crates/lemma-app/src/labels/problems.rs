@@ -1,10 +1,11 @@
 //! The label tools in the Problems page: undefined references and citations are the
-//! "References" section of the panel (`DiagSource::Labels`, `DiagnosticsPanel::set_findings`,
-//! file by file; never underlined by the panel: the label tools underline the names
-//! themselves), each with the actions "Use ‘closest’" (a reviewable fix, when a label or key
-//! of a similar name exists) and "Unused Labels and Entries…". The unused labels and
-//! bibliography entries are listed on demand (`win.unused-labels`, also in the main menu's Go
-//! section and the command palette; never underlined).
+//! "References" section of the panel (`DiagSource::Labels`,
+//! `DiagnosticsPanel::set_findings_many`, the files whose names changed in one batch; never
+//! underlined by the panel: the label tools underline the names themselves), each with the
+//! actions "Use ‘closest’" (a reviewable fix, when a label or key of a similar name exists) and
+//! "Unused Labels and Entries…". The unused labels and bibliography entries are listed on
+//! demand (`win.unused-labels`, also in the main menu's Go section and the command palette;
+//! never underlined).
 
 use super::scan::{self, Finding, NameKind};
 use super::{display_path, unused};
@@ -15,8 +16,8 @@ use crate::window::WindowState;
 use adw::prelude::*;
 use lemma_core::{DiagSource, Origin};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// The action that lists the unused labels and entries.
@@ -87,8 +88,9 @@ pub(super) fn install(state: &Rc<WindowState>) {
     }
 }
 
-/// The problem of an undefined name (`finding.line` is 0-based).
-fn problem_of(finding: &Finding) -> Problem {
+/// The problem of an undefined name (`finding.line` is 0-based) in the file `path` (its path,
+/// normalized).
+fn problem_of(finding: &Finding, path: PathBuf) -> Problem {
     let (message, context) = match finding.kind {
         NameKind::Label => (
             format!("Undefined reference ‘{}’", finding.name),
@@ -100,7 +102,7 @@ fn problem_of(finding: &Finding) -> Problem {
         ),
     };
     Problem {
-        path: crate::workspace::normalize(&finding.path),
+        path,
         line: Some(finding.line + 1),
         severity: lemma_core::Severity::Warning,
         message,
@@ -109,52 +111,74 @@ fn problem_of(finding: &Finding) -> Problem {
     }
 }
 
-/// Gives the Problems page the undefined names of the last check: their file's findings in the
-/// References section are replaced, files without any are cleared.
-pub(super) fn publish(state: &Rc<WindowState>, undefined: &[Finding]) {
+/// Gives the Problems page the undefined names of the last check, of which those in the files
+/// `changed` (named as the project index names them) changed since the one before: these
+/// files' findings in the References section are replaced in one batch, and those of files
+/// without any left are cleared. The other files' rows stay as they are, their lines following
+/// the edits.
+pub(super) fn publish(state: &Rc<WindowState>, undefined: &[Finding], changed: &BTreeSet<PathBuf>) {
+    // Each file's path is normalized once, not once per name.
+    fn normalize<'a>(normalized: &mut HashMap<&'a Path, PathBuf>, path: &'a Path) -> PathBuf {
+        normalized
+            .entry(path)
+            .or_insert_with(|| crate::workspace::normalize(path))
+            .clone()
+    }
+    let mut normalized: HashMap<&Path, PathBuf> = HashMap::new();
     let problems: Vec<(Problem, NameKind, String)> = undefined
         .iter()
-        .map(|f| (problem_of(f), f.kind, f.name.clone()))
+        .map(|f| {
+            let path = normalize(&mut normalized, &f.path);
+            (problem_of(f, path), f.kind, f.name.clone())
+        })
         .collect();
-    let files: BTreeSet<PathBuf> = problems.iter().map(|(p, ..)| p.path.clone()).collect();
-    let gone: Vec<PathBuf> = with_page(state, |page| {
+    let mut by_path: BTreeMap<&Path, Vec<&(Problem, NameKind, String)>> = BTreeMap::new();
+    for problem in &problems {
+        by_path.entry(&problem.0.path).or_default().push(problem);
+    }
+    let files: BTreeSet<PathBuf> = by_path.keys().map(|p| p.to_path_buf()).collect();
+    let mut update: BTreeSet<PathBuf> = changed
+        .iter()
+        .map(|p| normalize(&mut normalized, p))
+        .collect();
+    with_page(state, |page| {
         page.problems = problems.clone();
-        let gone = page.files.difference(&files).cloned().collect();
-        page.files = files.clone();
-        gone
+        update.extend(page.files.difference(&files).cloned());
+        page.files = files;
     });
     let Some(build) = state.build.get() else {
         return;
     };
-    let panel = build.diagnostics();
-    for path in gone {
-        panel.set_findings(DiagSource::Labels, &path, Vec::new(), None);
-    }
-    for path in &files {
-        let of_path: Vec<&(Problem, NameKind, String)> =
-            problems.iter().filter(|(p, ..)| &p.path == path).collect();
-        // The names' columns in the live text of a document Lemma has (read once).
-        let columns: Vec<Option<std::ops::Range<u32>>> = match state.workspace.get(path) {
-            Some(doc) => doc.with_text(|text| {
-                let index = doc.line_index();
-                of_path
-                    .iter()
-                    .map(|(problem, _, name)| columns(text, &index, problem, name))
-                    .collect()
-            }),
-            None => vec![None; of_path.len()],
-        };
-        let findings: Vec<diagnostics_panel::Finding> = of_path
-            .iter()
-            .zip(columns)
-            .map(|((problem, ..), columns)| diagnostics_panel::Finding {
-                columns,
-                problem: problem.clone(),
-                code: None,
-            })
-            .collect();
-        panel.set_findings(DiagSource::Labels, path, findings, None);
-    }
+    let updates: Vec<(PathBuf, Vec<diagnostics_panel::Finding>)> = update
+        .into_iter()
+        .map(|path| {
+            let of_path = by_path.get(path.as_path()).map_or(&[][..], Vec::as_slice);
+            // The names' columns in the live text of a document Lemma has (read once).
+            let columns: Vec<Option<std::ops::Range<u32>>> = match state.workspace.get(&path) {
+                Some(doc) if !of_path.is_empty() => doc.with_text(|text| {
+                    let index = doc.line_index();
+                    of_path
+                        .iter()
+                        .map(|(problem, _, name)| columns(text, &index, problem, name))
+                        .collect()
+                }),
+                _ => vec![None; of_path.len()],
+            };
+            let findings = of_path
+                .iter()
+                .zip(columns)
+                .map(|((problem, ..), columns)| diagnostics_panel::Finding {
+                    columns,
+                    problem: problem.clone(),
+                    code: None,
+                })
+                .collect();
+            (path, findings)
+        })
+        .collect();
+    build
+        .diagnostics()
+        .set_findings_many(DiagSource::Labels, updates, None);
 }
 
 /// Where on its line the name of `problem` is (for the panel's navigation).

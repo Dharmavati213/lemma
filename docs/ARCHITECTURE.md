@@ -798,7 +798,7 @@ pub struct Paths { pub config_dir: PathBuf, pub state_dir: PathBuf, pub data_dir
     | `get_diagnostics` | `file_path?` | — |
     | `get_selection` | — | File, line/column, selected text (at most 20k characters) |
     | `render_page` | `page` | PNG at 1.5×, max 1600 px tall, as image content, **plus** text naming a PNG copy in `$XDG_RUNTIME_DIR/lemma/` (images reach the model: **verified 2026-10-11**; the model read a word visible only in the rendered page) |
-    | `get_review_state` | — | `unified_diff` of pending hunks plus recent events |
+    | `get_review_state` | — | Unified diff of pending hunks (at most 50 changes or 12 KiB per file, about 48 KiB in all; the rest counted with its lines) plus recent events |
 
   - **Paths:** each resolved through `ProjectRoot::resolve`; refusal text: `"path outside project root"`.
 - **Permission card keys:** `y` = first `allow_once` option, `Y` = `allow_always`, `n` = `reject_once`. Cancel answers every pending request with `Cancelled`.
@@ -1010,6 +1010,16 @@ they conflict with the sections above, this section wins.
   - A lone UTF-16 surrogate in a request is answered under its own id.
   - The token handshake timeout covers the whole first line.
   - Stale sockets and render copies are removed on start.
+  - `get_review_state` (2026-10-25) writes each file's diff from the review's hunks
+    (`lemma_review::review_diff`, recomputed first if stale; the format and `@@` grouping of
+    `unified_diff`, which it equals when nothing is cut) and caps it: at most
+    `REVIEW_STATE_FILE_CHANGES` (50) changes or `REVIEW_STATE_FILE_BYTES` (12 KiB) per file,
+    then "… N more changes in FILE, lines A–B: read_file shows them"; a change too long to
+    quote by itself (a file the agent wrote whole) is only counted the same way; past
+    `REVIEW_STATE_BYTES` (48 KiB) of diff the other files are listed with their counts and line
+    spans (at most 100, then a count). About 400 bytes per changed line, so a review of about
+    250 changes went past Claude Code's 25k-token limit for a tool's result; 8000 changes in
+    301 files made a 605 KiB reply. The tool's description says so.
 - **Turns and watcher (§4.2):**
   - Only dirty buffers under the root are saved before a prompt.
   - Only Lemma's latest or running write counts as its own.
@@ -1473,6 +1483,36 @@ they conflict with the sections above, this section wins.
     first, then the files after (before) it, wrapping around, opening the file at the problem's
     mapped line as a click on its row does. Problems without a line, and findings, are skipped.
     Function keys are never typed, so the keys stay clear of Vim; Vim has no `]e` or `[e`.
+  - The page is one `GtkListView` (`diagnostics_panel/rows.rs`) over a model of the build's
+    rows and the sections' rows, one group (a `GtkSectionModel` section, whose header names
+    the file, and a section's title above its first file) per file. The view makes widgets
+    only for about 200 rows around the ones on screen, where the list boxes made one per row
+    (up to 500 for the build and 500 per section); a change replaces only the groups that
+    changed, one `items-changed` per run of them. A row's widgets are recycled: the details'
+    state (shown or not, the quick fix once found) lives in the panel, not in them, and their
+    toggle, details and "more" line are made when a row first needs them. The page lists no
+    rows while it is hidden (the model is emptied when they change), as before. A list
+    scrolled to its top is held there for three frames after an update: GTK 4.24 puts the new
+    first row at the top, its file's header above it, out of sight.
+  - `DiagnosticsPanel::set_findings_many` replaces the findings of many files of one source
+    at once: one refill of the section, the open editors' findings applied once each, one
+    refresh of the page. The label tools give it only the files whose undefined names changed
+    since the last check (`labels::check`'s `changed_paths`), each path normalized once;
+    they gave every file's findings one `set_findings` at a time, each refilling the whole
+    section (quadratic: 2–4 s for 400 findings in 40 files with the page shown, about 18 s for
+    6700 in 300 files; now 25–50 ms). `clear_findings` is one batch too.
+  - `problems_from` canonicalizes each file of a log once and sorts the problems by a rank per
+    file instead of comparing paths: 24 000 diagnostics in 300 files take 39 ms instead of
+    693 ms (at a load of 10–15) on the build thread, before the PDF opens. The build
+    controller asks for the PDF before it gives the panel the problems.
+- **Changes panel (§4.3, 2026-10-25):** a refresh while the page is hidden only remembers the
+  model (and sets the header's Undo Last Turn button); the page builds it when it is shown, or
+  when `rows()` or `groups()` asks (as the plain diff waited already). Shown, an update keeps groups by kind and rows by file: a count changes
+  a row's subtitle in place, and only rows and groups that came or went are added or removed;
+  a row's buttons look up its document when clicked. A focused widget that goes lets go of the
+  focus first, which then goes to the first file row or the editor, as before. With 300 files
+  under review, a decision or an agent write cost 100–120 ms of rebuilt rows, shown or not;
+  now 1–2 ms.
 - **Idle stop and `session/load` (§7, §10.3, §10.4, 2026-10-25):**
   - `AgentConfig` gains `load_session: Option<String>` and `AgentEvent::Ready` gains
     `loadable: bool` (the agent advertised `loadSession` in `initialize`). With

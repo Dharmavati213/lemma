@@ -89,7 +89,7 @@ pub fn minimal_edits(current: &str, new: &str) -> Vec<TextEdit> {
 }
 
 /// Lines of context around each change in [`unified_diff`].
-const CONTEXT: u32 = 3;
+pub(crate) const CONTEXT: u32 = 3;
 
 /// Unified diff (3 lines context) for the Changes panel's plain-text view and for get_review_state.
 ///
@@ -118,7 +118,12 @@ pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
 }
 
 /// Writes one `@@` hunk covering `group` plus context.
-fn write_group(out: &mut String, group: &[LineHunk], old_lines: &[&str], new_lines: &[&str]) {
+pub(crate) fn write_group(
+    out: &mut String,
+    group: &[LineHunk],
+    old_lines: &[&str],
+    new_lines: &[&str],
+) {
     let (first, last) = (&group[0], &group[group.len() - 1]);
     let old_lo = first.old_lines.start.saturating_sub(CONTEXT);
     let new_lo = first.new_lines.start - (first.old_lines.start - old_lo);

@@ -342,6 +342,21 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   too); `gtk_app`'s `several_files_and_lines` and `usage_errors_and_help` run the binary. The
   command line's parsing (with files on disk) and the sweep of old session files are unit
   tests in `cli.rs` and `session.rs`.
+- **Problems and Changes panels:** the Problems page's list view in `gtk_lint`
+  (`problem_rows_are_built_when_shown_and_capped`: rows listed only while the page shows,
+  widgets only for the rows near the screen, a header per file from the section model, the
+  line of the problems left out at the end of the last file's group, opening nothing;
+  `problem_headers_follow_other_files`: the section's count and title and each file's header
+  stay right while only other files' rows are replaced) and `gtk_labels`
+  (`problems_page_references_section_and_fix`, the References section fed by
+  `set_findings_many`); the splices of an update (only the groups that changed) are unit tests
+  in `diagnostics_panel/rows.rs`. The Changes panel in `gtk_review`
+  (`changes_panel_waits_while_hidden_and_updates_in_place`: nothing built while hidden, rows
+  kept as the same widgets while a count, a new file or a decided file changes them) and
+  `gtk_regress2_d` (the focus rule on real keys). `get_review_state`'s cut in `gtk_agent_tools`
+  (`review_state_of_a_large_review_is_capped`, with a new file too long to quote) and
+  `lemma-review`'s `review_diff` unit tests (equal to `unified_diff` when not cut; a cut hunk
+  ends before the change it leaves out; a change longer than the limit is only counted).
 - **Recovery of unsaved changes** (`recovery.rs`): unit tests for the file format, the
   decision on a file found when a document opens, the bar's texts, the copy delays, the writer
   (the newest operation per file wins, the process's lock), a running writer told by its lock,
@@ -506,7 +521,8 @@ check the budgets only in release builds:
 | `lemma-core` `perf_line_index_replace_all_large_tex` | the line index through the 40 000 changes of a replace all of 20 000 matches in `large.tex`, from the end and from the start, ≤ 50 ms each |
 | `gtk_document` `perf_apply_edits_replace_all` | `apply_edits` of 20 000 matches in a file under review: ≤ 0.5 s closed, ≤ 1.5 s open |
 | `gtk_session` `perf_recovery_copy_large_tex` | the recovery copy's main-thread cost: ≤ 2 ms for 10k lines (a copy can come due while typing goes on), ≤ 8 ms for `large.tex` (measured 0.9 and 4.5 ms in a dev build: the copy is GTK's), and ≤ 100 µs of a keystroke |
-| `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files, the `set` call and the next frame's work: ≤ 60 ms with the Problems page hidden (no rows built), ≤ 300 ms with it shown (500 rows and the line counting the rest) |
+| `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files: the `set` call, then the main loop's longest step and its work until the next frame is drawn (with the open editor's marks): ≤ 150 ms with the Problems page hidden (no rows listed); showing the page (501 rows in a list view that makes widgets for about 200) adds ≤ 175 ms, and no step takes over 120 ms (measured at a load of 6–9: 117 ms and a 57 ms step, at 10–15 225 ms and 118 ms; 242 ms and 126 ms, 460 ms and 251 ms with a list box row per problem) |
+| `gtk_lint` `perf_problems_from_many_files` | `problems_from` of 24 000 diagnostics in 300 files ≤ 60 ms median (measured 39 ms at a load of 10–15; 693 ms when every diagnostic's path was canonicalized and the problems sorted by comparing paths) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
 | `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
 | `lemma-pdf` `perf_dark_pages` | colouring a page for dark mode (stress and pdf50 pages at scale_q 10 and 21) takes under 1/2.5 of the time of the transform without its fast paths for white and grey pixels (measured 0.6 against 3.4 ms, and 2.7–2.9 against 15.5–16.2 ms), with the same bytes; through the PDF thread a dark stress page at scale_q 21 costs under 1.5 times a light one (measured 12.6 and 10.7 ms; 18.6 and 7.9 before) |
@@ -520,7 +536,10 @@ check the budgets only in release builds:
 | `gtk_labels` `perf_equation_numbers_follow_lines` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`, on the CPU: a line break above them ≤ 1 ms median inside the change (measured 0.07 ms; 2.6 ms while the numbers were added again there), and ten line changes made at once, with what is ready to run after them, ≤ 10 ms median (measured 3.0 ms, once; 26 ms, once per change). The line break with what runs after it, before the next frame, is printed (2.6–2.7 ms either way) |
 | `gtk_labels` `perf_undefined_check_big_project` | the undefined-reference check on a generated book (`tests/common/big_project.rs`: 300 chapters, 20k labels, 30k references, 40k citations, a 10k-entry bibliography and an `.aux`), once a chapter was indexed again, on the CPU (the time spent waiting for one left out): ≤ 1 ms median after prose, ≤ 8 ms after Enter, a `\ref`, a `\label` and a reference to nothing (measured 0.08 ms after prose and 0.5–3 ms after the others; 22–34 ms before, when every check went through the whole project) |
 | `gtk_outline` `perf_outline_big_project` | the Outline of that book (16 500 rows) looking at the index once the chapter was indexed again, on the CPU: ≤ 1 ms median after Enter, a `\label` or a `\ref` in prose (the same but for lines: nothing recomputed), ≤ 10 ms after a new `\section` (measured 0.16–0.26 ms and 3.7 ms; 34–40 ms before, when every change recomputed and patched the whole outline) |
+| `gtk_labels` `perf_undefined_references_many_files` | Enter in one of 40 chapters with 402 undefined references: the main loop's longest step until the check ran and a frame was drawn ≤ 100 ms with the Problems page shown, ≤ 60 ms hidden (measured 53 and 26 ms at a load of 10–15, 25 and 13 ms at 6; 4.0 s shown when every check gave the panel every file's findings one file at a time, each refilling the section) |
 | `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms; prints a line break above the hunks and accepting one (with the main loop's work after it) |
+| `gtk_review` `perf_changes_panel_many_files` | 300 closed files with 10 changes each: the review's refresh after accepting one ≤ 10 ms with the Changes page hidden, ≤ 20 ms shown (measured 1.4 and 2.1 ms; 202 and 227 ms when every refresh built every row again); prints how long the 300 agent writes took (1.3 s; 41 s) |
+| `gtk_agent_tools` `perf_review_state_of_a_large_review` | `get_review_state` of 8000 changes in 301 files: the reply under 64 KiB, ≤ 10 ms (measured 52 KiB and 5.5 ms; 605 KiB and 40 ms with the whole unified diff) |
 
 `perf_completion_keystroke` lays the document out before it measures and reports the window
 frames Broadway renders meanwhile separately (about 40–50 ms each in software, about once a

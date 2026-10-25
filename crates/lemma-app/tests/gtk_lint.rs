@@ -2,12 +2,13 @@
 //! underline and its hover, silencing by comment and by configuration, the defaults, a missing
 //! chktex), plain-English explanations and quick fixes of build errors (each fix's hunk, and
 //! Reject restoring the text), next and previous problem (F4 / Shift+F4), the build's rows
-//! built when the page shows them and capped, and the word count (equal to a direct texcount
+//! listed when the page shows them and capped, and the word count (equal to a direct texcount
 //! run; selection; after a build; a missing texcount).
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_lint`. The ignored
-//! `perf_problems_long_list` times replacing 3000 problems (release: `cargo test --release -p
-//! lemma-app --test gtk_lint -- --ignored perf`).
+//! `perf_problems_long_list` times replacing 3000 problems, `perf_problems_from_many_files`
+//! turning 24 000 diagnostics into problems (release: `cargo test --release -p lemma-app --test
+//! gtk_lint -- --ignored perf`).
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `o-problems-lint-light.png` / `-dark.png` there.
 //! chktex and texcount tests print `SKIP` and pass when the program is missing.
 
@@ -56,6 +57,10 @@ fn main() -> ExitCode {
             "problem_rows_are_built_when_shown_and_capped",
             rows_lazy_and_capped,
         ),
+        (
+            "problem_headers_follow_other_files",
+            headers_follow_other_files,
+        ),
         ("quick_fix_wraps_math", fix_missing_dollar),
         ("quick_fix_loads_the_package", fix_package),
         ("quick_fix_closest_macro", fix_closest_macro),
@@ -71,6 +76,10 @@ fn main() -> ExitCode {
     ];
     if ignored {
         tests.push(("perf_problems_long_list", perf_long_list));
+        tests.push((
+            "perf_problems_from_many_files",
+            perf_problems_from_many_files,
+        ));
     }
     common::run(&tests)
 }
@@ -226,28 +235,18 @@ fn lint_open_and_save() {
     assert_eq!(w2.problem.line, Some(3));
     assert_eq!(w2.problem.source, DiagSource::Lint);
     assert_eq!(w2.problem.path, f.path("main.tex"));
-    // WP3.10: the rows (several widgets per finding) are built when the page shows them; until
+    // WP3.10: the rows (several widgets per finding) are listed when the page shows them; until
     // then the findings cost no widgets (lint runs on open: about 1.5 MB at idle for the
     // warnings of a 1k-line document).
-    let rows = |f: &Fixture| {
-        let mut n = 0;
-        let mut stack = vec![f.state.sidebar.problems.clone().upcast::<gtk::Widget>()];
-        while let Some(w) = stack.pop() {
-            let mut child = w.first_child();
-            while let Some(c) = child {
-                child = c.next_sibling();
-                stack.push(c);
-            }
-            n += usize::from(w.is::<gtk::ListBoxRow>());
-        }
-        n
-    };
     f.state.sidebar.split.set_show_sidebar(false);
     common::pump_for(Duration::from_millis(50));
-    assert_eq!(rows(&f), 0, "rows were built for a hidden page");
+    assert_eq!(rows(&f), 0, "rows were listed for a hidden page");
+    assert_eq!(row_widgets(&f), 0, "rows were built for a hidden page");
     f.state.sidebar.split.set_show_sidebar(true);
     f.state.sidebar.show_page(lemma_app::window::PAGE_PROBLEMS);
-    common::pump_until(TIMEOUT, || rows(&f) == findings.len());
+    common::pump_until(TIMEOUT, || {
+        rows(&f) == findings.len() && row_widgets(&f) == findings.len()
+    });
     // The build's problems are not touched: lint is a section of its own.
     assert!(f.panel().problems().is_empty());
     assert!(f.panel().shows_filter_bar());
@@ -660,6 +659,22 @@ fn explanations() {
     assert_eq!(panel.context_menu(1).unwrap().n_items(), 1);
     // Gutter tooltips carry the explanation too (checked through the explanation table).
     assert!(panel.fix_label(2).is_none());
+    // A new build with more problems than fit, while the page shows the top: its file's header
+    // stays on screen (GTK puts the new first row at the top, its header above it, unless the
+    // list holds the top).
+    let many: Vec<Problem> = (1..=40)
+        .map(|line| error(&f, "main.tex", line, "Something nobody explains.", None))
+        .collect();
+    panel.set(many, &root);
+    assert!(block_on(testmode::wait_for_frames(&f.state.window, 2)));
+    let list = panel.list_view();
+    let top = widgets(list.upcast_ref())
+        .iter()
+        .filter(|w| w.has_css_class("lemma-problems-header") && w.is_mapped())
+        .filter_map(|w| w.compute_point(&list, &gtk::graphene::Point::new(0.0, 0.0)))
+        .map(|p| p.y())
+        .fold(f32::MAX, f32::min);
+    assert!((0.0..50.0).contains(&top), "the first header is at {top}");
 }
 
 /// Applies the fix of `problem` (the only problem of a build of main.tex): its label is
@@ -1130,9 +1145,11 @@ fn next_and_previous_problem() {
     assert_eq!(cursor_at(&f), Some(("b.tex".to_owned(), 5)));
 }
 
-/// The build's rows are built when the Problems page shows them, and it lists at most
-/// `MAX_SECTION_ROWS` of them, the most severe ones, and a line counting the others; those still
-/// have their gutter marks, open from `activate` and are reached by next and previous problem.
+/// The build's rows are listed when the Problems page shows them, at most `MAX_SECTION_ROWS` of
+/// them, the most severe ones, and a line counting the others, under a header per file; the
+/// list view makes widgets only for the rows near the ones on screen. The problems left out
+/// still have their gutter marks, open from `activate` and are reached by next and previous
+/// problem.
 fn rows_lazy_and_capped() {
     use lemma_app::diagnostics_panel::{MAX_SECTION_ROWS, WARNING_CATEGORY};
     use sourceview5::prelude::BufferExt;
@@ -1141,36 +1158,54 @@ fn rows_lazy_and_capped() {
     let f = fixture_with("problem-rows", &files, |c| c.lint.chktex = false);
     let root = f.path("main.tex");
     let problems = thesis_problems(&f, 1800);
-    let list = build_list(&f);
     // Hidden: no rows.
     f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
     f.panel().set(problems.clone(), &root);
-    assert_eq!(row_count(&list), 0, "a hidden page builds no rows");
+    assert_eq!(rows(&f), 0, "a hidden page lists no rows");
     assert_eq!(f.panel().summary_text(), "600 warnings · 1200 bad boxes");
     // Shown: the most severe ones and the line about the others, which opens nothing. Each
     // file's 120 warnings come before its 240 bad boxes, so the first 500 problems of the list
     // would leave out the warnings of the last three files.
     lemma_app::diagnostics_panel::reveal(&f.state);
-    common::pump_until(TIMEOUT, || row_count(&list) > 0);
-    assert_eq!(row_count(&list), MAX_SECTION_ROWS + 1);
-    let icon = |row: gtk::ListBoxRow| {
-        widgets(row.upcast_ref())
-            .into_iter()
-            .find_map(|w| w.downcast::<gtk::Image>().ok())
-            .and_then(|image| image.icon_name())
-    };
-    let warning_rows = (0..MAX_SECTION_ROWS as i32)
-        .filter_map(|i| list.row_at_index(i))
-        .filter(|row| icon(row.clone()).as_deref() == Some("dialog-warning-symbolic"))
-        .count();
-    assert_eq!(warning_rows, MAX_SECTION_ROWS, "warnings before bad boxes");
-    let more = list.row_at_index(MAX_SECTION_ROWS as i32).unwrap();
-    assert!(!more.is_activatable());
-    assert!(more.header().is_none());
-    assert_eq!(
-        all_labels(&more),
-        [format!("{} more not listed", 1800 - MAX_SECTION_ROWS)]
+    common::pump_until(TIMEOUT, || rows(&f) > 0);
+    assert_eq!(rows(&f), MAX_SECTION_ROWS + 1);
+    let listed = f.panel().listed();
+    assert_eq!(listed.len(), MAX_SECTION_ROWS);
+    assert!(
+        listed
+            .iter()
+            .all(|&i| problems[i].severity == Severity::Warning),
+        "warnings before bad boxes"
     );
+    // The list view makes widgets only for the rows around the ones on screen.
+    common::pump_until(TIMEOUT, || row_widgets(&f) > 0);
+    assert!(row_widgets(&f) < MAX_SECTION_ROWS, "{}", row_widgets(&f));
+    // Each file's rows under a header with its name and count, the first one's on screen.
+    common::pump_until(TIMEOUT, || {
+        headers(&f)
+            .iter()
+            .any(|h| h.iter().any(|l| l == "main.tex") && h.iter().any(|l| l == "360"))
+    });
+    let list = f.panel().list_view();
+    let sections = list
+        .model()
+        .and_then(|m| m.dynamic_cast::<gtk::SectionModel>().ok())
+        .expect("the rows are grouped by file");
+    assert_eq!(sections.section(0), (0, 120));
+    // The line after the listed problems is the last file's, without a header of its own.
+    let more = MAX_SECTION_ROWS as u32;
+    assert!(sections.section(more).0 < more);
+    list.scroll_to(more, gtk::ListScrollFlags::NONE, None);
+    let text = format!("{} more not listed", 1800 - MAX_SECTION_ROWS);
+    common::pump_until(TIMEOUT, || {
+        widgets(list.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .any(|l| l.is_mapped() && l.text() == text)
+    });
+    WidgetExt::activate_action(&list, "list.activate-item", Some(&more.to_variant())).unwrap();
+    common::pump_for(Duration::from_millis(50));
+    assert!(f.state.active_editor().is_none(), "the line opens nothing");
     assert!(f.panel().context_menu(1799).is_some());
     assert!(f.panel().context_menu(1800).is_none());
     // The last file: its first 20 warnings are listed, the others and its bad boxes are not;
@@ -1207,12 +1242,94 @@ fn rows_lazy_and_capped() {
     // A short list while shown, then a long one while hidden again.
     lemma_app::diagnostics_panel::reveal(&f.state);
     f.panel().set(problems[..3].to_vec(), &root);
-    assert_eq!(row_count(&list), 3);
+    assert_eq!(rows(&f), 3);
     f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
     f.panel().set(problems, &root);
-    assert_eq!(row_count(&list), 0);
+    assert_eq!(rows(&f), 0);
+    assert_eq!(row_widgets(&f), 0);
     lemma_app::diagnostics_panel::reveal(&f.state);
-    common::pump_until(TIMEOUT, || row_count(&list) == MAX_SECTION_ROWS + 1);
+    common::pump_until(TIMEOUT, || rows(&f) == MAX_SECTION_ROWS + 1);
+}
+
+/// Only the rows of a file whose findings changed are replaced, but the headers of the others
+/// follow: the section's count above its first file, the section's title when the first file
+/// goes or another comes before it, and each file's own name and count where its rows moved.
+fn headers_follow_other_files() {
+    let files: Vec<(&str, &str)> = ["main.tex", "a.tex", "b.tex", "c.tex"]
+        .iter()
+        .map(|n| (*n, "Text.\n"))
+        .collect();
+    let f = fixture_with("problem-headers", &files, |c| c.lint.chktex = false);
+    let set = |file: &str, n: u32| {
+        let findings = (1..=n)
+            .map(|line| Finding {
+                problem: Problem {
+                    path: f.path(file),
+                    line: Some(line),
+                    severity: Severity::Warning,
+                    message: format!("Undefined reference ‘x{line}’"),
+                    context: None,
+                    source: DiagSource::Labels,
+                },
+                columns: None,
+                code: None,
+            })
+            .collect();
+        f.panel()
+            .set_findings(DiagSource::Labels, &f.path(file), findings, None);
+    };
+    // Each header on screen, top to bottom: "References 6 / a.tex 2", "b.tex 1".
+    let headers = || -> Vec<String> {
+        let list = f.panel().list_view();
+        let texts = |w: &gtk::Widget| -> String {
+            let mut texts = Vec::new();
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                if let Ok(label) = c.downcast::<gtk::Label>() {
+                    texts.push(label.text().to_string());
+                }
+            }
+            texts.join(" ")
+        };
+        let mut found: Vec<(f32, String)> = widgets(list.upcast_ref())
+            .into_iter()
+            .filter(|w| w.has_css_class("lemma-problems-header") && w.is_mapped())
+            .filter_map(|file| {
+                let at = file.compute_point(&list, &gtk::graphene::Point::new(0.0, 0.0))?;
+                let text = match file.prev_sibling().filter(|s| s.is_visible()) {
+                    Some(section) => format!("{} / {}", texts(&section), texts(&file)),
+                    None => texts(&file),
+                };
+                Some((at.y(), text))
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.into_iter().map(|(_, text)| text).collect()
+    };
+    // The headers once a frame shows them (or what they are after a while).
+    let expect = |expected: &[&str]| {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while headers() != expected && std::time::Instant::now() < deadline {
+            common::pump_for(Duration::from_millis(20));
+        }
+        assert_eq!(headers(), expected);
+    };
+    f.open("main.tex");
+    lemma_app::diagnostics_panel::reveal(&f.state);
+    set("a.tex", 2);
+    set("b.tex", 1);
+    set("c.tex", 3);
+    expect(&["References 6 / a.tex 2", "b.tex 1", "c.tex 3"]);
+    // b.tex's rows change: a.tex's header counts the section again.
+    set("b.tex", 4);
+    expect(&["References 9 / a.tex 2", "b.tex 4", "c.tex 3"]);
+    // a.tex's go: the title moves to b.tex.
+    set("a.tex", 0);
+    expect(&["References 7 / b.tex 4", "c.tex 3"]);
+    // They come back above the others, which move down a row without being replaced.
+    set("a.tex", 1);
+    expect(&["References 8 / a.tex 1", "b.tex 4", "c.tex 3"]);
 }
 
 /// `widget` and everything under it, breadth first.
@@ -1230,20 +1347,29 @@ fn widgets(widget: &gtk::Widget) -> Vec<gtk::Widget> {
     out
 }
 
-/// The build's list of the Problems page (the first list box under the page: the findings'
-/// sections come after it).
-fn build_list(f: &Fixture) -> gtk::ListBox {
-    widgets(&f.panel().widget())
-        .into_iter()
-        .find_map(|w| w.downcast::<gtk::ListBox>().ok())
-        .expect("the Problems page has a list")
+/// The rows the Problems page lists (the items of its list view).
+fn rows(f: &Fixture) -> usize {
+    f.panel()
+        .list_view()
+        .model()
+        .map_or(0, |m| m.n_items() as usize)
 }
 
-/// The rows `list` holds.
-fn row_count(list: &gtk::ListBox) -> usize {
-    (0..)
-        .take_while(|&i| list.row_at_index(i).is_some())
+/// The rows the Problems page has widgets for.
+fn row_widgets(f: &Fixture) -> usize {
+    widgets(f.panel().list_view().upcast_ref())
+        .iter()
+        .filter(|w| w.has_css_class("lemma-problem-row"))
         .count()
+}
+
+/// The texts of the file headers the Problems page shows (name, count).
+fn headers(f: &Fixture) -> Vec<Vec<String>> {
+    widgets(f.panel().list_view().upcast_ref())
+        .iter()
+        .filter(|w| w.has_css_class("lemma-problems-header") && w.is_mapped())
+        .map(all_labels)
+        .collect()
 }
 
 /// The files of a long thesis: the root and four chapters of 700 lines each.
@@ -1288,13 +1414,18 @@ fn thesis_problems(f: &Fixture, n: u32) -> Vec<Problem> {
 }
 
 /// A long thesis's build: 3000 warnings and bad boxes in five files. Prints what replacing the
-/// problems costs on the main thread, with the Problems page hidden and shown: the `set` call
-/// and the next frame's work (before-paint to after-paint: layout, snapshot and render; under
-/// Broadway frames come about once a second, so the wait for one is not counted), and the rows
-/// the list then holds. Release builds check that a hidden page holds no rows and a shown one
-/// `MAX_SECTION_ROWS` and the line saying how many more there are, and that the call and the
-/// frame take at most 60 ms with the page hidden and 300 ms with it shown (measured: about
-/// 20 ms and 130 ms; before the rows were built lazily and capped, 0.35 s and 0.7 s).
+/// problems costs on the main thread, with the Problems page hidden and shown: the `set` call,
+/// then the main loop's longest step and its work in all until the next frame was drawn (the
+/// frame's layout, snapshot and render included, and the open editor's marks and underlines;
+/// under Broadway frames come about once a second, so the wait for one is not counted), and the
+/// rows the list then holds (medians of 5). Release builds check that a hidden page lists no
+/// rows and a shown one `MAX_SECTION_ROWS` and the line saying how many more there are, that
+/// the call and the work after it take at most 150 ms with the page hidden (the editor's), that
+/// showing the page adds at most 175 ms to them, and that no step takes over 120 ms with it
+/// shown. Measured at a load of 6-9: 5 + 89 ms hidden, 44 + 167 ms shown (117 ms the page's),
+/// with a longest step of 57 ms; at 10-15: 10 + 143 ms and 93 + 285 ms (225 ms), 118 ms. With
+/// a list box row per problem: 242 ms the page's and a 126 ms step at 6-9; 460 ms and 251 ms
+/// at 10-15 (before the rows were built lazily and capped, 0.35 s and 0.7 s).
 fn perf_long_list() {
     let body = "A line of the thesis.\n".repeat(700);
     let files: Vec<(&str, &str)> = THESIS.iter().map(|n| (*n, body.as_str())).collect();
@@ -1304,60 +1435,126 @@ fn perf_long_list() {
     let problems = thesis_problems(&f, 3000);
     assert_eq!(problems.len(), 3000);
     let clock = f.state.window.frame_clock().unwrap();
-    let frame_start = Rc::new(std::cell::Cell::new(None::<std::time::Instant>));
-    let frames: Rc<std::cell::RefCell<Vec<Duration>>> = Rc::default();
-    let start = frame_start.clone();
-    let before = clock.connect_before_paint(move |_| start.set(Some(std::time::Instant::now())));
-    let (start, done) = (frame_start.clone(), frames.clone());
-    let after = clock.connect_after_paint(move |_| {
-        if let Some(t) = start.take() {
-            done.borrow_mut().push(t.elapsed());
-        }
-    });
-    let measure = |shown: bool| -> (Duration, Duration, usize) {
+    let painted = Rc::new(std::cell::Cell::new(0u64));
+    let count = painted.clone();
+    let handler = clock.connect_after_paint(move |_| count.set(count.get() + 1));
+    let measure = |shown: bool| -> (Duration, Duration, Duration, usize) {
         if shown {
             lemma_app::diagnostics_panel::reveal(&f.state);
         } else {
             f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
         }
         assert!(block_on(testmode::wait_for_frames(&f.state.window, 1)));
-        let (mut set, mut frame) = (Vec::new(), Vec::new());
+        let (mut set, mut longest, mut work) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..5 {
+            common::pump_for(Duration::from_millis(100));
             let replacement = problems.clone();
-            frames.borrow_mut().clear();
+            let frames = painted.get();
             let started = std::time::Instant::now();
             f.panel().set(replacement, &root);
             set.push(started.elapsed());
-            assert!(block_on(testmode::wait_for_frames(&f.state.window, 1)));
-            frame.push(frames.borrow().first().copied().unwrap_or_default());
+            f.state.window.queue_draw();
+            let (mut step, mut total) = (Duration::ZERO, Duration::ZERO);
+            let deadline = std::time::Instant::now() + TIMEOUT;
+            while painted.get() == frames {
+                assert!(std::time::Instant::now() < deadline, "no frame");
+                let t = common::timed_iteration();
+                step = step.max(t);
+                total += t;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            longest.push(step);
+            work.push(total);
         }
         set.sort();
-        frame.sort();
-        (set[2], frame[2], row_count(&build_list(&f)))
+        longest.sort();
+        work.sort();
+        (set[2], longest[2], work[2], rows(&f))
     };
-    let (hidden_set, hidden_frame, hidden_rows) = measure(false);
-    let (shown_set, shown_frame, shown_rows) = measure(true);
-    clock.disconnect(before);
-    clock.disconnect(after);
+    let (hidden_set, hidden_step, hidden_work, hidden_rows) = measure(false);
+    let (shown_set, shown_step, shown_work, shown_rows) = measure(true);
+    clock.disconnect(handler);
     println!(
         "perf_problems_long_list: 3000 problems, medians of 5: hidden page: set {hidden_set:.2?}, \
-         next frame {hidden_frame:.2?}, {hidden_rows} rows; shown page: set {shown_set:.2?}, next \
-         frame {shown_frame:.2?}, {shown_rows} rows"
+         then longest step {hidden_step:.2?}, work {hidden_work:.2?}, {hidden_rows} rows; shown \
+         page: set {shown_set:.2?}, then longest step {shown_step:.2?}, work {shown_work:.2?}, \
+         {shown_rows} rows"
     );
     if cfg!(debug_assertions) {
         println!("    (debug build: budgets not checked)");
         return;
     }
     let max_rows = lemma_app::diagnostics_panel::MAX_SECTION_ROWS + 1;
-    assert_eq!(hidden_rows, 0, "a hidden page builds no rows");
+    assert_eq!(hidden_rows, 0, "a hidden page lists no rows");
     assert_eq!(
         shown_rows, max_rows,
         "MAX_SECTION_ROWS rows and the line after them"
     );
-    let hidden = hidden_set + hidden_frame;
-    let shown = shown_set + shown_frame;
-    assert!(hidden <= Duration::from_millis(60), "hidden: {hidden:?}");
-    assert!(shown <= Duration::from_millis(300), "shown: {shown:?}");
+    let hidden = hidden_set + hidden_work;
+    let shown = shown_set + shown_work;
+    assert!(hidden <= Duration::from_millis(150), "hidden: {hidden:?}");
+    // The page's own part: what showing it adds.
+    let page = shown.saturating_sub(hidden);
+    assert!(
+        page <= Duration::from_millis(175),
+        "the shown page's part: {page:?} ({shown:?} against {hidden:?} hidden)"
+    );
+    assert!(
+        shown_step <= Duration::from_millis(120),
+        "shown, the longest step: {shown_step:?}"
+    );
+}
+
+/// A long book's log: 24 000 diagnostics in 300 files (as `problems_from` gets them after a
+/// build, off the main thread, while the PDF waits). Prints the median and maximum of 5 calls;
+/// release builds check that the median is at most 60 ms (measured 39 ms at a load of 10-15;
+/// 693 ms when each diagnostic's path was canonicalized, and the problems sorted by comparing
+/// paths).
+fn perf_problems_from_many_files() {
+    let dir = common::temp_dir("perf-problems-from");
+    let root = dir.join("main.tex");
+    std::fs::write(&root, "x\n").unwrap();
+    let files: Vec<PathBuf> = (0..300)
+        .map(|i| {
+            let path = dir.join(format!("chapters/c{i}.tex"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x\n").unwrap();
+            path
+        })
+        .collect();
+    let diagnostics: Vec<lemma_core::Diagnostic> = (0..24_000u32)
+        .map(|i| lemma_core::Diagnostic {
+            path: files[(i % 300) as usize].clone(),
+            line: Some(i / 300 + 1),
+            severity: if i % 4 == 0 {
+                Severity::Warning
+            } else {
+                Severity::BadBox
+            },
+            message: format!("Overfull \\hbox (1.0pt too wide) in paragraph at lines {i}--{i}"),
+            context: None,
+            source: DiagSource::Tex,
+        })
+        .collect();
+    let mut times: Vec<Duration> = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let problems =
+                lemma_app::diagnostics_panel::problems_from(&diagnostics, &root, ".build");
+            let elapsed = started.elapsed();
+            assert_eq!(problems.len(), diagnostics.len());
+            elapsed
+        })
+        .collect();
+    times.sort();
+    println!(
+        "perf_problems_from_many_files: 24000 diagnostics in 300 files: median {:.2?}, max \
+         {:.2?}",
+        times[2], times[4]
+    );
+    if !cfg!(debug_assertions) {
+        assert!(times[2] <= Duration::from_millis(60), "{times:?}");
+    }
 }
 
 /// A copy of the `proj` fixture.

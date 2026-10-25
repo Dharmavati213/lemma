@@ -38,7 +38,10 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Tests that only run with `--ignored` or `--include-ignored`, with the reason (none at the
 /// moment: the end-to-end tests build the fake agent and the MCP bridge themselves).
-const IGNORED: &[(&str, &str)] = &[];
+const IGNORED: &[(&str, &str)] = &[(
+    "perf_review_state_of_a_large_review",
+    "a release timing test (--ignored)",
+)];
 
 fn main() -> ExitCode {
     let tests: &[common::Test] = &[
@@ -52,6 +55,14 @@ fn main() -> ExitCode {
         ("render_page_png", render_page),
         ("render_page_caps_tall_pages", render_page_tall),
         ("review_state_diff_and_events", review_state),
+        (
+            "review_state_of_a_large_review_is_capped",
+            review_state_capped,
+        ),
+        (
+            "perf_review_state_of_a_large_review",
+            perf_review_state_large,
+        ),
         ("tool_records_and_feedback", tool_records),
         ("turn_start_and_end_bookkeeping", turn_bookkeeping),
         (
@@ -849,6 +860,144 @@ fn review_state() {
         !f.call_text(EditorRequest::ReviewState)
             .contains("<review_feedback>")
     );
+}
+
+/// `get_review_state` of a large review stays a reply the agent can take: it quotes at most
+/// `REVIEW_STATE_FILE_CHANGES` changes of a file and counts the others with the lines they span,
+/// counts a change too long to quote (a new file of 2000 lines), and past `REVIEW_STATE_BYTES`
+/// it lists the files by name.
+fn review_state_capped() {
+    let big: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+    let small: String = (0..40)
+        .map(|i| format!("line {i} of a text long enough to fill the diff\n"))
+        .collect();
+    let names: Vec<String> = (0..60).map(|i| format!("s{i:02}.tex")).collect();
+    let mut files: Vec<(&str, &str)> = vec![("big.tex", big.as_str())];
+    files.extend(names.iter().map(|n| (n.as_str(), small.as_str())));
+    let f = fixture("review-state-capped", &files);
+    let changed = |text: &str, every: usize| -> String {
+        text.lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i % every == 1 {
+                    format!("{line} changed\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect()
+    };
+    let write = |path: &str, content: String| {
+        f.call_text(EditorRequest::Write {
+            path: path.into(),
+            content,
+        });
+    };
+    write("big.tex", changed(&big, 10));
+    write(
+        "new.tex",
+        (0..2000).map(|i| format!("new line {i}\n")).collect(),
+    );
+    for name in &names {
+        write(name, changed(&small, 4));
+    }
+    let text = f.call_text(EditorRequest::ReviewState);
+    assert!(
+        text.starts_with("701 changes awaiting review in 62 files."),
+        "{}",
+        &text[..200]
+    );
+    assert!(text.len() < 64 << 10, "{} bytes", text.len());
+    // The new file is one change of 2000 lines: counted, not quoted.
+    assert!(
+        text.contains(
+            "\n… 1 change in new.tex, lines 1–2000, too long to quote here: read_file shows them\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("new line 0") && !text.contains("--- a/new.tex"));
+    // big.tex: its first 50 changes, then the others counted.
+    let big_diff = text
+        .split("--- a/big.tex\n")
+        .nth(1)
+        .and_then(|rest| rest.split("--- a/").next())
+        .expect("big.tex's diff");
+    assert_eq!(
+        big_diff.matches("@@ -").count(),
+        tools::REVIEW_STATE_FILE_CHANGES
+    );
+    assert!(big_diff.contains("+line 491 changed\n"));
+    assert!(!big_diff.contains("line 501 changed"));
+    assert!(
+        big_diff.contains("… 50 more changes in big.tex, lines 502–992: read_file shows them\n"),
+        "{big_diff}"
+    );
+    // Past the reply's limit the files are listed: their changes and lines.
+    assert!(
+        text.contains("0 changes, not shown (the reply's limit); read_file shows them:\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  s59.tex: 10 changes, lines 2–38\n"),
+        "{text}"
+    );
+    assert!(text.contains("--- a/s00.tex\n") && !text.contains("--- a/s59.tex\n"));
+}
+
+/// A large review: 5000 one-line changes in a 20 000-line file and 10 in each of 300 small
+/// files. Prints the size of `get_review_state`'s reply and the time it takes (medians and
+/// maxima of 5); release builds check that the reply stays under 64 KiB (about 16k tokens:
+/// MCP clients cap a tool result, Claude Code at 25k tokens) and takes at most 10 ms (measured
+/// 52 KiB and 5.5 ms at a load of 10-15; 605 KiB and 40 ms with the whole unified diff).
+fn perf_review_state_large() {
+    let base: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+    let small: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    let names: Vec<String> = (0..300).map(|i| format!("s{i:03}.tex")).collect();
+    let mut files: Vec<(&str, &str)> = vec![("large.tex", base.as_str())];
+    files.extend(names.iter().map(|n| (n.as_str(), small.as_str())));
+    let f = fixture("review-state-large", &files);
+    let changed = |text: &str, every: usize| -> String {
+        text.lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i % every == 1 {
+                    format!("{line} changed\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect()
+    };
+    let write = |path: &str, content: String| {
+        f.call_text(EditorRequest::Write {
+            path: path.into(),
+            content,
+        });
+    };
+    write("large.tex", changed(&base, 4));
+    for name in &names {
+        write(name, changed(&small, 10));
+    }
+    let mut times = Vec::new();
+    let mut bytes = 0;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let text = f.call_text(EditorRequest::ReviewState);
+        times.push(started.elapsed());
+        bytes = text.len();
+        assert!(text.starts_with("8000 changes awaiting review in 301 files."));
+    }
+    times.sort();
+    println!(
+        "    get_review_state of 8000 changes in 301 files: {} KiB, median {:.2?}, max {:.2?}",
+        bytes / 1024,
+        times[2],
+        times[4]
+    );
+    if !cfg!(debug_assertions) {
+        assert!(bytes < 64 << 10, "{bytes} bytes");
+        assert!(times[2] <= Duration::from_millis(10), "{times:?}");
+    }
 }
 
 /// The bridge keeps a record of every answered call, and every reply carries the feedback.

@@ -17,7 +17,7 @@
 //! | `Diagnostics` | the last build's problems (lines moved to the current text), optionally of one file |
 //! | `Selection` | the active editor's file, cursor line and column, and selection (≤ [`SELECTION_MAX_CHARS`] characters) |
 //! | `RenderPage` | a PNG at [`RENDER_SCALE`]×, at most [`RENDER_MAX_HEIGHT`] px tall (poppler on a render thread that keeps the PDF and its last pages), plus a copy in `runtime_dir/page-<n>.png` (removed when the agent stops); waits for a running build up to `build.timeout_s` + 10 s, then renders the PDF from before it with a note |
-//! | `ReviewState` | `unified_diff` of every file with pending hunks, plus the review events since the last report |
+//! | `ReviewState` | the unified diff of every file with pending hunks, from the reviews' hunks: at most [`REVIEW_STATE_FILE_CHANGES`] changes or [`REVIEW_STATE_FILE_BYTES`] bytes per file and [`REVIEW_STATE_BYTES`] in all, the rest counted with the lines it spans; plus the review events since the last report |
 //! | `ReadText`, `WriteText` | ACP `fs/*` of non-Claude agents (WP5.2): [`agent_edits::apply`]'s raw read and its write; no review feedback is taken for them (ACP's answer has no place for it) |
 
 use super::bridge::{self, ToolRecord};
@@ -33,7 +33,7 @@ use gtk::prelude::*;
 use lemma_agent::{EditorRequest, PromptBlock, ToolCall, ToolContent, ToolReply};
 use lemma_build::{BuildOutcome, BuildStatus};
 use lemma_core::{PathError, ProjectRoot, Severity};
-use lemma_review::unified_diff;
+use lemma_review::{DiffLimit, review_diff};
 use lemma_syntax::{FileIndex, IncludeKind, ProjectIndex, index_file, parse_magic};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -56,6 +56,17 @@ pub const RENDER_SCALE: f64 = 1.5;
 pub const RENDER_MAX_HEIGHT: i32 = 1600;
 /// Widest image `render_page` returns, in pixels (landscape and poster pages).
 pub const RENDER_MAX_WIDTH: i32 = 2400;
+/// Most changes `get_review_state` quotes from one file (a one-line change with its context is
+/// about 400 bytes); the others are counted with the lines they span.
+pub const REVIEW_STATE_FILE_CHANGES: usize = 50;
+/// Most bytes of diff `get_review_state` quotes from one file (a change is quoted whole or not
+/// at all).
+pub const REVIEW_STATE_FILE_BYTES: usize = 12 << 10;
+/// Most bytes of diff `get_review_state` quotes in all (about 12k tokens; MCP clients cap a
+/// tool's result, Claude Code at 25k tokens); the files after are listed with their counts.
+pub const REVIEW_STATE_BYTES: usize = 48 << 10;
+/// Most files past [`REVIEW_STATE_BYTES`] that `get_review_state` lists by name.
+pub const REVIEW_STATE_LISTED_FILES: usize = 100;
 
 /// Files read to follow a document's includes.
 const GRAPH_MAX_FILES: usize = 300;
@@ -1494,31 +1505,115 @@ fn render_png(document: &poppler::Document, page: u32) -> Result<PagePng, String
 
 // ----- get_review_state -----
 
+/// The pending changes as a unified diff per file, made from the reviews' hunks and cut so that
+/// a large review stays a reply the agent can take (MCP clients cap a tool's result, Claude
+/// Code at 25k tokens): a file's diff stops after [`REVIEW_STATE_FILE_CHANGES`] changes or
+/// [`REVIEW_STATE_FILE_BYTES`] bytes, the reply's after [`REVIEW_STATE_BYTES`], and what is
+/// left out is counted with the lines it spans, for `read_file`.
 fn review_state(state: &WindowState) -> String {
     let ws = &state.workspace;
+    // The hunks of the current texts.
+    for doc in review_ui::reviewed_documents(ws) {
+        review_ui::recompute_if_stale(&doc);
+    }
     let docs = review_ui::reviewed_documents(ws);
     let mut out = String::new();
     if docs.is_empty() {
         out.push_str("No pending changes: the user has accepted or rejected all of them.\n");
-    } else {
-        let (files, hunks) = review_ui::summary(ws);
+        // The review feedback follows (added by `handle`).
+        return out;
+    }
+    let (files, hunks) = review_ui::summary(ws);
+    let _ = writeln!(
+        out,
+        "{} awaiting review in {}. Unified diff of the text the user accepted (---) and the \
+         current text (+++):",
+        plural(hunks, "change", "changes"),
+        plural(files, "file", "files")
+    );
+    // Files past the reply's limit, by name: their changes and the lines they span.
+    let mut unshown: Vec<(String, usize, std::ops::RangeInclusive<u32>)> = Vec::new();
+    let mut diff_bytes = 0;
+    for doc in docs {
+        let rel = relative(state, doc.path());
+        let review = doc.review.borrow();
+        let Some(review) = review.as_ref() else {
+            continue;
+        };
+        let changes = review.hunks();
+        if diff_bytes >= REVIEW_STATE_BYTES {
+            if let (Some(first), Some(last)) = (changes.first(), changes.last()) {
+                let lines =
+                    first.cur_lines.start + 1..=last.cur_lines.end.max(last.cur_lines.start + 1);
+                unshown.push((rel, changes.len(), lines));
+            }
+            continue;
+        }
+        let left = REVIEW_STATE_BYTES - diff_bytes;
+        let limit = DiffLimit {
+            changes: REVIEW_STATE_FILE_CHANGES,
+            bytes: REVIEW_STATE_FILE_BYTES.min(left),
+        };
+        let (diff, left_out) =
+            doc.with_text(|current| review_diff(&rel, review.baseline(), current, changes, limit));
+        if let Some(left_out) = &left_out
+            && diff.is_empty()
+            && left < REVIEW_STATE_FILE_BYTES
+        {
+            // Not even its first change fits in what is left of the reply: it and the files
+            // after it are listed.
+            diff_bytes = REVIEW_STATE_BYTES;
+            unshown.push((rel, left_out.changes, left_out.lines.clone()));
+            continue;
+        }
+        diff_bytes += diff.len();
+        out.push_str(&diff);
+        if !diff.is_empty() && !diff.ends_with('\n') {
+            out.push('\n');
+        }
+        if let Some(left_out) = left_out {
+            let n = left_out.changes;
+            let (first, last) = (left_out.lines.start(), left_out.lines.end());
+            let what = if n == 1 { "change" } else { "changes" };
+            let _ = if diff.is_empty() {
+                // A change longer than a file's limit by itself (a file written whole).
+                writeln!(
+                    out,
+                    "… {n} {what} in {rel}, lines {first}–{last}, too long to quote here: \
+                     read_file shows them"
+                )
+            } else {
+                writeln!(
+                    out,
+                    "… {n} more {what} in {rel}, lines {first}–{last}: read_file shows them"
+                )
+            };
+        }
+    }
+    if !unshown.is_empty() {
+        let n = unshown.len();
+        let changes: usize = unshown.iter().map(|(_, n, _)| n).sum();
         let _ = writeln!(
             out,
-            "{} awaiting review in {}. Unified diff of the text the user accepted (---) and \
-             the current text (+++):",
-            plural(hunks, "change", "changes"),
-            plural(files, "file", "files")
+            "… {n} more {} with {}, not shown (the reply's limit); read_file shows them:",
+            if n == 1 { "file" } else { "files" },
+            plural(changes, "change", "changes")
         );
-        for doc in docs {
-            let rel = relative(state, doc.path());
-            let review = doc.review.borrow();
-            if let Some(review) = review.as_ref() {
-                let diff = doc.with_text(|current| unified_diff(&rel, review.baseline(), current));
-                out.push_str(&diff);
-                if !diff.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
+        for (rel, n, lines) in unshown.iter().take(REVIEW_STATE_LISTED_FILES) {
+            let _ = writeln!(
+                out,
+                "  {rel}: {}, lines {}–{}",
+                plural(*n, "change", "changes"),
+                lines.start(),
+                lines.end()
+            );
+        }
+        if unshown.len() > REVIEW_STATE_LISTED_FILES {
+            let _ = writeln!(
+                out,
+                "  … and {} more",
+                plural(unshown.len() - REVIEW_STATE_LISTED_FILES, "file", "files")
+            );
         }
     }
     // The review feedback follows (added by `handle`).

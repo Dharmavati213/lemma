@@ -636,7 +636,7 @@ fn ask_agent_to_fix() {
     // The rows' context action is installed for the list and reaches the agent hook.
     let list = descendants(&build.diagnostics().widget())
         .into_iter()
-        .find_map(|w| w.downcast::<gtk::ListBox>().ok())
+        .find_map(|w| w.downcast::<gtk::ListView>().ok())
         .expect("the Problems list");
     assert!(
         WidgetExt::activate_action(&list, "problems.ask-agent-fix", Some(&0u32.to_variant()))

@@ -203,7 +203,7 @@
   {
     "name": "get_review_state",
     "title": "Review state",
-    "description": "Returns the changes still waiting for the user's review, as a unified diff per file, plus the user's recent decisions (hunks accepted, rejected or edited). The user reviews every change you make as red/green hunks; check this before redoing work, and do not re-apply rejected changes unless asked. This tool changes nothing.",
+    "description": "Returns the changes still waiting for the user's review, as a unified diff per file, plus the user's recent decisions (hunks accepted, rejected or edited). A large review is cut: at most 50 changes per file and about 48 KB of diff in all; the rest is counted with the lines it spans, which read_file shows. The user reviews every change you make as red/green hunks; check this before redoing work, and do not re-apply rejected changes unless asked. This tool changes nothing.",
     "inputSchema": {
       "type": "object",
       "properties": {},

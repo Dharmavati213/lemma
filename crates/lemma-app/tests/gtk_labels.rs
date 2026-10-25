@@ -66,6 +66,10 @@ fn main() -> ExitCode {
         tests.push(("perf_equation_numbers_large_tex", perf_equation_numbers));
         tests.push(("perf_undefined_check_big_project", perf_check_big_project));
         tests.push(("perf_equation_numbers_follow_lines", perf_numbers_follow));
+        tests.push((
+            "perf_undefined_references_many_files",
+            perf_undefined_many_files,
+        ));
     }
     common::run(&tests)
 }
@@ -1223,5 +1227,103 @@ fn perf_check_big_project() {
         let median = times[times.len() / 2];
         let budget = Duration::from_millis(if *kind == "prose" { 1 } else { 8 });
         assert!(median <= budget, "{kind}: median {median:?}");
+    }
+}
+
+/// Chapters and undefined references per chapter of [`perf_undefined_many_files`].
+const PERF_CHAPTERS: usize = 40;
+const PERF_UNDEFINED: usize = 10;
+
+/// A project whose 40 chapters cite 10 undefined labels each (402 findings with the fixture's
+/// two). Enter at the start of one chapter moves its findings: prints the main loop's longest
+/// step and its work in all from the key until the check that follows ran and a frame was
+/// drawn, with the Problems page hidden and shown (medians and maxima of 5). Release builds
+/// check that the longest step takes at most 100 ms with the page shown and 60 ms with it
+/// hidden (measured 53 ms and 26 ms at a load of 10-15, 25 ms and 13 ms at 6; 4.0 s and 28 ms
+/// when every check gave the panel every file's findings, one file at a time, and each refilled
+/// the whole section).
+fn perf_undefined_many_files() {
+    let f = fixture("labels-perf-undefined");
+    let inputs: String = (0..PERF_CHAPTERS)
+        .map(|k| format!("\\input{{chapters/p{k}}}\n"))
+        .collect();
+    let main = MAIN.replace("\\end{document}\n", &format!("{inputs}\\end{{document}}\n"));
+    std::fs::write(f.dir.join("main.tex"), main).unwrap();
+    for k in 0..PERF_CHAPTERS {
+        let text: String = (0..PERF_UNDEFINED)
+            .map(|j| format!("Part {k}, see \\ref{{undef:{k}:{j}}} here.\nMore text.\n"))
+            .collect();
+        std::fs::write(f.dir.join(format!("chapters/p{k}.tex")), text).unwrap();
+    }
+    let editor = f.open("chapters/p20.tex");
+    f.wait_index();
+    let state = f.state.clone();
+    let expected = PERF_CHAPTERS * PERF_UNDEFINED + 2;
+    common::pump_until(Duration::from_secs(60), || {
+        labels::check_now(&state);
+        !completion::project_busy(&state) && labels::undefined(&state).len() == expected
+    });
+    let clock = f.state.window.frame_clock().unwrap();
+    let painted = Rc::new(std::cell::Cell::new(0u64));
+    let count = painted.clone();
+    let handler = clock.connect_after_paint(move |_| count.set(count.get() + 1));
+    let buffer = editor.buffer();
+    let measure = |shown: bool| -> (Vec<Duration>, Vec<Duration>) {
+        if shown {
+            lemma_app::diagnostics_panel::reveal(&f.state);
+        } else {
+            f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
+        }
+        assert!(block_on(lemma_app::testmode::wait_for_frames(
+            &f.state.window,
+            1
+        )));
+        let (mut longest, mut total) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            common::pump_for(Duration::from_millis(100));
+            let checks = labels::checks_done(&state);
+            buffer.insert(&mut buffer.start_iter(), "\n");
+            let (mut step, mut work) = (Duration::ZERO, Duration::ZERO);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut frame = None;
+            while frame.is_none_or(|n| painted.get() <= n) {
+                assert!(Instant::now() < deadline, "no check or frame");
+                let t = common::timed_iteration();
+                step = step.max(t);
+                work += t;
+                if frame.is_none() && labels::checks_done(&state) > checks {
+                    frame = Some(painted.get());
+                    f.state.window.queue_draw();
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            longest.push(step);
+            total.push(work);
+        }
+        longest.sort();
+        total.sort();
+        (longest, total)
+    };
+    let (hidden, hidden_work) = measure(false);
+    let (shown, shown_work) = measure(true);
+    clock.disconnect(handler);
+    assert_eq!(labels::undefined(&state).len(), expected);
+    let ms = |d: &Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+    println!(
+        "    {expected} undefined references in {} files, Enter in one: longest main-loop step \
+         (median, max): page hidden {} / {} ms (work {} ms), shown {} / {} ms (work {} ms)",
+        PERF_CHAPTERS + 1,
+        ms(&hidden[2]),
+        ms(&hidden[4]),
+        ms(&hidden_work[2]),
+        ms(&shown[2]),
+        ms(&shown[4]),
+        ms(&shown_work[2])
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(hidden[2] <= Duration::from_millis(60), "hidden: {hidden:?}");
+        assert!(shown[2] <= Duration::from_millis(100), "shown: {shown:?}");
     }
 }

@@ -158,6 +158,26 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   reached by F4. A build with 3000 warnings and bad boxes now keeps the main thread busy for
   about 20 ms instead of 0.35 s while the page is hidden, and 0.13 s instead of 0.7 s while it
   is shown.
+- The Problems page is one list that makes widgets only for the rows near the ones on screen
+  (about 200) and replaces only the files whose rows changed, where it made a row of widgets for
+  each of up to 500 build problems and 500 findings of each section, and made them all again
+  for any change. A build with 3000 warnings and bad boxes, the page shown, costs the page
+  about half the main thread's time it did (on a busy machine, 0.23 s instead of 0.46 s), with
+  no step over 120 ms instead of 250 ms; and the PDF is asked for before the page lists the
+  problems.
+- Undefined references and citations reach the Problems page at once, and only those of the
+  files whose names changed, not every file's one file at a time, each of which listed the
+  section's rows again. Enter in one of 40 chapters with 400 undefined references in all held
+  up the window for 2 to 4 s while the page was shown (about 18 s with 6700 in 300 files); it
+  now takes 25 to 50 ms.
+- The Changes panel is no longer built again after every decision and every agent write: while
+  its page is hidden it waits until it is shown, and shown, a count changes in its row, and only
+  the rows of files that came or went are added or removed. With 300 files under review,
+  accepting a change costs about 2 ms instead of 0.2 s, and an agent turn that writes all 300
+  files takes 1.3 s instead of 41 s.
+- A build's log is turned into problems one file at a time instead of one diagnostic at a time:
+  24 000 warnings in 300 files take 39 ms instead of 0.7 s (on a busy machine) between
+  latexmk's exit and the PDF's reload.
 - The API backend appends each streamed piece of an answer or of its thinking in place instead
   of copying everything received so far, which made a long answer cost time quadratic in its
   length on the agent's thread (32,000 pieces: under 1 ms instead of 230 ms).
@@ -260,6 +280,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Fixed
 
+- The agent's `get_review_state` no longer answers a large review with more than the agent
+  can take: about 250 pending changes already passed Claude Code's limit for a tool's result
+  (25,000 tokens), and 8000 changes in 301 files made a reply of 605 KB. It quotes at most 50
+  changes of a file and about 48 KB of diff in all, and counts the rest with the lines they
+  span, which `read_file` shows (that reply is now 52 KB, made in 5.5 ms instead of 40 ms); a
+  change too long to quote by itself, such as a new file the agent wrote, is counted too.
 - An editor that went away with its hover popover still on it no longer hangs Lemma in an
   endless loop of "GtkPopover is not a child of LemmaTexView" warnings (seen with GTK's own
   input method, when no IBus or Fcitx module is installed).

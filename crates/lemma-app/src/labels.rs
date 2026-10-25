@@ -407,7 +407,7 @@ fn check(state: &Rc<WindowState>, labels: &Rc<Labels>) {
         annotations::refresh(state, &editor);
     }
     if !changed_paths.is_empty() {
-        publish_problems(state, labels);
+        publish_problems(state, labels, &changed_paths);
     }
 }
 
@@ -552,8 +552,9 @@ pub fn underlined(editor: &Editor) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-/// Gives the Problems page the undefined names (`DiagSource::Labels`).
-fn publish_problems(state: &Rc<WindowState>, labels: &Labels) {
+/// Gives the Problems page the undefined names (`DiagSource::Labels`), of which those in the
+/// files `changed` are new.
+fn publish_problems(state: &Rc<WindowState>, labels: &Labels, changed: &BTreeSet<PathBuf>) {
     let undefined: Vec<Finding> = labels
         .undefined
         .borrow()
@@ -561,7 +562,7 @@ fn publish_problems(state: &Rc<WindowState>, labels: &Labels) {
         .flatten()
         .cloned()
         .collect();
-    problems::publish(state, &undefined);
+    problems::publish(state, &undefined, changed);
 }
 
 /// The labels and bibliography entries the project never uses, by path and line: read from

@@ -531,17 +531,18 @@ impl Inner {
             outcome.status,
             outcome.elapsed
         );
+        // The PDF first: the PDF thread opens it while the Problems page fills its rows.
+        let has_output = outcome.status == BuildStatus::Success
+            || (outcome.status == BuildStatus::Errors && outcome.exit_code == Some(12));
+        if has_output && let (Some(pdf), Some(controller)) = (&outcome.pdf, state.pdf.get()) {
+            controller.open_if_changed(pdf, outcome.pdf_stamp);
+        }
         // A stopped or timed-out build's log is incomplete: keep the previous diagnostics.
         if matches!(outcome.status, BuildStatus::Success | BuildStatus::Errors) {
             match journal {
                 Some(journal) => self.diagnostics.set_from_build(problems, &root, journal),
                 None => self.diagnostics.set(problems, &root),
             }
-        }
-        let has_output = outcome.status == BuildStatus::Success
-            || (outcome.status == BuildStatus::Errors && outcome.exit_code == Some(12));
-        if has_output && let (Some(pdf), Some(controller)) = (&outcome.pdf, state.pdf.get()) {
-            controller.open_if_changed(pdf, outcome.pdf_stamp);
         }
         self.last.replace(Some(outcome.clone()));
         let next = self.queue.borrow_mut().finished();

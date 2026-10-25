@@ -300,10 +300,11 @@ fn descendants(root: &gtk::Widget) -> Vec<gtk::Widget> {
     out
 }
 
-/// The Changes panel's widgets.
+/// The Changes panel's widgets (built when the page shows them, or its rows are asked for).
 fn panel_widgets(f: &Fixture) -> Vec<gtk::Widget> {
     f.refresh();
     let panel = f.state.review.get().unwrap().changes_panel().unwrap();
+    panel.rows();
     descendants(panel.widget().upcast_ref())
 }
 

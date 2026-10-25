@@ -12,19 +12,23 @@
 //! Activating a row shows its first change. The "Plain diff" toggle replaces the list with the
 //! `unified_diff` of every file in a read-only text view.
 //!
-//! The widgets are rebuilt only when what they show changes (the counts, not the hunk ids, which
-//! change at every keystroke inside a hunk); a row's buttons look its hunks up when clicked. When
-//! a rebuild removes the widget that had the keyboard focus (the Reject Turn button just
-//! activated), the focus goes to the first file row, whose activation only shows a change, or else
-//! to the editor: never to whatever widget comes next (a toast's Undo button), where the next key
-//! would act.
+//! The widgets change only when what they show changes (the counts, not the hunk ids, which
+//! change at every keystroke inside a hunk), and only those that do: rows are kept by group and
+//! file, a count changes a row's subtitle in place, and only the rows and groups that came or
+//! went are added or removed. A row's buttons look its document and hunks up when clicked. While
+//! the page is hidden no row is built: the latest model waits until the page is shown (or its
+//! rows are asked for), as the plain diff does; only the header's Undo Last Turn follows at
+//! once. When an update removes the widget that had the keyboard focus (the Reject Turn button
+//! just activated), the focus goes to the first file row, whose activation only shows a change,
+//! or else to the editor: never to whatever widget comes next (a toast's Undo button), where the
+//! next key would act.
 
 use crate::document::{DocRef, Document};
 use crate::review_ui::{self, Decision, GroupKind, ReviewSummary, TurnGroup};
 use crate::window::WindowState;
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 /// What one row shows and decides.
@@ -49,7 +53,7 @@ struct GroupModel {
     rows: Vec<RowModel>,
 }
 
-/// What the page shows; the widgets are rebuilt only when it changes.
+/// What the page shows; the widgets change only when it changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Model {
     /// Grouped by turn (else a single group of whole-file rows).
@@ -59,11 +63,21 @@ struct Model {
     latest: Option<(u32, String, bool)>,
 }
 
+/// The widgets of one group: its header (with turns), its list and the list's rows.
+struct GroupWidgets {
+    /// What they show.
+    model: GroupModel,
+    header: Option<gtk::Box>,
+    list: gtk::ListBox,
+    /// The rows of `model.rows`, in order.
+    rows: Vec<adw::ActionRow>,
+}
+
 /// The Changes page of one window.
 pub struct ChangesPanel {
     root: gtk::Box,
     stack: gtk::Stack,
-    /// Holds the lists (rebuilt when the model changes).
+    /// Holds the groups' headers and lists.
     lists: gtk::Box,
     undo_turn: gtk::Button,
     diff_toggle: gtk::ToggleButton,
@@ -72,7 +86,13 @@ pub struct ChangesPanel {
     /// shown (or its text is asked for).
     diff_stale: Cell<bool>,
     state: Weak<WindowState>,
+    /// What the widgets show.
     shown: RefCell<Option<Model>>,
+    /// What they will show once the page is shown (or its rows are asked for): the model of a
+    /// refresh while it was hidden.
+    pending: RefCell<Option<Model>>,
+    /// The widgets of `shown`'s groups, in order.
+    groups: RefCell<Vec<GroupWidgets>>,
 }
 
 impl ChangesPanel {
@@ -197,6 +217,8 @@ impl ChangesPanel {
             diff_stale: Cell::new(false),
             state: Rc::downgrade(state),
             shown: RefCell::new(None),
+            pending: RefCell::new(None),
+            groups: RefCell::new(Vec::new()),
         });
         let (weak, state_weak) = (Rc::downgrade(&panel), Rc::downgrade(state));
         panel.diff_toggle.connect_toggled(move |_| {
@@ -204,13 +226,14 @@ impl ChangesPanel {
                 panel.refresh(&state, &review_ui::review_summary(&state));
             }
         });
-        // The plain diff is only built while the page is shown.
+        // The rows and the plain diff are only built while the page is shown.
         let (weak, state_weak) = (Rc::downgrade(&panel), Rc::downgrade(state));
         panel.root.connect_map(move |_| {
-            if let (Some(panel), Some(state)) = (weak.upgrade(), state_weak.upgrade())
-                && panel.diff_stale.get()
-            {
-                panel.fill_diff(&state, &review_ui::reviewed_documents(&state.workspace));
+            if let (Some(panel), Some(state)) = (weak.upgrade(), state_weak.upgrade()) {
+                panel.show_pending(&state);
+                if panel.diff_stale.get() {
+                    panel.fill_diff(&state, &review_ui::reviewed_documents(&state.workspace));
+                }
             }
         });
         panel
@@ -234,6 +257,9 @@ impl ChangesPanel {
     /// Title (relative path) and subtitle (counts) of every file row, in order (with turns, the
     /// rows of every group in turn).
     pub fn rows(&self) -> Vec<(String, String)> {
+        if let Some(state) = self.state.upgrade() {
+            self.show_pending(&state);
+        }
         self.shown.borrow().as_ref().map_or_else(Vec::new, |m| {
             m.groups
                 .iter()
@@ -245,6 +271,9 @@ impl ChangesPanel {
     /// With turns, each group's title ("Turn 3 · 4 changes in 2 files") and its file rows; empty
     /// for the list without turns.
     pub fn groups(&self) -> Vec<(String, Vec<(String, String)>)> {
+        if let Some(state) = self.state.upgrade() {
+            self.show_pending(&state);
+        }
         self.shown.borrow().as_ref().map_or_else(Vec::new, |m| {
             if !m.grouped {
                 return Vec::new();
@@ -274,12 +303,33 @@ impl ChangesPanel {
         self.diff.text(&start, &end, false).into()
     }
 
-    /// Shows `summary` (see [`review_ui::review_summary`]).
+    /// Shows `summary` (see [`review_ui::review_summary`]); while the page is hidden, only
+    /// remembers it.
     pub fn refresh(&self, state: &Rc<WindowState>, summary: &ReviewSummary) {
         let model = model(state, summary);
-        if self.shown.borrow().as_ref() != Some(&model) {
-            self.rebuild(state, &model);
+        // The header's button follows at once, shown or not (one widget).
+        match &model.latest {
+            Some((_, label, running)) => {
+                self.undo_turn.set_visible(true);
+                self.undo_turn.set_sensitive(!running);
+                let what = if *running {
+                    format!("{label} is still running")
+                } else {
+                    format!("reject every change of {label}")
+                };
+                self.undo_turn
+                    .set_tooltip_text(Some(&format!("Undo Last Turn: {what}")));
+            }
+            None => self.undo_turn.set_visible(false),
+        }
+        if self.shown.borrow().as_ref() == Some(&model) {
+            self.pending.replace(None);
+        } else if self.root.is_mapped() {
+            self.pending.replace(None);
+            self.update(state, &model);
             self.shown.replace(Some(model));
+        } else {
+            self.pending.replace(Some(model));
         }
         if self.diff_toggle.is_active() {
             if self.root.is_mapped() {
@@ -301,51 +351,86 @@ impl ChangesPanel {
         }
     }
 
-    /// Replaces the lists with `model`'s.
-    fn rebuild(&self, state: &Rc<WindowState>, model: &Model) {
-        // The focus must not follow a removed widget to whatever comes next (see the module docs).
-        let had_focus = gtk::prelude::GtkWindowExt::focus(&state.window)
-            .is_some_and(|w| w.is_ancestor(&self.lists));
-        if had_focus {
-            gtk::prelude::GtkWindowExt::set_focus(&state.window, None::<&gtk::Widget>);
+    /// Shows the model a refresh left while the page was hidden.
+    fn show_pending(&self, state: &Rc<WindowState>) {
+        let pending = self.pending.take();
+        if let Some(model) = pending {
+            self.update(state, &model);
+            self.shown.replace(Some(model));
         }
-        while let Some(child) = self.lists.first_child() {
-            self.lists.remove(&child);
-        }
-        match &model.latest {
-            Some((_, label, running)) => {
-                self.undo_turn.set_visible(true);
-                self.undo_turn.set_sensitive(!running);
-                let what = if *running {
-                    format!("{label} is still running")
-                } else {
-                    format!("reject every change of {label}")
-                };
-                self.undo_turn
-                    .set_tooltip_text(Some(&format!("Undo Last Turn: {what}")));
+    }
+
+    /// Makes the lists show `model`: groups and rows are kept by kind and file, those whose
+    /// texts changed are updated in place, and only those that came or went are added or
+    /// removed.
+    fn update(&self, state: &Rc<WindowState>, model: &Model) {
+        let lost_focus = Cell::new(false);
+        // The focus must not follow a removed widget to whatever comes next (see the module
+        // docs): it is let go first.
+        let remove = |parent: &gtk::Widget, widget: &gtk::Widget| {
+            let focus = gtk::prelude::GtkWindowExt::focus(&state.window);
+            if focus.is_some_and(|f| &f == widget || f.is_ancestor(widget)) {
+                gtk::prelude::GtkWindowExt::set_focus(&state.window, None::<&gtk::Widget>);
+                lost_focus.set(true);
             }
-            None => self.undo_turn.set_visible(false),
-        }
-        let mut first_row: Option<adw::ActionRow> = None;
+            if let Some(list) = parent.downcast_ref::<gtk::ListBox>() {
+                list.remove(widget);
+            } else if let Some(lists) = parent.downcast_ref::<gtk::Box>() {
+                lists.remove(widget);
+            }
+        };
+        let lists = self.lists.clone().upcast::<gtk::Widget>();
+        // Grouped and plain lists have different rows: nothing is kept between them.
+        let regrouped = self
+            .shown
+            .borrow()
+            .as_ref()
+            .is_none_or(|shown| shown.grouped != model.grouped);
+        let mut old = self.groups.take();
+        let mut groups = Vec::with_capacity(model.groups.len());
         for group in &model.groups {
-            if model.grouped {
-                self.lists.append(&group_header(group));
-            }
-            let list = gtk::ListBox::builder()
-                .selection_mode(gtk::SelectionMode::None)
-                .css_classes(["boxed-list"])
-                .build();
-            for row in &group.rows {
-                let widget = file_row(state, group, row);
-                list.append(&widget);
-                first_row.get_or_insert(widget);
-            }
-            if model.grouped {
-                list.update_property(&[gtk::accessible::Property::Label(&group.title)]);
-            }
-            self.lists.append(&list);
+            let kept = (!regrouped)
+                .then(|| old.iter().position(|g| g.model.kind == group.kind))
+                .flatten()
+                .map(|i| old.remove(i));
+            let widgets = match kept {
+                Some(mut widgets) => {
+                    self.update_group(state, &mut widgets, group, model.grouped, &remove);
+                    widgets
+                }
+                None => {
+                    let widgets = new_group(state, group, model.grouped);
+                    if let Some(header) = &widgets.header {
+                        self.lists.append(header);
+                    }
+                    self.lists.append(&widgets.list);
+                    widgets
+                }
+            };
+            groups.push(widgets);
         }
-        if had_focus {
+        for gone in old {
+            if let Some(header) = &gone.header {
+                remove(&lists, header.upcast_ref());
+            }
+            remove(&lists, gone.list.upcast_ref());
+        }
+        // In the model's order: each group's header, then its list.
+        let mut previous: Option<gtk::Widget> = None;
+        for widgets in &groups {
+            let parts = widgets
+                .header
+                .iter()
+                .map(|h| h.clone().upcast::<gtk::Widget>())
+                .chain([widgets.list.clone().upcast()]);
+            for part in parts {
+                self.lists.reorder_child_after(&part, previous.as_ref());
+                previous = Some(part);
+            }
+        }
+        let first_row = groups.iter().find_map(|g| g.rows.first().cloned());
+        self.groups.replace(groups);
+        if lost_focus.get() {
             // A row, whose activation only shows a change; never a decision button, where a
             // stray key would decide something.
             let focused = first_row.is_some_and(|row| row.grab_focus());
@@ -353,6 +438,80 @@ impl ChangesPanel {
                 editor.view().grab_focus();
             }
         }
+    }
+
+    /// Makes `widgets` (a group of the same kind) show `group`. A new header replaces the old
+    /// one when its texts or buttons change; rows are kept by file, their texts updated in
+    /// place, and only the rows of files that came or went are added or removed (`remove` takes
+    /// a widget out of its parent).
+    fn update_group(
+        &self,
+        state: &Rc<WindowState>,
+        widgets: &mut GroupWidgets,
+        group: &GroupModel,
+        grouped: bool,
+        remove: &dyn Fn(&gtk::Widget, &gtk::Widget),
+    ) {
+        let old = &widgets.model;
+        let (lists, list) = (
+            self.lists.clone().upcast::<gtk::Widget>(),
+            widgets.list.clone().upcast::<gtk::Widget>(),
+        );
+        // What the header shows and what the rows' buttons may do.
+        let same_header =
+            old.title == group.title && old.running == group.running && old.named == group.named;
+        if !same_header {
+            if let Some(header) = widgets.header.take() {
+                remove(&lists, header.upcast_ref());
+            }
+            if grouped {
+                let header = group_header(group);
+                self.lists.append(&header);
+                widgets.header = Some(header);
+                widgets
+                    .list
+                    .update_property(&[gtk::accessible::Property::Label(&group.title)]);
+            }
+        }
+        // A running turn's rows have their buttons off: rows of another state are new rows.
+        let keep_rows = old.running == group.running;
+        let mut rows: Vec<Option<adw::ActionRow>> = vec![None; group.rows.len()];
+        let mut at = 0;
+        for (row, widget) in old.rows.iter().zip(&widgets.rows) {
+            // Both lists are by path: a kept row is found at or after the last one.
+            let found = keep_rows
+                .then(|| group.rows[at..].iter().position(|r| r.path == row.path))
+                .flatten()
+                .map(|i| at + i);
+            match found {
+                Some(i) => {
+                    let new = &group.rows[i];
+                    if new.title != row.title {
+                        widget.set_title(&new.title);
+                    }
+                    if new.subtitle != row.subtitle {
+                        widget.set_subtitle(&new.subtitle);
+                    }
+                    rows[i] = Some(widget.clone());
+                    at = i + 1;
+                }
+                None => remove(&list, widget.upcast_ref()),
+            }
+        }
+        let rows: Vec<adw::ActionRow> = rows
+            .into_iter()
+            .zip(&group.rows)
+            .enumerate()
+            .map(|(i, (kept, row))| {
+                kept.unwrap_or_else(|| {
+                    let widget = file_row(state, group, row);
+                    widgets.list.insert(&widget, i32::try_from(i).unwrap_or(-1));
+                    widget
+                })
+            })
+            .collect();
+        widgets.rows = rows;
+        widgets.model = group.clone();
     }
 
     /// Fills the plain diff view with the unified diff of `docs`.
@@ -463,6 +622,32 @@ fn counts(n: usize, added: u32, removed: u32) -> String {
     format!("{count} · +{added} −{removed}")
 }
 
+/// The widgets of a new group: its header (with turns), and its list of file rows.
+fn new_group(state: &Rc<WindowState>, group: &GroupModel, grouped: bool) -> GroupWidgets {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let rows: Vec<adw::ActionRow> = group
+        .rows
+        .iter()
+        .map(|row| {
+            let widget = file_row(state, group, row);
+            list.append(&widget);
+            widget
+        })
+        .collect();
+    if grouped {
+        list.update_property(&[gtk::accessible::Property::Label(&group.title)]);
+    }
+    GroupWidgets {
+        model: group.clone(),
+        header: grouped.then(|| group_header(group)),
+        list,
+        rows,
+    }
+}
+
 /// The heading of a group, with Keep Turn / Reject Turn for a turn.
 fn group_header(group: &GroupModel) -> gtk::Box {
     let header = gtk::Box::builder()
@@ -540,7 +725,6 @@ fn file_row(state: &Rc<WindowState>, group: &GroupModel, row: &RowModel) -> adw:
         .activatable(true)
         .tooltip_text("Show the first change")
         .build();
-    let doc = state.workspace.get(&row.path);
     // A running turn's changes are decided once it has ended, as its header says ("· running").
     let running = matches!(row.group, Some(GroupKind::Turn(_))) && group.running;
     let (accept_tip, reject_tip) = match row.group {
@@ -565,13 +749,9 @@ fn file_row(state: &Rc<WindowState>, group: &GroupModel, row: &RowModel) -> adw:
             .css_classes(["flat"])
             .sensitive(!running)
             .build();
-        let (state, doc, kind) = (
-            Rc::downgrade(state),
-            doc.as_ref().map(Rc::downgrade),
-            row.group,
-        );
+        let (state, path, kind) = (Rc::downgrade(state), row.path.clone(), row.group);
         button.connect_clicked(move |_| {
-            let Some((state, doc)) = upgrade(&state, doc.as_ref()) else {
+            let Some((state, doc)) = document(&state, &path) else {
                 return;
             };
             match kind {
@@ -594,13 +774,9 @@ fn file_row(state: &Rc<WindowState>, group: &GroupModel, row: &RowModel) -> adw:
         Decision::Accept,
     ));
     widget.add_suffix(&button("edit-undo-symbolic", reject_tip, Decision::Reject));
-    let (state, doc, kind) = (
-        Rc::downgrade(state),
-        doc.as_ref().map(Rc::downgrade),
-        row.group,
-    );
+    let (state, path, kind) = (Rc::downgrade(state), row.path.clone(), row.group);
     widget.connect_activated(move |_| {
-        let Some((state, doc)) = upgrade(&state, doc.as_ref()) else {
+        let Some((state, doc)) = document(&state, &path) else {
             return;
         };
         let ids = kind.map(|kind| review_ui::group_hunks(&doc, kind));
@@ -619,11 +795,12 @@ fn file_row(state: &Rc<WindowState>, group: &GroupModel, row: &RowModel) -> adw:
     widget
 }
 
-fn upgrade(
-    state: &Weak<WindowState>,
-    doc: Option<&Weak<Document>>,
-) -> Option<(Rc<WindowState>, DocRef)> {
-    Some((state.upgrade()?, doc?.upgrade()?))
+/// The window and its document of `path`, looked up when a row is used: rows stay while the
+/// counts change, and the document of a path may be another one by then.
+fn document(state: &Weak<WindowState>, path: &Path) -> Option<(Rc<WindowState>, DocRef)> {
+    let state = state.upgrade()?;
+    let doc = state.workspace.get(path)?;
+    Some((state, doc))
 }
 
 /// Called once per window; fills `state.sidebar.changes` and registers the panel with the review

@@ -22,6 +22,7 @@
 mod diff;
 mod edits;
 mod review;
+mod review_diff;
 mod text;
 
 use lemma_core::TextEdit;
@@ -32,6 +33,7 @@ use std::path::PathBuf;
 
 pub use edits::{EditError, minimal_edits, str_replace, unified_diff};
 pub use review::FileReview;
+pub use review_diff::{DiffLimit, LeftOut, review_diff};
 
 /// fnv1a64(old_text, new_text, occurrence index among hunks with identical (old,new)). Stable across
 /// recomputes and across accept/reject of other hunks.

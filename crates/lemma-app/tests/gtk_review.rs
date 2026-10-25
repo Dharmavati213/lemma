@@ -69,6 +69,10 @@ fn main() -> ExitCode {
         ("ex_commands_and_chords", ex_commands_and_chords),
         ("vim_ex_commands_typed", vim_ex_commands_typed),
         ("banner_summary_and_changes_panel", banner_and_panel),
+        (
+            "changes_panel_waits_while_hidden_and_updates_in_place",
+            changes_panel_in_place,
+        ),
         ("reading_mode_shrinks_bands", reading_mode),
         ("gutter_numbers_follow_the_text", gutter_alignment),
         ("a_pasted_anchor_line_reserves_nothing", pasted_anchor_line),
@@ -87,6 +91,10 @@ fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_review_many_hunks", perf_many_hunks));
         tests.push(("perf_review_5000_hunks", perf_5000_hunks));
+        tests.push((
+            "perf_changes_panel_many_files",
+            perf_changes_panel_many_files,
+        ));
     }
     common::run(&tests)
 }
@@ -1303,6 +1311,75 @@ fn banner_and_panel() {
     assert!(!f.state.banner.is_revealed());
 }
 
+/// The Changes panel builds no rows while its page is hidden (the model a refresh leaves waits
+/// for the page, or for `rows()`), and once shown changes only what changed: a count in place,
+/// a row for a file that came between the others, none for a file whose changes were all
+/// decided; every other row stays the same widget.
+fn changes_panel_in_place() {
+    let f = fixture(
+        "panel-in-place",
+        &[
+            ("a.tex", &lines(20)),
+            ("b.tex", &lines(20)),
+            ("c.tex", &lines(20)),
+        ],
+    );
+    let controller = f.state.review.get().unwrap();
+    let panel = controller.changes_panel().expect("the Changes panel");
+    let rows = || -> Vec<adw::ActionRow> {
+        descendants(panel.widget())
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+            .collect()
+    };
+    let subtitles = || -> Vec<String> {
+        rows()
+            .iter()
+            .map(|r| format!("{}: {}", r.title(), r.subtitle().unwrap_or_default()))
+            .collect()
+    };
+    f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
+    f.frames(1);
+    f.edit("a.tex", "line 2\n", "line two\n");
+    f.edit("a.tex", "line 12\n", "line twelve\n");
+    f.edit("c.tex", "line 3\n", "line three\n");
+    controller.refresh();
+    assert!(rows().is_empty(), "rows were built for a hidden page");
+    f.state.sidebar.show_page(lemma_app::window::PAGE_CHANGES);
+    common::pump_until(TIMEOUT, || rows().len() == 2);
+    let before = rows();
+    // One change of a.tex accepted: its counts change in its row.
+    let a = f.doc("a.tex");
+    let id = f.hunks("a.tex")[0].id;
+    review_ui::decide(&f.state, &a, id, Decision::Accept).unwrap();
+    controller.refresh();
+    assert_eq!(rows(), before, "the rows stay");
+    assert_eq!(
+        subtitles(),
+        ["a.tex: 1 change · +1 −1", "c.tex: 1 change · +1 −1"]
+    );
+    // A change in b.tex: its row goes between the others.
+    f.edit("b.tex", "line 7\n", "line seven\n");
+    controller.refresh();
+    let now = rows();
+    assert_eq!(now.len(), 3);
+    assert!(now[0] == before[0] && now[2] == before[1], "the rows stay");
+    assert_eq!(now[1].title(), "b.tex");
+    // Every change of c.tex accepted: its row goes, and only it.
+    review_ui::decide_document(&f.state, &f.doc("c.tex"), Decision::Accept);
+    controller.refresh();
+    assert_eq!(rows(), now[..2]);
+    // Hidden again: a refresh only remembers the model, which reading the rows (or showing the
+    // page) shows.
+    f.state.sidebar.show_page(lemma_app::window::PAGE_OUTLINE);
+    f.edit("a.tex", "line 5\n", "line five\n");
+    controller.refresh();
+    assert_eq!(subtitles()[0], "a.tex: 1 change · +1 −1");
+    assert_eq!(panel.rows()[0].1, "2 changes · +2 −2");
+    assert_eq!(subtitles()[0], "a.tex: 2 changes · +2 −2");
+    assert_eq!(rows(), now[..2], "the rows stay");
+}
+
 fn reading_mode() {
     let f = fixture("reading", &[("main.tex", &lines(20))]);
     let editor = f.open("main.tex");
@@ -2327,4 +2404,88 @@ fn red_and_green_pixels(png: &Path) -> (usize, usize) {
         }
     }
     (red, green)
+}
+
+/// Files under review in [`perf_changes_panel_many_files`].
+const PERF_PANEL_FILES: usize = 300;
+
+/// An agent turn over a whole project: 300 closed files with 10 changes each. Prints how long
+/// the 300 writes took, and the review's refresh (banner, header and Changes panel, which
+/// follows every decision and agent write) after accepting one change, with the Changes page
+/// hidden and shown (medians and maxima of 5). Release builds check that the refresh takes at
+/// most 10 ms hidden and 20 ms shown (measured 1.4 ms and 2.1 ms at a load of 10-15, the
+/// writes 1.3 s; 202 ms and 227 ms when every refresh built every row again, hidden or not,
+/// and the writes 41 s).
+fn perf_changes_panel_many_files() {
+    let text = lines(100);
+    let changed: String = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i % 10 == 5 {
+                format!("{line} changed\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    let names: Vec<String> = (0..PERF_PANEL_FILES)
+        .map(|i| format!("f{i:03}.tex"))
+        .collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), text.as_str())).collect();
+    let f = fixture("perf-changes-panel", &files);
+    let started = Instant::now();
+    for name in &names {
+        f.write(name, &changed);
+    }
+    let writes = started.elapsed();
+    let controller = f.state.review.get().unwrap();
+    controller.refresh();
+    let panel = controller.changes_panel().expect("the Changes panel");
+    assert_eq!(panel.rows().len(), PERF_PANEL_FILES);
+    let mut next = 0;
+    let mut measure = |shown: bool| -> Vec<Duration> {
+        f.state.sidebar.show_page(if shown {
+            lemma_app::window::PAGE_CHANGES
+        } else {
+            lemma_app::window::PAGE_OUTLINE
+        });
+        f.frames(1);
+        let mut times: Vec<Duration> = (0..5)
+            .map(|_| {
+                let doc = f.doc(&names[next]);
+                next += 7;
+                let id = f.hunks(&names[next - 7])[0].id;
+                review_ui::decide(&f.state, &doc, id, Decision::Accept).unwrap();
+                let started = Instant::now();
+                controller.refresh();
+                started.elapsed()
+            })
+            .collect();
+        times.sort();
+        times
+    };
+    let hidden = measure(false);
+    let shown = measure(true);
+    assert_eq!(panel.rows().len(), PERF_PANEL_FILES);
+    assert_eq!(
+        panel
+            .rows()
+            .iter()
+            .filter(|(_, s)| s.starts_with("9 "))
+            .count(),
+        10
+    );
+    println!(
+        "    {PERF_PANEL_FILES} files under review, written in {writes:.2?}; the refresh after \
+         accepting one change (median, max): Changes page hidden {:.2?} / {:.2?}, shown {:.2?} \
+         / {:.2?}",
+        hidden[2], hidden[4], shown[2], shown[4]
+    );
+    if cfg!(debug_assertions) {
+        println!("    (debug build: the budget is checked in release)");
+    } else {
+        assert!(hidden[2] <= Duration::from_millis(10), "hidden: {hidden:?}");
+        assert!(shown[2] <= Duration::from_millis(20), "shown: {shown:?}");
+    }
 }

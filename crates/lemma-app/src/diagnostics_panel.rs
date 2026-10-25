@@ -12,22 +12,27 @@
 //! finishes, and the panel then follows every later change. Marks, underlines and Problems-list
 //! navigation all use the mapped line.
 //!
-//! The list's rows are built when the page first shows them, and it lists at most
-//! [`MAX_SECTION_ROWS`] problems, the most severe ones, then a line saying how many more there
-//! are: a long thesis's thousands of bad boxes would otherwise cost tens of thousands of widgets
-//! on every build. The problems it leaves out still get their gutter marks, and
-//! `win.problem-next` / `win.problem-prev` (F4 / Shift+F4, `]e` / `[e` in Vim) go from the
-//! cursor to the next or previous problem in the list's order, listed or not, opening its file as
-//! a click on its row does ([`DiagnosticsPanel::goto_problem`]).
+//! The page is one list view over the build's problems and the sections of findings
+//! (`diagnostics_panel/rows.rs`): it makes widgets only for the rows around the ones on screen
+//! (about 200), recycles them, and replaces only the files whose rows changed. Its rows are
+//! listed when the page first shows them, and it lists at most [`MAX_SECTION_ROWS`] problems,
+//! the most severe ones, then a line saying how many more there are. The problems it leaves
+//! out still get their gutter marks, and `win.problem-next` / `win.problem-prev` (F4 /
+//! Shift+F4, `]e` / `[e` in Vim) go from the cursor to the next or previous problem in the
+//! list's order, listed or not, opening its file as a click on its row does
+//! ([`DiagnosticsPanel::goto_problem`]).
 //!
 //! **M3 (WP3.7, additive):** problems of other sources than the build — chktex warnings
 //! (`DiagSource::Lint`, [`crate::lint`]) and, for WP3.2, undefined references
 //! (`DiagSource::Labels`) — are [`Finding`]s in their own section below the build's problems,
-//! replaced file by file ([`DiagnosticsPanel::set_findings`]) and kept across builds. A filter
+//! replaced file by file, or many files at once ([`DiagnosticsPanel::set_findings`],
+//! [`DiagnosticsPanel::set_findings_many`]), and kept across builds. A filter
 //! bar (All, Build, one toggle per section) appears while there are findings. Build errors the
 //! table of [`lemma_build::explain`] knows get a plain-English explanation in their tooltip and
 //! in an expander under the row, with "Ask Agent" and, where [`crate::quickfix`] has a safe one,
 //! a quick fix applied as reviewable hunks.
+
+mod rows;
 
 use crate::document::{DocRef, Document, ObserverId};
 use crate::editor::{Editor, remove_tag_everywhere};
@@ -35,9 +40,10 @@ use crate::window::{PAGE_PROBLEMS, WindowState};
 use crate::workspace::normalize;
 use adw::prelude::*;
 use lemma_core::{DiagSource, Diagnostic, Severity};
+use rows::{Group, GroupKey, HeaderWidgets, Heading, Row, RowWidgets, RowsModel};
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -59,6 +65,9 @@ const WARNING_ICON: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="
 /// Styles of the Problems page.
 pub(crate) const CSS: &str = "
 .lemma-problems-summary { margin: 6px 12px 0 12px; }
+.lemma-problems > header { padding: 0; font-weight: normal; }
+.lemma-problems-heading { margin: 20px 12px 6px 12px; }
+.lemma-problems-heading.first { margin-top: 10px; }
 .lemma-problems-header { margin: 10px 8px 2px 8px; }
 .lemma-problems row { padding-top: 3px; padding-bottom: 3px; }
 .lemma-problems-filter { margin: 8px 10px 2px 10px; }
@@ -98,65 +107,82 @@ pub struct Problem {
 /// files outside the root's directory (packages of the TeX distribution) are attributed to the
 /// root document without a line. When `outdir` is the root's directory (`"."`) or above it, the
 /// sources live there too, so only the extension marks a file as generated. Paths are
-/// canonicalized, so call this off the main thread.
+/// canonicalized, so call this off the main thread. Each file is looked at once, not once per
+/// diagnostic: a long book's log names a few hundred files in tens of thousands of them.
 pub fn problems_from(diagnostics: &[Diagnostic], root: &Path, outdir: &str) -> Vec<Problem> {
     let root = normalize(root);
     let root_dir = root.parent().map(Path::to_path_buf).unwrap_or_default();
     let out_dir = lexical_normalize(&root_dir.join(outdir));
     let separate_out_dir = !root_dir.starts_with(&out_dir);
-    let mut problems: Vec<Problem> = diagnostics
-        .iter()
-        .map(|d| {
+    // The files the problems are in (`targets`), and where each diagnostic's file goes: its
+    // target, and its name when it is moved to the root.
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut target_ids: HashMap<PathBuf, usize> = HashMap::new();
+    let mut placed: HashMap<&Path, (usize, Option<String>)> = HashMap::new();
+    let mut problems: Vec<(usize, Problem)> = Vec::with_capacity(diagnostics.len());
+    for d in diagnostics {
+        let (target, moved) = placed.entry(d.path.as_path()).or_insert_with(|| {
             let path = normalize(&d.path);
             let generated = (separate_out_dir && path.starts_with(&out_dir))
                 || path
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| GENERATED_EXTENSIONS.contains(&e));
-            if generated || !path.starts_with(&root_dir) {
-                let name = path.file_name().map_or_else(
+            let moved = (generated || !path.starts_with(&root_dir)).then(|| {
+                path.file_name().map_or_else(
                     || path.display().to_string(),
                     |n| n.to_string_lossy().into_owned(),
-                );
-                Problem {
-                    path: root.clone(),
-                    line: None,
-                    severity: d.severity,
-                    message: d.message.clone(),
-                    context: Some(match &d.context {
-                        Some(c) => format!("in {name}: {c}"),
-                        None => format!("in {name}"),
-                    }),
-                    source: d.source,
-                }
-            } else {
-                Problem {
-                    path,
-                    line: d.line,
-                    severity: d.severity,
-                    message: d.message.clone(),
-                    context: d.context.clone(),
-                    source: d.source,
-                }
-            }
-        })
-        .collect();
-    let mut worst: HashMap<PathBuf, u8> = HashMap::new();
-    for p in &problems {
-        let rank = worst.entry(p.path.clone()).or_insert(u8::MAX);
-        *rank = (*rank).min(severity_rank(p.severity));
+                )
+            });
+            let target = if moved.is_some() { root.clone() } else { path };
+            let id = *target_ids.entry(target.clone()).or_insert_with(|| {
+                targets.push(target);
+                targets.len() - 1
+            });
+            (id, moved)
+        });
+        let problem = match moved {
+            Some(name) => Problem {
+                path: root.clone(),
+                line: None,
+                severity: d.severity,
+                message: d.message.clone(),
+                context: Some(match &d.context {
+                    Some(c) => format!("in {name}: {c}"),
+                    None => format!("in {name}"),
+                }),
+                source: d.source,
+            },
+            None => Problem {
+                path: targets[*target].clone(),
+                line: d.line,
+                severity: d.severity,
+                message: d.message.clone(),
+                context: d.context.clone(),
+                source: d.source,
+            },
+        };
+        problems.push((*target, problem));
     }
-    let key = |p: &Problem| {
-        let file = worst.get(&p.path).copied().unwrap_or(u8::MAX);
-        (
-            file,
-            p.path != root,
-            p.path.clone(),
-            severity_rank(p.severity),
-            p.line,
-        )
-    };
-    problems.sort_by_cached_key(key);
+    // The files in their order: by their most severe problem, the root first, then by path.
+    let mut worst = vec![u8::MAX; targets.len()];
+    for (target, p) in &problems {
+        worst[*target] = worst[*target].min(severity_rank(p.severity));
+    }
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by(|&a, &b| {
+        (worst[a], targets[a] != root, &targets[a]).cmp(&(
+            worst[b],
+            targets[b] != root,
+            &targets[b],
+        ))
+    });
+    let mut rank = vec![0; targets.len()];
+    for (i, &target) in order.iter().enumerate() {
+        rank[target] = i;
+    }
+    problems.sort_by_key(|(target, p)| (rank[*target], severity_rank(p.severity), p.line));
+    let mut problems: Vec<Problem> = problems.into_iter().map(|(_, p)| p).collect();
     problems.dedup();
     problems
 }
@@ -318,11 +344,13 @@ struct Inner {
     state: Weak<WindowState>,
     /// "none" (never built), "clean" or "list".
     stack: gtk::Stack,
-    list: gtk::ListBox,
+    /// The page's rows: the build's problems, then the sections of findings ([`rows`]).
+    view: gtk::ListView,
+    model: RowsModel,
     summary: gtk::Label,
     problems: Rc<RefCell<Vec<Problem>>>,
     /// Number of problems per file, for the group headers.
-    file_counts: Rc<RefCell<HashMap<PathBuf, usize>>>,
+    file_counts: RefCell<HashMap<PathBuf, usize>>,
     /// Each problem's 1-based line in the current text: its build line moved by the edits made
     /// since the build's sources were saved. `None` when it has no line, or when its document
     /// changed in ways that were not recorded.
@@ -342,26 +370,47 @@ struct Inner {
     filter: adw::ToggleGroup,
     /// The sections of findings, in the order their sources first appeared.
     sections: RefCell<Vec<Rc<Section>>>,
-    sections_box: gtk::Box,
     /// Shown instead of the build's rows when the filter shows only the build and it has none.
     build_empty: gtk::Label,
     /// A build finished (the page is past "none").
     built: Cell<bool>,
-    /// The details (explanation, actions) of the build rows, by problem index.
-    details: RefCell<HashMap<usize, RowDetails>>,
+    /// The build's rows, by file ([`Inner::build_groups`]); `None` until the page lists them.
+    build_groups: RefCell<Option<Vec<Group>>>,
+    /// What the build's rows with an explanation remember while their widgets come and go, by
+    /// problem index (made when the page lists the rows).
+    row_states: RefCell<HashMap<usize, RowState>>,
+    /// The version of the build's rows (new problems, new rows).
+    build_version: Cell<u64>,
+    /// The last version given to rows ([`Inner::next_version`]).
+    versions: Cell<u64>,
+    /// The rows changed while the page was hidden: the model holds none until it shows.
+    stale: Cell<bool>,
+    /// While above 0, the list stays scrolled to its top ([`Inner::hold_top`]).
+    holding_top: Rc<Cell<u32>>,
+    /// The widgets of the rows and headers the view made, to find a row's widgets.
+    row_widgets: RefCell<Vec<Weak<RowWidgets>>>,
+    header_widgets: RefCell<Vec<(glib::WeakRef<gtk::ListHeader>, Rc<HeaderWidgets>)>>,
     /// True while [`Inner::refresh_page`] runs.
     refreshing: Cell<bool>,
-    /// The error kinds whose first row was expanded (the others start collapsed).
-    expanded_kinds: RefCell<std::collections::HashSet<lemma_build::explain::ErrorKind>>,
-    /// `list` holds the rows of `problems` (they are built when the page is shown).
-    rows_built: Cell<bool>,
-    /// The problem each row of `list` shows, by row index ([`listed_problems`]).
-    listed: Rc<RefCell<Vec<usize>>>,
     /// The problem gone to last (a row's click, next or previous problem): the next step goes
     /// on from it while the cursor is still on its line.
     at: Cell<Option<usize>>,
     /// True while the file of the problem gone to last is being opened.
     opening: Cell<bool>,
+}
+
+/// What a build row with an explanation remembers while the view recycles its widgets.
+struct RowState {
+    /// The explanation (the details' text).
+    text: String,
+    /// The explanation table knows a quick fix for this kind of error.
+    has_fix: bool,
+    /// The details are shown.
+    expanded: bool,
+    /// The quick fix's label and description, once [`crate::quickfix::proposal`] found one.
+    fix: Option<(String, String)>,
+    /// The quick fix was asked for (when the details were first shown).
+    asked: bool,
 }
 
 impl DiagnosticsPanel {
@@ -384,18 +433,21 @@ impl DiagnosticsPanel {
             .wrap(true)
             .css_classes(["caption", "dim-label", "lemma-problems-summary"])
             .build();
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .activate_on_single_click(true)
+        let model = RowsModel::default();
+        let view = gtk::ListView::builder()
+            .model(&gtk::NoSelection::new(Some(model.clone())))
+            .single_click_activate(true)
             .css_classes(["navigation-sidebar", "lemma-problems"])
             .build();
+        view.update_property(&[gtk::accessible::Property::Label("Problems")]);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
+            .child(&view)
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        // M3: the filter bar (hidden until there are findings) above the summary; the build's
-        // list, its "nothing" line and the findings' sections share the scroller.
+        // M3: the filter bar (hidden until there are findings) above the summary, then the
+        // build's "nothing" line, then the rows of the build and the findings' sections.
         // Not homogeneous: equal widths cut "References" next to All, Build and Lint in the
         // sidebar's 300 px.
         let filter = adw::ToggleGroup::builder()
@@ -428,14 +480,9 @@ impl DiagnosticsPanel {
             .visible(false)
             .css_classes(["dim-label", "lemma-problems-section"])
             .build();
-        let sections_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&list);
-        content.append(&build_empty);
-        content.append(&sections_box);
-        scroller.set_child(Some(&content));
         page.append(&filter_bar);
         page.append(&summary);
+        page.append(&build_empty);
         page.append(&scroller);
         let stack = gtk::Stack::new();
         stack.add_named(&none, Some("none"));
@@ -446,10 +493,11 @@ impl DiagnosticsPanel {
         let inner = Rc::new(Inner {
             state: Rc::downgrade(state),
             stack,
-            list,
+            view,
+            model,
             summary,
             problems: Rc::new(RefCell::new(Vec::new())),
-            file_counts: Rc::new(RefCell::new(HashMap::new())),
+            file_counts: RefCell::new(HashMap::new()),
             lines: Rc::new(RefCell::new(Vec::new())),
             trackers: RefCell::new(HashMap::new()),
             mark_names: RefCell::new(HashMap::new()),
@@ -459,14 +507,17 @@ impl DiagnosticsPanel {
             filter_bar,
             filter,
             sections: RefCell::new(Vec::new()),
-            sections_box,
             build_empty,
             built: Cell::new(false),
-            details: RefCell::new(HashMap::new()),
+            build_groups: RefCell::new(None),
+            row_states: RefCell::new(HashMap::new()),
+            build_version: Cell::new(0),
+            versions: Cell::new(0),
+            stale: Cell::new(false),
+            holding_top: Rc::new(Cell::new(0)),
+            row_widgets: RefCell::new(Vec::new()),
+            header_widgets: RefCell::new(Vec::new()),
             refreshing: Cell::new(false),
-            expanded_kinds: RefCell::new(std::collections::HashSet::new()),
-            rows_built: Cell::new(false),
-            listed: Rc::new(RefCell::new(Vec::new())),
             at: Cell::new(None),
             opening: Cell::new(false),
         });
@@ -500,15 +551,11 @@ impl DiagnosticsPanel {
         let inner = &self.inner;
         inner.root.replace(root.to_path_buf());
         inner.built.set(true);
-        inner.details.borrow_mut().clear();
-        inner.expanded_kinds.borrow_mut().clear();
+        inner.row_states.borrow_mut().clear();
+        inner.build_groups.replace(None);
+        inner.build_version.set(inner.next_version());
         inner.at.set(None);
         inner.opening.set(false);
-        // Empty the list while there are no problems: each removed row makes the list rerun the
-        // header function on the next one, which must not look at the new problems.
-        inner.problems.replace(Vec::new());
-        inner.listed.replace(Vec::new());
-        inner.list.remove_all();
         inner.trackers.borrow_mut().clear();
         inner.mark_names.borrow_mut().clear();
         inner.tooltips.borrow_mut().clear();
@@ -733,47 +780,355 @@ impl Inner {
     }
 
     fn connect_list(self: &Rc<Self>) {
-        let problems = self.problems.clone();
-        let listed = self.listed.clone();
-        let file_counts = self.file_counts.clone();
-        let root = self.root.clone();
-        self.list.set_header_func(move |row, before| {
-            let problems = problems.borrow();
-            let listed = listed.borrow();
-            let shown = |r: &gtk::ListBoxRow| row_problem(&listed, r).and_then(|i| problems.get(i));
-            let Some(current) = shown(row) else {
-                row.set_header(None::<&gtk::Widget>);
-                return;
-            };
-            let previous = before.and_then(shown);
-            if previous.is_some_and(|p| p.path == current.path) {
-                row.set_header(None::<&gtk::Widget>);
-            } else {
-                let count = file_counts
-                    .borrow()
-                    .get(&current.path)
-                    .copied()
-                    .unwrap_or(0);
-                row.set_header(Some(&file_header(&current.path, &root.borrow(), count)));
-            }
-        });
+        self.view.set_factory(Some(&self.row_factory()));
+        self.view.set_header_factory(Some(&self.header_factory()));
         let weak = Rc::downgrade(self);
-        self.list.connect_row_activated(move |_, row| {
+        self.view.connect_activate(move |_, position| {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            let index = row_problem(&inner.listed.borrow(), row);
-            if let Some(index) = index {
-                inner.open_problem(index);
+            match inner.model.row(position) {
+                Some(Row::Problem(index)) => inner.open_problem(index),
+                Some(Row::Finding(source, path, i)) => {
+                    if let Some(finding) = inner.finding_in(source, &path, i) {
+                        inner.open_finding(finding);
+                    }
+                }
+                Some(Row::More(_)) | None => {}
             }
         });
-        // The rows are built when the page first shows them (see `fill_list`).
+        // A list held at its top goes back there when GTK moves it (see `hold_top`).
+        if let Some(adjustment) = self.view.vadjustment() {
+            let holding = self.holding_top.clone();
+            adjustment.connect_value_changed(move |adjustment| {
+                if holding.get() > 0 && adjustment.value() > adjustment.lower() {
+                    adjustment.set_value(adjustment.lower());
+                }
+            });
+        }
+        // The rows are listed when the page first shows them (see `show_rows`).
         let weak = Rc::downgrade(self);
-        self.list.connect_map(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                inner.build_rows();
+        self.view.connect_map(move |_| {
+            if let Some(inner) = weak.upgrade()
+                && inner.stale.get()
+            {
+                inner.show_rows();
             }
         });
+    }
+
+    /// A version for rows that show something new.
+    fn next_version(&self) -> u64 {
+        self.versions.set(self.versions.get() + 1);
+        self.versions.get()
+    }
+
+    /// The factory of the rows: each list item's [`RowWidgets`] follow the row it is bound to,
+    /// with the context menu on a right click or a long press.
+    fn row_factory(self: &Rc<Self>) -> gtk::SignalListItemFactory {
+        let factory = gtk::SignalListItemFactory::new();
+        let weak = Rc::downgrade(self);
+        factory.connect_setup(move |_, item| {
+            let (Some(inner), Some(item)) = (weak.upgrade(), item.downcast_ref::<gtk::ListItem>())
+            else {
+                return;
+            };
+            let widgets = RowWidgets::new();
+            item.set_child(Some(&widgets.root));
+            inner.connect_row(&widgets);
+            let mut all = inner.row_widgets.borrow_mut();
+            all.retain(|w| w.strong_count() > 0);
+            all.push(Rc::downgrade(&widgets));
+            drop(all);
+            let weak = Rc::downgrade(&inner);
+            item.connect_item_notify(move |item| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.bind_row(&widgets, item);
+                }
+            });
+        });
+        factory.connect_teardown(|_, item| {
+            if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+                item.set_child(None::<&gtk::Widget>);
+            }
+        });
+        factory
+    }
+
+    /// The factory of the group headers (the file and its count, and above a section's first
+    /// file the section's title).
+    fn header_factory(self: &Rc<Self>) -> gtk::SignalListItemFactory {
+        let factory = gtk::SignalListItemFactory::new();
+        let weak = Rc::downgrade(self);
+        factory.connect_setup(move |_, header| {
+            let (Some(inner), Some(header)) =
+                (weak.upgrade(), header.downcast_ref::<gtk::ListHeader>())
+            else {
+                return;
+            };
+            let widgets = HeaderWidgets::new();
+            header.set_child(Some(&widgets.root));
+            let mut headers = inner.header_widgets.borrow_mut();
+            headers.retain(|(h, _)| h.upgrade().is_some());
+            headers.push((header.downgrade(), widgets));
+        });
+        let weak = Rc::downgrade(self);
+        factory.connect_bind(move |_, header| {
+            if let (Some(inner), Some(header)) =
+                (weak.upgrade(), header.downcast_ref::<gtk::ListHeader>())
+            {
+                inner.refresh_header(header);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        factory.connect_teardown(move |_, header| {
+            if let Some(header) = header.downcast_ref::<gtk::ListHeader>() {
+                header.set_child(None::<&gtk::Widget>);
+                if let Some(inner) = weak.upgrade() {
+                    inner
+                        .header_widgets
+                        .borrow_mut()
+                        .retain(|(h, _)| h.upgrade().is_some_and(|h| &h != header));
+                }
+            }
+        });
+        factory
+    }
+
+    /// Shows the heading of `header`'s group.
+    fn refresh_header(&self, header: &gtk::ListHeader) {
+        let headers = self.header_widgets.borrow();
+        let widgets = headers
+            .iter()
+            .find(|(h, _)| h.upgrade().as_ref() == Some(header))
+            .map(|(_, w)| w);
+        if let (Some(widgets), Some(heading)) = (widgets, self.model.heading(header.start())) {
+            widgets.show(&heading, header.start() == 0);
+        }
+    }
+
+    /// Shows the headings of every bound header again: a section's count changes with any of
+    /// its files, whose rows (and header) stay.
+    fn refresh_headers(&self) {
+        let headers: Vec<gtk::ListHeader> = self
+            .header_widgets
+            .borrow()
+            .iter()
+            .filter_map(|(h, _)| h.upgrade())
+            .filter(|h| h.item().is_some())
+            .collect();
+        for header in headers {
+            self.refresh_header(&header);
+        }
+    }
+
+    /// The details toggle and the context menu of a row's widgets.
+    fn connect_row(self: &Rc<Self>, widgets: &Rc<RowWidgets>) {
+        let weak = Rc::downgrade(self);
+        widgets.connect_toggled(move |widgets, active| {
+            if let Some(inner) = weak.upgrade() {
+                inner.toggled(widgets, active);
+            }
+        });
+        let click = gtk::GestureClick::builder().button(3).build();
+        let (weak, row) = (Rc::downgrade(self), Rc::downgrade(widgets));
+        click.connect_pressed(move |gesture, _, x, y| {
+            if let (Some(inner), Some(widgets)) = (weak.upgrade(), row.upgrade())
+                && widgets.row.borrow().is_some()
+            {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                inner.show_context_menu(&widgets, Some((x, y)));
+            }
+        });
+        widgets.root.add_controller(click);
+        let press = gtk::GestureLongPress::new();
+        let (weak, row) = (Rc::downgrade(self), Rc::downgrade(widgets));
+        press.connect_pressed(move |_, x, y| {
+            if let (Some(inner), Some(widgets)) = (weak.upgrade(), row.upgrade()) {
+                inner.show_context_menu(&widgets, Some((x, y)));
+            }
+        });
+        widgets.root.add_controller(press);
+    }
+
+    /// Shows the row `item` is bound to in its `widgets`, or forgets it (unbound).
+    fn bind_row(self: &Rc<Self>, widgets: &RowWidgets, item: &gtk::ListItem) {
+        let row = item
+            .item()
+            .and_downcast::<glib::BoxedAnyObject>()
+            .map(|object| object.borrow::<Row>().clone());
+        widgets.row.replace(row.clone());
+        match row {
+            Some(Row::Problem(index)) => {
+                item.set_activatable(true);
+                self.bind_problem(widgets, index);
+            }
+            Some(Row::More(left_out)) => {
+                item.set_activatable(false);
+                widgets.show_more(left_out);
+            }
+            Some(Row::Finding(source, path, i)) => {
+                item.set_activatable(true);
+                self.bind_finding(widgets, source, &path, i);
+            }
+            // Unbound: the details' widgets go.
+            None => widgets.bind_details(None),
+        }
+    }
+
+    /// Shows build problem `index`: [`RowWidgets::show_problem`] plus, for errors the
+    /// explanation table knows, the explanation (tooltip and details), "Ask Agent" and the
+    /// quick fix once [`crate::quickfix::proposal`] found one.
+    fn bind_problem(self: &Rc<Self>, widgets: &RowWidgets, index: usize) {
+        let Some(problem) = self.problems.borrow().get(index).cloned() else {
+            return;
+        };
+        let mut tooltip = match &problem.context {
+            Some(context) => format!("{}\n\n{context}", problem.message),
+            None => problem.message.clone(),
+        };
+        let expanded = self.row_states.borrow().get(&index).map(|s| {
+            tooltip.push_str("\n\n");
+            tooltip.push_str(&s.text);
+            s.expanded
+        });
+        widgets.show_problem(&problem, &tooltip);
+        widgets.set_toggle(expanded);
+        let details = (expanded == Some(true)).then(|| self.problem_details(index));
+        widgets.bind_details(details);
+    }
+
+    /// The details of build problem `index`: its explanation, then the quick fix (once found)
+    /// and "Ask Agent". The quick fix is asked for when they are first shown.
+    fn problem_details(self: &Rc<Self>, index: usize) -> gtk::Widget {
+        let (text, fix, ask) = {
+            let mut states = self.row_states.borrow_mut();
+            let Some(state) = states.get_mut(&index) else {
+                return details_box(None).0;
+            };
+            let ask = state.has_fix && !state.asked;
+            state.asked |= ask;
+            (state.text.clone(), state.fix.clone(), ask)
+        };
+        let (details, actions) = details_box(Some(&text));
+        if let Some((label, description)) = fix {
+            let text = gtk::Label::builder()
+                .label(&label)
+                .ellipsize(pango::EllipsizeMode::End)
+                .max_width_chars(30)
+                .build();
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            content.append(&gtk::Image::from_icon_name("error-correct-symbolic"));
+            content.append(&text);
+            let button = gtk::Button::builder()
+                .child(&content)
+                .tooltip_text(&description)
+                .css_classes(["suggested-action"])
+                .build();
+            let weak = Rc::downgrade(self);
+            button.connect_clicked(move |_| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.apply_fix(index);
+                }
+            });
+            actions.append(&button);
+        }
+        let ask_agent = ask_agent_button();
+        let weak = Rc::downgrade(self);
+        ask_agent.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.ask_agent(index);
+            }
+        });
+        actions.append(&ask_agent);
+        if ask {
+            self.ask_fix(index);
+        }
+        details
+    }
+
+    /// Looks for the quick fix of build problem `index`, which its row's details then offer.
+    fn ask_fix(self: &Rc<Self>, index: usize) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(problem) = self.problems.borrow().get(index).cloned() else {
+            return;
+        };
+        // With its line in the current text, while the list still shows it.
+        let current = self
+            .problem_for_agent(index)
+            .filter(|p| p.message == problem.message)
+            .unwrap_or(problem);
+        let proposal = crate::quickfix::proposal(&state, &current);
+        let (weak, version) = (Rc::downgrade(self), self.build_version.get());
+        glib::spawn_future_local(async move {
+            let Some(proposal) = proposal.await else {
+                return;
+            };
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.build_version.get() != version {
+                return;
+            }
+            let found = inner.row_states.borrow_mut().get_mut(&index).map(|s| {
+                s.fix = Some((proposal.label, proposal.description));
+            });
+            if found.is_some() {
+                inner.refresh_problem_row(index);
+            }
+        });
+    }
+
+    /// Shows the details of build problem `index` again where its row is bound (its quick fix
+    /// was found, or it was expanded or collapsed from outside).
+    fn refresh_problem_row(self: &Rc<Self>, index: usize) {
+        let expanded = self.row_states.borrow().get(&index).map(|s| s.expanded);
+        for widgets in self.bound_rows(&Row::Problem(index)) {
+            widgets.set_toggle(expanded);
+            let details = (expanded == Some(true)).then(|| self.problem_details(index));
+            widgets.bind_details(details);
+        }
+    }
+
+    /// The widgets bound to `row`.
+    fn bound_rows(&self, row: &Row) -> Vec<Rc<RowWidgets>> {
+        let mut all = self.row_widgets.borrow_mut();
+        all.retain(|w| w.strong_count() > 0);
+        all.iter()
+            .filter_map(Weak::upgrade)
+            .filter(|w| w.row.borrow().as_ref() == Some(row))
+            .collect()
+    }
+
+    /// The details toggle of `widgets` was pressed (`active`) or released.
+    fn toggled(self: &Rc<Self>, widgets: &RowWidgets, active: bool) {
+        let Some(row) = widgets.row.borrow().clone() else {
+            return;
+        };
+        let content = match &row {
+            Row::Problem(index) => {
+                if let Some(state) = self.row_states.borrow_mut().get_mut(index) {
+                    state.expanded = active;
+                }
+                (active && !widgets.has_details()).then(|| self.problem_details(*index))
+            }
+            Row::Finding(source, path, i) => {
+                if let Some(section) = self.section(*source)
+                    && let Some(file) = section.files.borrow_mut().get_mut(&**path)
+                {
+                    if active {
+                        file.expanded.insert(*i);
+                    } else {
+                        file.expanded.remove(i);
+                    }
+                }
+                (active && !widgets.has_details()).then(|| self.finding_details(*source, path, *i))
+            }
+            Row::More(_) => None,
+        };
+        widgets.reveal_details(content, active);
     }
 
     /// Opens the file of problem `index` and puts the cursor on the problem's current line (a
@@ -940,110 +1295,128 @@ impl Inner {
             }
         });
         group.add_action(&action);
+        // The findings' rows (row `u` of the section named `s`, see `filter_name`).
+        let run =
+            gio::SimpleAction::new("finding-run", Some(glib::VariantTy::new("(suu)").unwrap()));
+        let weak = Rc::downgrade(self);
+        run.connect_activate(move |_, target| {
+            if let (Some(inner), Some((name, row, action))) = (
+                weak.upgrade(),
+                target.and_then(|v| v.get::<(String, u32, u32)>()),
+            ) && let Some(source) = inner.source_named(&name)
+            {
+                inner.run_finding_action(source, row as usize, action as usize);
+            }
+        });
+        group.add_action(&run);
+        let ask = gio::SimpleAction::new(
+            "finding-ask-agent",
+            Some(glib::VariantTy::new("(su)").unwrap()),
+        );
+        let weak = Rc::downgrade(self);
+        ask.connect_activate(move |_, target| {
+            if let (Some(inner), Some((name, row))) = (
+                weak.upgrade(),
+                target.and_then(|v| v.get::<(String, u32)>()),
+            ) && let Some(finding) = inner
+                .source_named(&name)
+                .and_then(|source| inner.finding_by_row(source, row as usize))
+            {
+                inner.ask_agent_about_finding(&finding);
+            }
+        });
+        group.add_action(&ask);
         // On the page's root, an ancestor of the list and of the menus.
         self.stack.insert_action_group("problems", Some(&group));
 
-        let click = gtk::GestureClick::builder().button(3).build();
-        let weak = Rc::downgrade(self);
-        click.connect_pressed(move |gesture, _, x, y| {
-            if let Some(inner) = weak.upgrade()
-                && let Some(row) = inner.list.row_at_y(y as i32)
-            {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                inner.show_context_menu(&row, Some((x, y)));
-            }
-        });
-        self.list.add_controller(click);
-        let press = gtk::GestureLongPress::new();
-        let weak = Rc::downgrade(self);
-        press.connect_pressed(move |_, x, y| {
-            if let Some(inner) = weak.upgrade()
-                && let Some(row) = inner.list.row_at_y(y as i32)
-            {
-                inner.show_context_menu(&row, Some((x, y)));
-            }
-        });
-        self.list.add_controller(press);
+        // A right click or a long press on a row is the row's (see `connect_row`).
         let keys = gtk::ShortcutController::new();
         let weak = Rc::downgrade(self);
         keys.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("Menu|<Shift>F10"),
-            Some(gtk::CallbackAction::new(move |list, _| {
+            Some(gtk::CallbackAction::new(move |view, _| {
                 let Some(inner) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                let focused = list
+                let focused = view
                     .root()
                     .and_then(|root| root.focus())
-                    .and_then(|w| w.ancestor(gtk::ListBoxRow::static_type()))
-                    .and_then(|w| w.downcast::<gtk::ListBoxRow>().ok());
+                    .and_then(|focus| inner.row_with_focus(&focus));
                 match focused {
-                    Some(row) => {
-                        inner.show_context_menu(&row, None);
+                    Some(widgets) => {
+                        inner.show_context_menu(&widgets, None);
                         glib::Propagation::Stop
                     }
                     None => glib::Propagation::Proceed,
                 }
             })),
         ));
-        self.list.add_controller(keys);
+        self.view.add_controller(keys);
     }
 
-    /// Shows the context menu of `row`, at `at` (list coordinates) or below the row.
-    fn show_context_menu(&self, row: &gtk::ListBoxRow, at: Option<(f64, f64)>) {
-        let index = row_problem(&self.listed.borrow(), row);
-        let Some(index) = index.and_then(|i| u32::try_from(i).ok()) else {
-            return;
-        };
-        let menu = context_menu(index);
-        self.add_fix_item(&menu, index);
-        // Parented to the page's box, which treats any child alike (a list box or its rows
-        // would complain about a foreign child when they are refilled or go).
-        let Some(host) = self.summary.parent() else {
-            return;
-        };
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_has_arrow(false);
-        popover.set_parent(&host);
-        let point = at.and_then(|(x, y)| {
-            self.list
-                .compute_point(&host, &gtk::graphene::Point::new(x as f32, y as f32))
-        });
-        let rect = match point {
-            Some(p) => gtk::gdk::Rectangle::new(p.x() as i32, p.y() as i32, 1, 1),
-            None => {
-                let bounds = row.compute_bounds(&host);
-                bounds.map_or(gtk::gdk::Rectangle::new(0, 0, 1, 1), |b| {
-                    gtk::gdk::Rectangle::new(
-                        b.x() as i32,
-                        b.y() as i32,
-                        b.width() as i32,
-                        b.height() as i32,
-                    )
-                })
+    /// The widgets of the bound row that has the keyboard focus (its list item, or a widget
+    /// in its details).
+    fn row_with_focus(&self, focus: &gtk::Widget) -> Option<Rc<RowWidgets>> {
+        self.row_widgets
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|w| w.row.borrow().is_some())
+            .find(|w| {
+                w.root.parent().as_ref() == Some(focus)
+                    || w.root.upcast_ref::<gtk::Widget>() == focus
+                    || focus.is_ancestor(&w.root)
+            })
+    }
+
+    /// Shows the context menu of the row `widgets` show, at `at` (the row's coordinates) or
+    /// below the row.
+    fn show_context_menu(&self, widgets: &RowWidgets, at: Option<(f64, f64)>) {
+        let menu = match widgets.row.borrow().clone() {
+            Some(Row::Problem(index)) => {
+                let Ok(index) = u32::try_from(index) else {
+                    return;
+                };
+                let menu = context_menu(index);
+                self.add_fix_item(&menu, index);
+                menu
             }
+            Some(Row::Finding(source, path, i)) => {
+                let Some(section) = self.section(source) else {
+                    return;
+                };
+                let index = section
+                    .rows
+                    .borrow()
+                    .iter()
+                    .position(|(p, j)| *p == *path && *j == i);
+                let Some(index) = index else {
+                    return;
+                };
+                self.finding_menu(&section, index)
+            }
+            Some(Row::More(_)) | None => return,
         };
-        popover.set_pointing_to(Some(&rect));
-        // Unparented once closed (after its action ran).
-        popover.connect_closed(|popover| {
-            let popover = popover.clone();
-            glib::idle_add_local_once(move || {
-                if popover.parent().is_some() {
-                    popover.unparent();
-                }
-            });
-        });
-        popover.popup();
+        // Parented to the page's box, which treats any child alike (the list view or its rows
+        // would complain about a foreign child when they are refilled or go).
+        if let Some(host) = self.summary.parent() {
+            popup_menu(&menu, &host, widgets.root.upcast_ref(), at);
+        }
     }
 
-    /// Fills the list (it is empty) and updates the summary. The rows are widgets (several per
-    /// problem): they are built when the page shows them, so the problems of a build nobody
+    /// The source of the section whose filter toggle is named `name`.
+    fn source_named(&self, name: &str) -> Option<DiagSource> {
+        self.sections
+            .borrow()
+            .iter()
+            .find(|s| filter_name(s.source) == name)
+            .map(|s| s.source)
+    }
+
+    /// Lists the build's new problems and updates the summary. The rows are widgets (several
+    /// per problem): they are listed when the page shows them, so the problems of a build nobody
     /// looks at in the list cost no widgets.
     fn fill_list(self: &Rc<Self>) {
-        self.rows_built.set(false);
-        if self.list.is_mapped() {
-            self.build_rows();
-        }
         let (errors, _, _) = counts(&self.problems.borrow());
         self.refresh_page();
         if let Some(state) = self.state.upgrade() {
@@ -1052,22 +1425,117 @@ impl Inner {
         }
     }
 
-    /// Fills the list with the rows of at most [`MAX_SECTION_ROWS`] problems, the most severe
-    /// ones ([`listed_problems`]), and a line counting the others, unless it holds them.
-    fn build_rows(self: &Rc<Self>) {
-        if self.rows_built.replace(true) {
-            return;
+    /// The build's rows: at most [`MAX_SECTION_ROWS`] problems, the most severe ones
+    /// ([`listed_problems`]), by file, then a line counting the others. Made once per build,
+    /// with the state of the rows that have an explanation: the first error of each kind shows
+    /// it, repeats and warnings start collapsed (and look for their fix when first opened).
+    fn build_groups(&self) -> Vec<Group> {
+        if let Some(groups) = self.build_groups.borrow().as_ref() {
+            return groups.clone();
         }
         let problems = self.problems.borrow();
         let listed = listed_problems(&problems, MAX_SECTION_ROWS);
-        // Before the rows: appending one runs the header function, which looks it up.
-        self.listed.replace(listed.clone());
+        let mut kinds = HashSet::new();
+        let mut states = HashMap::new();
         for &index in &listed {
-            self.list.append(&self.build_row(index, &problems[index]));
+            let problem = &problems[index];
+            if let Some(explanation) = crate::quickfix::explanation(problem) {
+                let expanded =
+                    problem.severity == Severity::Error && kinds.insert(explanation.kind);
+                let state = RowState {
+                    text: explanation.text,
+                    has_fix: explanation.fix.is_some(),
+                    expanded,
+                    fix: None,
+                    asked: false,
+                };
+                states.insert(index, state);
+            }
         }
-        if problems.len() > listed.len() {
-            self.list.append(&more_row(problems.len() - listed.len()));
+        let root = self.root.borrow();
+        let counts = self.file_counts.borrow();
+        let version = self.build_version.get();
+        let mut groups: Vec<Group> = Vec::new();
+        let mut last: Option<&Path> = None;
+        for &index in &listed {
+            let path = problems[index].path.as_path();
+            match groups.last_mut() {
+                Some(group) if last == Some(path) => group.rows.push(Row::Problem(index)),
+                _ => groups.push(Group {
+                    key: GroupKey::Build(groups.len()),
+                    version,
+                    heading: Heading {
+                        name: file_name(path, &root),
+                        count: counts.get(path).copied().unwrap_or(0),
+                        section: None,
+                    },
+                    rows: vec![Row::Problem(index)],
+                }),
+            }
+            last = Some(path);
         }
+        if problems.len() > listed.len()
+            && let Some(group) = groups.last_mut()
+        {
+            group.rows.push(Row::More(problems.len() - listed.len()));
+        }
+        drop((root, counts, problems));
+        self.row_states.replace(states);
+        self.build_groups.replace(Some(groups.clone()));
+        groups
+    }
+
+    /// Lists the rows the filter selects (only the groups that changed are replaced), or,
+    /// while the page is hidden, lets go of them until it shows.
+    fn show_rows(&self) {
+        if !self.view.is_mapped() {
+            if self.model.n_items() > 0 {
+                self.model.update(Vec::new());
+            }
+            self.stale.set(true);
+            return;
+        }
+        self.stale.set(false);
+        let filter = self.current_filter();
+        let mut groups = Vec::new();
+        if matches!(filter, ProblemFilter::All | ProblemFilter::Build) {
+            groups.extend(self.build_groups());
+        }
+        for section in self.sections.borrow().iter() {
+            if filter == ProblemFilter::All || filter == ProblemFilter::Source(section.source) {
+                groups.extend(section.groups.borrow().iter().cloned());
+            }
+        }
+        let at_top = self
+            .view
+            .vadjustment()
+            .is_some_and(|a| a.value() <= a.lower());
+        self.model.update(groups);
+        self.refresh_headers();
+        if at_top {
+            self.hold_top();
+        }
+    }
+
+    /// Keeps the list at its top for the next frames. When the rows at the top are replaced,
+    /// GTK puts the new first row there, with its group's header above it, out of sight (a new
+    /// build's first file had no header on screen).
+    fn hold_top(&self) {
+        let Some(adjustment) = self.view.vadjustment() else {
+            return;
+        };
+        adjustment.set_value(adjustment.lower());
+        self.holding_top.set(self.holding_top.get() + 1);
+        let holding = self.holding_top.clone();
+        let frames = Cell::new(0);
+        self.view.add_tick_callback(move |_, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 3 {
+                return glib::ControlFlow::Continue;
+            }
+            holding.set(holding.get().saturating_sub(1));
+            glib::ControlFlow::Break
+        });
     }
 
     /// Replaces the marks and underlines in `editor`'s buffer with its file's problems. Like
@@ -1143,14 +1611,6 @@ impl Inner {
     }
 }
 
-/// The problem a row of the build's list shows (`listed` is [`Inner::listed`]): its index,
-/// `None` for the line after the last one the list holds.
-fn row_problem(listed: &[usize], row: &gtk::ListBoxRow) -> Option<usize> {
-    usize::try_from(row.index())
-        .ok()
-        .and_then(|i| listed.get(i).copied())
-}
-
 /// The problems the build's list shows, in its order: all of them, or when there are more than
 /// `max`, the `max` most severe ones (errors, then warnings, then bad boxes, each in the list's
 /// order). Its first `max` rows would not do: a file's errors come before its bad boxes, but the
@@ -1163,21 +1623,6 @@ fn listed_problems(problems: &[Problem], max: usize) -> Vec<usize> {
         listed.sort_unstable();
     }
     listed
-}
-
-/// The last row of a list cut at [`MAX_SECTION_ROWS`]: how many problems it leaves out.
-fn more_row(left_out: usize) -> gtk::ListBoxRow {
-    let label = gtk::Label::builder()
-        .label(format!("{left_out} more not listed"))
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["dim-label", "lemma-problems-more"])
-        .build();
-    gtk::ListBoxRow::builder()
-        .child(&label)
-        .activatable(false)
-        .selectable(false)
-        .build()
 }
 
 /// The problem that next problem (`forward`) or previous problem goes to: an index into
@@ -1258,82 +1703,13 @@ fn ensure_tag(buffer: &sourceview5::Buffer, name: &str, color: gtk::gdk::RGBA) -
     })
 }
 
-/// The group header of a file: its path relative to the root's directory and the count.
-fn file_header(path: &Path, root: &Path, count: usize) -> gtk::Widget {
+/// The name of a group's file in its header: its path relative to the directory of `root`.
+fn file_name(path: &Path, root: &Path) -> String {
     let root_dir = root.parent().unwrap_or(Path::new("/"));
-    let name = path
-        .strip_prefix(root_dir)
+    path.strip_prefix(root_dir)
         .unwrap_or(path)
         .display()
-        .to_string();
-    let label = gtk::Label::builder()
-        .label(&name)
-        .xalign(0.0)
-        .hexpand(true)
-        .ellipsize(pango::EllipsizeMode::Middle)
-        .css_classes(["heading"])
-        .build();
-    let count = gtk::Label::builder()
-        .label(count.to_string())
-        .css_classes(["dim-label", "numeric", "caption"])
-        .build();
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    header.add_css_class("lemma-problems-header");
-    header.append(&label);
-    header.append(&count);
-    header.upcast()
-}
-
-fn problem_row(problem: &Problem) -> gtk::ListBoxRow {
-    let (icon, class) = match problem.severity {
-        Severity::Error => ("dialog-error-symbolic", "error"),
-        Severity::Warning => ("dialog-warning-symbolic", "warning"),
-        Severity::BadBox => ("format-justify-fill-symbolic", "dim-label"),
-        Severity::Info => ("dialog-information-symbolic", "dim-label"),
-    };
-    let image = gtk::Image::builder()
-        .icon_name(icon)
-        .valign(gtk::Align::Start)
-        .css_classes([class])
-        .build();
-    let message = gtk::Label::builder()
-        .label(display_message(&problem.message))
-        .xalign(0.0)
-        .valign(gtk::Align::Start)
-        .hexpand(true)
-        .wrap(true)
-        .wrap_mode(pango::WrapMode::WordChar)
-        .lines(3)
-        .ellipsize(pango::EllipsizeMode::End)
-        .build();
-    let location = match (problem.line, problem.source) {
-        (Some(line), _) => line.to_string(),
-        (None, DiagSource::Biber) => "biber".to_owned(),
-        (None, DiagSource::Bibtex) => "bibtex".to_owned(),
-        (None, _) => String::new(),
-    };
-    let location = gtk::Label::builder()
-        .label(&location)
-        .valign(gtk::Align::Start)
-        .xalign(1.0)
-        .width_chars(4)
-        .tooltip_text("Line")
-        .css_classes(["dim-label", "numeric"])
-        .build();
-    // Centred as a whole in the row (single-line messages sit level with their icon); within
-    // it everything aligns to the first line.
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    content.set_valign(gtk::Align::Center);
-    content.append(&image);
-    content.append(&message);
-    content.append(&location);
-    let row = gtk::ListBoxRow::builder().child(&content).build();
-    let tooltip = match &problem.context {
-        Some(context) => format!("{}\n\n{context}", problem.message),
-        None => problem.message.clone(),
-    };
-    row.set_tooltip_text(Some(&tooltip));
-    row
+        .to_string()
 }
 
 /// Opens `path` in an editor tab (or selects its tab) and, with a 1-based `line`, puts the
@@ -1502,47 +1878,40 @@ pub struct FindingStyle {
     pub color: (f32, f32, f32, f32),
 }
 
-/// One section of findings: a heading and a list grouped by file.
+/// One section of findings: its rows below the build's, grouped by file under the section's
+/// title.
 struct Section {
     source: DiagSource,
-    widget: gtk::Box,
-    count: gtk::Label,
-    list: gtk::ListBox,
+    /// Its place on the page (after the build's rows, in the order the sources appeared).
+    rank: usize,
     files: RefCell<BTreeMap<PathBuf, SectionFile>>,
     /// The row order: (file, index of the finding in that file).
-    rows: Rc<RefCell<Vec<(PathBuf, usize)>>>,
-    /// Findings per file, for the group headers.
-    file_counts: Rc<RefCell<HashMap<PathBuf, usize>>>,
+    rows: RefCell<Vec<(PathBuf, usize)>>,
+    /// The rows by file, for the list ([`Inner::fill_section`]).
+    groups: RefCell<Vec<Group>>,
     style: Cell<Option<FindingStyle>>,
     actions: RefCell<Option<Rc<FindingActionsFn>>>,
     next_mark: Cell<u64>,
-    /// `list` holds the rows of `rows` (they are built when the page is shown).
-    rows_built: Cell<bool>,
 }
 
 /// One file's findings in a section.
 struct SectionFile {
     findings: Vec<Finding>,
+    /// The version of the file's rows ([`Inner::next_version`]): new findings, new rows.
+    version: u64,
     /// Each finding's 1-based line in the current text (`None` when unknown).
     lines: Rc<RefCell<Vec<Option<u32>>>>,
     tracker: Option<LineTracker>,
     /// The name of each finding's start mark in the open buffer.
     marks: Vec<Option<String>>,
+    /// The findings whose details are shown.
+    expanded: HashSet<usize>,
 }
 
 impl Section {
     fn total(&self) -> usize {
         self.files.borrow().values().map(|f| f.findings.len()).sum()
     }
-}
-
-/// The details under a build row: its explanation, revealed by a toggle.
-#[derive(Clone)]
-struct RowDetails {
-    toggle: gtk::ToggleButton,
-    /// The label of the quick fix, once [`crate::quickfix::proposal`] found one (the details
-    /// were shown).
-    fix: Rc<RefCell<Option<String>>>,
 }
 
 /// The toggle name of `source`'s section.
@@ -1577,7 +1946,20 @@ impl DiagnosticsPanel {
         findings: Vec<Finding>,
         journal: Option<EditJournal>,
     ) {
-        self.inner.set_findings(source, path, findings, journal);
+        self.inner
+            .set_findings_many(source, vec![(path.to_path_buf(), findings)], journal);
+    }
+
+    /// [`Self::set_findings`] for many files at once (each with all its findings of `source`;
+    /// empty removes them): the section's rows are made again once, and only the rows of these
+    /// files are replaced in the list.
+    pub fn set_findings_many(
+        &self,
+        source: DiagSource,
+        files: Vec<(PathBuf, Vec<Finding>)>,
+        journal: Option<EditJournal>,
+    ) {
+        self.inner.set_findings_many(source, files, journal);
     }
 
     /// Removes every finding of `source`.
@@ -1585,10 +1967,13 @@ impl DiagnosticsPanel {
         let Some(section) = self.inner.section(source) else {
             return;
         };
-        let paths: Vec<PathBuf> = section.files.borrow().keys().cloned().collect();
-        for path in paths {
-            self.inner.set_findings(source, &path, Vec::new(), None);
-        }
+        let files: Vec<(PathBuf, Vec<Finding>)> = section
+            .files
+            .borrow()
+            .keys()
+            .map(|path| (path.clone(), Vec::new()))
+            .collect();
+        self.inner.set_findings_many(source, files, None);
     }
 
     /// The findings of `source` in row order, each with its line in the current text.
@@ -1652,14 +2037,8 @@ impl DiagnosticsPanel {
     /// Activates the row of finding `index` of `source` (as a click does): opens its file at
     /// its line and column.
     pub fn activate_finding(&self, source: DiagSource, index: usize) {
-        let Some(section) = self.inner.section(source) else {
-            return;
-        };
-        self.inner.build_section_rows(&section);
-        if let Ok(index) = i32::try_from(index)
-            && let Some(row) = section.list.row_at_index(index)
-        {
-            row.emit_activate();
+        if let Some(finding) = self.inner.finding_by_row(source, index) {
+            self.inner.open_finding(finding);
         }
     }
 
@@ -1709,13 +2088,14 @@ impl DiagnosticsPanel {
     }
 
     /// The label of the quick fix offered for build problem `index`, once it is known (its row
-    /// computes it when its details are first shown; rows exist once the page showed the list).
+    /// looks for it when its details are first shown; the page lists its rows once it showed
+    /// them).
     pub fn fix_label(&self, index: usize) -> Option<String> {
         self.inner
-            .details
+            .row_states
             .borrow()
             .get(&index)
-            .and_then(|d| d.fix.borrow().clone())
+            .and_then(|s| s.fix.as_ref().map(|(label, _)| label.clone()))
     }
 
     /// Applies the quick fix of build problem `index` (its button; reviewable hunks).
@@ -1724,20 +2104,46 @@ impl DiagnosticsPanel {
     }
 
     /// Whether the details (explanation and actions) of build problem `index` are shown (false
-    /// while its row does not exist).
+    /// while the page does not list its row).
     pub fn is_expanded(&self, index: usize) -> bool {
         self.inner
-            .details
+            .row_states
             .borrow()
             .get(&index)
-            .is_some_and(|d| d.toggle.is_active())
+            .is_some_and(|s| s.expanded)
     }
 
-    /// Shows or hides the details of build problem `index`, if the list holds its row.
+    /// Shows or hides the details of build problem `index`, if the page lists its row.
     pub fn set_expanded(&self, index: usize, expanded: bool) {
-        if let Some(d) = self.inner.details.borrow().get(&index) {
-            d.toggle.set_active(expanded);
+        let known = self
+            .inner
+            .row_states
+            .borrow_mut()
+            .get_mut(&index)
+            .map(|s| s.expanded = expanded);
+        if known.is_some() {
+            self.inner.refresh_problem_row(index);
         }
+    }
+
+    /// The build problems the page lists, in its order (nothing until the page showed them).
+    pub fn listed(&self) -> Vec<usize> {
+        self.inner
+            .build_groups
+            .borrow()
+            .iter()
+            .flatten()
+            .flat_map(|g| &g.rows)
+            .filter_map(|row| match row {
+                Row::Problem(index) => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The page's list of rows (tests).
+    pub fn list_view(&self) -> gtk::ListView {
+        self.inner.view.clone()
     }
 }
 
@@ -1772,16 +2178,6 @@ impl Inner {
                 inner.refresh_page();
             }
         });
-        // The findings' rows are built when the page first shows them (see `fill_section`).
-        let weak = Rc::downgrade(self);
-        self.sections_box.connect_map(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                let sections = inner.sections.borrow().clone();
-                for section in &sections {
-                    inner.build_section_rows(section);
-                }
-            }
-        });
     }
 
     /// The section of `source`, created (empty, hidden) on first use.
@@ -1789,106 +2185,49 @@ impl Inner {
         if let Some(section) = self.section(source) {
             return section;
         }
-        let (_, heading, _, _) = section_names(source);
-        let title = gtk::Label::builder()
-            .label(heading)
-            .xalign(0.0)
-            .hexpand(true)
-            .css_classes(["heading"])
-            .build();
-        let count = gtk::Label::builder()
-            .css_classes(["dim-label", "numeric", "caption"])
-            .build();
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        header.add_css_class("lemma-problems-section");
-        header.append(&title);
-        header.append(&count);
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .activate_on_single_click(true)
-            .css_classes(["navigation-sidebar", "lemma-problems"])
-            .build();
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.set_visible(false);
-        widget.append(&header);
-        widget.append(&list);
-        self.sections_box.append(&widget);
+        let rank = self.sections.borrow().len() + 1;
         let section = Rc::new(Section {
             source,
-            widget,
-            count,
-            list,
+            rank,
             files: RefCell::new(BTreeMap::new()),
-            rows: Rc::new(RefCell::new(Vec::new())),
-            file_counts: Rc::new(RefCell::new(HashMap::new())),
+            rows: RefCell::new(Vec::new()),
+            groups: RefCell::new(Vec::new()),
             style: Cell::new(None),
             actions: RefCell::new(None),
             next_mark: Cell::new(0),
-            rows_built: Cell::new(false),
         });
-        // Group headers: the file, relative to the project root.
-        let rows = section.rows.clone();
-        let counts = section.file_counts.clone();
-        let state = self.state.clone();
-        section.list.set_header_func(move |row, before| {
-            let rows = rows.borrow();
-            let path_of = |r: &gtk::ListBoxRow| {
-                usize::try_from(r.index())
-                    .ok()
-                    .and_then(|i| rows.get(i))
-                    .map(|(p, _)| p.clone())
-            };
-            let Some(current) = path_of(row) else {
-                row.set_header(None::<&gtk::Widget>);
-                return;
-            };
-            if before.and_then(path_of).as_ref() == Some(&current) {
-                row.set_header(None::<&gtk::Widget>);
-                return;
-            }
-            let count = counts.borrow().get(&current).copied().unwrap_or(0);
-            // `file_header` names files relative to the root document's directory.
-            let anchor = state
-                .upgrade()
-                .map(|s| s.workspace.root().path().join("root"))
-                .unwrap_or_default();
-            row.set_header(Some(&file_header(&current, &anchor, count)));
-        });
-        let weak = Rc::downgrade(self);
-        let source_of = source;
-        section.list.connect_row_activated(move |_, row| {
-            if let (Some(inner), Ok(index)) = (weak.upgrade(), usize::try_from(row.index())) {
-                inner.open_finding(source_of, index);
-            }
-        });
-        self.connect_finding_menu(&section);
         // Its filter toggle comes with its first finding (`refresh_page`).
         self.sections.borrow_mut().push(section.clone());
         section
     }
 
-    fn set_findings(
+    fn set_findings_many(
         self: &Rc<Self>,
         source: DiagSource,
-        path: &Path,
-        findings: Vec<Finding>,
+        files: Vec<(PathBuf, Vec<Finding>)>,
         journal: Option<EditJournal>,
     ) {
-        let path = normalize(path);
         let section = self.section_or_create(source);
-        let editor = self.state.upgrade().and_then(|state| {
-            state
-                .editors()
-                .into_iter()
-                .find(|e| normalize(e.document().path()) == path)
-        });
-        // The old findings' marks go with them.
-        if let Some(old) = section.files.borrow_mut().remove(&path)
-            && let Some(editor) = &editor
-        {
-            remove_marks(editor, &old.marks);
-        }
-        if !findings.is_empty() {
+        // Each editor's path is normalized once for all the files, not once per file.
+        let editors = self.editors_by_path();
+        let mut touched: Vec<Rc<Editor>> = Vec::new();
+        for (path, findings) in files {
+            let path = normalize(&path);
+            let editor = editors.get(&path);
+            // The old findings' marks go with them.
+            if let Some(old) = section.files.borrow_mut().remove(&path)
+                && let Some(editor) = editor
+            {
+                remove_marks(editor, &old.marks);
+            }
+            if let Some(editor) = editor
+                && !touched.iter().any(|e| Rc::ptr_eq(e, editor))
+            {
+                touched.push(editor.clone());
+            }
+            if findings.is_empty() {
+                continue;
+            }
             let lines = Rc::new(RefCell::new(
                 findings.iter().map(|f| f.problem.line).collect::<Vec<_>>(),
             ));
@@ -1916,19 +2255,19 @@ impl Inner {
                 }
             }
             let marks = vec![None; findings.len()];
-            section.files.borrow_mut().insert(
-                path.clone(),
-                SectionFile {
-                    findings,
-                    lines,
-                    tracker,
-                    marks,
-                },
-            );
+            let file = SectionFile {
+                findings,
+                version: self.next_version(),
+                lines,
+                tracker,
+                marks,
+                expanded: HashSet::new(),
+            };
+            section.files.borrow_mut().insert(path, file);
         }
         drop(journal);
         self.fill_section(&section);
-        if let Some(editor) = &editor {
+        for editor in &touched {
             self.apply_findings(editor);
         }
         self.refresh_page();
@@ -1960,20 +2299,27 @@ impl Inner {
         }
     }
 
-    /// Rebuilds the rows of `section`: files in path order (the root document first), each
-    /// file's findings by line and column.
-    fn fill_section(self: &Rc<Self>, section: &Rc<Section>) {
-        section.rows.borrow_mut().clear();
-        section.list.remove_all();
+    /// Makes the rows of `section` again: files in path order (the root document first), each
+    /// file's findings by line and column, at most [`MAX_SECTION_ROWS`] in all. The list
+    /// replaces only the files whose rows changed (see [`Inner::show_rows`]).
+    fn fill_section(&self, section: &Section) {
         let root = self.root.borrow().clone();
+        // Files are named relative to the project root's directory.
+        let anchor = self
+            .state
+            .upgrade()
+            .map(|s| s.workspace.root().path().join("root"))
+            .unwrap_or_default();
         let files = section.files.borrow();
         let mut paths: Vec<&PathBuf> = files.keys().collect();
         paths.sort_by_key(|p| (**p != root, (*p).clone()));
         let mut rows = Vec::new();
-        let mut counts = HashMap::new();
+        let mut groups = Vec::new();
         for path in paths {
+            if rows.len() >= MAX_SECTION_ROWS {
+                break;
+            }
             let file = &files[path];
-            counts.insert(path.clone(), file.findings.len());
             let mut order: Vec<usize> = (0..file.findings.len()).collect();
             order.sort_by_key(|&i| {
                 let f = &file.findings[i];
@@ -1983,108 +2329,133 @@ impl Inner {
                     severity_rank(f.problem.severity),
                 )
             });
+            order.truncate(MAX_SECTION_ROWS - rows.len());
+            let shared: Rc<Path> = Rc::from(path.as_path());
+            groups.push(Group {
+                key: GroupKey::File(section.rank, *path != root, path.clone()),
+                version: file.version,
+                heading: Heading {
+                    name: file_name(path, &anchor),
+                    count: file.findings.len(),
+                    section: None,
+                },
+                rows: order
+                    .iter()
+                    .map(|&i| Row::Finding(section.source, shared.clone(), i))
+                    .collect(),
+            });
             rows.extend(order.into_iter().map(|i| (path.clone(), i)));
         }
-        rows.truncate(MAX_SECTION_ROWS);
-        section.file_counts.replace(counts);
-        section.rows.replace(rows);
-        section.rows_built.set(false);
         drop(files);
-        // The rows are widgets (several per finding): they are built when the page shows them,
-        // so the findings of a page nobody looks at (lint warnings of a file just opened) cost
-        // no widgets.
-        if self.sections_box.is_mapped() {
-            self.build_section_rows(section);
+        if let Some(first) = groups.first_mut() {
+            let (_, heading, _, _) = section_names(section.source);
+            first.heading.section = Some((heading, section.total()));
         }
-        let total = section.total();
-        section.count.set_text(&total.to_string());
+        section.rows.replace(rows);
+        section.groups.replace(groups);
     }
 
-    /// Fills the list of `section` with the rows of its findings, unless it holds them.
-    fn build_section_rows(self: &Rc<Self>, section: &Rc<Section>) {
-        if section.rows_built.replace(true) {
-            return;
-        }
-        let rows = section.rows.borrow().clone();
-        let files = section.files.borrow();
-        for (index, (path, i)) in rows.iter().enumerate() {
-            if let Some(finding) = files.get(path).and_then(|f| f.findings.get(*i)) {
-                section
-                    .list
-                    .append(&self.finding_row(section, index, finding));
-            }
-        }
-    }
-
-    /// The row of `finding` (row `index` of `section`).
-    fn finding_row(
+    /// Shows finding `i` of `path` in `source`'s section: [`RowWidgets::show_problem`] with its
+    /// code (chktex's number) in the tooltip, and the details toggle.
+    fn bind_finding(
         self: &Rc<Self>,
-        section: &Rc<Section>,
-        index: usize,
-        finding: &Finding,
-    ) -> gtk::ListBoxRow {
-        let mut problem = finding.problem.clone();
-        // A code (chktex's number) is what the tooltip shows after the message.
-        if let Some(code) = finding.code {
-            problem.context = Some(match section.source {
+        widgets: &RowWidgets,
+        source: DiagSource,
+        path: &Path,
+        i: usize,
+    ) {
+        let Some(section) = self.section(source) else {
+            return;
+        };
+        let (mut problem, code, expanded) = {
+            let files = section.files.borrow();
+            let Some(file) = files.get(path) else {
+                return;
+            };
+            let Some(finding) = file.findings.get(i) else {
+                return;
+            };
+            (
+                finding.problem.clone(),
+                finding.code,
+                file.expanded.contains(&i),
+            )
+        };
+        // A code is what the tooltip shows after the message.
+        if let Some(code) = code {
+            problem.context = Some(match source {
                 DiagSource::Lint => lemma_build::chktex::code_label(code),
                 _ => code.to_string(),
             });
         }
-        let row = problem_row(&problem);
-        if section.source == DiagSource::Lint {
+        let tooltip = match &problem.context {
+            Some(context) => format!("{}\n\n{context}", problem.message),
+            None => problem.message.clone(),
+        };
+        widgets.show_problem(&problem, &tooltip);
+        if source == DiagSource::Lint {
             // Lint is advice, not a failure: the information icon in the accent colour.
-            if let Some(image) = first_image(&row) {
-                image.set_icon_name(Some("dialog-information-symbolic"));
-                image.set_css_classes(&["accent"]);
-            }
+            widgets
+                .icon
+                .set_icon_name(Some("dialog-information-symbolic"));
+            widgets.icon.set_css_classes(&["accent"]);
         }
-        let caption = match (section.source, finding.code) {
+        widgets.set_toggle(Some(expanded));
+        let details = expanded.then(|| self.finding_details(source, path, i));
+        widgets.bind_details(details);
+    }
+
+    /// The details of finding `i` of `path` in `source`'s section: its caption, then the
+    /// section's actions on it and "Ask Agent".
+    fn finding_details(self: &Rc<Self>, source: DiagSource, path: &Path, i: usize) -> gtk::Widget {
+        let finding = self.section(source).and_then(|section| {
+            let files = section.files.borrow();
+            files.get(path).and_then(|f| f.findings.get(i)).cloned()
+        });
+        let Some(finding) = finding else {
+            return details_box(None).0;
+        };
+        let caption = match (source, finding.code) {
             (DiagSource::Lint, Some(c)) => Some(format!(
                 "chktex warning {c}. Disable it on this line with a “% chktex {c}” comment, or \
                  everywhere."
             )),
             _ => finding.problem.context.clone(),
         };
-        let weak = Rc::downgrade(self);
-        let source = section.source;
-        let finding = finding.clone();
-        // Built when first shown: a long list of warnings costs only its rows.
-        add_details(&row, false, move || {
-            let (details, actions) = details_box(caption.as_deref());
-            let Some(inner) = weak.upgrade() else {
-                return details;
-            };
-            let offered = inner
-                .section(source)
-                .and_then(|section| section.actions.borrow().clone());
-            if let Some(offered) = offered {
-                for (i, action) in offered(&finding).into_iter().enumerate() {
-                    let button = gtk::Button::builder()
-                        .label(&action.label)
-                        .css_classes(["flat"])
-                        .build();
-                    button.set_tooltip_text(action.tooltip.as_deref());
-                    let weak = Rc::downgrade(&inner);
-                    button.connect_clicked(move |_| {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.run_finding_action(source, index, i);
-                        }
-                    });
-                    actions.append(&button);
-                }
+        let (details, actions) = details_box(caption.as_deref());
+        let offered = self
+            .section(source)
+            .and_then(|section| section.actions.borrow().clone());
+        let path: Rc<Path> = Rc::from(path);
+        if let Some(offered) = offered {
+            for (k, action) in offered(&finding).into_iter().enumerate() {
+                let button = gtk::Button::builder()
+                    .label(&action.label)
+                    .css_classes(["flat"])
+                    .build();
+                button.set_tooltip_text(action.tooltip.as_deref());
+                let (weak, path) = (Rc::downgrade(self), path.clone());
+                button.connect_clicked(move |_| {
+                    if let Some(inner) = weak.upgrade()
+                        && let Some(finding) = inner.finding_in(source, &path, i)
+                    {
+                        inner.run_action_on(source, &finding, k);
+                    }
+                });
+                actions.append(&button);
             }
-            let ask = ask_agent_button();
-            let weak = Rc::downgrade(&inner);
-            ask.connect_clicked(move |_| {
-                if let Some(inner) = weak.upgrade() {
-                    inner.ask_agent_about_finding(source, index);
-                }
-            });
-            actions.append(&ask);
-            details
+        }
+        let ask = ask_agent_button();
+        let weak = Rc::downgrade(self);
+        ask.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade()
+                && let Some(finding) = inner.finding_in(source, &path, i)
+            {
+                inner.ask_agent_about_finding(&finding);
+            }
         });
-        row
+        actions.append(&ask);
+        details
     }
 
     /// Finding `i` of `path` in `section`, with its line in the current text: its mark's line
@@ -2133,11 +2504,15 @@ impl Inner {
         self.current_finding(&section, &path, i)
     }
 
-    /// Opens finding `index` of `source` at its line and column.
-    fn open_finding(&self, source: DiagSource, index: usize) {
-        let (Some(state), Some(finding)) =
-            (self.state.upgrade(), self.finding_by_row(source, index))
-        else {
+    /// Finding `i` of `path` in `source`'s section, with its line in the current text.
+    fn finding_in(&self, source: DiagSource, path: &Path, i: usize) -> Option<Finding> {
+        let section = self.section(source)?;
+        self.current_finding(&section, path, i)
+    }
+
+    /// Opens `finding` (with its current line) at its line and column.
+    fn open_finding(&self, finding: Finding) {
+        let Some(state) = self.state.upgrade() else {
             return;
         };
         state.sidebar.dismiss_overlay();
@@ -2163,24 +2538,26 @@ impl Inner {
     }
 
     fn run_finding_action(&self, source: DiagSource, index: usize, action: usize) {
-        let (Some(state), Some(section)) = (self.state.upgrade(), self.section(source)) else {
-            return;
-        };
-        let Some(finding) = self.finding_by_row(source, index) else {
-            return;
-        };
-        let actions = section.actions.borrow().clone();
-        if let Some(action) = actions.and_then(|a| a(&finding).into_iter().nth(action)) {
-            (action.run)(&state, &finding);
+        if let Some(finding) = self.finding_by_row(source, index) {
+            self.run_action_on(source, &finding, action);
         }
     }
 
-    fn ask_agent_about_finding(&self, source: DiagSource, index: usize) {
-        if let (Some(state), Some(finding)) =
-            (self.state.upgrade(), self.finding_by_row(source, index))
-        {
-            let mut problem = finding.problem;
-            if let (DiagSource::Lint, Some(code)) = (source, finding.code) {
+    /// Runs action `action` of `source`'s section on `finding` (with its current line).
+    fn run_action_on(&self, source: DiagSource, finding: &Finding, action: usize) {
+        let (Some(state), Some(section)) = (self.state.upgrade(), self.section(source)) else {
+            return;
+        };
+        let actions = section.actions.borrow().clone();
+        if let Some(action) = actions.and_then(|a| a(finding).into_iter().nth(action)) {
+            (action.run)(&state, finding);
+        }
+    }
+
+    fn ask_agent_about_finding(&self, finding: &Finding) {
+        if let Some(state) = self.state.upgrade() {
+            let mut problem = finding.problem.clone();
+            if let (DiagSource::Lint, Some(code)) = (problem.source, finding.code) {
                 problem.message = format!("chktex warning {code}: {}", problem.message);
             }
             crate::agent::quick::fix_diagnostic(&state, &problem);
@@ -2188,105 +2565,32 @@ impl Inner {
     }
 
     /// The context menu of finding row `index`: the section's actions, then "Ask Agent to Fix"
-    /// (actions `finding.run((uu))` and `finding.ask-agent(u)` on the section).
+    /// (actions `problems.finding-run((suu))` and `problems.finding-ask-agent((su))` on the
+    /// page, with the section's filter name).
     fn finding_menu(&self, section: &Section, index: usize) -> gio::Menu {
         let menu = gio::Menu::new();
+        let name = filter_name(section.source);
         let row = u32::try_from(index).unwrap_or(u32::MAX);
         let finding = self.finding_by_row(section.source, index);
         let actions = section.actions.borrow().clone();
         if let (Some(finding), Some(actions)) = (finding, actions) {
             for (i, action) in actions(&finding).into_iter().enumerate() {
                 let item = gio::MenuItem::new(Some(&action.label), None);
+                let action = u32::try_from(i).unwrap_or(u32::MAX);
                 item.set_action_and_target_value(
-                    Some("finding.run"),
-                    Some(&(row, u32::try_from(i).unwrap_or(u32::MAX)).to_variant()),
+                    Some("problems.finding-run"),
+                    Some(&(name.as_str(), row, action).to_variant()),
                 );
                 menu.append_item(&item);
             }
         }
         let item = gio::MenuItem::new(Some("Ask Agent to _Fix"), None);
-        item.set_action_and_target_value(Some("finding.ask-agent"), Some(&row.to_variant()));
+        item.set_action_and_target_value(
+            Some("problems.finding-ask-agent"),
+            Some(&(name.as_str(), row).to_variant()),
+        );
         menu.append_item(&item);
         menu
-    }
-
-    /// The section's context menu: right click, long press, Menu or Shift+F10 on a row.
-    fn connect_finding_menu(self: &Rc<Self>, section: &Rc<Section>) {
-        let group = gio::SimpleActionGroup::new();
-        let run = gio::SimpleAction::new("run", Some(glib::VariantTy::new("(uu)").unwrap()));
-        let weak = Rc::downgrade(self);
-        let source = section.source;
-        run.connect_activate(move |_, target| {
-            if let (Some(inner), Some((row, action))) =
-                (weak.upgrade(), target.and_then(|v| v.get::<(u32, u32)>()))
-            {
-                inner.run_finding_action(source, row as usize, action as usize);
-            }
-        });
-        group.add_action(&run);
-        let ask = gio::SimpleAction::new("ask-agent", Some(glib::VariantTy::UINT32));
-        let weak = Rc::downgrade(self);
-        ask.connect_activate(move |_, target| {
-            if let (Some(inner), Some(row)) = (weak.upgrade(), target.and_then(|v| v.get::<u32>()))
-            {
-                inner.ask_agent_about_finding(source, row as usize);
-            }
-        });
-        group.add_action(&ask);
-        section.widget.insert_action_group("finding", Some(&group));
-
-        let show = {
-            let weak = Rc::downgrade(self);
-            let section = Rc::downgrade(section);
-            move |row: &gtk::ListBoxRow, at: Option<(f64, f64)>| {
-                let (Some(inner), Some(section)) = (weak.upgrade(), section.upgrade()) else {
-                    return;
-                };
-                let Ok(index) = usize::try_from(row.index()) else {
-                    return;
-                };
-                let menu = inner.finding_menu(&section, index);
-                popup_menu(&menu, &section.widget, &section.list, row, at);
-            }
-        };
-        let click = gtk::GestureClick::builder().button(3).build();
-        let list = section.list.clone();
-        let on_click = show.clone();
-        click.connect_pressed(move |gesture, _, x, y| {
-            if let Some(row) = list.row_at_y(y as i32) {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                on_click(&row, Some((x, y)));
-            }
-        });
-        section.list.add_controller(click);
-        let press = gtk::GestureLongPress::new();
-        let list = section.list.clone();
-        let on_press = show.clone();
-        press.connect_pressed(move |_, x, y| {
-            if let Some(row) = list.row_at_y(y as i32) {
-                on_press(&row, Some((x, y)));
-            }
-        });
-        section.list.add_controller(press);
-        let keys = gtk::ShortcutController::new();
-        keys.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("Menu|<Shift>F10"),
-            Some(gtk::CallbackAction::new(move |list, _| {
-                let focused = list
-                    .root()
-                    .and_then(|root| root.focus())
-                    .and_then(|w| w.ancestor(gtk::ListBoxRow::static_type()))
-                    .and_then(|w| w.downcast::<gtk::ListBoxRow>().ok());
-                match focused {
-                    Some(row) => {
-                        show(&row, None);
-                        glib::Propagation::Stop
-                    }
-                    None => glib::Propagation::Proceed,
-                }
-            })),
-        ));
-        section.list.add_controller(keys);
     }
 
     /// Underlines the findings of `editor`'s file (sections with a style) and puts a mark at
@@ -2424,93 +2728,6 @@ impl Inner {
         None
     }
 
-    /// The build row of problem `index`: [`problem_row`] plus, for errors the explanation table
-    /// knows, the explanation (tooltip and details), "Ask Agent" and the quick fix once
-    /// [`crate::quickfix::proposal`] found one.
-    fn build_row(self: &Rc<Self>, index: usize, problem: &Problem) -> gtk::ListBoxRow {
-        let row = problem_row(problem);
-        let Some(explanation) = crate::quickfix::explanation(problem) else {
-            // As wide as the details toggle of the other rows, so the line numbers align.
-            if let Some(content) = row.child().and_then(|c| c.downcast::<gtk::Box>().ok()) {
-                content.append(&gtk::Box::builder().width_request(TOGGLE_WIDTH).build());
-            }
-            return row;
-        };
-        let tooltip = row
-            .tooltip_text()
-            .map(|t| t.to_string())
-            .unwrap_or_default();
-        row.set_tooltip_text(Some(&format!("{tooltip}\n\n{}", explanation.text)));
-        // The first error of each kind shows its explanation; repeats and warnings start
-        // collapsed (and compute their fix when first opened).
-        let expanded = problem.severity == Severity::Error
-            && self.expanded_kinds.borrow_mut().insert(explanation.kind);
-        let fix: Rc<RefCell<Option<String>>> = Rc::default();
-        let weak = Rc::downgrade(self);
-        let text = explanation.text.clone();
-        let has_fix = explanation.fix.is_some();
-        let problem = problem.clone();
-        let ready = fix.clone();
-        let toggle = add_details(&row, expanded, move || {
-            let (details, actions) = details_box(Some(&text));
-            let Some(inner) = weak.upgrade() else {
-                return details;
-            };
-            let ask = ask_agent_button();
-            let weak = Rc::downgrade(&inner);
-            ask.connect_clicked(move |_| {
-                if let Some(inner) = weak.upgrade() {
-                    inner.ask_agent(index);
-                }
-            });
-            actions.append(&ask);
-            if has_fix && let Some(state) = inner.state.upgrade() {
-                // With its line in the current text, while the list still shows it.
-                let current = inner
-                    .problem_for_agent(index)
-                    .filter(|p| p.message == problem.message)
-                    .unwrap_or_else(|| problem.clone());
-                let proposal = crate::quickfix::proposal(&state, &current);
-                let actions = actions.downgrade();
-                let ready = ready.clone();
-                let weak = Rc::downgrade(&inner);
-                glib::spawn_future_local(async move {
-                    let Some(proposal) = proposal.await else {
-                        return;
-                    };
-                    let (Some(actions), Some(_)) = (actions.upgrade(), weak.upgrade()) else {
-                        return;
-                    };
-                    let label = gtk::Label::builder()
-                        .label(&proposal.label)
-                        .ellipsize(pango::EllipsizeMode::End)
-                        .max_width_chars(30)
-                        .build();
-                    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                    content.append(&gtk::Image::from_icon_name("error-correct-symbolic"));
-                    content.append(&label);
-                    let button = gtk::Button::builder()
-                        .child(&content)
-                        .tooltip_text(&proposal.description)
-                        .css_classes(["suggested-action"])
-                        .build();
-                    button.connect_clicked(move |_| {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.apply_fix(index);
-                        }
-                    });
-                    actions.prepend(&button);
-                    ready.replace(Some(proposal.label));
-                });
-            }
-            details
-        });
-        self.details
-            .borrow_mut()
-            .insert(index, RowDetails { toggle, fix });
-        row
-    }
-
     fn apply_fix(&self, index: usize) {
         let (Some(state), Some(problem)) = (self.state.upgrade(), self.problem_for_agent(index))
         else {
@@ -2526,10 +2743,10 @@ impl Inner {
     /// Adds "Apply Fix: …" to the context menu of build row `index` when it has a fix.
     fn add_fix_item(&self, menu: &gio::Menu, index: u32) {
         let label = self
-            .details
+            .row_states
             .borrow()
             .get(&(index as usize))
-            .and_then(|d| d.fix.borrow().clone());
+            .and_then(|s| s.fix.as_ref().map(|(label, _)| label.clone()));
         if let Some(label) = label {
             let item = gio::MenuItem::new(Some(&format!("Apply Fix: {label}")), None);
             item.set_action_and_target_value(Some("problems.apply-fix"), Some(&index.to_variant()));
@@ -2579,7 +2796,6 @@ impl Inner {
         self.filter_bar.set_visible(any_findings);
         let filter = self.current_filter();
         let shows_build = matches!(filter, ProblemFilter::All | ProblemFilter::Build);
-        self.list.set_visible(shows_build && !problems.is_empty());
         self.build_empty
             .set_visible(any_findings && problems.is_empty() && filter == ProblemFilter::Build);
         self.build_empty.set_text(if self.built.get() {
@@ -2600,7 +2816,6 @@ impl Inner {
             let shown = total > 0
                 && (filter == ProblemFilter::All
                     || filter == ProblemFilter::Source(section.source));
-            section.widget.set_visible(shown);
             if shown {
                 let (_, _, one, many) = section_names(section.source);
                 parts.push(format!("{total} {}", if total == 1 { one } else { many }));
@@ -2615,6 +2830,9 @@ impl Inner {
         } else {
             "none"
         };
+        drop((problems, sections));
+        // Before the page shows (which lists the rows of a hidden page, see `connect_list`).
+        self.show_rows();
         self.stack.set_visible_child_name(page);
     }
 }
@@ -2680,22 +2898,6 @@ fn remove_marks(editor: &Editor, marks: &[Option<String>]) {
     }
 }
 
-/// The first image in `row` (its severity icon).
-fn first_image(row: &gtk::ListBoxRow) -> Option<gtk::Image> {
-    let mut stack = vec![row.clone().upcast::<gtk::Widget>()];
-    while let Some(widget) = stack.pop() {
-        if let Ok(image) = widget.clone().downcast::<gtk::Image>() {
-            return Some(image);
-        }
-        let mut child = widget.last_child();
-        while let Some(c) = child {
-            child = c.prev_sibling();
-            stack.push(c);
-        }
-    }
-    None
-}
-
 fn ask_agent_button() -> gtk::Button {
     gtk::Button::builder()
         .label("Ask Agent")
@@ -2728,69 +2930,15 @@ fn details_box(text: Option<&str>) -> (gtk::Widget, adw::WrapBox) {
     (details.upcast(), actions)
 }
 
-/// Gives `row` (a [`problem_row`]) a toggle at its end that reveals details below it, built by
-/// `make` when they are first shown (at once when `expanded`). Returns the toggle.
-fn add_details(
-    row: &gtk::ListBoxRow,
-    expanded: bool,
-    make: impl Fn() -> gtk::Widget + 'static,
-) -> gtk::ToggleButton {
-    let content = row.child().expect("a problem row has content");
-    row.set_child(None::<&gtk::Widget>);
-    let toggle = gtk::ToggleButton::builder()
-        .icon_name("pan-end-symbolic")
-        .valign(gtk::Align::Start)
-        .tooltip_text("Explain and Fix")
-        .css_classes(["flat", "circular", "lemma-problem-toggle"])
-        .build();
-    if let Ok(top) = content.clone().downcast::<gtk::Box>() {
-        top.append(&toggle);
-    }
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    column.set_valign(gtk::Align::Center);
-    column.append(&content);
-    row.set_child(Some(&column));
-    let built = Cell::new(false);
-    let host = column.downgrade();
-    toggle.connect_toggled(move |t| {
-        t.set_icon_name(if t.is_active() {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        });
-        if t.is_active()
-            && !built.replace(true)
-            && let Some(column) = host.upgrade()
-        {
-            let revealer = gtk::Revealer::builder()
-                .child(&make())
-                .transition_type(gtk::RevealerTransitionType::SlideDown)
-                .build();
-            column.append(&revealer);
-            t.bind_property("active", &revealer, "reveal-child")
-                .sync_create()
-                .build();
-        }
-    });
-    toggle.set_active(expanded);
-    toggle
-}
-
-/// Pops `menu` up for `row` of `list`, parented to `host` (an ancestor that holds the menu's
-/// actions), at `at` (list coordinates) or below the row; it is unparented once closed.
-fn popup_menu(
-    menu: &gio::Menu,
-    host: &gtk::Box,
-    list: &gtk::ListBox,
-    row: &gtk::ListBoxRow,
-    at: Option<(f64, f64)>,
-) {
+/// Pops `menu` up for `row` (a row's widget), parented to `host` (an ancestor that holds the
+/// menu's actions), at `at` (the row's coordinates) or below the row; it is unparented once
+/// closed (after its action ran).
+fn popup_menu(menu: &gio::Menu, host: &gtk::Widget, row: &gtk::Widget, at: Option<(f64, f64)>) {
     let popover = gtk::PopoverMenu::from_model(Some(menu));
     popover.set_has_arrow(false);
     popover.set_parent(host);
-    let point = at.and_then(|(x, y)| {
-        list.compute_point(host, &gtk::graphene::Point::new(x as f32, y as f32))
-    });
+    let point = at
+        .and_then(|(x, y)| row.compute_point(host, &gtk::graphene::Point::new(x as f32, y as f32)));
     let rect = match point {
         Some(p) => gtk::gdk::Rectangle::new(p.x() as i32, p.y() as i32, 1, 1),
         None => row
