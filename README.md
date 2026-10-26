@@ -29,9 +29,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
   dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: the **Source** and
-  **PDF** buttons on the left edge of the PDF, next to the editor, show the page on screen in the
-  source and the cursor's line in the PDF (Ctrl+Alt+J, or Show in PDF in the editor's right-click
-  menu), and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width
+  **PDF** buttons in the top left corner of the PDF show the page on screen in the source and
+  the cursor's line in the PDF (Ctrl+Alt+J, or Show in PDF in the editor's right-click menu),
+  and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width
   or the whole page (for slides) and zooms to 100% (Ctrl+0 and Ctrl+1 in the PDF; Left and
   Right, or h and l, scroll sideways). It also opens the PDF in another app, to print it or
   present it, and shows it in your file manager, as the build keeps it in a hidden `.build`

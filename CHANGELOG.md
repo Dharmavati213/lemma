@@ -8,10 +8,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Added
 
-- Two labelled buttons on the left edge of the PDF, next to the editor, jump between the source
-  and the PDF. **Source** opens the source line at the middle of the page on screen (the page
-  number the toolbar shows), and **PDF** scrolls the PDF to the cursor's line and flashes it, as
-  Ctrl+Alt+J does. Show in PDF is in the editor's right-click menu as well, Show PDF Page in
+- A small pill of two labelled buttons in the top left corner of the PDF jumps between the
+  source and the PDF. **Source** opens the source line at the middle of the page on screen (the
+  page number the toolbar shows), and **PDF** scrolls the PDF to the cursor's line and flashes
+  it, as Ctrl+Alt+J does. Show in PDF is in the editor's right-click menu as well, Show PDF Page in
   Source is in the command palette, and the buttons work in the PDF's own window. Ctrl+click in
   the PDF still opens the line of the point clicked.
 - Files and folders can be linked to the agent for a project: the pin button beside the

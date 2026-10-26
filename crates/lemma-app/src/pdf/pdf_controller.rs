@@ -3,7 +3,7 @@
 //!
 //! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (page n/N, zoom
 //! out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's file) above the
-//! [`PdfView`]. Over the left edge of the view, next to the editor, two labelled buttons jump
+//! [`PdfView`]. A small pill in the top left corner of the view has two labelled buttons that jump
 //! between the source and the PDF ([`PdfController::sync_buttons`]): "Source" is
 //! `win.sync-inverse` (the source line of the middle of what the view shows of the current page)
 //! and "PDF" is `win.sync-forward` (Ctrl+Alt+J: the cursor's line in the PDF), which the editor's
@@ -72,9 +72,10 @@ pdfview.lemma-pdf-view { background-color: color-mix(in srgb, var(--window-bg-co
 .lemma-pdf-toolbar entry { min-height: 26px; padding: 0 6px; }
 .lemma-pdf-toolbar button { min-height: 26px; min-width: 26px; padding: 2px; }
 .lemma-pdf-toolbar .zoom-label { min-width: 3.4em; }
-.lemma-pdf-sync { margin-left: 8px; opacity: 0.88; }
+.lemma-pdf-sync { margin: 6px; opacity: 0.75; }
 .lemma-pdf-sync:hover { opacity: 1; }
-.lemma-pdf-sync button { min-height: 26px; padding: 2px 10px; font-size: 0.9em; }
+.lemma-pdf-sync button { min-height: 20px; min-width: 0; padding: 0 7px; font-size: 0.8em; }
+.lemma-pdf-sync button image { -gtk-icon-size: 10px; }
 .lemma-pdf-content searchbar > revealer > box { padding: 4px 6px; }
 .lemma-pdf-content searchbar entry { min-height: 26px; }
 .lemma-pdf-content searchbar button { min-height: 26px; min-width: 26px; padding: 2px; }
@@ -256,7 +257,7 @@ impl PdfController {
         &self.inner.toolbar.bar
     }
 
-    /// The SyncTeX buttons over the left edge of the view: Source (`win.sync-inverse`), then
+    /// The SyncTeX buttons in the top left corner of the view: Source (`win.sync-inverse`), then
     /// PDF (`win.sync-forward`).
     pub fn sync_buttons(&self) -> &gtk::Box {
         &self.inner.sync_buttons
@@ -948,38 +949,44 @@ fn build_toolbar() -> Toolbar {
     }
 }
 
-/// The SyncTeX buttons over the left edge of the view, next to the editor, so that they are found
+/// The SyncTeX buttons, a small pill in the top left corner of the view, so that they are found
 /// without searching the toolbar (which has no room for their labels in a narrow pane). Their
-/// arrows point at the side they jump to: the source on the left, and into the PDF.
+/// arrows point outwards: Source to the editor on the left, PDF into the view.
 fn build_sync_buttons() -> gtk::Box {
-    let button = |icon: &str, label: &str, tooltip: &str, action: &str| {
-        gtk::Button::builder()
-            .child(
-                &adw::ButtonContent::builder()
-                    .icon_name(icon)
-                    .label(label)
-                    .build(),
-            )
+    let button = |label: &str, icon: &str, tooltip: &str, action: &str| {
+        let image = gtk::Image::from_icon_name(icon);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+        let text = gtk::Label::new(Some(label));
+        if action == "win.sync-inverse" {
+            content.append(&image);
+            content.append(&text);
+        } else {
+            content.append(&text);
+            content.append(&image);
+        }
+        let button = gtk::Button::builder()
+            .child(&content)
             .tooltip_text(tooltip)
             .action_name(action)
             .css_classes(["osd"])
-            .build()
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
+        button
     };
     let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
         .halign(gtk::Align::Start)
-        .valign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
         .css_classes(["linked", "lemma-pdf-sync"])
         .build();
     buttons.append(&button(
-        "go-previous-symbolic",
         "Source",
+        "go-previous-symbolic",
         "Show This Page in the Source",
         "win.sync-inverse",
     ));
     buttons.append(&button(
-        "go-next-symbolic",
         "PDF",
+        "go-next-symbolic",
         "Show the Cursor in the PDF (Ctrl+Alt+J)",
         "win.sync-forward",
     ));
