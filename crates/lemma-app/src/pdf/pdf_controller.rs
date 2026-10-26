@@ -1,9 +1,11 @@
 //! The PDF controller (ARCHITECTURE §6): owns the PDF thread handle and the document
 //! generations, reloads after builds, and runs forward/inverse SyncTeX.
 //!
-//! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (page n/N, zoom
-//! out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's file) above the
-//! [`PdfView`]. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
+//! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (SyncTeX both ways,
+//! page n/N, zoom out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's
+//! file) above the [`PdfView`]. Its SyncTeX buttons are `win.sync-inverse` (the source line of
+//! the middle of what the view shows of the current page) and `win.sync-forward` (Ctrl+Alt+J:
+//! the cursor's line in the PDF); Ctrl+click in the PDF is inverse search at the point clicked. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
 //! new generation; the view keeps showing the previous generation until the new one has opened,
 //! and a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the
 //! scroll position; another PDF starts at the top. A rebuild of the file asked for last is a
@@ -413,6 +415,17 @@ impl Inner {
             file: file.to_path_buf(),
             line,
         });
+    }
+
+    /// Inverse search from the page the view shows (`win.sync-inverse`).
+    fn inverse_from_view(&self) {
+        if self.shown.borrow().is_none() {
+            if let Some(state) = self.state.upgrade() {
+                state.toast("There is no PDF to search yet; build with F5");
+            }
+            return;
+        }
+        self.view.inverse_search_current();
     }
 
     /// Forward search from the active editor's cursor line.
@@ -889,6 +902,19 @@ fn build_toolbar() -> Toolbar {
     let spacer = gtk::Box::builder().hexpand(true).build();
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     bar.add_css_class("lemma-pdf-toolbar");
+    // SyncTeX both ways (arrows would read as the previous and next page beside the page
+    // number).
+    bar.append(&button(
+        "text-editor-symbolic",
+        "Show Page in Source",
+        "win.sync-inverse",
+    ));
+    bar.append(&button(
+        "find-location-symbolic",
+        "Show Cursor in PDF (Ctrl+Alt+J)",
+        "win.sync-forward",
+    ));
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(&page);
     bar.append(&pages);
     bar.append(&spacer);
@@ -1096,6 +1122,7 @@ fn install_actions(state: &Rc<WindowState>, inner: &Rc<Inner>) {
     simple("sync-forward", |i| {
         i.forward_from_cursor(Some(Reveal::Always))
     });
+    simple("sync-inverse", |i| i.inverse_from_view());
     // Until a PDF is shown (`Inner::enable_handoff`).
     simple("pdf-open-external", |i| i.hand_off(Handoff::Open)).set_enabled(false);
     simple("pdf-show-in-folder", |i| i.hand_off(Handoff::ShowInFolder)).set_enabled(false);

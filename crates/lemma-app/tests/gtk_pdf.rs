@@ -71,6 +71,10 @@ fn main() -> ExitCode {
         ),
         ("ctrl_click_opens_the_source_line", inverse_search),
         (
+            "the_toolbar_buttons_sync_both_ways",
+            toolbar_syncs_both_ways,
+        ),
+        (
             "follow_cursor_searches_after_the_cursor_rests",
             follow_cursor,
         ),
@@ -1400,6 +1404,62 @@ fn inverse_search() {
         !view.inverse_search_at(1.0, 1.0),
         "the gap is not on a page"
     );
+    state.window.destroy();
+}
+
+/// The toolbar's SyncTeX buttons: Show Page in Source opens the source line of the middle of the
+/// page shown, and Show Cursor in PDF brings that line back to the same page.
+fn toolbar_syncs_both_ways() {
+    let dir = copy_proj("toolbar-sync", true);
+    let state = window(&dir, config());
+    let editor = open(&state, &dir.join("main.tex"));
+    wait_for_pages(&state);
+    let view = view(&state);
+    let controller = state.pdf.get().unwrap();
+    let button = |action: &str| {
+        controller
+            .toolbar()
+            .observe_children()
+            .into_iter()
+            .filter_map(|w| w.ok()?.downcast::<gtk::Button>().ok())
+            .find(|b| b.action_name().as_deref() == Some(action))
+            .unwrap_or_else(|| panic!("a toolbar button for {action}"))
+    };
+    let cursor = |state: &WindowState| {
+        state.active_editor().map(|e| {
+            let buffer = e.buffer();
+            let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+            (e.document().path().to_path_buf(), line)
+        })
+    };
+    let buffer = editor.buffer();
+    buffer.place_cursor(&buffer.start_iter());
+    view.goto_page(2);
+    wait_for_pages(&state);
+    let page = view.current_page();
+    let before = cursor(&state);
+    button("win.sync-inverse").emit_clicked();
+    common::pump_until(TIMEOUT, || cursor(&state) != before);
+    let (file, line) = cursor(&state).unwrap();
+    println!("  page {} -> {}:{}", page + 1, file.display(), line + 1);
+    view.goto_page(0);
+    wait_for_pages(&state);
+    button("win.sync-forward").emit_clicked();
+    common::pump_until(TIMEOUT, || view.highlight().is_some_and(|(p, _)| p == page));
+    // In the PDF's own window the buttons have the main window's actions.
+    activate(&state, "win.pdf-detach");
+    let window = lemma_app::pdf::detach::window(&state).expect("the PDF window");
+    common::pump_until(TIMEOUT, || window.is_mapped());
+    view.goto_page(1);
+    wait_for_pages(&state);
+    let before = cursor(&state);
+    let inverse = button("win.sync-inverse");
+    assert!(
+        inverse.is_sensitive(),
+        "the PDF window has win.sync-inverse"
+    );
+    inverse.emit_clicked();
+    common::pump_until(TIMEOUT, || cursor(&state) != before);
     state.window.destroy();
 }
 

@@ -24,8 +24,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
-  dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways (Ctrl+Alt+J forward,
-  Ctrl+click in the PDF for inverse). Its menu fits the width or the whole page (for slides) and
+  dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: two buttons at the
+  start of the PDF toolbar show the page on screen in the source and the cursor's line in the
+  PDF (Ctrl+Alt+J), and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width or the whole page (for slides) and
   zooms to 100% (Ctrl+0 and Ctrl+1 in the PDF; Left and Right, or h and l, scroll sideways). It
   also opens the PDF in another app, to print it or present it, and shows it in your file
   manager, as the build keeps it in a hidden `.build` folder. When a damaged `.aux` or `.bbl`

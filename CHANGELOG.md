@@ -6,6 +6,14 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ## Unreleased
 
+### Added
+
+- Two buttons at the start of the PDF toolbar jump between the source and the PDF. Show Page in
+  Source opens the source line at the middle of the page on screen (the page number the toolbar
+  shows), and Show Cursor in PDF scrolls the PDF to the cursor's line and flashes it, as
+  Ctrl+Alt+J does. Show PDF Page in Source is in the command palette too, and the buttons work
+  in the PDF's own window. Ctrl+click in the PDF still opens the line of the point clicked.
+
 ### Changed
 
 - Enter takes the first word proposed in prose too, as it already did for commands, references

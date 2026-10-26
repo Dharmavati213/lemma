@@ -32,7 +32,9 @@
 //!   After a toggle, the textures of the other mode stand in through a colour matrix until the
 //!   pages are re-rendered, so the switch is immediate.
 //! - **SyncTeX:** forward-search boxes are scrolled to a third of the view and flashed for
-//!   [`FLASH_DURATION`]; Ctrl+click reports the page point under the pointer for inverse search.
+//!   [`FLASH_DURATION`]; Ctrl+click reports the page point under the pointer for inverse search,
+//!   and [`PdfView::inverse_search_current`] the middle of what the view shows of the current
+//!   page.
 //! - **Search (M3):** the matches of the pages on screen are drawn over them, the current one
 //!   emphasised ([`PdfView::set_search_matches`], [`PdfView::set_current_match`]).
 //! - **Popovers (M3):** popovers parented to the view (the link preview) are positioned on every
@@ -1591,6 +1593,46 @@ impl PdfView {
             inverse(page, x_bp, y_bp);
         }
         true
+    }
+
+    /// Inverse search from the page the view shows (the toolbar's Show Page in Source): calls the
+    /// inverse handler with [`PdfView::current_page_middle`]. Returns false when no document is
+    /// shown.
+    pub fn inverse_search_current(&self) -> bool {
+        let Some((page, x_bp, y_bp)) = self.current_page_middle() else {
+            return false;
+        };
+        let inverse = self.imp().inverse.borrow().clone();
+        if let Some(inverse) = inverse {
+            inverse(page, x_bp, y_bp);
+        }
+        true
+    }
+
+    /// The middle of the part of the current page ([`PdfView::current_page`], the toolbar's
+    /// page number) that the view shows: 0-based page and point in bp.
+    pub fn current_page_middle(&self) -> Option<(u32, f64, f64)> {
+        let imp = self.imp();
+        let page = self.current_page();
+        let (width, height) = imp.view_size();
+        let (sx, sy) = imp.scroll();
+        let model = imp.model.borrow();
+        let rect = page_rect(&model.doc.as_ref()?.layout, page, model.zoom, width);
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return None;
+        }
+        // From the page's start along one axis; the page's own middle when none of it is shown.
+        let middle = |start: f64, len: f64, scroll: f64, extent: f64| {
+            let (a, b) = (start.max(scroll), (start + len).min(scroll + extent));
+            if a < b {
+                (a + b) / 2.0 - start
+            } else {
+                len / 2.0
+            }
+        };
+        let x = middle(rect.x, rect.width, sx, width);
+        let y = middle(rect.y, rect.height, sy, height);
+        Some((page, x / model.zoom, y / model.zoom))
     }
 
     /// The 0-based pages intersecting the view.

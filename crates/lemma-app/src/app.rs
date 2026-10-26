@@ -245,6 +245,7 @@ pub const ACTIONS: &[ActionInfo] = {
         info("win.problem-next", "Next Problem", BuildPdf),
         info("win.problem-prev", "Previous Problem", BuildPdf),
         info("win.sync-forward", "Show Cursor in PDF", BuildPdf),
+        info("win.sync-inverse", "Show PDF Page in Source", BuildPdf),
         info("win.pdf-invert", "Dark PDF Pages", BuildPdf),
         info("win.pdf-zoom-in", "Zoom In PDF", BuildPdf),
         info("win.pdf-zoom-out", "Zoom Out PDF", BuildPdf),

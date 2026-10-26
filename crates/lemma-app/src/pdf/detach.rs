@@ -49,6 +49,7 @@ const SHARED_ACTIONS: &[&str] = &[
     "pdf-search",
     "toggle-pdf-sidebar",
     "sync-forward",
+    "sync-inverse",
     "goto-back",
     "build",
     "stop-build",
