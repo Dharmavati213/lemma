@@ -22,10 +22,6 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   too. The ACP agents take PDFs and text files of any size: large ones are sent as a link
   that the agent opens itself. With the API backend everything travels inside the request, so
   PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
-- **Link files to the agent.** The pin button beside the paperclip keeps files and folders
-  linked to the agent in a project, such as notes, a style guide or the papers you cite. The agent
-  gets them with the first message of every conversation and again whenever they change, so it
-  always has them; a folder stands for the PDFs and text files in it.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
   dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: the **Source** and

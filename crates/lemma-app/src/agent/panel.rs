@@ -14,7 +14,7 @@
 //! │ [Selection · main.tex 12–14]                                                   │
 //! │ [🖼 fig.png ✕] [📄 paper.pdf ✕]                                                 │  attachments
 //! │ ┌ prompt (Enter sends, Shift+Enter newline) ┐ [➤]                              │
-//! └ [📎] [📌 2] [Quick actions ▾]                                                  ┘
+//! └ [📎] [Quick actions ▾]                                                         ┘
 //! ```
 //!
 //! # Contract
@@ -87,16 +87,12 @@
 //!   chips above the prompt box (an image with a preview) with a remove button; a prompt may be
 //!   only attachments. Sending waits until every attachment is read. Images show as previews in
 //!   the transcript.
-//! - **Linked files:** the pin button beside the paperclip shows how many files and folders are
-//!   linked to the agent in the project, and its popover lists them, unlinks them and links more
-//!   ([`linked_files`](super::linked_files) keeps the list and sends them with the prompts).
 //! - Tool cards for `edit`/`write` link to the hunk the call made (the review's hunks before the
 //!   call and after it completes are compared); clicking one shows it. A `compile` card shows
 //!   the Problems page.
 
 use super::attach::{self, Attachment};
 use super::bridge::ToolRecord;
-use super::linked_files;
 use super::markdown::{self, Block};
 use super::{AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, install};
 use crate::review_ui;
@@ -139,7 +135,7 @@ const MAX_LOG_LINES: usize = 400;
 /// not take `y`, `Y` or `n`: keys typed in that moment were meant for the prompt box.
 pub const AUTO_FOCUS_GRACE: Duration = Duration::from_millis(500);
 /// Extensions of the files offered after `@` (text files a LaTeX project has).
-pub(crate) const TEXT_EXTENSIONS: &[&str] = &[
+const TEXT_EXTENSIONS: &[&str] = &[
     "tex", "ltx", "sty", "cls", "bib", "bst", "dtx", "ins", "cfg", "def", "bbx", "cbx", "lbx",
     "tikz", "txt", "md", "csv", "dat", "lua", "py", "sh", "toml", "yaml", "yml", "json", "mk",
 ];
@@ -555,11 +551,6 @@ impl Panel {
     /// The paperclip button (opens a file chooser).
     pub fn attach_button(&self) -> gtk::Button {
         self.inner.attach_button.clone()
-    }
-
-    /// The linked files button beside the paperclip.
-    pub fn linked_button(&self) -> gtk::MenuButton {
-        self.inner.linked_button.clone()
     }
 
     /// The selection chip's text while it is shown.
@@ -1974,7 +1965,6 @@ pub(crate) struct Inner {
     placeholder: gtk::Label,
     send_button: gtk::Button,
     attach_button: gtk::Button,
-    linked_button: gtk::MenuButton,
     quick_menu: gio::Menu,
     // agent data
     agent_name: RefCell<String>,
@@ -2287,8 +2277,6 @@ impl Inner {
             .update_property(&[gtk::accessible::Property::Label("Attach images or files")]);
         let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bottom.append(&attach_button);
-        let linked_button = linked_files::button(state, controller.linked_files());
-        bottom.append(&linked_button);
         bottom.append(&quick_button);
         let prompt_area = gtk::Box::new(gtk::Orientation::Vertical, 4);
         prompt_area.add_css_class("lemma-agent-prompt-area");
@@ -2338,7 +2326,6 @@ impl Inner {
             placeholder,
             send_button,
             attach_button,
-            linked_button,
             quick_menu,
             agent_name: RefCell::new(String::new()),
             session: RefCell::new(String::new()),

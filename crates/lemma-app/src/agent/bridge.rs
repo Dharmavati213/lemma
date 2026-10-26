@@ -59,13 +59,8 @@
 //! project sources ([`turn_start_text`]: a document that leaves the workspace during the turn
 //! still has its baseline), write a local-history snapshot ([`super::history::record_turn`]),
 //! call [`review_ui::on_turn_started`], announce the prompt ([`AgentController::emit_prompt`])
-//! and build the blocks: the `<review_feedback>` ([`tools::take_feedback`]), the linked files
-//! ([`linked_files::for_prompt`], prepared after the save; a notice in the transcript names the
-//! files it sends), the user's blocks, and a resource describing the current file, the cursor
-//! line and the selection. The session remembers the linked files its conversation was given
-//! once the prompt is sent (a conversation continued after an idle stop keeps them). A slash
-//! command (`/compact`) goes without them, and after `/clear` or `/compact` they are sent again.
-//! Then
+//! and build the blocks: the `<review_feedback>` ([`tools::take_feedback`]), the user's blocks,
+//! and a resource describing the current file, the cursor line and the selection. Then
 //! `AgentCmd::Prompt` goes out. Feedback that goes into a prompt that is not sent is kept for the
 //! next one.
 //!
@@ -127,8 +122,8 @@
 //! while no prompt went to it, so that nothing is lost; otherwise it keeps running.
 
 use super::{
-    AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, history, install,
-    linked_files, panel, tools, watcher,
+    AgentController, AgentState, PromptBlock, PromptOrigin, SentPrompt, history, install, panel,
+    tools, watcher,
 };
 use crate::build_ui::Reason;
 use crate::hooks::{HookId, Hooks};
@@ -263,8 +258,6 @@ struct Session {
     conversation: bool,
     /// Its mode, model and effort now (from `Ready` and the agent's updates).
     preferences: Preferences,
-    /// The linked files its conversation was given (see [`linked_files`]).
-    linked: linked_files::Given,
 }
 
 /// The mode, model and effort of a session (see [`apply_preferences`]).
@@ -318,8 +311,6 @@ struct Resume {
     backend: AgentBackend,
     /// What the session had chosen, chosen again once it is loaded.
     preferences: Preferences,
-    /// The linked files the conversation was given.
-    linked: linked_files::Given,
 }
 
 impl Session {
@@ -358,8 +349,6 @@ struct HeldPrompt {
     blocks: Vec<PromptBlock>,
     /// The review feedback among `blocks` (kept for the next prompt if this one is not sent).
     feedback: Option<String>,
-    /// The linked files among `blocks` (the conversation has them once the prompt is sent).
-    linked: Vec<(PathBuf, linked_files::Stamp)>,
 }
 
 /// A turn whose prompt is ready to send.
@@ -367,7 +356,6 @@ struct Prepared {
     turn: u32,
     blocks: Vec<PromptBlock>,
     feedback: Option<String>,
-    linked: Vec<(PathBuf, linked_files::Stamp)>,
 }
 
 /// The bridge's private state, owned by the [`AgentController`].
@@ -978,7 +966,6 @@ fn attach_session(
         loadable: None,
         conversation: false,
         preferences: Preferences::default(),
-        linked: linked_files::Given::default(),
     }));
     if !bridge.root_hooked.replace(true)
         && let Some(state) = controller.window()
@@ -1040,7 +1027,6 @@ pub fn attach_channel(controller: &Rc<AgentController>, cmd: async_channel::Send
         loadable: None,
         conversation: false,
         preferences: Preferences::default(),
-        linked: linked_files::Given::default(),
     }));
     forget_held(controller);
     controller.set_state(AgentState::Starting);
@@ -1400,9 +1386,6 @@ pub fn handle_event(controller: &Rc<AgentController>, event: AgentEvent) {
                 s.loadable = loadable.then(|| session.clone());
                 s.conversation |= resumed.is_some();
                 s.preferences = Preferences::of(mode, options);
-                if let Some(resumed) = &resumed {
-                    s.linked.clone_from(&resumed.linked);
-                }
                 // The idle stop's notice promised to resume it: say why this start did not.
                 // (An agent that could not load it says so itself.)
                 notice = forgotten.filter(|r| r.cwd != s.cwd).map(|r| {
@@ -1665,20 +1648,14 @@ async fn run_prompt(
         hold(controller, prepared);
         return Ok(());
     }
-    send_prompt(
-        controller,
-        prepared.blocks,
-        prepared.feedback,
-        prepared.linked,
-    )
+    send_prompt(controller, prepared.blocks, prepared.feedback)
 }
 
-/// Sends the running turn's prompt; the conversation then has the `linked` files.
+/// Sends the running turn's prompt.
 fn send_prompt(
     controller: &AgentController,
     blocks: Vec<PromptBlock>,
     feedback: Option<String>,
-    linked: Vec<(PathBuf, linked_files::Stamp)>,
 ) -> Result<(), String> {
     let bridge = controller.bridge();
     if !bridge.send(AgentCmd::Prompt(blocks)) {
@@ -1688,7 +1665,6 @@ fn send_prompt(
     }
     if let Some(session) = bridge.session.borrow_mut().as_mut() {
         session.conversation = true;
-        session.linked.extend(linked);
     }
     if let Some(mut open) = bridge.turn.get() {
         open.sent = true;
@@ -1710,7 +1686,6 @@ fn hold(controller: &Rc<AgentController>, prepared: Prepared) {
         turn,
         blocks: prepared.blocks,
         feedback: prepared.feedback,
-        linked: prepared.linked,
     }));
     Bridge::clear_timer(&bridge.held_timer);
     let weak = Rc::downgrade(controller);
@@ -1752,7 +1727,7 @@ fn release_held(controller: &AgentController) {
         return;
     }
     tracing::info!("turn {}: the agent is ready; sending the prompt", held.turn);
-    if let Err(message) = send_prompt(controller, held.blocks, held.feedback, held.linked) {
+    if let Err(message) = send_prompt(controller, held.blocks, held.feedback) {
         controller.emit_event(&AgentEvent::Error(message));
     }
 }
@@ -1818,36 +1793,6 @@ async fn prepare_turn(
     if !still_open() {
         return Err(STOPPED.to_owned());
     }
-    // The linked files the conversation has not been given yet, or that changed (read after
-    // the save, as the agent would read them). A slash command goes as it is, so the agent sees
-    // it first; after `/clear` or `/compact` the conversation may no longer have them.
-    let command = match blocks.first() {
-        Some(PromptBlock::Text(text)) => text.trim_start().strip_prefix('/'),
-        _ => None,
-    };
-    let linked = match command {
-        Some(command) => {
-            let name = command.split_whitespace().next().unwrap_or_default();
-            if matches!(name, "clear" | "compact")
-                && let Some(session) = bridge.session.borrow_mut().as_mut()
-            {
-                session.linked.clear();
-            }
-            linked_files::ForPrompt::default()
-        }
-        None => {
-            let (given, embed_only) = bridge
-                .session
-                .borrow()
-                .as_ref()
-                .map(|s| (s.linked.clone(), s.backend == AgentBackend::Api))
-                .unwrap_or_default();
-            linked_files::for_prompt(controller.linked_files().paths(), given, embed_only).await
-        }
-    };
-    if !still_open() {
-        return Err(STOPPED.to_owned());
-    }
     // 2. The baselines of files that other programs may change during the turn.
     let cap = usize::try_from(state.config.agent.snapshot_cap_mib)
         .unwrap_or(usize::MAX / 2)
@@ -1874,16 +1819,12 @@ async fn prepare_turn(
         origin,
         blocks: blocks.clone(),
     });
-    if let Some(notice) = linked.notice {
-        controller.emit_event(&AgentEvent::Notice(notice));
-    }
-    // 5. Review feedback first, then the linked files, the user's blocks, and where the user is.
-    let mut out = Vec::with_capacity(blocks.len() + linked.blocks.len() + 2);
+    // 5. Review feedback first, then the user's blocks, then where the user is.
+    let mut out = Vec::with_capacity(blocks.len() + 2);
     let feedback = tools::take_feedback(&state);
     if let Some(feedback) = &feedback {
         out.push(PromptBlock::Text(feedback.clone()));
     }
-    out.extend(linked.blocks);
     out.extend(blocks);
     if let Some(resource) = tools::editor_resource(&state) {
         out.push(resource);
@@ -1892,7 +1833,6 @@ async fn prepare_turn(
         turn,
         blocks: out,
         feedback,
-        linked: linked.given,
     })
 }
 
@@ -2179,10 +2119,9 @@ fn idle_stop(controller: &AgentController, after: Duration) {
             s.cwd.clone(),
             s.backend,
             s.preferences.clone(),
-            s.linked.clone(),
         )
     });
-    let Some((continuable, conversation, cwd, backend, preferences, linked)) = session else {
+    let Some((continuable, conversation, cwd, backend, preferences)) = session else {
         return;
     };
     let resume = match continuable {
@@ -2191,7 +2130,6 @@ fn idle_stop(controller: &AgentController, after: Duration) {
             cwd,
             backend,
             preferences,
-            linked,
         }),
         None if conversation => return,
         _ => None,

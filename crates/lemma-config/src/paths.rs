@@ -125,12 +125,6 @@ impl Paths {
         self.state_dir.join("review")
     }
 
-    /// `state_dir/linked-files/` (one `<fnv(root)>.json` per project: the files and folders
-    /// linked to the agent).
-    pub fn linked_files_dir(&self) -> PathBuf {
-        self.state_dir.join("linked-files")
-    }
-
     /// `state_dir/sessions/` (M3: one `<fnv(root)>.json` per project: open tabs, positions,
     /// panel layout).
     pub fn sessions_dir(&self) -> PathBuf {

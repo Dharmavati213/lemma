@@ -1113,16 +1113,6 @@ they conflict with the sections above, this section wins.
   - API backend: `Image` → an `image` block, a PDF `Document` with bytes → a `document`
     block, any other `Document` → a note naming the file.
   - The fake agent's `_options.no_images` advertises `image: false`.
-- **Linked files** (`agent/linked_files.rs`): files and folders linked to the agent per project
-  (the pin button beside the paperclip), kept in `Paths::linked_files_dir()/<fnv1a64(root) as 16
-  hex>.json` (not for windows without `paths` or scripted runs). A folder stands for its PDFs and
-  `@`-offered text files, subfolders included, hidden entries left out, at most 50 per folder.
-  Every prompt gets a `<linked_files>` text after the review feedback; a file the conversation
-  has not been given, or whose size or modification time changed, is attached after it through
-  `attach::from_file` (at most 1 MiB of text per prompt; more goes as links, or is left out for
-  the API backend). The session keeps what its conversation was given, also across an idle stop
-  that resumes it, and records it only once the prompt is sent; a transcript `Notice` names the
-  files sent.
 - **M5 (2026-10-12):**
   - The M4 row is cut. Its important parts (completion for packed packages, environment tools, the align helper and
     latexindent as hunks) are in M5.
