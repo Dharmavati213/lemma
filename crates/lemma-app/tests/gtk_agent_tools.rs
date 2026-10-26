@@ -70,6 +70,7 @@ fn main() -> ExitCode {
             turn_end_build_skipped,
         ),
         ("commands_and_events_through_a_channel", commands_and_events),
+        ("linked_files_go_once_per_conversation", linked_files),
         ("start_failures_and_exits", start_failures),
         ("cancel_watchdog_ends_the_turn", cancel_watchdog),
         ("injected_chunks_main_thread_cost", injected_chunk_cost),
@@ -1216,6 +1217,90 @@ fn turn_end_build_skipped() {
     bridge::note_file_changed(&agent);
     f.end_turn(StopReason::EndTurn);
     assert!(!build.is_busy());
+}
+
+/// Linked files go with the first prompt of the conversation, and again only when they change.
+fn linked_files() {
+    let f = fixture(
+        "linked",
+        &[
+            ("main.tex", "x\n"),
+            ("notes/style.md", "British spelling.\n"),
+            ("notes/old/ref.tex", "\\cite{a}\n"),
+            ("notes/fig.png", "not a document"),
+        ],
+    );
+    let agent = f.agent();
+    let events = f.events();
+    let (tx, rx) = async_channel::unbounded();
+    bridge::attach_channel(&agent, tx);
+    let started = agent.ensure_started();
+    bridge::handle_event(&agent, ready_event("default"));
+    assert_eq!(block_on_timeout(TIMEOUT, started), Ok(()));
+    drain(&rx);
+    let linked = agent.linked_files();
+    assert_eq!(linked.add([f.path("notes"), f.path("main.tex")]), 2);
+    assert_eq!(linked.add([f.path("notes")]), 0, "linked once");
+    let prompt = |text: &str| -> (String, Vec<String>) {
+        agent.prompt(vec![PromptBlock::Text(text.into())], PromptOrigin::Panel);
+        common::pump_until(TIMEOUT, || !rx.is_empty());
+        let sent = drain(&rx);
+        bridge::handle_event(&agent, AgentEvent::TurnEnded(StopReason::EndTurn));
+        let [AgentCmd::Prompt(blocks)] = sent.as_slice() else {
+            panic!("one prompt: {sent:?}");
+        };
+        assert_eq!(blocks.last(), Some(&PromptBlock::Text(text.into())));
+        let list = match &blocks[0] {
+            PromptBlock::Text(t) if t.starts_with("<linked_files>") => t.clone(),
+            _ => String::new(),
+        };
+        let files = blocks
+            .iter()
+            .filter_map(|b| match b {
+                PromptBlock::Resource { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        (list, files)
+    };
+    let (list, files) = prompt("one");
+    assert_eq!(files, ["\\cite{a}\n", "British spelling.\n", "x\n"]);
+    assert_eq!(list.matches(": attached below").count(), 3, "{list}");
+    let notice = AgentEvent::Notice("Sent the linked files: ref.tex, style.md, main.tex.".into());
+    assert!(events.borrow().contains(&notice), "{:?}", events.borrow());
+    let (list, files) = prompt("two");
+    assert!(files.is_empty());
+    assert_eq!(list.matches("unchanged since").count(), 3, "{list}");
+    std::fs::write(f.path("notes/style.md"), "American spelling, please.\n").unwrap();
+    let (list, files) = prompt("three");
+    assert_eq!(files, ["American spelling, please.\n"], "{list}");
+    assert!(linked.remove(&f.path("notes")));
+    let (list, _) = prompt("four");
+    assert!(list.contains("main.tex: given to you earlier"), "{list}");
+    assert!(!list.contains("style.md"), "{list}");
+    // A slash command goes as it is, and after /compact the files go again.
+    assert_eq!(prompt("/compact"), (String::new(), Vec::new()));
+    assert_eq!(prompt("again").1, ["x\n"]);
+    assert!(linked.remove(&f.path("main.tex")));
+    assert_eq!(
+        prompt("five"),
+        (String::new(), Vec::new()),
+        "nothing linked"
+    );
+    // A new conversation is given the files again.
+    linked.add([f.path("main.tex")]);
+    let (tx, rx2) = async_channel::unbounded();
+    bridge::attach_channel(&agent, tx);
+    bridge::handle_event(&agent, ready_event("default"));
+    drain(&rx2);
+    agent.prompt(vec![PromptBlock::Text("six".into())], PromptOrigin::Panel);
+    common::pump_until(TIMEOUT, || !rx2.is_empty());
+    let sent = drain(&rx2);
+    assert!(
+        matches!(sent.as_slice(), [AgentCmd::Prompt(b)]
+            if b.iter().any(|b| matches!(b, PromptBlock::Resource { text, .. } if text == "x\n"))),
+        "{sent:?}"
+    );
 }
 
 fn commands_and_events() {

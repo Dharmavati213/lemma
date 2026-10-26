@@ -329,7 +329,7 @@ Rules:
   - **Dark mode:** invert(1) followed by hue-rotate(180°), mapped into a soft paper..ink grey range (`lemma_pdf::dark`). The PDF thread applies it to the bitmaps of dark requests (`PageKey::dark`), so the view draws them as plain textures. A `Snapshot::push_color_matrix` over the view would be free on the GPU renderers, but GTK's cairo renderer (the default) runs it per pixel on the CPU on every frame: 12 ms for a 384×956 pane and 30 ms for 940×1000 [V], so scrolling missed frames. After a toggle, the textures of the other mode stand in through that colour matrix (or its inverse) until the pages are re-rendered, so the switch shows at once. It follows `adw::StyleManager`; Ctrl+Shift+I toggles it per document.
 - **SyncTeX:**
   - **Forward** (Ctrl+Alt+J, optional follow-cursor debounced 200 ms) draws `(h, v−H, W, H)` in bp scaled by zoom × scale, scrolled to one third of the view and faded over 600 ms.
-  - **Inverse** (Ctrl+click on the PDF) calls `to_page`, then `Scanner::inverse`, then opens the file at that line. Sync is per line only, because pdfTeX records column −1. The toolbar's Show Page in Source (`win.sync-inverse`) does the same from the middle of what the view shows of the current page; its Show Cursor in PDF button is the forward search.
+  - **Inverse** (Ctrl+click on the PDF) calls `to_page`, then `Scanner::inverse`, then opens the file at that line. Sync is per line only, because pdfTeX records column −1. Two labelled buttons over the left edge of the view, next to the editor, jump both ways: Source (`win.sync-inverse`) does the same from the middle of what the view shows of the current page, and PDF is the forward search, which the editor's context menu offers too (Show in PDF). They are an overlay rather than toolbar buttons because the toolbar has no room for labels in a pane of the default width, and icons alone there went unnoticed.
   - The scanner opens on the first sync and is reopened when the `.synctex.gz` modification time changes, on a helper thread of the PDF thread, so pages render meanwhile (§11, PDF view, 2026-10-25).
 - **Link hover (M3)** works like sioyek: `link_mapping` gives the destination, and a popover renders that region of the target page.
 
@@ -1113,6 +1113,16 @@ they conflict with the sections above, this section wins.
   - API backend: `Image` → an `image` block, a PDF `Document` with bytes → a `document`
     block, any other `Document` → a note naming the file.
   - The fake agent's `_options.no_images` advertises `image: false`.
+- **Linked files** (`agent/linked_files.rs`): files and folders linked to the agent per project
+  (the pin button beside the paperclip), kept in `Paths::linked_files_dir()/<fnv1a64(root) as 16
+  hex>.json` (not for windows without `paths` or scripted runs). A folder stands for its PDFs and
+  `@`-offered text files, subfolders included, hidden entries left out, at most 50 per folder.
+  Every prompt gets a `<linked_files>` text after the review feedback; a file the conversation
+  has not been given, or whose size or modification time changed, is attached after it through
+  `attach::from_file` (at most 1 MiB of text per prompt; more goes as links, or is left out for
+  the API backend). The session keeps what its conversation was given, also across an idle stop
+  that resumes it, and records it only once the prompt is sent; a transcript `Notice` names the
+  files sent.
 - **M5 (2026-10-12):**
   - The M4 row is cut. Its important parts (completion for packed packages, environment tools, the align helper and
     latexindent as hunks) are in M5.

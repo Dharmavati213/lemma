@@ -70,10 +70,7 @@ fn main() -> ExitCode {
             forward_search,
         ),
         ("ctrl_click_opens_the_source_line", inverse_search),
-        (
-            "the_toolbar_buttons_sync_both_ways",
-            toolbar_syncs_both_ways,
-        ),
+        ("the_sync_buttons_sync_both_ways", sync_buttons),
         (
             "follow_cursor_searches_after_the_cursor_rests",
             follow_cursor,
@@ -1407,10 +1404,11 @@ fn inverse_search() {
     state.window.destroy();
 }
 
-/// The toolbar's SyncTeX buttons: Show Page in Source opens the source line of the middle of the
-/// page shown, and Show Cursor in PDF brings that line back to the same page.
-fn toolbar_syncs_both_ways() {
-    let dir = copy_proj("toolbar-sync", true);
+/// The SyncTeX buttons over the view: Source opens the source line of the middle of the page
+/// shown, PDF brings that line back to the same page, and the editor's context menu has the
+/// latter.
+fn sync_buttons() {
+    let dir = copy_proj("sync-buttons", true);
     let state = window(&dir, config());
     let editor = open(&state, &dir.join("main.tex"));
     wait_for_pages(&state);
@@ -1418,12 +1416,12 @@ fn toolbar_syncs_both_ways() {
     let controller = state.pdf.get().unwrap();
     let button = |action: &str| {
         controller
-            .toolbar()
+            .sync_buttons()
             .observe_children()
             .into_iter()
             .filter_map(|w| w.ok()?.downcast::<gtk::Button>().ok())
             .find(|b| b.action_name().as_deref() == Some(action))
-            .unwrap_or_else(|| panic!("a toolbar button for {action}"))
+            .unwrap_or_else(|| panic!("a sync button for {action}"))
     };
     let cursor = |state: &WindowState| {
         state.active_editor().map(|e| {
@@ -1446,6 +1444,23 @@ fn toolbar_syncs_both_ways() {
     wait_for_pages(&state);
     button("win.sync-forward").emit_clicked();
     common::pump_until(TIMEOUT, || view.highlight().is_some_and(|(p, _)| p == page));
+    let menu = editor.extra_menu();
+    let actions: Vec<String> = (0..menu.n_items())
+        .filter_map(|i| menu.item_link(i, gio::MENU_LINK_SECTION))
+        .flat_map(|section| {
+            (0..section.n_items())
+                .filter_map(|j| {
+                    section
+                        .item_attribute_value(j, gio::MENU_ATTRIBUTE_ACTION, None)?
+                        .get::<String>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        actions.iter().any(|a| a == "win.sync-forward"),
+        "Show in PDF in the editor's context menu: {actions:?}"
+    );
     // In the PDF's own window the buttons have the main window's actions.
     activate(&state, "win.pdf-detach");
     let window = lemma_app::pdf::detach::window(&state).expect("the PDF window");

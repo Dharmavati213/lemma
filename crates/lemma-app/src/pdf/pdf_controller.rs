@@ -1,11 +1,14 @@
 //! The PDF controller (ARCHITECTURE §6): owns the PDF thread handle and the document
 //! generations, reloads after builds, and runs forward/inverse SyncTeX.
 //!
-//! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (SyncTeX both ways,
-//! page n/N, zoom out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's
-//! file) above the [`PdfView`]. Its SyncTeX buttons are `win.sync-inverse` (the source line of
-//! the middle of what the view shows of the current page) and `win.sync-forward` (Ctrl+Alt+J:
-//! the cursor's line in the PDF); Ctrl+click in the PDF is inverse search at the point clicked. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
+//! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (page n/N, zoom
+//! out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's file) above the
+//! [`PdfView`]. Over the left edge of the view, next to the editor, two labelled buttons jump
+//! between the source and the PDF ([`PdfController::sync_buttons`]): "Source" is
+//! `win.sync-inverse` (the source line of the middle of what the view shows of the current page)
+//! and "PDF" is `win.sync-forward` (Ctrl+Alt+J: the cursor's line in the PDF), which the editor's
+//! context menu offers too as Show in PDF; Ctrl+click in the PDF is inverse search at the point
+//! clicked. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
 //! new generation; the view keeps showing the previous generation until the new one has opened,
 //! and a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the
 //! scroll position; another PDF starts at the top. A rebuild of the file asked for last is a
@@ -69,6 +72,9 @@ pdfview.lemma-pdf-view { background-color: color-mix(in srgb, var(--window-bg-co
 .lemma-pdf-toolbar entry { min-height: 26px; padding: 0 6px; }
 .lemma-pdf-toolbar button { min-height: 26px; min-width: 26px; padding: 2px; }
 .lemma-pdf-toolbar .zoom-label { min-width: 3.4em; }
+.lemma-pdf-sync { margin-left: 8px; opacity: 0.88; }
+.lemma-pdf-sync:hover { opacity: 1; }
+.lemma-pdf-sync button { min-height: 26px; padding: 2px 10px; font-size: 0.9em; }
 .lemma-pdf-content searchbar > revealer > box { padding: 4px 6px; }
 .lemma-pdf-content searchbar entry { min-height: 26px; }
 .lemma-pdf-content searchbar button { min-height: 26px; min-width: 26px; padding: 2px; }
@@ -122,6 +128,8 @@ struct Inner {
     stack: gtk::Stack,
     placeholder: adw::StatusPage,
     toolbar: Toolbar,
+    /// [`build_sync_buttons`], over the view.
+    sync_buttons: gtk::Box,
     /// Given to the PDF thread when it starts; `None` once the controller shuts down.
     events: RefCell<Option<async_channel::Sender<PdfEvent>>>,
     worker: RefCell<Option<PdfHandle>>,
@@ -246,6 +254,12 @@ impl PdfController {
     /// The toolbar above the view.
     pub fn toolbar(&self) -> &gtk::Box {
         &self.inner.toolbar.bar
+    }
+
+    /// The SyncTeX buttons over the left edge of the view: Source (`win.sync-inverse`), then
+    /// PDF (`win.sync-forward`).
+    pub fn sync_buttons(&self) -> &gtk::Box {
+        &self.inner.sync_buttons
     }
 
     /// The toolbar's search button (the search bar binds it).
@@ -902,19 +916,6 @@ fn build_toolbar() -> Toolbar {
     let spacer = gtk::Box::builder().hexpand(true).build();
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     bar.add_css_class("lemma-pdf-toolbar");
-    // SyncTeX both ways (arrows would read as the previous and next page beside the page
-    // number).
-    bar.append(&button(
-        "text-editor-symbolic",
-        "Show Page in Source",
-        "win.sync-inverse",
-    ));
-    bar.append(&button(
-        "find-location-symbolic",
-        "Show Cursor in PDF (Ctrl+Alt+J)",
-        "win.sync-forward",
-    ));
-    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(&page);
     bar.append(&pages);
     bar.append(&spacer);
@@ -947,6 +948,44 @@ fn build_toolbar() -> Toolbar {
     }
 }
 
+/// The SyncTeX buttons over the left edge of the view, next to the editor, so that they are found
+/// without searching the toolbar (which has no room for their labels in a narrow pane). Their
+/// arrows point at the side they jump to: the source on the left, and into the PDF.
+fn build_sync_buttons() -> gtk::Box {
+    let button = |icon: &str, label: &str, tooltip: &str, action: &str| {
+        gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(icon)
+                    .label(label)
+                    .build(),
+            )
+            .tooltip_text(tooltip)
+            .action_name(action)
+            .css_classes(["osd"])
+            .build()
+    };
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .css_classes(["linked", "lemma-pdf-sync"])
+        .build();
+    buttons.append(&button(
+        "go-previous-symbolic",
+        "Source",
+        "Show This Page in the Source",
+        "win.sync-inverse",
+    ));
+    buttons.append(&button(
+        "go-next-symbolic",
+        "PDF",
+        "Show the Cursor in the PDF (Ctrl+Alt+J)",
+        "win.sync-forward",
+    ));
+    buttons
+}
+
 /// Called once per window after the layout is built; puts the PDF view into `state.pdf_pane`.
 pub fn install(state: &Rc<WindowState>) -> PdfController {
     install_css_once("pdf", CSS);
@@ -964,7 +1003,10 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
     // M3 (WP3.0): the strip of thumbnails and bookmarks at the left of the view, and its
     // toggle at the start of the toolbar (see `WindowState::pdf_sidebar`).
     toolbar.bar.prepend(&state.pdf_sidebar.toggle);
-    state.pdf_sidebar.split.set_content(Some(&scroller));
+    let sync_buttons = build_sync_buttons();
+    let view_overlay = gtk::Overlay::builder().child(&scroller).build();
+    view_overlay.add_overlay(&sync_buttons);
+    state.pdf_sidebar.split.set_content(Some(&view_overlay));
     content.append(&state.pdf_sidebar.split);
     let placeholder = adw::StatusPage::builder()
         .icon_name("view-paged-symbolic")
@@ -986,6 +1028,7 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         stack,
         placeholder,
         toolbar,
+        sync_buttons,
         events: RefCell::new(Some(events)),
         worker: RefCell::new(None),
         last_generation: Cell::new(0),

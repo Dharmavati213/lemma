@@ -8,11 +8,18 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Added
 
-- Two buttons at the start of the PDF toolbar jump between the source and the PDF. Show Page in
-  Source opens the source line at the middle of the page on screen (the page number the toolbar
-  shows), and Show Cursor in PDF scrolls the PDF to the cursor's line and flashes it, as
-  Ctrl+Alt+J does. Show PDF Page in Source is in the command palette too, and the buttons work
-  in the PDF's own window. Ctrl+click in the PDF still opens the line of the point clicked.
+- Two labelled buttons on the left edge of the PDF, next to the editor, jump between the source
+  and the PDF. **Source** opens the source line at the middle of the page on screen (the page
+  number the toolbar shows), and **PDF** scrolls the PDF to the cursor's line and flashes it, as
+  Ctrl+Alt+J does. Show in PDF is in the editor's right-click menu as well, Show PDF Page in
+  Source is in the command palette, and the buttons work in the PDF's own window. Ctrl+click in
+  the PDF still opens the line of the point clicked.
+- Files and folders can be linked to the agent for a project: the pin button beside the
+  paperclip lists them, links more and unlinks them, and shows how many there are. The agent gets
+  them with the first message of every conversation and again whenever one changes (a notice in
+  the conversation says which were sent), so notes, a style guide or the papers you cite are
+  always at hand. A folder stands for the PDFs and text files in it and its subfolders, up to 50.
+  The list is kept per project and survives restarts.
 
 ### Changed
 

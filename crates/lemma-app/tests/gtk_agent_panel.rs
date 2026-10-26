@@ -90,6 +90,7 @@ fn main() -> ExitCode {
         ("selection_chip", selection_chip),
         ("attachments_from_files_and_paste", attachments),
         ("attachments_too_large_to_include", large_attachments),
+        ("linked_files_button_lists_and_unlinks", linked_files_button),
         ("tool_cards_link_to_hunks", tool_cards),
         (
             "cli_tools_have_names_and_tool_search_is_quiet",
@@ -2479,7 +2480,7 @@ fn inline_closed_tab() {
     inline::cancel(&f.state);
     inline::open(&f.state, &editor);
     let popover = inline::popover(&f.state).unwrap();
-    common::pump_until(TIMEOUT, || popover.is_mapped());
+    common::pump_until(TIMEOUT, || popover.is_visible());
     inline::cancel(&f.state);
     inline::open(&f.state, &editor);
     let popover = inline::popover(&f.state).unwrap();
@@ -2502,7 +2503,7 @@ fn inline_closed_tab() {
     let editor = f.open("main.tex");
     inline::open(&f.state, &editor);
     let popover = inline::popover(&f.state).unwrap();
-    common::pump_until(TIMEOUT, || popover.is_mapped());
+    common::pump_until(TIMEOUT, || popover.is_visible());
     f.state.close_editor(&editor, true);
     drop(editor);
     common::pump_until(TIMEOUT, || f.state.editors().is_empty());
@@ -3186,6 +3187,64 @@ fn update_hint() {
     install::detect(&g.state.config.agent, &paths).unwrap();
     g.agent().set_state(AgentState::Idle);
     assert_eq!(g.panel().update_hint(), None);
+}
+
+/// The pin button counts the linked files; its popover lists them and unlinks them.
+fn linked_files_button() {
+    let f = fixture("linked-button", &[("main.tex", MAIN)], Hook::Swallow);
+    f.open("main.tex");
+    f.show_panel();
+    let button = f.panel().linked_button();
+    let descendants = |w: &gtk::Widget| -> Vec<gtk::Widget> {
+        let mut out = Vec::new();
+        let mut stack = vec![w.clone()];
+        while let Some(w) = stack.pop() {
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+            out.push(w);
+        }
+        out
+    };
+    let labels = |w: &gtk::Widget| -> Vec<gtk::Label> {
+        descendants(w)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .collect()
+    };
+    // The button's own content (its popover is a child of the button too).
+    let content = button.child().unwrap();
+    let count = || {
+        labels(&content)
+            .into_iter()
+            .find(|l| l.is_visible())
+            .map(|l| l.label().to_string())
+    };
+    assert_eq!(count(), None, "no count while nothing is linked");
+    let linked = f.agent().linked_files().clone();
+    std::fs::create_dir_all(f.dir.join("refs")).unwrap();
+    linked.add([f.dir.join("refs"), f.dir.join("main.tex")]);
+    assert_eq!(count().as_deref(), Some("2"));
+    // Not shown: under Broadway a popover in this window makes GDK log a critical.
+    let body = button.popover().unwrap().child().unwrap();
+    let shown: Vec<String> = labels(&body)
+        .iter()
+        .map(|l| l.label().to_string())
+        .collect();
+    assert!(
+        shown.contains(&"refs".to_owned()) && shown.contains(&"main.tex".to_owned()),
+        "{shown:?}"
+    );
+    let unlink = descendants(&body)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .find(|b| b.tooltip_text().as_deref() == Some("Unlink"))
+        .expect("an unlink button");
+    unlink.emit_clicked();
+    assert_eq!(linked.paths().len(), 1);
+    assert_eq!(count().as_deref(), Some("1"));
 }
 
 // ----- snapshot -----

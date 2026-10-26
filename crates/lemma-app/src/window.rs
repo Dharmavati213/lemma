@@ -537,6 +537,10 @@ impl WindowState {
         let editor = Editor::new(doc, &self.config.editor)?;
         let dark = adw::StyleManager::default().is_dark();
         editor.set_style_scheme(editor::style_scheme(&self.config.editor, dark).as_ref());
+        // Forward SyncTeX here too: the PDF's Source and PDF buttons are a pane away.
+        let pdf = gio::Menu::new();
+        pdf.append(Some("Show in _PDF"), Some("win.sync-forward"));
+        editor.extra_menu().append_section(None, &pdf);
         editor.extra_menu().append_section(None, &self.editor_menu);
         // Registered before the page exists: appending the first page selects it right away.
         self.editors.borrow_mut().push(editor.clone());

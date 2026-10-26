@@ -22,16 +22,21 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   too. The ACP agents take PDFs and text files of any size: large ones are sent as a link
   that the agent opens itself. With the API backend everything travels inside the request, so
   PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
+- **Link files to the agent.** The pin button beside the paperclip keeps files and folders
+  linked to the agent in a project, such as notes, a style guide or the papers you cite. The agent
+  gets them with the first message of every conversation and again whenever they change, so it
+  always has them; a folder stands for the PDFs and text files in it.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
-  dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: two buttons at the
-  start of the PDF toolbar show the page on screen in the source and the cursor's line in the
-  PDF (Ctrl+Alt+J), and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width or the whole page (for slides) and
-  zooms to 100% (Ctrl+0 and Ctrl+1 in the PDF; Left and Right, or h and l, scroll sideways). It
-  also opens the PDF in another app, to print it or present it, and shows it in your file
-  manager, as the build keeps it in a hidden `.build` folder. When a damaged `.aux` or `.bbl`
-  keeps a build failing, **Clean Build Files and Rebuild** in the command palette runs
-  `latexmk -c` (the PDF stays) and builds again.
+  dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: the **Source** and
+  **PDF** buttons on the left edge of the PDF, next to the editor, show the page on screen in the
+  source and the cursor's line in the PDF (Ctrl+Alt+J, or Show in PDF in the editor's right-click
+  menu), and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width
+  or the whole page (for slides) and zooms to 100% (Ctrl+0 and Ctrl+1 in the PDF; Left and
+  Right, or h and l, scroll sideways). It also opens the PDF in another app, to print it or
+  present it, and shows it in your file manager, as the build keeps it in a hidden `.build`
+  folder. When a damaged `.aux` or `.bbl` keeps a build failing, **Clean Build Files and
+  Rebuild** in the command palette runs `latexmk -c` (the PDF stays) and builds again.
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
   explanations and quick fixes for common errors, plus optional `chktex` lint. F4 and Shift+F4
   (`]e` and `[e` in Vim) go to the next and previous build problem, across files.

@@ -19,6 +19,7 @@
 //! | `inline` | WP2.5 | Ctrl+K inline edit |
 //! | `quick` | WP2.5 | quick actions (prompt templates) and "Ask agent to fix" |
 //! | `attach` | — | images and files attached to a prompt (button, drop, paste) |
+//! | `linked_files` | — | files and folders linked to the agent for every prompt of a project |
 //!
 //! The shell calls, once per window and in this order, after the M1 install hooks:
 //! [`review_persist::install`](crate::review_persist::install), [`AgentController::new`] (stored
@@ -34,6 +35,7 @@ pub mod bridge;
 pub mod history;
 pub mod inline;
 pub mod install;
+pub mod linked_files;
 pub mod markdown;
 pub mod panel;
 pub mod quick;
@@ -108,6 +110,8 @@ pub struct AgentController {
     states: Hooks<dyn Fn(&AgentState)>,
     prompts: Hooks<dyn Fn(&SentPrompt)>,
     bridge: bridge::Bridge,
+    /// The files and folders linked to the agent in the window's project.
+    linked_files: Rc<linked_files::LinkedFiles>,
     /// The application's `window-removed` handler that stops the agent with its window.
     removed_handler: RefCell<Option<(glib::WeakRef<adw::Application>, glib::SignalHandlerId)>>,
 }
@@ -117,6 +121,20 @@ impl AgentController {
     /// when the window leaves the application (closed or destroyed) and when it is dropped. The
     /// shell stores it in `state.agent.controller`.
     pub fn new(state: &Rc<WindowState>) -> Rc<Self> {
+        // Kept like the review state: not for windows without `paths` or runs that quit by
+        // themselves.
+        let dir = state
+            .paths
+            .as_ref()
+            .filter(|_| !state.scripted)
+            .map(lemma_config::Paths::linked_files_dir);
+        let linked_files = linked_files::LinkedFiles::new(dir, state.workspace.root().path());
+        let weak = Rc::downgrade(&linked_files);
+        state.connect_root_changed(move |state| {
+            if let Some(linked) = weak.upgrade() {
+                linked.set_root(state.workspace.root().path());
+            }
+        });
         let controller = Rc::new(Self {
             window: Rc::downgrade(state),
             state: RefCell::new(AgentState::Stopped),
@@ -126,6 +144,7 @@ impl AgentController {
             states: Hooks::default(),
             prompts: Hooks::default(),
             bridge: bridge::Bridge::default(),
+            linked_files,
             removed_handler: RefCell::new(None),
         });
         let (weak, window) = (Rc::downgrade(&controller), state.window.downgrade());
@@ -151,6 +170,11 @@ impl AgentController {
     /// The bridge's private state (WP2.4).
     pub fn bridge(&self) -> &bridge::Bridge {
         &self.bridge
+    }
+
+    /// The files and folders linked to the agent in the window's project.
+    pub fn linked_files(&self) -> &Rc<linked_files::LinkedFiles> {
+        &self.linked_files
     }
 
     // ----- operations (delegated to the bridge) -----
