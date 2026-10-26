@@ -23,7 +23,7 @@ use broadway_input::{Browser, CONTROL, SHIFT};
 use gtk::gdk;
 use lemma_app::editor::completion::{self, Trigger};
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, VimMode, vim};
+use lemma_app::editor::{Editor, VimMode, spell, vim};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_complete::{Insert, Item, ItemKind};
@@ -75,6 +75,10 @@ fn main() -> ExitCode {
         ("accepting_each_kind_of_proposal", accepting),
         ("accepted_proposals_rank_higher", recency),
         ("tab_precedence_through_the_key_layer", tab_precedence),
+        (
+            "word_popups_select_only_unfinished_words",
+            word_popups_select_unfinished_words,
+        ),
         ("detach_disconnects_everything", detach),
         (
             "end_offers_the_environment_that_is_open",
@@ -148,6 +152,11 @@ fn fixture(name: &str, vim: bool) -> Fixture {
 
 /// A window on the project in `dir`, showing `file`.
 fn fixture_at(dir: &std::path::Path, file: &str, vim: bool) -> Fixture {
+    fixture_with(dir, file, |config| config.editor.vim = vim)
+}
+
+/// [`fixture_at`] with `edit` applied to the test configuration.
+fn fixture_with(dir: &std::path::Path, file: &str, edit: impl FnOnce(&mut Config)) -> Fixture {
     if let Some(settings) = gtk::Settings::default() {
         settings.set_gtk_cursor_blink(false);
         settings.set_gtk_enable_animations(false);
@@ -156,13 +165,13 @@ fn fixture_at(dir: &std::path::Path, file: &str, vim: bool) -> Fixture {
     let mut config = Config::default();
     config.build.on_save = false;
     config.build.on_agent_turn_end = false;
-    config.editor.vim = vim;
     config.spell.word_lists = vec![dir.join("words.txt")];
     // Spell checking (WP2.9b) is not under test here.
     config.spell.enabled = false;
     config.agent.node = "/nonexistent/lemma-test/node".into();
     config.agent.claude = "/nonexistent/lemma-test/claude".into();
     config.agent.adapter_dir = dir.join(".no-adapter");
+    edit(&mut config);
     let app = common::application();
     let ws = Workspace::new(ProjectRoot::new(&dir).unwrap());
     let state = WindowState::new(&app, Rc::new(config), None, ws, true);
@@ -1461,7 +1470,7 @@ fn real_popup(f: &Fixture, real: &mut Real, vim: bool) {
     if vim {
         assert_eq!(f.editor.vim_status().unwrap().mode, VimMode::Normal);
     }
-    // A word popup selects nothing: Enter makes a new line.
+    // Without spell checking a word popup selects nothing: Enter makes a new line.
     real.start(f, "The Lor", "");
     real.text(f, "e");
     f.wait("the word popup", || {
@@ -1747,6 +1756,33 @@ fn end_offers_the_open_environment() {
     assert!(completion::show(&f.state, &f.editor));
     assert!(!completion::popup_selects_first(&f.state, &f.editor));
     completion::hide(&f.state, &f.editor);
+}
+
+/// With spell checking on, a word popup selects its first row while the word is unfinished
+/// (Enter takes `Lorem` after `Lor`), but not after a word the dictionary has (`the`, with
+/// `theorem` proposed, or `Lore`): Enter then breaks the line.
+fn word_popups_select_unfinished_words() {
+    let f = fixture_with(&project("word-select"), "main.tex", |config| {
+        config.spell.enabled = true;
+    });
+    f.wait("spell checking", || spell::is_checking(&f.editor));
+    // The case that selects follows one that does not, so that its popup, not the last one, set
+    // the selection.
+    for (before, typed, selects) in [
+        ("We study th", "e", false),
+        ("The Lo", "r", true),
+        ("The Lor", "e", false),
+    ] {
+        f.probe(before, "");
+        f.type_text(typed);
+        common::pump_for(Duration::from_millis(5));
+        assert_eq!(
+            completion::popup_selects_first(&f.state, &f.editor),
+            selects,
+            "{before}{typed}"
+        );
+        completion::hide(&f.state, &f.editor);
+    }
 }
 
 /// Re-indexing runs one job per document at a time: edits made while it runs are indexed once

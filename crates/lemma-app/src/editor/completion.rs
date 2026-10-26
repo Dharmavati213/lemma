@@ -29,10 +29,13 @@
 //!   proposal (`\item`: Enter then makes a new line).
 //!
 //! While the popup is open GtkSourceView refilters it on word characters ([`Provider`]'s
-//! `refilter` recomputes the proposals). Command and argument popups select their first row
-//! (Enter accepts it); word popups do not, so Enter in prose still breaks the line. Tab never
-//! accepts a proposal (it is the snippet key, as in the user's LazyVim setup). Escape closes the
-//! popup (and in Vim leaves insert mode as usual). Ctrl+Space opens it anywhere.
+//! `refilter` recomputes the proposals). Popups select their first row, so Enter accepts it (in
+//! prose too: Enter after `Lor` gives `Lorem`), except when the typed text is already complete:
+//! a whole proposal (`\item`), or in text a word the spell checker accepts or the project uses
+//! (`the`, with `theorem` proposed). Enter then breaks the line, as it does in prose without
+//! spell checking. Tab never accepts a proposal (it is the snippet key, as in the user's
+//! LazyVim setup). Escape closes the popup (and in Vim leaves insert mode as usual). Ctrl+Space
+//! opens it anywhere.
 //!
 //! # Accepting
 //!
@@ -85,7 +88,7 @@
 //! `WindowState::snippets()` (reloads apply at once).
 
 use super::snippets::{self, Driver};
-use super::{Editor, TexView, VimMode, keys};
+use super::{Editor, TexView, VimMode, keys, spell};
 use crate::document::{DocRef, Document, ObserverId};
 use crate::hooks::HookId;
 use crate::settings::ConfigFile;
@@ -1019,13 +1022,35 @@ impl Attached {
             self.hide();
             return;
         };
-        let select = trigger != Trigger::Word && !stash.exact;
+        let select =
+            !stash.exact && !(trigger == Trigger::Word && self.whole_word(&shared, &stash.needle));
         if word_char && self.popup_visible() && self.selecting.get() == select {
             // GtkSourceView refilters the open popup itself (`refilter`, from the stash).
             self.stash.replace(Some(stash));
             return;
         }
         self.show_stash(stash, select);
+    }
+
+    /// Whether `word`, typed in text, is already a whole word, so that Enter after it breaks the
+    /// line: the spell checker accepts it, or the project uses it. Without spell checking (or a
+    /// dictionary, as libspelling then accepts everything) every word is.
+    fn whole_word(&self, shared: &Shared, word: &str) -> bool {
+        let checker = self
+            .editor
+            .upgrade()
+            .and_then(|editor| spell::adapter(&editor))
+            .and_then(|adapter| adapter.checker());
+        let Some(checker) = checker else {
+            return true;
+        };
+        checker.check_word(word)
+            || shared
+                .words
+                .borrow()
+                .words()
+                .binary_search_by(|w| (**w).cmp(word))
+                .is_ok()
     }
 
     /// Opens the popup at the cursor when there is something to propose: computes the

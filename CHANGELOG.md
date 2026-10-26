@@ -4,6 +4,16 @@ Releases are named after Greek letters; the version number is in `Cargo.toml`. E
 notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 [releases page](https://github.com/dharmavati213/lemma/releases).
 
+## Unreleased
+
+### Changed
+
+- Enter takes the first word proposed in prose too, as it already did for commands, references
+  and citations: Enter after `Lor` gives `Lorem`. After a word that is already whole (one the
+  spell checker accepts or the project uses, such as `the` with `theorem` proposed), Enter still
+  breaks the line, and so does every Enter in prose while spell checking is off. Up and Down
+  pick another proposal; Escape closes the popup.
+
 ## zeta (0.2.0), 2026-10-25
 
 The second release, and the first for Windows.
