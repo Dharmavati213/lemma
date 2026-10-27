@@ -4,19 +4,20 @@
 //! The PDF pane shows a placeholder until the first PDF opens, then a toolbar (page n/N, zoom
 //! out/in, fit width, dark pages, and a menu with Fit Page, 100% and the PDF's file) above the
 //! [`PdfView`]. A small pill in the top left corner of the view has two labelled buttons that jump
-//! between the source and the PDF ([`PdfController::sync_buttons`]): "Source" is
-//! `win.sync-inverse` (the source line of the middle of what the view shows of the current page)
-//! and "PDF" is `win.sync-forward` (Ctrl+Alt+J: the cursor's line in the PDF), which the editor's
-//! context menu offers too as Show in PDF; Ctrl+click in the PDF is inverse search at the point
-//! clicked. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
-//! new generation; the view keeps showing the previous generation until the new one has opened,
-//! and a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the
-//! scroll position; another PDF starts at the top. A rebuild of the file asked for last is a
-//! `PdfCmd::Reload`: with as many pages it shows with the old page sizes at once, and the view
-//! and the strip follow the sizes the PDF thread reads afterwards (`PdfEvent::PageSizes`). A
-//! build whose PDF has not changed since the last open (the same size and modification time)
-//! opens nothing ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the
-//! links, a search and a SyncTeX highlight stay as they are.
+//! between the source and the PDF ([`PdfController::sync_buttons`]): "Source" is `win.sync-inverse`
+//! (the source line of the middle of what the view shows of the current page, or of the last
+//! highlight while the view has not moved since) and "PDF" is `win.sync-forward` (Ctrl+Alt+J: the
+//! cursor's line in the PDF, showing a hidden pane), which the editor's context menu offers too as
+//! Show in PDF; Ctrl+click in the PDF is inverse search at the point clicked. The buttons take no
+//! keyboard focus. The PDF thread starts with the first [`PdfController::open`]. Every open gets a
+//! new generation; the view keeps showing the previous generation until the new one has opened, and
+//! a PDF that fails to open leaves it in place. A new generation of the PDF shown keeps the scroll
+//! position; another PDF starts at the top. A rebuild of the file asked for last is a
+//! `PdfCmd::Reload`: with as many pages it shows with the old page sizes at once, and the view and
+//! the strip follow the sizes the PDF thread reads afterwards (`PdfEvent::PageSizes`). A build
+//! whose PDF has not changed since the last open (the same size and modification time) opens
+//! nothing ([`PdfController::open_if_changed`]), so the textures, the thumbnails, the links, a
+//! search and a SyncTeX highlight stay as they are.
 //!
 //! M3 (WP3.4): the controller also dispatches the PDF thread's answers to the [`links`],
 //! [`search`] and [`sidebar`] modules (each registers itself here when it installs), sends their
@@ -34,7 +35,7 @@
 //! [`search`]: super::search
 //! [`sidebar`]: super::sidebar
 
-use super::pdf_view::{PdfView, Reveal};
+use super::pdf_view::{PageRect, PdfView, Reveal};
 use super::{detach, links, search, sidebar};
 use crate::build_ui::{install_css_once, set_default_accels};
 use crate::diagnostics_panel;
@@ -148,6 +149,11 @@ struct Inner {
     /// How the answer to the pending forward search scrolls; `None` when it was not asked by
     /// the user (no message when nothing is found).
     forward_reveal: Cell<Option<Reveal>>,
+    /// The file and 1-based line of the pending forward search.
+    forward_line: RefCell<Option<(PathBuf, u32)>>,
+    /// The file and line of the last forward search answered, with the page and first box the
+    /// view highlighted for it (see [`Inner::inverse_from_view`]).
+    highlighted: RefCell<Option<(PathBuf, u32, u32, PageRect)>>,
     follow_timer: RefCell<Option<glib::SourceId>>,
     /// The "pdf" page of `stack`: toolbar, search bar, strip and view.
     content: gtk::Box,
@@ -425,14 +431,25 @@ impl Inner {
             }
             return;
         }
+        // Asked for: a hidden pane shows. A PDF in its own window is left where it is, so the
+        // keyboard focus stays in the editor.
+        if reveal.is_some()
+            && let Some(state) = self.state.upgrade()
+            && !detach::is_detached(&state)
+        {
+            state.pdf_pane.set_visible(true);
+        }
         self.forward_reveal.set(reveal);
+        self.forward_line.replace(Some((file.to_path_buf(), line)));
         self.send(PdfCmd::Forward {
             file: file.to_path_buf(),
             line,
         });
     }
 
-    /// Inverse search from the page the view shows (`win.sync-inverse`).
+    /// Inverse search from what the view shows (`win.sync-inverse`). While it still shows the
+    /// highlight of a forward search, that search's line: SyncTeX is per line, and the
+    /// highlighted line of the PDF may begin with the source line before.
     fn inverse_from_view(&self) {
         if self.shown.borrow().is_none() {
             if let Some(state) = self.state.upgrade() {
@@ -440,7 +457,35 @@ impl Inner {
             }
             return;
         }
-        self.view.inverse_search_current();
+        let shown = self.view.shown_highlight();
+        let searched = self
+            .highlighted
+            .borrow()
+            .clone()
+            .filter(|(_, _, page, rect)| shown == Some((*page, *rect)));
+        match searched {
+            Some((file, line, ..)) => self.show_source(file, line),
+            None => {
+                self.view.inverse_search_current();
+            }
+        }
+    }
+
+    /// Opens `file` at the 1-based `line`. From a PDF in its own window, the editor's window
+    /// comes forward.
+    fn show_source(&self, file: PathBuf, line: u32) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        if detach::is_detached(&state) {
+            state.window.present();
+        }
+        glib::spawn_future_local(async move {
+            let opened = diagnostics_panel::open_at_line(&state, &file, Some(line)).await;
+            if let Err(e) = opened {
+                state.toast(&e);
+            }
+        });
     }
 
     /// Forward search from the active editor's cursor line.
@@ -449,6 +494,9 @@ impl Inner {
             return;
         };
         let Some(editor) = state.active_editor() else {
+            if reveal.is_some() {
+                state.toast("There is no source file open to show in the PDF");
+            }
             return;
         };
         let (line, _) = editor.cursor_position();
@@ -468,31 +516,14 @@ impl Inner {
             PdfEvent::OpenFailed { generation, error } => self.open_failed(generation, &error),
             PdfEvent::Rendered(rendered) => self.view.add_rendered(rendered),
             PdfEvent::Forward { boxes, .. } => self.forward_answer(&boxes),
-            PdfEvent::Inverse { target } => {
-                let Some(state) = self.state.upgrade() else {
-                    return;
-                };
-                match target {
-                    Some(target) => {
-                        // From a PDF in its own window, the editor's window comes forward.
-                        if detach::is_detached(&state) {
-                            state.window.present();
-                        }
-                        glib::spawn_future_local(async move {
-                            let opened = diagnostics_panel::open_at_line(
-                                &state,
-                                &target.file,
-                                Some(target.line),
-                            )
-                            .await;
-                            if let Err(e) = opened {
-                                state.toast(&e);
-                            }
-                        });
+            PdfEvent::Inverse { target } => match target {
+                Some(target) => self.show_source(target.file, target.line),
+                None => {
+                    if let Some(state) = self.state.upgrade() {
+                        state.toast("No source location found at this point");
                     }
-                    None => state.toast("No source location found at this point"),
                 }
-            }
+            },
             PdfEvent::Links {
                 generation,
                 page,
@@ -629,6 +660,7 @@ impl Inner {
 
     fn forward_answer(&self, boxes: &[SyncBox]) {
         let reveal = self.forward_reveal.take();
+        let searched = self.forward_line.take();
         let Some(first) = boxes.first() else {
             if reveal.is_some()
                 && let Some(state) = self.state.upgrade()
@@ -651,10 +683,13 @@ impl Inner {
                 )
             })
             .collect();
-        self.view.flash_boxes(
-            page.saturating_sub(1),
-            &rects,
-            reveal.unwrap_or(Reveal::IfHidden),
+        let page = page.saturating_sub(1);
+        self.view
+            .flash_boxes(page, &rects, reveal.unwrap_or(Reveal::IfHidden));
+        self.highlighted.replace(
+            searched
+                .zip(rects.first())
+                .map(|((file, line), rect)| (file, line, page, *rect)),
         );
     }
 
@@ -964,10 +999,12 @@ fn build_sync_buttons() -> gtk::Box {
             content.append(&text);
             content.append(&image);
         }
+        // A click leaves the keyboard focus where it was (in the editor after PDF).
         let button = gtk::Button::builder()
             .child(&content)
             .tooltip_text(tooltip)
             .action_name(action)
+            .focus_on_click(false)
             .css_classes(["osd"])
             .build();
         button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
@@ -1045,6 +1082,8 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         shown: RefCell::new(None),
         dark_overrides: RefCell::new(HashMap::new()),
         forward_reveal: Cell::new(None),
+        forward_line: RefCell::new(None),
+        highlighted: RefCell::new(None),
         follow_timer: RefCell::new(None),
         content,
         search: OnceCell::new(),

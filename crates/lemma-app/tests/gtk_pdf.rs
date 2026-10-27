@@ -72,6 +72,10 @@ fn main() -> ExitCode {
         ("ctrl_click_opens_the_source_line", inverse_search),
         ("the_sync_buttons_sync_both_ways", sync_buttons),
         (
+            "forward_search_shows_a_hidden_pane",
+            forward_search_shows_the_pane,
+        ),
+        (
             "follow_cursor_searches_after_the_cursor_rests",
             follow_cursor,
         ),
@@ -1405,8 +1409,9 @@ fn inverse_search() {
 }
 
 /// The SyncTeX buttons over the view: Source opens the source line of the middle of the page
-/// shown, PDF brings that line back to the same page, and the editor's context menu has the
-/// latter.
+/// shown, PDF brings that line back to the same page, and Source then comes back to that line
+/// (not to the middle of the page). The buttons take no keyboard focus, and the editor's context
+/// menu has PDF as Show in PDF (with a mnemonic of its own).
 fn sync_buttons() {
     let dir = copy_proj("sync-buttons", true);
     let state = window(&dir, config());
@@ -1430,6 +1435,12 @@ fn sync_buttons() {
             (e.document().path().to_path_buf(), line)
         })
     };
+    for action in ["win.sync-inverse", "win.sync-forward"] {
+        assert!(
+            !button(action).gets_focus_on_click(),
+            "{action}: a click leaves the focus in the editor"
+        );
+    }
     let buffer = editor.buffer();
     buffer.place_cursor(&buffer.start_iter());
     view.goto_page(2);
@@ -1444,22 +1455,55 @@ fn sync_buttons() {
     wait_for_pages(&state);
     button("win.sync-forward").emit_clicked();
     common::pump_until(TIMEOUT, || view.highlight().is_some_and(|(p, _)| p == page));
+    // PDF, then Source: back to the line PDF showed (the middle of the page is another line, and
+    // the record of the highlighted PDF line can be the source line before, as for line 90).
+    for want in [65, 89, 119, 149, 199] {
+        buffer.place_cursor(&buffer.iter_at_line(want).unwrap());
+        view.goto_page(0);
+        common::pump_until(TIMEOUT, || view.highlight().is_none());
+        button("win.sync-forward").emit_clicked();
+        common::pump_until(TIMEOUT, || view.highlight().is_some());
+        buffer.place_cursor(&buffer.start_iter());
+        let before = cursor(&state);
+        button("win.sync-inverse").emit_clicked();
+        common::pump_until(TIMEOUT, || cursor(&state) != before);
+        assert_eq!(
+            cursor(&state),
+            Some((file.clone(), want)),
+            "PDF from line {} and then Source",
+            want + 1
+        );
+    }
+    // Once the view has moved, Source goes by the page again.
+    view.goto_page(2);
+    wait_for_pages(&state);
+    let before = cursor(&state);
+    button("win.sync-inverse").emit_clicked();
+    common::pump_until(TIMEOUT, || cursor(&state) != before);
+    assert_eq!(cursor(&state), Some((file.clone(), line)));
     let menu = editor.extra_menu();
-    let actions: Vec<String> = (0..menu.n_items())
+    let items: Vec<(String, String)> = (0..menu.n_items())
         .filter_map(|i| menu.item_link(i, gio::MENU_LINK_SECTION))
         .flat_map(|section| {
             (0..section.n_items())
                 .filter_map(|j| {
-                    section
-                        .item_attribute_value(j, gio::MENU_ATTRIBUTE_ACTION, None)?
-                        .get::<String>()
+                    let attribute =
+                        |name: &str| section.item_attribute_value(j, name, None)?.get::<String>();
+                    Some((
+                        attribute(gio::MENU_ATTRIBUTE_ACTION)?,
+                        attribute(gio::MENU_ATTRIBUTE_LABEL)?,
+                    ))
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
+    let show_in_pdf = items
+        .iter()
+        .find(|(action, _)| action == "win.sync-forward")
+        .map(|(_, label)| label.as_str());
     assert!(
-        actions.iter().any(|a| a == "win.sync-forward"),
-        "Show in PDF in the editor's context menu: {actions:?}"
+        show_in_pdf.is_some_and(|label| !label.to_lowercase().contains("_p")),
+        "Show in PDF in the editor's context menu, without Paste's mnemonic: {items:?}"
     );
     // In the PDF's own window the buttons have the main window's actions.
     activate(&state, "win.pdf-detach");
@@ -1475,6 +1519,40 @@ fn sync_buttons() {
     );
     inverse.emit_clicked();
     common::pump_until(TIMEOUT, || cursor(&state) != before);
+    state.window.destroy();
+}
+
+/// The PDF button (Ctrl+Alt+J, Show in PDF) shows a hidden PDF pane, which follow-cursor leaves
+/// hidden; without a source file open it says so.
+fn forward_search_shows_the_pane() {
+    let dir = copy_proj("sync-hidden", true);
+    let mut config = config();
+    config.pdf.follow_cursor = true;
+    let state = window(&dir, config);
+    let editor = open(&state, &dir.join("main.tex"));
+    wait_for_pages(&state);
+    let view = view(&state);
+    let buffer = editor.buffer();
+    state.pdf_pane.set_visible(false);
+    buffer.place_cursor(&buffer.iter_at_line(65).unwrap());
+    common::pump_until(TIMEOUT, || view.highlight().is_some_and(|(p, _)| p == 1));
+    common::pump_for(Duration::from_millis(100));
+    assert!(
+        !state.pdf_pane.is_visible(),
+        "follow-cursor leaves the pane hidden"
+    );
+    buffer.place_cursor(&buffer.iter_at_line(149).unwrap());
+    activate(&state, "win.sync-forward");
+    assert!(
+        state.pdf_pane.is_visible(),
+        "Show Cursor in PDF shows the pane"
+    );
+    common::pump_until(TIMEOUT, || view.highlight().is_some_and(|(p, _)| p == 2));
+    state.close_editor(&editor, true);
+    common::pump_until(TIMEOUT, || state.active_editor().is_none());
+    activate(&state, "win.sync-forward");
+    let toast = "There is no source file open to show in the PDF".to_owned();
+    common::pump_until(TIMEOUT, || toast_titles(&state).contains(&toast));
     state.window.destroy();
 }
 

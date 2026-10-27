@@ -33,8 +33,8 @@
 //!   pages are re-rendered, so the switch is immediate.
 //! - **SyncTeX:** forward-search boxes are scrolled to a third of the view and flashed for
 //!   [`FLASH_DURATION`]; Ctrl+click reports the page point under the pointer for inverse search,
-//!   and [`PdfView::inverse_search_current`] the middle of what the view shows of the current
-//!   page.
+//!   and [`PdfView::inverse_search_current`] the last highlight while the view has not moved
+//!   since, else the middle of what the view shows of the current page.
 //! - **Search (M3):** the matches of the pages on screen are drawn over them, the current one
 //!   emphasised ([`PdfView::set_search_matches`], [`PdfView::set_current_match`]).
 //! - **Popovers (M3):** popovers parented to the view (the link preview) are positioned on every
@@ -130,6 +130,18 @@ struct Flash {
     started: Instant,
 }
 
+/// The last SyncTeX highlight's first box and the view it was shown in (see
+/// [`PdfView::shown_highlight`]).
+#[derive(Clone, Copy)]
+struct Synced {
+    /// 0-based page.
+    page: u32,
+    rect: PageRect,
+    generation: u64,
+    zoom: f64,
+    scroll: (f64, f64),
+}
+
 /// Everything the view draws and requests (no GTK calls happen while it is borrowed).
 struct Model {
     doc: Option<Doc>,
@@ -147,6 +159,7 @@ struct Model {
     extra: Range<u32>,
     dark: bool,
     flash: Option<Flash>,
+    synced: Option<Synced>,
     /// Pointer position in widget coordinates while it is over the view.
     pointer: Option<(f64, f64)>,
     /// The zoom when the current pinch gesture began.
@@ -181,6 +194,7 @@ impl Default for Model {
             extra: 0..0,
             dark: false,
             flash: None,
+            synced: None,
             pointer: None,
             gesture_start_zoom: 1.0,
             max_snapshot: Duration::ZERO,
@@ -1561,6 +1575,19 @@ impl PdfView {
         if let Some((x, y)) = target {
             self.set_scroll_position(x, y);
         }
+        // Once scrolled (the adjustments clamp the offsets).
+        let scroll = imp.scroll();
+        {
+            let mut model = imp.model.borrow_mut();
+            let model = &mut *model;
+            model.synced = model.doc.as_ref().map(|doc| Synced {
+                page,
+                rect: (bx, by, bw, bh),
+                generation: doc.generation,
+                zoom: model.zoom,
+                scroll,
+            });
+        }
         imp.animate_flash();
         self.queue_draw();
     }
@@ -1595,11 +1622,10 @@ impl PdfView {
         true
     }
 
-    /// Inverse search from the page the view shows (the toolbar's Show Page in Source): calls the
-    /// inverse handler with [`PdfView::current_page_middle`]. Returns false when no document is
-    /// shown.
+    /// Inverse search from what the view shows (the Source button): calls the inverse handler
+    /// with [`PdfView::sync_point`]. Returns false when no document is shown.
     pub fn inverse_search_current(&self) -> bool {
-        let Some((page, x_bp, y_bp)) = self.current_page_middle() else {
+        let Some((page, x_bp, y_bp)) = self.sync_point() else {
             return false;
         };
         let inverse = self.imp().inverse.borrow().clone();
@@ -1607,6 +1633,33 @@ impl PdfView {
             inverse(page, x_bp, y_bp);
         }
         true
+    }
+
+    /// The point of what the view shows that the Source button searches the source for: the
+    /// middle of [`PdfView::shown_highlight`], else [`PdfView::current_page_middle`]. 0-based
+    /// page and point in bp.
+    pub fn sync_point(&self) -> Option<(u32, f64, f64)> {
+        match self.shown_highlight() {
+            Some((page, (x, y, w, h))) => Some((page, x + w / 2.0, y + h / 2.0)),
+            None => self.current_page_middle(),
+        }
+    }
+
+    /// The last SyncTeX highlight's 0-based page and first box (bp), as [`PdfView::flash_boxes`]
+    /// got them, while the view has not moved since (also after the highlight faded).
+    pub fn shown_highlight(&self) -> Option<(u32, PageRect)> {
+        let imp = self.imp();
+        let (sx, sy) = imp.scroll();
+        let model = imp.model.borrow();
+        let synced = model.synced?;
+        let unmoved = model
+            .doc
+            .as_ref()
+            .is_some_and(|d| d.generation == synced.generation)
+            && (synced.zoom - model.zoom).abs() < 1e-9
+            && (synced.scroll.0 - sx).abs() < 0.5
+            && (synced.scroll.1 - sy).abs() < 0.5;
+        unmoved.then_some((synced.page, synced.rect))
     }
 
     /// The middle of the part of the current page ([`PdfView::current_page`], the toolbar's

@@ -10,10 +10,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 - A small pill of two labelled buttons in the top left corner of the PDF jumps between the
   source and the PDF. **Source** opens the source line at the middle of the page on screen (the
-  page number the toolbar shows), and **PDF** scrolls the PDF to the cursor's line and flashes
-  it, as Ctrl+Alt+J does. Show in PDF is in the editor's right-click menu as well, Show PDF Page in
-  Source is in the command palette, and the buttons work in the PDF's own window. Ctrl+click in
-  the PDF still opens the line of the point clicked.
+  page number the toolbar shows), or, while the PDF has not moved since **PDF**, the line that
+  showed. **PDF** scrolls the PDF to the cursor's line and flashes it, as Ctrl+Alt+J does, and
+  shows the PDF pane if it is hidden. Neither button takes the keyboard focus, so typing goes on
+  in the editor. Show in PDF is in the editor's right-click menu as well, Show PDF Page in Source
+  is in the command palette, and the buttons work in the PDF's own window. Ctrl+click in the PDF
+  still opens the line of the point clicked.
 
 ### Changed
 
