@@ -26,7 +26,7 @@ pub struct BuildRequest {
 
 /// Environment that widens TeX's log lines so the log parser sees whole messages and full error
 /// context instead of 79-column fragments.
-const LOG_ENV: [(&str, &str); 3] = [
+pub(crate) const LOG_ENV: [(&str, &str); 3] = [
     ("max_print_line", "10000"),
     ("error_line", "254"),
     ("half_error_line", "238"),

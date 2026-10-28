@@ -202,6 +202,11 @@ impl PdfController {
         requested.is_some() && requested == self.generation()
     }
 
+    /// The generation of the latest [`PdfController::open`] (`None` before the first).
+    pub fn requested_generation(&self) -> Option<u64> {
+        self.inner.requested.borrow().as_ref().map(|(g, _)| *g)
+    }
+
     /// The PDF the latest [`PdfController::open`] asked for.
     pub fn requested_pdf(&self) -> Option<PathBuf> {
         self.inner

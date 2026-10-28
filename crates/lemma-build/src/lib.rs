@@ -10,6 +10,8 @@ pub mod chktex;
 mod detect;
 pub mod explain;
 mod paths;
+mod pdf_copy;
+pub mod preamble;
 mod process;
 mod queue;
 mod request;
@@ -18,6 +20,7 @@ mod texlog;
 
 pub use blg::parse_blg;
 pub use detect::{Engine, RootGuess, RootSource, detect_engine, detect_root};
+pub use pdf_copy::copy_pdf_beside_root;
 pub use process::{Build, BuildOutcome, BuildStatus, Canceller, PdfStamp};
 pub use queue::BuildQueue;
 pub use request::{BuildRequest, clean_command_line, command_line};

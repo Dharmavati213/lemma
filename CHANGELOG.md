@@ -19,11 +19,37 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Changed
 
+- Builds with pdflatex are faster: the preamble is precompiled once (with `mylatexformat`, after
+  the first build, in the background) and reused by every build until the preamble, or a
+  package or file it reads, changes. Loading the packages was half of each build: for a 27-page
+  thesis with tikz-cd, hyperref and microtype, a build after a small edit went from 1.5 s to
+  0.9 s of CPU time, with the same pages, links, bookmarks and SyncTeX positions. The
+  preamble's warnings still show on the Problems page. XeLaTeX, LuaLaTeX, a project with a
+  latexmkrc, and preambles that a format cannot keep (`\makeindex`, `\makeglossaries`,
+  `\immediate`, images, shell escape) build as before, and so does a project whose format
+  pdflatex cannot load. Turn it off with **Precompile the Preamble** in Preferences, or
+  `[build] fast_preamble = false`.
+- Each build that writes a PDF copies it next to the main document, so the `main.pdf` beside
+  `main.tex` that a file manager, a mail or an upload finds is always the one the preview
+  shows. It used to stay in the hidden `.build` folder only, and a `main.pdf` beside the source
+  stayed whatever an older build or another program had left there. The copy is made only when
+  the PDF changed, and replaces the old one in one step, so a PDF viewer that has it open never
+  reads half a file. A copy that fails (a viewer on Windows that locks the file) says so in a
+  toast. Turn it off with **PDF Next to the Main Document** in Preferences, or
+  `[build] copy_pdf = false`.
 - Enter takes the first word proposed in prose too, as it already did for commands, references
   and citations: Enter after `Lor` gives `Lorem`. After a word that is already whole (one the
   spell checker accepts or the project uses, such as `the` with `theorem` proposed), Enter still
   breaks the line, and so does every Enter in prose while spell checking is off. Up and Down
   pick another proposal; Escape closes the popup.
+
+### Fixed
+
+- The PDF pane no longer switches to an older PDF after a build. Opening a document looks for
+  the PDF of an earlier build; when that search ended after the first build had already shown
+  its PDF, it opened the PDF it had found, which could be an old `main.pdf` beside `main.tex`
+  instead of the new one in `.build` (and without its SyncTeX file). A PDF opened meanwhile now
+  stays.
 
 ## zeta (0.2.0), 2026-10-25
 

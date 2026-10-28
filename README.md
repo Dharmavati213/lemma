@@ -30,8 +30,11 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   and Ctrl+click in the PDF opens the line of the point clicked. Its menu fits the width
   or the whole page (for slides) and zooms to 100% (Ctrl+0 and Ctrl+1 in the PDF; Left and
   Right, or h and l, scroll sideways). It also opens the PDF in another app, to print it or
-  present it, and shows it in your file manager, as the build keeps it in a hidden `.build`
-  folder. When a damaged `.aux` or `.bbl` keeps a build failing, **Clean Build Files and
+  present it, and shows it in your file manager. The build runs in a hidden `.build` folder and
+  copies each new PDF next to the main document, so `main.pdf` beside `main.tex` is always the
+  latest (`[build] copy_pdf = false` keeps it in `.build` only). With pdflatex, the preamble is
+  precompiled after the first build and reused until it changes, so a save's build skips
+  loading the packages again (`[build] fast_preamble`). When a damaged `.aux` or `.bbl` keeps a build failing, **Clean Build Files and
   Rebuild** in the command palette runs `latexmk -c` (the PDF stays) and builds again.
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
   explanations and quick fixes for common errors, plus optional `chktex` lint. F4 and Shift+F4

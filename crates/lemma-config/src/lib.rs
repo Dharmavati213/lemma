@@ -193,6 +193,12 @@ pub struct BuildCfg {
     pub on_agent_turn_end: bool,
     /// Output directory, relative to the root document's directory.
     pub outdir: String,
+    /// After a build that wrote a PDF, copy it out of `outdir` next to the root document, so
+    /// the `main.pdf` beside `main.tex` is always the newest.
+    pub copy_pdf: bool,
+    /// Precompile the root's preamble (pdflatex), so that a build loads its packages once
+    /// instead of on every save, until the preamble changes.
+    pub fast_preamble: bool,
     /// Builds running longer than this are killed.
     pub timeout_s: u64,
     /// The latexmk executable (looked up in `PATH` when relative).
@@ -205,6 +211,8 @@ impl Default for BuildCfg {
             on_save: true,
             on_agent_turn_end: true,
             outdir: ".build".into(),
+            copy_pdf: true,
+            fast_preamble: true,
             timeout_s: 180,
             latexmk: "latexmk".into(),
         }
@@ -771,6 +779,8 @@ mod tests {
         assert!(c.build.on_save);
         assert!(c.build.on_agent_turn_end);
         assert_eq!(c.build.outdir, ".build");
+        assert!(c.build.copy_pdf);
+        assert!(c.build.fast_preamble);
         assert_eq!(c.build.timeout_s, 180);
         assert_eq!(c.build.latexmk, PathBuf::from("latexmk"));
 

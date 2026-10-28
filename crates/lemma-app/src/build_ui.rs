@@ -10,7 +10,12 @@
 //! or TeX errors with output) the preview reloads it as a new generation, and the diagnostics
 //! replace the previous ones. A build that left the PDF as it was (latexmk found nothing to do)
 //! reloads nothing: the build thread stamps the PDF ([`lemma_build::PdfStamp`]), and the preview
-//! compares the stamp with the one of the PDF it opened last.
+//! compares the stamp with the one of the PDF it opened last. With `build.copy_pdf`, the build
+//! thread also copies such a PDF next to the root document ([`lemma_build::copy_pdf_beside_root`]:
+//! only when it changed, and atomically), so the `main.pdf` beside `main.tex` that other programs
+//! see is the one the preview shows; a copy that fails is toasted. With `build.fast_preamble`,
+//! pdflatex starts with the root's preamble precompiled ([`lemma_build::preamble`]), which the
+//! build thread dumps after a build whose preamble had none.
 //!
 //! A failed build is toasted; each build's result replaces the toast of the one before, so a
 //! series of failing builds (repeated saves, auto-save, the agent's `compile` calls) never queues
@@ -25,7 +30,8 @@ use crate::window::WindowState;
 use adw::prelude::*;
 use lemma_build::{
     Build, BuildOutcome, BuildQueue, BuildRequest, BuildStatus, Canceller, Engine, PdfStamp,
-    RootGuess, RootSource, detect_engine, detect_root,
+    RootGuess, RootSource, copy_pdf_beside_root, detect_engine, detect_root,
+    preamble::{self, Preamble},
 };
 use lemma_syntax::{FileIndex, IncludeKind, ProjectIndex, index_file};
 use std::cell::{Cell, RefCell};
@@ -78,6 +84,8 @@ enum BuildMsg {
 struct Finished {
     outcome: BuildOutcome,
     problems: Vec<Problem>,
+    /// Why the PDF could not be copied next to the root document (`build.copy_pdf`).
+    copy_error: Option<String>,
 }
 
 /// The build being run.
@@ -199,8 +207,8 @@ impl BuildController {
     }
 
     /// Finds the active document's root and shows the PDF its last build left (in the output
-    /// directory, else next to the root), unless the preview already shows or loads that PDF.
-    /// Resolves to the PDF's path.
+    /// directory, else next to the root), unless the preview already shows or loads that PDF, or
+    /// a build opened its PDF meanwhile. Resolves to the PDF's path.
     pub fn show_existing_pdf(&self) -> impl Future<Output = Result<PathBuf, String>> + use<> {
         let inner = self.inner.clone();
         async move { inner.show_existing_pdf(false).await }
@@ -506,14 +514,22 @@ impl Inner {
         self.show_running();
         let (tx, rx) = async_channel::unbounded();
         let thread_request = request.clone();
+        let options = self
+            .state
+            .upgrade()
+            .map_or_else(ThreadOptions::default, |s| ThreadOptions {
+                copy_pdf: s.config.build.copy_pdf,
+                fast_preamble: s.config.build.fast_preamble,
+            });
         let spawned = std::thread::Builder::new()
             .name("build".into())
-            .spawn(move || run_build(&thread_request, clean, &tx));
+            .spawn(move || run_build(&thread_request, clean, options, &tx));
         if let Err(e) = spawned {
             let outcome = BuildOutcome::spawn_failed(&e);
             self.finish(Finished {
                 outcome,
                 problems: Vec::new(),
+                copy_error: None,
             });
             return;
         }
@@ -579,7 +595,11 @@ impl Inner {
     }
 
     fn finish(self: &Rc<Self>, finished: Finished) {
-        let Finished { outcome, problems } = finished;
+        let Finished {
+            outcome,
+            problems,
+            copy_error,
+        } = finished;
         let running = self.running.take();
         let Some(state) = self.state.upgrade() else {
             return;
@@ -595,9 +615,9 @@ impl Inner {
             outcome.elapsed
         );
         // The PDF first: the PDF thread opens it while the Problems page fills its rows.
-        let has_output = outcome.status == BuildStatus::Success
-            || (outcome.status == BuildStatus::Errors && outcome.exit_code == Some(12));
-        if has_output && let (Some(pdf), Some(controller)) = (&outcome.pdf, state.pdf.get()) {
+        if has_output(&outcome)
+            && let (Some(pdf), Some(controller)) = (&outcome.pdf, state.pdf.get())
+        {
             controller.open_if_changed(pdf, outcome.pdf_stamp);
         }
         // A stopped or timed-out build's log is incomplete: keep the previous diagnostics.
@@ -609,7 +629,7 @@ impl Inner {
         }
         self.last.replace(Some(outcome.clone()));
         let next = self.queue.borrow_mut().finished();
-        self.show_result(&state, &outcome, &root, reason);
+        self.show_result(&state, &outcome, &root, reason, copy_error);
         let observers = self.finished.borrow().clone();
         for observer in observers {
             observer(&outcome);
@@ -660,6 +680,8 @@ impl Inner {
     /// ([`Inner::detect_for_tab`]).
     async fn show_existing_pdf(self: &Rc<Self>, tab_switch: bool) -> Result<PathBuf, String> {
         let state = self.state.upgrade().ok_or("the window is gone")?;
+        // A PDF opened while this one is looked for (a build's) is newer: it stays.
+        let asked = state.pdf.get().and_then(|c| c.requested_generation());
         let detection = if tab_switch {
             self.detect_for_tab(&state).await
         } else {
@@ -683,7 +705,9 @@ impl Inner {
         .ok_or("no PDF from an earlier build")?;
         let controller = state.pdf.get().ok_or("no PDF preview")?;
         // With its stamp, so that a first build that finds nothing to do does not reload it.
-        if controller.requested_pdf().as_deref() != Some(pdf.as_path()) {
+        if controller.requested_generation() == asked
+            && controller.requested_pdf().as_deref() != Some(pdf.as_path())
+        {
             controller.open_if_changed(&pdf, stamp);
         }
         // Until this session builds, say where the PDF on screen comes from.
@@ -742,6 +766,7 @@ impl Inner {
         outcome: &BuildOutcome,
         root: &Path,
         reason: Reason,
+        copy_error: Option<String>,
     ) {
         if self.running.borrow().is_none() {
             let button = &state.header.build_button;
@@ -825,6 +850,8 @@ impl Inner {
             BuildStatus::SpawnFailed(error) => Some((format!("Could not build: {error}"), false)),
             BuildStatus::Success | BuildStatus::Cancelled => None,
         };
+        // The build's own failure says more; a copy that failed after a good build is told.
+        let toast = toast.or_else(|| copy_error.map(|e| (e, false)));
         let toast = toast.map(|(title, show_problems)| {
             let toast = adw::Toast::builder().title(title).use_markup(false).build();
             if show_problems {
@@ -840,6 +867,13 @@ impl Inner {
         });
         self.replace_toast(state, toast);
     }
+}
+
+/// Whether `outcome` is a build that wrote a PDF to show: a success, or TeX errors with output
+/// (latexmk's exit code 12).
+fn has_output(outcome: &BuildOutcome) -> bool {
+    outcome.status == BuildStatus::Success
+        || (outcome.status == BuildStatus::Errors && outcome.exit_code == Some(12))
 }
 
 /// Whether `outcome` is a build whose latexmk is not installed ([`LATEXMK_MISSING`]).
@@ -902,37 +936,108 @@ fn earlier_pdf_text(modified: Option<SystemTime>) -> String {
 /// canceller (the clean-up's first), waits, and maps the diagnostics to problems (which touches
 /// the file system, so it happens here rather than on the main thread). A failed clean-up is the
 /// build's outcome: the files it was to remove would make the build fail again. A stopped one
-/// ends the build.
-fn run_build(request: &BuildRequest, clean: bool, tx: &async_channel::Sender<BuildMsg>) {
+/// ends the build (and removes the precompiled preamble). With `copy_pdf`, a PDF the build wrote
+/// is copied next to the root document.
+///
+/// With `fast_preamble`, a build whose precompiled preamble is current runs with it
+/// ([`lemma_build::preamble`]); one that pdflatex cannot load is given up and the build runs
+/// again without it. When the preamble has none for its text as it is, the build runs without,
+/// and the preamble is dumped once the outcome is sent, so the preview does not wait for it.
+fn run_build(
+    request: &BuildRequest,
+    clean: bool,
+    options: ThreadOptions,
+    tx: &async_channel::Sender<BuildMsg>,
+) {
     // The receiver only goes away with the window; the build is still waited for.
     let started = |canceller| {
         let _ = tx.send_blocking(BuildMsg::Started(canceller));
     };
+    let run = |build: io::Result<Build>| match build {
+        Ok(build) => {
+            started(build.canceller());
+            build.wait()
+        }
+        Err(e) => spawn_failed(&e),
+    };
+    let mut dump = false;
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         if clean {
             match Build::clean(request, started) {
-                Ok(()) => {}
+                Ok(()) => preamble::clear_preamble(request),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                     return BuildOutcome::cancelled();
                 }
                 Err(e) => return spawn_failed(&e),
             }
         }
-        match Build::start(request) {
-            Ok(build) => {
-                started(build.canceller());
-                build.wait()
-            }
-            Err(e) => spawn_failed(&e),
+        let preamble = if options.fast_preamble {
+            preamble::preamble_for(request)
+        } else {
+            Preamble::Unsupported
+        };
+        let Preamble::Current(format) = preamble else {
+            dump = matches!(preamble, Preamble::Stale);
+            return run(Build::start(request));
+        };
+        let outcome = run(Build::start_with(request, &format));
+        if !preamble::format_failed(request) {
+            return outcome;
         }
+        // Made by another TeX installation, say: without it from now on.
+        tracing::warn!(
+            "the precompiled preamble of {} did not load; building without it",
+            request.root.display()
+        );
+        preamble::give_up(request);
+        run(Build::start_forced(request))
     }))
     .unwrap_or_else(|_| BuildOutcome::spawn_failed(&io::Error::other("the build thread panicked")));
+    let built = matches!(outcome.status, BuildStatus::Success | BuildStatus::Errors);
     let problems = diagnostics_panel::problems_from(
         &outcome.report.diagnostics,
         &request.root,
         &request.outdir,
     );
-    let _ = tx.send_blocking(BuildMsg::Finished(Box::new(Finished { outcome, problems })));
+    let copy_error = match &outcome.pdf {
+        Some(pdf) if options.copy_pdf && has_output(&outcome) => {
+            copy_pdf_beside_root(pdf, &request.root).err().map(|e| {
+                tracing::warn!("cannot copy {} next to the root: {e}", pdf.display());
+                format!(
+                    "Could not update {} next to {}: {e}",
+                    display_name(pdf),
+                    display_name(&request.root)
+                )
+            })
+        }
+        _ => None,
+    };
+    let _ = tx.send_blocking(BuildMsg::Finished(Box::new(Finished {
+        outcome,
+        problems,
+        copy_error,
+    })));
+    if dump && built {
+        let started = Instant::now();
+        match preamble::dump_preamble(request) {
+            Ok(true) => tracing::info!(
+                "precompiled the preamble of {} in {:.1?}",
+                request.root.display(),
+                started.elapsed()
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("cannot precompile the preamble: {e}"),
+        }
+    }
+}
+
+/// The `[build]` settings a build thread follows, as they were when it started.
+#[derive(Clone, Copy, Debug, Default)]
+struct ThreadOptions {
+    /// `build.copy_pdf`.
+    copy_pdf: bool,
+    /// `build.fast_preamble`.
+    fast_preamble: bool,
 }
 
 /// The outcome of a build whose latexmk did not start. A program that does not exist (latexmk,

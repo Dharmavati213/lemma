@@ -5,9 +5,10 @@
 //! once they are one bitmap, and over several notches keep the scale of their first bands, which
 //! are all drawn), large pages in full-width bands (the band below the view rendered ahead,
 //! search highlights and dark mode over bands), Fit Page and 100%, handing the PDF to another
-//! application, dark mode, save → build → diagnostics (and a build with nothing to do), stopping
-//! a build, and SyncTeX in both directions (also after a memory trim); with a fake latexmk, the
-//! build toasts, a latexmk that is not installed, and Clean Build Files and Rebuild.
+//! application, dark mode, save → build → diagnostics (and a build with nothing to do, the PDF
+//! copied next to the root, the precompiled preamble), stopping a build, and SyncTeX in both
+//! directions (also after a memory trim); with a fake latexmk, the build toasts, a latexmk that
+//! is not installed, and Clean Build Files and Rebuild.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_pdf`. The scrolling and
 //! demo tests need `target/fixtures/pdf50.pdf` (`scripts/build-fixtures.sh`); the build tests
@@ -1580,6 +1581,25 @@ fn save_build_diagnostics() {
         return;
     }
     let dir = copy_proj("build", false);
+    // What another program left beside the root: the first build replaces it with its own.
+    let beside = dir.join("main.pdf");
+    std::fs::write(&beside, "%PDF-1.5 from another program").unwrap();
+    let copied = |built: &Path| {
+        let (copy, pdf) = (
+            std::fs::metadata(&beside).unwrap(),
+            std::fs::metadata(built).unwrap(),
+        );
+        assert_eq!(
+            copy.len(),
+            pdf.len(),
+            "main.pdf beside main.tex is the built one"
+        );
+        assert_eq!(copy.modified().unwrap(), pdf.modified().unwrap());
+        assert_eq!(
+            std::fs::read(&beside).unwrap(),
+            std::fs::read(built).unwrap()
+        );
+    };
     let mut config = config();
     config.build.on_save = true;
     let state = window(&dir, config);
@@ -1601,6 +1621,16 @@ fn save_build_diagnostics() {
     );
     assert_eq!(outcome.status, BuildStatus::Errors);
     assert_eq!(outcome.exit_code, Some(12));
+    // A PDF with errors is shown, so it is the one beside the root too.
+    copied(&dir.join(".build/main.pdf"));
+    assert!(
+        state
+            .build
+            .get()
+            .unwrap()
+            .toast()
+            .is_some_and(|t| t.title().is_some_and(|t| t.starts_with("Build failed")))
+    );
     assert!(
         std::fs::read_to_string(dir.join("main.tex"))
             .unwrap()
@@ -1667,7 +1697,11 @@ fn save_build_diagnostics() {
         buffer.iter_at_mark(&buffer.get_insert()).line() == 65
     });
 
-    // Fixing the error and saving again clears it.
+    // The build thread precompiles the preamble once that build is shown.
+    let format = dir.join(".build/.lemma-preamble/main/lemma-preamble.fmt");
+    common::pump_until(BUILD_TIMEOUT, || format.is_file());
+
+    // Fixing the error and saving again clears it, in a build with the precompiled preamble.
     let generation = controller.generation();
     let mut start = buffer.iter_at_line(65).unwrap();
     let mut end = start;
@@ -1677,6 +1711,19 @@ fn save_build_diagnostics() {
     common::pump_until(BUILD_TIMEOUT, || outcomes.borrow().len() == 2);
     let outcome = outcomes.borrow()[1].clone();
     assert_eq!(outcome.status, BuildStatus::Success, "{outcome:?}");
+    let log = std::fs::read_to_string(dir.join(".build/main.log")).unwrap();
+    assert!(
+        log.lines()
+            .next()
+            .is_some_and(|l| l.contains("format=main ")),
+        "{}",
+        log.lines().next().unwrap_or_default()
+    );
+    copied(&dir.join(".build/main.pdf"));
+    assert!(
+        build.toast().is_none(),
+        "a good build with a good copy says nothing"
+    );
     let problems = build.diagnostics().problems();
     assert!(
         problems.iter().all(|p| p.severity != Severity::Error),
@@ -1706,6 +1753,7 @@ fn save_build_diagnostics() {
     assert_eq!(again.pdf, outcome.pdf);
     assert!(again.pdf_stamp.is_some());
     assert_eq!(again.pdf_stamp, outcome.pdf_stamp);
+    copied(&dir.join(".build/main.pdf"));
     common::pump_for(Duration::from_millis(300));
     assert_eq!(
         controller.generation(),
@@ -1723,7 +1771,10 @@ fn save_build_diagnostics() {
     activate(&state, "win.build");
     common::pump_until(BUILD_TIMEOUT, || outcomes.borrow().len() == 4);
     assert_ne!(outcomes.borrow()[3].pdf_stamp, again.pdf_stamp);
+    copied(&pdf);
     common::pump_until(TIMEOUT, || controller.generation() > shown);
+    // The preview stays on the build's PDF, beside its SyncTeX file, not on the copy.
+    assert_eq!(controller.pdf(), Some(pdf.clone()));
     state.window.destroy();
 }
 

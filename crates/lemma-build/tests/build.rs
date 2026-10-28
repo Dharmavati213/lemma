@@ -470,3 +470,113 @@ fn dropping_a_build_stops_it() {
         group_members(pgid)
     );
 }
+
+fn have_mylatexformat() -> bool {
+    let found = Command::new("kpsewhich")
+        .arg("mylatexformat.ltx")
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        eprintln!("SKIP: mylatexformat.ltx not found");
+    }
+    found
+}
+
+/// The precompiled preamble: none at first (the build runs without it), then dumped, then used
+/// by the next build of an edited body, with the same pages and the preamble's warnings; stale
+/// again after a preamble edit; refused for a preamble that opens files; and given up when
+/// pdflatex cannot load it.
+#[cfg(unix)]
+#[test]
+fn a_precompiled_preamble_is_dumped_used_and_renewed() {
+    use lemma_build::preamble::{Preamble, dump_preamble, format_failed, give_up, preamble_for};
+    if !have_latexmk() || !have_mylatexformat() {
+        return;
+    }
+    let text = |preamble: &str, body: &str| {
+        format!(
+            "\\documentclass{{article}}\n\\usepackage{{amsmath}}\n{preamble}\n\
+             \\begin{{document}}\n{body}\n\\end{{document}}\n"
+        )
+    };
+    let warning = "\\PackageWarningNoLine{mine}{from the preamble}";
+    let dir = project(&[("main.tex", &text(warning, "Hello $a^2$."))]);
+    let root = dir.path().join("main.tex");
+    let req = request(root.clone(), Duration::from_secs(120));
+    assert!(matches!(preamble_for(&req), Preamble::Stale));
+    let first = build(&req);
+    assert_eq!(first.status, BuildStatus::Success, "{:?}", errors(&first));
+    assert!(dump_preamble(&req).expect("dump"), "a usable format");
+    let Preamble::Current(format) = preamble_for(&req) else {
+        panic!("the format is current after the dump");
+    };
+    // Nothing to do while it is current.
+    assert!(!dump_preamble(&req).expect("no dump"));
+
+    // An edit of the body is built with the format.
+    fs::write(&root, text(warning, "Hello again, $\\sum_i a_i$.")).unwrap();
+    let second = Build::start_with(&req, &format).expect("start").wait();
+    assert_eq!(second.status, BuildStatus::Success, "{:?}", errors(&second));
+    assert!(!format_failed(&req));
+    let log = fs::read_to_string(dir.path().join(".build/main.log")).unwrap();
+    assert!(
+        log.lines()
+            .next()
+            .is_some_and(|l| l.contains("format=main ")),
+        "{}",
+        log.lines().next().unwrap_or_default()
+    );
+    assert_eq!(second.report.output.as_ref().map(|o| o.1), Some(1));
+    assert!(
+        second
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("from the preamble")),
+        "the preamble's warning is kept: {:#?}",
+        second.report.diagnostics
+    );
+    let warnings = |o: &BuildOutcome| {
+        o.report
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count()
+    };
+    assert_eq!(
+        warnings(&second),
+        warnings(&first),
+        "{:#?}",
+        second.report.diagnostics
+    );
+
+    // A preamble edit makes it stale.
+    fs::write(&root, text("\\newcommand\\x{y}", "Hello.")).unwrap();
+    assert!(matches!(preamble_for(&req), Preamble::Stale));
+    assert!(dump_preamble(&req).expect("dump"));
+    let Preamble::Current(format) = preamble_for(&req) else {
+        panic!("current again");
+    };
+
+    // A format pdflatex cannot load: the build says so, and the format is given up.
+    fs::write(format.log().with_extension("fmt"), "not a format").unwrap();
+    fs::write(&root, text("\\newcommand\\x{y}", "Hello there.")).unwrap();
+    let broken = Build::start_with(&req, &format).expect("start").wait();
+    assert_ne!(broken.status, BuildStatus::Success);
+    assert!(format_failed(&req));
+    give_up(&req);
+    assert!(matches!(preamble_for(&req), Preamble::Unsupported));
+    let plain = Build::start_forced(&req).expect("start").wait();
+    assert_eq!(plain.status, BuildStatus::Success, "{:?}", errors(&plain));
+    assert!(!format_failed(&req));
+
+    // Clean Build Files and Rebuild removes it.
+    lemma_build::preamble::clear_preamble(&req);
+    assert!(!dir.path().join(".build/.lemma-preamble/main").exists());
+
+    // A preamble that opens a file cannot be dumped.
+    fs::write(&root, text("\\makeindex", "Hello.")).unwrap();
+    assert!(matches!(preamble_for(&req), Preamble::Unsupported));
+    assert!(!dump_preamble(&req).expect("no dump"));
+}

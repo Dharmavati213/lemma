@@ -4,7 +4,8 @@
 //! ([`PAGES`]): the editor font, wrapping, inline equation numbers, the git gutter, the word
 //! count, auto-save, the recovery of unsaved changes, session restore, Vim, the typing helpers
 //! and replacements, completion while typing, spell checking and its language (the installed
-//! dictionaries); build on save and after agent turns, chktex, the PDF preview's dark pages,
+//! dictionaries); build on save and after agent turns, the precompiled preamble, the PDF's copy
+//! next to the main document, chktex, the PDF preview's dark pages,
 //! cursor following and thumbnail strip, hover popovers, the math preview and the hover delay,
 //! the outline following the cursor; agent notifications and the local history limits — plus
 //! the configuration file's path with an Open button (the system's handler for the file, through
@@ -291,6 +292,20 @@ pub const PAGES: &[Page] = &[
                         "Build After Agent Turns",
                         "When a turn of the agent changed files",
                         |c| c.build.on_agent_turn_end,
+                    ),
+                    switch(
+                        "build",
+                        "fast_preamble",
+                        "Precompile the Preamble",
+                        "Faster builds: packages load once, until the preamble changes",
+                        |c| c.build.fast_preamble,
+                    ),
+                    switch(
+                        "build",
+                        "copy_pdf",
+                        "PDF Next to the Main Document",
+                        "Copy each new PDF out of the hidden .build folder",
+                        |c| c.build.copy_pdf,
                     ),
                     switch(
                         "lint",

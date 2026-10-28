@@ -221,7 +221,7 @@ fn layout() {
     // The spec's list: font, Vim, wrap, build on save, dark PDF, spelling and its language,
     // typing helpers, completion, history limits, notifications, outline, math preview; and
     // the documented switches added later (auto-save, the recovery of unsaved changes,
-    // replacements, chktex, the git gutter, the word count, session restore).
+    // replacements, chktex, the git gutter, the word count, session restore, the PDF's copy, the precompiled preamble).
     let keys: Vec<(&str, &str)> = prefs::settings().map(|s| (s.section, s.key)).collect();
     for key in [
         ("editor", "font"),
@@ -235,6 +235,8 @@ fn layout() {
         ("status", "word_count"),
         ("session", "restore"),
         ("build", "on_save"),
+        ("build", "copy_pdf"),
+        ("build", "fast_preamble"),
         ("pdf", "dark_invert"),
         ("spell", "enabled"),
         ("spell", "language"),

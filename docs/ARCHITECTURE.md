@@ -317,7 +317,9 @@ Rules:
   - "File not found" takes its line from the following "Emergency stop";
   - biber's temp-file paths are mapped back to the `.bib`;
   - runaway arguments are located with the search heuristic;
-  - whenever the log has `Output written`, including on exit 12, the PDF is reopened with a new generation.
+  - whenever the log has `Output written`, including on exit 12, the PDF is reopened with a new generation;
+  - with `fast_preamble` (the default), a pdflatex build whose preamble was precompiled runs with it (`lemma_build::preamble`): `latexmk -pdf -pdflatex="pdflatex -fmt=lemma-preamble %O %S"` with the format's directory (`.build/.lemma-preamble/<stem>/`) first on `TEXFORMATS`. The format is dumped by `pdftex -ini "&pdflatex" mylatexformat.ltx ./<root>.tex` on the build thread after a build whose preamble had none, once that build's outcome is sent; a record keeps the hash of the root's text up to `\begin{document}` and the size and modification time of every file the dump read (its `.fls`), and the format is used while they are unchanged. On the thesis that asked for it (27 pages, tikz-cd, hyperref, microtype) a save's pdflatex run went from 1.34 s to 0.78 s of CPU, latexmk's from 1.50 s to 0.91 s [V]; the preamble alone was 0.67 s. Pages, text, links, bookmarks and SyncTeX lines are the same [V]. Not used for XeTeX and LuaTeX, on Windows, with a latexmkrc, for a root name that is not plain ASCII, or for a preamble with `\makeindex`, `\immediate`, images and the like; a failed dump is not retried while its inputs stay the same; a format pdflatex cannot load is given up and the build reruns with `-g` (latexmk does not see that the command changed). The dump's log supplies the preamble's warnings;
+  - with `copy_pdf` (the default), that PDF is also copied next to the root document (`lemma_build::copy_pdf_beside_root`, on the build thread): only when the copy there has another size or modification time (the copy takes the PDF's), written to a hidden temporary file and renamed over the old one, so a viewer never reads half a PDF. A failed copy is toasted after a build that succeeded.
 - **PdfView** is one custom widget implementing `gtk::Scrollable`; there is no widget per page.
   - **Layout:** continuous scrolling, fit-width by default.
   - **Zoom:** Ctrl+wheel or `GestureZoom`, anchored at the pointer. Existing textures are stretched immediately and re-rendered after 120 ms idle at `scale_q = round(zoom × surface.scale() × 8)`. `Surface::scale()` (v4_12) exists [S]. The user's eDP-1 runs at scale 1; fractional scales are **[U]**.
@@ -754,7 +756,7 @@ pub mod mcp { pub const TOOL_TIMEOUT: Duration /*30 s*/; pub const PROTOCOL_VERS
 // ===== lemma-config =====
 pub struct Config { pub editor: EditorCfg, pub build: BuildCfg, pub pdf: PdfCfg, pub agent: AgentCfg, pub spell: SpellCfg, pub keys: KeysCfg }
 // EditorCfg{vim=true, font="Monospace 11", scheme_light="Adwaita", scheme_dark="Adwaita-dark", math_envs=[], wrap=true}
-// BuildCfg{on_save=true, on_agent_turn_end=true, outdir=".build", timeout_s=180, latexmk="latexmk"}
+// BuildCfg{on_save=true, on_agent_turn_end=true, outdir=".build", copy_pdf=true, fast_preamble=true, timeout_s=180, latexmk="latexmk"}
 // PdfCfg{cache_mib=48, dark_invert=true(follows style), follow_cursor=false}
 // AgentCfg{node, claude (absolute; auto-detected once), adapter_dir="~/.local/share/lemma/acp", adapter_version="0.89.1",
 //          save_before_prompt=true, snapshot_cap_mib=4, idle_stop_min=10 (M5)}

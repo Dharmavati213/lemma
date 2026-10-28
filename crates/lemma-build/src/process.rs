@@ -2,6 +2,7 @@
 //! clean-up of a build's files (`latexmk -c`).
 
 use crate::paths::{normalize, resolve};
+use crate::preamble::Format;
 use crate::runaway::runaway_text;
 use crate::{
     BuildRequest, LogReport, clean_command_line, command_line, locate_runaways, parse_blg,
@@ -165,6 +166,8 @@ pub struct Build {
     group: Arc<Group>,
     started: Instant,
     req: BuildRequest,
+    /// The log of the precompiled preamble the build runs with ([`Build::start_with`]).
+    preamble_log: Option<PathBuf>,
 }
 
 /// How a build ended.
@@ -254,6 +257,26 @@ impl Build {
         Build::launch(req, &args, env)
     }
 
+    /// [`Build::start`] with `-g`: latexmk runs TeX even when it finds nothing changed. After
+    /// a build whose pdflatex could not load its precompiled preamble, latexmk would otherwise
+    /// only repeat that run's error (it does not see that the command changed).
+    pub fn start_forced(req: &BuildRequest) -> io::Result<Build> {
+        let (mut args, env) = command_line(req);
+        args.insert(args.len() - 1, "-g".into());
+        Build::launch(req, &args, env)
+    }
+
+    /// [`Build::start`] with the precompiled preamble `format` (see [`crate::preamble`]): TeX
+    /// starts with the preamble loaded, and the outcome's diagnostics begin with those of the
+    /// run that loaded it.
+    pub fn start_with(req: &BuildRequest, format: &Format) -> io::Result<Build> {
+        let (mut args, mut env) = command_line(req);
+        format.apply(&mut args, &mut env);
+        let mut build = Build::launch(req, &args, env)?;
+        build.preamble_log = Some(format.log().to_path_buf());
+        Ok(build)
+    }
+
     /// Blocking: removes what the build of `req` generated (`latexmk -c`, see
     /// [`clean_command_line`]), so that the next build starts from the sources, and waits for it,
     /// enforcing `req.timeout`. It runs as a build does (in the root's directory and its own
@@ -292,6 +315,21 @@ impl Build {
         env: Vec<(String, String)>,
     ) -> io::Result<Build> {
         let (root_dir, stem) = root_parts(&req.root)?;
+        let output = root_dir
+            .join(&req.outdir)
+            .join(file_name(stem, "latexmk.log"));
+        Build::launch_program(req, &req.latexmk, args, env, &output)
+    }
+
+    /// [`Build::launch`] of `program` instead of latexmk, its output going to `output`.
+    pub(crate) fn launch_program(
+        req: &BuildRequest,
+        program: &Path,
+        args: &[OsString],
+        env: Vec<(String, String)>,
+        output: &Path,
+    ) -> io::Result<Build> {
+        let (root_dir, _) = root_parts(&req.root)?;
         let out_dir = root_dir.join(&req.outdir);
         fs::create_dir_all(&out_dir)?;
         for dir in &req.mirror_dirs {
@@ -299,7 +337,7 @@ impl Build {
                 fs::create_dir_all(out_dir.join(dir))?;
             }
         }
-        let (stdout, stderr) = match File::create(out_dir.join(file_name(stem, "latexmk.log"))) {
+        let (stdout, stderr) = match File::create(output) {
             Ok(file) => match file.try_clone() {
                 Ok(copy) => (Stdio::from(file), Stdio::from(copy)),
                 Err(_) => (Stdio::from(file), Stdio::null()),
@@ -307,7 +345,7 @@ impl Build {
             Err(_) => (Stdio::null(), Stdio::null()),
         };
         let started = Instant::now();
-        let mut command = Command::new(&req.latexmk);
+        let mut command = Command::new(program);
         command
             .args(args)
             .envs(env)
@@ -316,10 +354,7 @@ impl Build {
             .stdout(stdout)
             .stderr(stderr);
         let cannot_run = |e: io::Error| {
-            io::Error::new(
-                e.kind(),
-                format!("cannot run {}: {e}", req.latexmk.display()),
-            )
+            io::Error::new(e.kind(), format!("cannot run {}: {e}", program.display()))
         };
         #[cfg(unix)]
         let (child, group) = {
@@ -339,6 +374,7 @@ impl Build {
             group: Arc::new(group),
             started,
             req: req.clone(),
+            preamble_log: None,
         })
     }
 
@@ -365,7 +401,7 @@ impl Build {
     /// Blocking: waits for latexmk (stopping it at `req.timeout`) and, after a cancel or timeout,
     /// up to 1.5 s for the rest of its process group. Returns how the run ended, latexmk's exit
     /// code (`None` when a signal ended it) and how long it ran.
-    fn wait_for_exit(&mut self) -> (BuildStatus, Option<i32>, Duration) {
+    pub(crate) fn wait_for_exit(&mut self) -> (BuildStatus, Option<i32>, Duration) {
         let timeout = self.req.timeout.saturating_sub(self.started.elapsed());
         let (done, finished) = mpsc::channel::<()>();
         let group = Arc::clone(&self.group);
@@ -416,9 +452,22 @@ impl Build {
         let out_dir = resolve(&root_dir, Path::new(&self.req.outdir));
         let output_file = |ext: &str| out_dir.join(file_name(&stem, ext));
 
+        let parse = |log: &str| parse_log(log, &root_dir, &|p: &Path| root_dir.join(p).is_file());
         let mut report = read_capped(&output_file("log"), MAX_LOG_BYTES)
-            .map(|log| parse_log(&log, &root_dir, &|p: &Path| root_dir.join(p).is_file()))
+            .map(|log| parse(&log))
             .unwrap_or_default();
+        // The preamble's warnings were logged when it was precompiled: first, as in its own log.
+        if let Some(log) = self
+            .preamble_log
+            .as_deref()
+            .and_then(|p| read_capped(p, MAX_LOG_BYTES))
+        {
+            let mut diagnostics = parse(&log).diagnostics;
+            // A dump ships no pages, which its log says.
+            diagnostics.retain(|d| !d.message.starts_with("No pages of output"));
+            diagnostics.append(&mut report.diagnostics);
+            report.diagnostics = diagnostics;
+        }
         if report.diagnostics.iter().any(|d| runaway_text(d).is_some()) {
             let sources = project_sources(&output_file("fls"), &root, &root_dir, &out_dir);
             locate_runaways(&mut report, &sources);
@@ -487,7 +536,7 @@ impl Drop for Build {
 }
 
 /// The root's directory (`.` for a bare file name) and its file stem.
-fn root_parts(root: &Path) -> io::Result<(PathBuf, &OsStr)> {
+pub(crate) fn root_parts(root: &Path) -> io::Result<(PathBuf, &OsStr)> {
     let stem = root.file_stem().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -502,7 +551,7 @@ fn root_parts(root: &Path) -> io::Result<(PathBuf, &OsStr)> {
 }
 
 /// `<stem>.<ext>`; the stem may itself contain dots.
-fn file_name(stem: &OsStr, ext: &str) -> PathBuf {
+pub(crate) fn file_name(stem: &OsStr, ext: &str) -> PathBuf {
     let mut name = stem.to_os_string();
     name.push(".");
     name.push(ext);
