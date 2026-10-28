@@ -354,17 +354,28 @@ fn editor_menus() {
         Some(editor.extra_menu()),
         "the editor's model is the view's"
     );
-    assert_eq!(editor.extra_menu().n_items(), 1, "the window's section");
-    let section = editor
-        .extra_menu()
-        .item_link(0, gio::MENU_LINK_SECTION)
-        .expect("a section");
-    assert_eq!(section.n_items(), before + 1);
+    // Show in PDF first, then the window's section.
+    assert_eq!(
+        editor.extra_menu().n_items(),
+        2,
+        "Show in PDF and the window's section"
+    );
+    let section = |i| {
+        editor
+            .extra_menu()
+            .item_link(i, gio::MENU_LINK_SECTION)
+            .expect("a section")
+    };
+    let action = section(0)
+        .item_attribute_value(0, gio::MENU_ATTRIBUTE_ACTION, None)
+        .and_then(|v| v.get::<String>());
+    assert_eq!(action.as_deref(), Some("win.sync-forward"));
+    assert_eq!(section(1).n_items(), before + 1);
     // Spell checking inserts its section first.
     let spelling = gio::Menu::new();
     spelling.append(Some("Add to Dictionary"), Some("spelling.add"));
     editor.extra_menu().insert_section(0, None, &spelling);
-    assert_eq!(editor.extra_menu().n_items(), 2);
+    assert_eq!(editor.extra_menu().n_items(), 3);
 
     for (section, item) in [
         (&f.state.header.menu_files, "win.new-file"),
