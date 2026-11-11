@@ -854,7 +854,7 @@ fn zoom_out_renders_at_the_live_scale() {
     state.window.destroy();
 }
 
-/// Shows `tests/fixtures/pdf/stress.pdf` (23 Letter pages, in bands from scale_q 24 on) in light
+/// Shows `tests/fixtures/pdf/stress.pdf` (23 Letter pages, in bands from scale 3 on) in light
 /// mode.
 fn show_stress(state: &WindowState) -> PdfView {
     let stress = common::fixtures().join("pdf/stress.pdf");

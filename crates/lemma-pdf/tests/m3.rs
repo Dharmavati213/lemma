@@ -369,7 +369,7 @@ fn renders_and_searches_take_turns() {
                 key: PageKey {
                     generation: 1,
                     page,
-                    scale_q: 8,
+                    scale_q: lemma_pdf::SCALE_STEPS,
                     tile: None,
                     dark: false,
                 },

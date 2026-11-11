@@ -186,7 +186,7 @@ fn regress_synctex_ignores_page_rotation() {
         key: PageKey {
             generation: 1,
             page: 0,
-            scale_q: 8,
+            scale_q: lemma_pdf::SCALE_STEPS,
             tile: None,
             dark: false,
         },
@@ -253,8 +253,14 @@ fn regress_synctex_ignores_page_rotation() {
 /// billion bp, as a PDF can declare in its MediaBox.
 #[test]
 fn regress_tile_grid_overflows_for_huge_pages() {
-    assert_eq!(page_pixels((3e9, 100.0), 8), (i32::MAX, 100));
-    assert_eq!(tile_grid((3e9, 100.0), 8), Some((u16::MAX, 1)));
+    assert_eq!(
+        page_pixels((3e9, 100.0), lemma_pdf::SCALE_STEPS),
+        (i32::MAX, 100)
+    );
+    assert_eq!(
+        tile_grid((3e9, 100.0), lemma_pdf::SCALE_STEPS),
+        Some((u16::MAX, 1))
+    );
 }
 
 /// Writes `main.pdf` (one Letter page with `/Rotate rotate`) whose content is the text
@@ -350,7 +356,7 @@ fn turned_text_pages_map_both_ways() {
             key: PageKey {
                 generation: 1,
                 page: 0,
-                scale_q: 8,
+                scale_q: lemma_pdf::SCALE_STEPS,
                 tile: None,
                 dark: false,
             },

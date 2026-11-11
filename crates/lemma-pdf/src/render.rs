@@ -2,12 +2,12 @@
 //!
 //! A page too large for one bitmap is rendered in tiles, and every tile costs a pass of poppler
 //! over the page's whole content stream (cairo clips the drawing to the tile). So the tiles are
-//! full-width bands of a few MiB rather than small squares: a stress.pdf page at scale_q 26
+//! full-width bands of a few MiB rather than small squares: a stress.pdf page at scale 3.25
 //! (1989 × 2574 px, a fit-width page on a HiDPI pane about 1000 px wide) takes 23–29 ms in its 5
 //! bands, 77–93 ms in the 24 tiles of 512² that tiled it before, and 10–12 ms whole
 //! (`perf_tiled_page`). A page wider than [`MAX_TILE_WIDTH`] is zoomed in far, and its view shows
 //! only part of its width, so it is cut into tiles of about 1024² (as many bytes as a band): in
-//! the middle of a stress page at scale_q 96 (7344 × 9504 px), a 1800 × 2000 px view takes 9 of
+//! the middle of a stress page at scale 12 (7344 × 9504 px), a 1800 × 2000 px view takes 9 of
 //! them (33 MiB) and 31–34 ms, against 25 tiles of 512² (25 MiB) and 77–78 ms, and 16 bands up
 //! to 4096 px wide (63 MiB, more than the view's default texture cache of 48 MiB) and 52 ms.
 
@@ -33,18 +33,25 @@ const SQUARE_TILE: i32 = 1024;
 /// cairo refuses image surfaces wider or taller than this.
 const MAX_SURFACE_DIM: i32 = 32_767;
 
-/// Quantizes `zoom × device scale` to 1/8 steps, as stored in [`PageKey::scale_q`] (at least 1).
+/// [`PageKey::scale_q`] steps per unit of render scale. Fine enough that a page up to 1024 bp
+/// rendered at the quantized scale has every point within half a device pixel of where the exact
+/// zoom puts it, so the view can draw the bitmap pixel for pixel rather than resample it (which
+/// blurs text); coarse enough that a `u16` reaches a scale of about 64 (zoom 8 at device scale 8).
+pub const SCALE_STEPS: u16 = 1024;
+
+/// Quantizes `zoom × device scale` to 1/[`SCALE_STEPS`] steps, as stored in
+/// [`PageKey::scale_q`] (at least 1).
 pub fn scale_q(zoom: f64, device_scale: f64) -> u16 {
-    let q = (zoom * device_scale * 8.0).round();
+    let q = (zoom * device_scale * f64::from(SCALE_STEPS)).round();
     if q.is_nan() {
-        return 8;
+        return SCALE_STEPS;
     }
     q.clamp(1.0, f64::from(u16::MAX)) as u16
 }
 
 /// The render scale (device pixels per bp) that `scale_q` stands for.
 pub fn scale_of(scale_q: u16) -> f64 {
-    f64::from(scale_q) / 8.0
+    f64::from(scale_q) / f64::from(SCALE_STEPS)
 }
 
 /// Size in device pixels of the full bitmap of a page of `size_bp` at `scale_q` (each side at least 1).
@@ -284,38 +291,55 @@ mod tests {
 
     const LETTER: (f64, f64) = (612.0, 792.0);
 
+    /// The `scale_q` of render scale `scale` (device pixels per bp).
+    fn at(scale: f64) -> u16 {
+        scale_q(scale, 1.0)
+    }
+
     #[test]
     fn scale_quantization() {
-        assert_eq!(scale_q(1.0, 2.0), 16);
-        assert_eq!(scale_q(1.3, 1.0), 10);
+        assert_eq!(scale_q(1.0, 2.0), 2048);
+        assert_eq!(scale_q(1.3, 1.0), 1331);
         assert_eq!(scale_q(0.0, 1.0), 1);
         assert_eq!(scale_q(1e9, 1.0), u16::MAX);
-        assert_eq!(scale_q(f64::NAN, 1.0), 8);
-        assert_eq!(scale_of(12), 1.5);
+        assert_eq!(scale_q(f64::NAN, 1.0), SCALE_STEPS);
+        assert_eq!(scale_of(1536), 1.5);
+        // Fine enough to draw the bitmap pixel for pixel: across 1024 bp, a fit-width zoom's
+        // quantized scale is off by at most half a device pixel.
+        for zoom in [0.6123, 1.0, 1.2378, 1.4853, 2.75, 7.9999] {
+            for device_scale in [1.0, 1.25, 2.0] {
+                let exact = zoom * device_scale;
+                let q = scale_q(zoom, device_scale);
+                assert!(
+                    (scale_of(q) - exact).abs() * 1024.0 <= 0.5,
+                    "{zoom} × {device_scale}"
+                );
+            }
+        }
     }
 
     #[test]
     fn pixel_sizes_round_up() {
-        assert_eq!(page_pixels(LETTER, 16), (1224, 1584));
-        assert_eq!(page_pixels((100.1, 0.0), 8), (101, 1));
+        assert_eq!(page_pixels(LETTER, at(2.0)), (1224, 1584));
+        assert_eq!(page_pixels((100.1, 0.0), at(1.0)), (101, 1));
     }
 
     #[test]
     fn tiling_starts_above_16_mib() {
         // 2x letter is 7.76 MB, 3x is 17.4 MB: five full-width bands of 476 rows (3.5 MB).
-        assert_eq!(tile_grid(LETTER, 16), None);
-        assert_eq!(tile_size(LETTER, 16), None);
-        assert_eq!(tile_grid(LETTER, 24), Some((1, 5)));
-        assert_eq!(tile_size(LETTER, 24), Some((1836, 476)));
+        assert_eq!(tile_grid(LETTER, at(2.0)), None);
+        assert_eq!(tile_size(LETTER, at(2.0)), None);
+        assert_eq!(tile_grid(LETTER, at(3.0)), Some((1, 5)));
+        assert_eq!(tile_size(LETTER, at(3.0)), Some((1836, 476)));
         // A very tall but narrow page exceeds cairo's dimension limit before the byte threshold.
-        assert_eq!(tile_grid((10.0, 40_000.0), 8), Some((1, 2)));
-        assert_eq!(tile_size((10.0, 40_000.0), 8), Some((10, 20_000)));
+        assert_eq!(tile_grid((10.0, 40_000.0), at(1.0)), Some((1, 2)));
+        assert_eq!(tile_size((10.0, 40_000.0), at(1.0)), Some((10, 20_000)));
     }
 
     #[test]
     fn tiles_are_full_width_bands_within_the_byte_bound() {
         // Letter from just over the threshold to the view's largest zoom on a HiDPI display.
-        for q in 24..=128 {
+        for q in (24..=128).map(|eighths| eighths * (SCALE_STEPS / 8)) {
             let (w, h) = page_pixels(LETTER, q);
             let (columns, rows) = tile_grid(LETTER, q).unwrap();
             let (tile_w, tile_h) = tile_size(LETTER, q).unwrap();
@@ -337,28 +361,28 @@ mod tests {
             assert!(i32::from(rows) * tile_h - h < i32::from(rows), "q {q}");
         }
         // A fit-width page on a HiDPI pane about 1000 px wide: 5 bands instead of 24 tiles.
-        assert_eq!(tile_grid(LETTER, 26), Some((1, 5)));
-        // Bands up to 4096 px wide (4055 × 5247 px at scale_q 53), then about square tiles:
-        // 4131 × 5346 px at scale_q 54 in 5 × 5 tiles of 827 × 1070.
-        assert_eq!(tile_size(LETTER, 53), Some((4055, 250)));
-        assert_eq!(tile_grid(LETTER, 54), Some((5, 5)));
-        assert_eq!(tile_size(LETTER, 54), Some((827, 1070)));
+        assert_eq!(tile_grid(LETTER, at(3.25)), Some((1, 5)));
+        // Bands up to 4096 px wide (4055 × 5247 px at scale 6.625), then about square tiles:
+        // 4131 × 5346 px at scale 6.75 in 5 × 5 tiles of 827 × 1070.
+        assert_eq!(tile_size(LETTER, at(6.625)), Some((4055, 250)));
+        assert_eq!(tile_grid(LETTER, at(6.75)), Some((5, 5)));
+        assert_eq!(tile_size(LETTER, at(6.75)), Some((827, 1070)));
         // Zoomed far in (9180 × 11880 px): 9 × 12 tiles of 1020 × 990.
-        assert_eq!(tile_grid(LETTER, 120), Some((9, 12)));
-        assert_eq!(tile_size(LETTER, 120), Some((1020, 990)));
+        assert_eq!(tile_grid(LETTER, at(15.0)), Some((9, 12)));
+        assert_eq!(tile_size(LETTER, at(15.0)), Some((1020, 990)));
     }
 
     #[test]
     fn huge_pages_keep_their_tiles_addressable() {
         // A side clamped to i32::MAX pixels: columns of SQUARE_TILE, cut to u16::MAX of them.
-        assert_eq!(tile_grid((3e9, 100.0), 8), Some((u16::MAX, 1)));
-        assert_eq!(tile_size((3e9, 100.0), 8), Some((SQUARE_TILE, 100)));
-        let last = tile_rect((3e9, 100.0), 8, (u16::MAX - 1, 0));
+        assert_eq!(tile_grid((3e9, 100.0), at(1.0)), Some((u16::MAX, 1)));
+        assert_eq!(tile_size((3e9, 100.0), at(1.0)), Some((SQUARE_TILE, 100)));
+        let last = tile_rect((3e9, 100.0), at(1.0), (u16::MAX - 1, 0));
         assert_eq!(last, (65_534 * SQUARE_TILE, 0, SQUARE_TILE, 100));
         // A 2e7 bp page at scale 1/8: 2442 × 2442 tiles of 1024².
-        let (w, h) = page_pixels((2e7, 2e7), 1);
-        let (columns, rows) = tile_grid((2e7, 2e7), 1).unwrap();
-        let (tile_w, tile_h) = tile_size((2e7, 2e7), 1).unwrap();
+        let (w, h) = page_pixels((2e7, 2e7), at(0.125));
+        let (columns, rows) = tile_grid((2e7, 2e7), at(0.125)).unwrap();
+        let (tile_w, tile_h) = tile_size((2e7, 2e7), at(0.125)).unwrap();
         assert_eq!((columns, rows), (2442, 2442));
         assert!(i64::from(columns) * i64::from(tile_w) >= i64::from(w));
         assert!(i64::from(rows) * i64::from(tile_h) >= i64::from(h));
@@ -367,32 +391,32 @@ mod tests {
     #[test]
     fn the_tiles_covering_a_region() {
         // Five bands of 476 rows.
-        assert_eq!(tiles_covering(LETTER, 16, (0, 0, 10, 10)), None);
+        assert_eq!(tiles_covering(LETTER, at(2.0), (0, 0, 10, 10)), None);
         assert_eq!(
-            tiles_covering(LETTER, 24, (100, 400, 300, 200)),
+            tiles_covering(LETTER, at(3.0), (100, 400, 300, 200)),
             Some(vec![(0, 0), (0, 1)])
         );
         assert_eq!(
-            tiles_covering(LETTER, 24, (0, 476, 1836, 476)),
+            tiles_covering(LETTER, at(3.0), (0, 476, 1836, 476)),
             Some(vec![(0, 1)])
         );
         // Clamped to the grid.
         assert_eq!(
-            tiles_covering(LETTER, 24, (-5, 2300, 5000, 5000)),
+            tiles_covering(LETTER, at(3.0), (-5, 2300, 5000, 5000)),
             Some(vec![(0, 4)])
         );
         // Several columns: tiles of 1020 × 990 px.
         assert_eq!(
-            tiles_covering(LETTER, 120, (3000, 980, 100, 20)),
+            tiles_covering(LETTER, at(15.0), (3000, 980, 100, 20)),
             Some(vec![(2, 0), (3, 0), (2, 1), (3, 1)])
         );
         // Every pixel of a region lies in one of its tiles.
         let region = (1234, 567, 2345, 1678);
-        let tiles = tiles_covering(LETTER, 120, region).unwrap();
+        let tiles = tiles_covering(LETTER, at(15.0), region).unwrap();
         for (x, y) in [(1234, 567), (3578, 2244), (3060, 990), (3059, 989)] {
             assert!(
                 tiles.iter().any(|&t| {
-                    let (tx, ty, tw, th) = tile_rect(LETTER, 120, t);
+                    let (tx, ty, tw, th) = tile_rect(LETTER, at(15.0), t);
                     (tx..tx + tw).contains(&x) && (ty..ty + th).contains(&y)
                 }),
                 "({x}, {y}) in {tiles:?}"
@@ -403,10 +427,10 @@ mod tests {
     #[test]
     fn an_untiled_page_has_tiles_of_the_same_shape() {
         // 1224 × 1584 px: two bands of 792 rows, were it tiled.
-        assert_eq!(tile_rect(LETTER, 16, (0, 0)), (0, 0, 1224, 792));
-        assert_eq!(tile_rect(LETTER, 16, (0, 1)), (0, 792, 1224, 792));
-        assert_eq!(tile_rect(LETTER, 16, (0, 2)).3, 0);
-        assert_eq!(tile_rect(LETTER, 16, (1, 0)).2, 0);
+        assert_eq!(tile_rect(LETTER, at(2.0), (0, 0)), (0, 0, 1224, 792));
+        assert_eq!(tile_rect(LETTER, at(2.0), (0, 1)), (0, 792, 1224, 792));
+        assert_eq!(tile_rect(LETTER, at(2.0), (0, 2)).3, 0);
+        assert_eq!(tile_rect(LETTER, at(2.0), (1, 0)).2, 0);
     }
 
     #[test]
@@ -419,7 +443,7 @@ mod tests {
 
     #[test]
     fn tile_rects_cover_the_page() {
-        for q in [24, 26, 64, 120] {
+        for q in [3.0, 3.25, 8.0, 15.0].map(at) {
             let (w, h) = page_pixels(LETTER, q);
             let (cols, rows) = tile_grid(LETTER, q).unwrap();
             let (size_w, size_h) = tile_size(LETTER, q).unwrap();

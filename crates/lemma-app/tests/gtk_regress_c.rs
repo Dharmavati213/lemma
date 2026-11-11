@@ -251,7 +251,7 @@ fn straddle(view: &PdfView, page: u32) {
     view.set_scroll_position(0.0, y - f64::from(view.height()) / 2.0);
 }
 
-/// C1: at zoom × scale 2.75 (scale_q 22; HiDPI fit-width in an ~800 px pane is the same) an A4
+/// C1: at zoom × scale 2.75 (HiDPI fit-width in an ~800 px pane is the same) an A4
 /// page is 15.2 MB, so two visible pages plus the two prefetch pages exceed the 48 MiB cache.
 /// When the four bitmaps arrive before the next frame, inserting the last one evicts the first,
 /// a visible page, and nothing asks for it again: it stays blank until the next scroll.

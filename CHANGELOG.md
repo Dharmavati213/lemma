@@ -50,6 +50,10 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
   its PDF, it opened the PDF it had found, which could be an old `main.pdf` beside `main.tex`
   instead of the new one in `.build` (and without its SyncTeX file). A PDF opened meanwhile now
   stays.
+- Text in the PDF is sharp at every zoom. A page was rendered at the zoom rounded to an eighth
+  and then stretched to the zoom shown, slightly blurring some letters and not others (at 148%,
+  rendered at 150% and shrunk by 1%). It is now rendered at the zoom shown and drawn pixel for
+  pixel.
 
 ## zeta (0.2.0), 2026-10-25
 

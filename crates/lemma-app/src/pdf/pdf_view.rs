@@ -1045,13 +1045,8 @@ mod imp {
                     let Some(texture) = model.cache.get(&key) else {
                         continue;
                     };
-                    let r = match key.tile {
-                        None => rect,
-                        Some(tile) => {
-                            let r = geometry::tile_view_rect(size, key.scale_q, tile, rect);
-                            Rect::new(snap(r.x), snap(r.y), r.width, r.height)
-                        }
-                    };
+                    let r = geometry::bitmap_view_rect(size, key.scale_q, key.tile, rect, scale);
+                    let r = Rect::new(snap(r.x), snap(r.y), r.width, r.height);
                     // A texture of the other mode (just after a toggle) is recoloured; the
                     // others are drawn as they are.
                     let recolour = (key.dark != model.dark).then(|| {

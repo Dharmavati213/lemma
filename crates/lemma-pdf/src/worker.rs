@@ -1151,6 +1151,7 @@ fn push_tiles(queue: &mut VecDeque<RenderReq>, req: RenderReq, (cols, rows): (u1
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SCALE_STEPS;
     use std::time::{Duration, Instant};
 
     fn fixture(name: &str) -> PathBuf {
@@ -1193,16 +1194,19 @@ mod tests {
             pdf: fixture("pdf/stress.pdf"),
         });
         assert!(matches!(next(&rx), PdfEvent::Opened { generation: 3, .. }));
-        pdf.send(PdfCmd::Want(vec![req(3, 0, PANIC_SCALE_Q), req(3, 4, 8)]));
+        pdf.send(PdfCmd::Want(vec![
+            req(3, 0, PANIC_SCALE_Q),
+            req(3, 4, SCALE_STEPS),
+        ]));
         // The panicking request is consumed; the rest of the queue survives the restart, and the
         // document is reopened silently under the same generation.
         match next(&rx) {
-            PdfEvent::Rendered(r) => assert_eq!(r.key, req(3, 4, 8).key),
+            PdfEvent::Rendered(r) => assert_eq!(r.key, req(3, 4, SCALE_STEPS).key),
             other => panic!("unexpected {other:?}"),
         }
-        pdf.send(PdfCmd::Want(vec![req(3, 5, 8)]));
+        pdf.send(PdfCmd::Want(vec![req(3, 5, SCALE_STEPS)]));
         match next(&rx) {
-            PdfEvent::Rendered(r) => assert_eq!(r.key, req(3, 5, 8).key),
+            PdfEvent::Rendered(r) => assert_eq!(r.key, req(3, 5, SCALE_STEPS).key),
             other => panic!("unexpected {other:?}"),
         }
         assert!(pdf.shutdown_and_join(Duration::from_secs(10)));
@@ -1210,15 +1214,20 @@ mod tests {
 
     #[test]
     fn untiled_requests_for_huge_pages_expand_in_row_major_order() {
-        let mut queue = VecDeque::from([req(1, 2, 8)]);
-        let big = req(1, 0, 24);
+        let mut queue = VecDeque::from([req(1, 2, SCALE_STEPS)]);
+        let big = req(1, 0, 3 * SCALE_STEPS);
         push_tiles(&mut queue, big, (2, 2));
         let tiles: Vec<_> = queue.iter().map(|r| r.key.tile).collect();
         assert_eq!(
             tiles,
             [Some((0, 0)), Some((1, 0)), Some((0, 1)), Some((1, 1)), None]
         );
-        assert!(queue.iter().take(4).all(|r| r.key.scale_q == 24));
+        assert!(
+            queue
+                .iter()
+                .take(4)
+                .all(|r| r.key.scale_q == 3 * SCALE_STEPS)
+        );
         push_tiles(&mut queue, big, (100, 100));
         assert_eq!(queue.len(), 5);
     }
@@ -1324,7 +1333,7 @@ mod tests {
         assert!(worker.parsing.is_some());
         assert_eq!(worker.state.sync_waiting.len(), 2);
         // Pages are rendered meanwhile.
-        let _ = worker.handle(PdfCmd::Want(vec![req(1, 0, 8)]));
+        let _ = worker.handle(PdfCmd::Want(vec![req(1, 0, SCALE_STEPS)]));
         assert!(worker.render_next().is_continue());
         assert!(matches!(
             drain(&received)[..],
@@ -1599,7 +1608,7 @@ mod tests {
         resized[7] = (300.0, 400.0);
         write_pages(&pdf, &resized);
         reload(&mut worker, 2, &pdf);
-        let _ = worker.handle(PdfCmd::Want(vec![req(2, 7, 8)]));
+        let _ = worker.handle(PdfCmd::Want(vec![req(2, 7, SCALE_STEPS)]));
         assert!(worker.render_next().is_continue());
         match &drain(&received)[..] {
             [
@@ -1688,7 +1697,10 @@ mod tests {
         let mut worker = Worker::restore(&events, &tx, &mut state);
         open(&mut worker, 1, &pdf);
         reload(&mut worker, 2, &pdf);
-        let _ = worker.handle(PdfCmd::Want(vec![req(2, 0, 8), req(2, 1, 8)]));
+        let _ = worker.handle(PdfCmd::Want(vec![
+            req(2, 0, SCALE_STEPS),
+            req(2, 1, SCALE_STEPS),
+        ]));
         let unread = |worker: &Worker| worker.doc.as_ref().map_or(0, |d| d.unread_left);
         // The pages asked for first, each read as it is rendered.
         assert!(worker.work_next().is_continue());

@@ -20,8 +20,8 @@ pub use layout::{Anchor, PageLayout};
 pub use lemma_synctex::{SyncBox, SyncTarget};
 pub use lru::ByteLru;
 pub use render::{
-    MAX_TILE_WIDTH, TILE_BYTES, TILE_THRESHOLD_BYTES, page_pixels, scale_of, scale_q, tile_grid,
-    tile_rect, tile_size, tiles_covering,
+    MAX_TILE_WIDTH, SCALE_STEPS, TILE_BYTES, TILE_THRESHOLD_BYTES, page_pixels, scale_of, scale_q,
+    tile_grid, tile_rect, tile_size, tiles_covering,
 };
 pub use worker::{PdfHandle, spawn};
 
@@ -30,14 +30,14 @@ use std::path::PathBuf;
 /// Identifies one bitmap: a page (or a tile of it) of one document generation at one scale, light
 /// or dark.
 ///
-/// zoom * device_scale quantized to 1/8 steps: scale_q = round(zoom * scale * 8).
+/// zoom * device_scale quantized to 1/[`SCALE_STEPS`] steps: scale_q = round(zoom * scale * 1024).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PageKey {
     /// The generation of the [`PdfCmd::Open`] the page belongs to.
     pub generation: u64,
     /// 0-based page index.
     pub page: u32,
-    /// Render scale in device pixels per bp, times 8 (see [`scale_q`]).
+    /// Render scale in device pixels per bp, times [`SCALE_STEPS`] (see [`scale_q`]).
     pub scale_q: u16,
     /// `(column, row)` of a tile (a full-width band unless the page is wider than
     /// [`MAX_TILE_WIDTH`]), used when a page bitmap would exceed [`TILE_THRESHOLD_BYTES`] (see

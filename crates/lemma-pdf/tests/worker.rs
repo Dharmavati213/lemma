@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, TryRecvError};
 use lemma_pdf::{
-    LinkDest, PageKey, PdfCmd, PdfEvent, PdfHandle, RenderReq, Rendered, page_pixels, tile_grid,
-    tile_rect, tiles_covering,
+    LinkDest, PageKey, PdfCmd, PdfEvent, PdfHandle, RenderReq, Rendered, SCALE_STEPS, page_pixels,
+    scale_q, tile_grid, tile_rect, tiles_covering,
 };
 
 const LETTER: (f64, f64) = (612.0, 792.0);
@@ -43,6 +43,11 @@ fn rendered(rx: &Receiver<PdfEvent>) -> Rendered {
         PdfEvent::Rendered(r) => r,
         other => panic!("expected Rendered, got {other:?}"),
     }
+}
+
+/// The `scale_q` of render scale `scale` (device pixels per bp).
+fn at(scale: f64) -> u16 {
+    scale_q(scale, 1.0)
 }
 
 fn key(generation: u64, page: u32, scale_q: u16) -> PageKey {
@@ -97,10 +102,14 @@ fn renders_three_stress_pages_at_2x() {
     let (pdf, rx, sizes) = open("pdf/stress.pdf", 1);
     assert_eq!(sizes.len(), 23);
     assert!(sizes.iter().all(|&s| s == LETTER));
-    pdf.send(want([key(1, 0, 16), key(1, 7, 16), key(1, 22, 16)]));
+    pdf.send(want([
+        key(1, 0, at(2.0)),
+        key(1, 7, at(2.0)),
+        key(1, 22, at(2.0)),
+    ]));
     for page in [0, 7, 22] {
         let r = rendered(&rx);
-        assert_eq!(r.key, key(1, page, 16));
+        assert_eq!(r.key, key(1, page, at(2.0)));
         assert_eq!((r.width, r.height), (1224, 1584));
         assert!(r.stride >= r.width * 4);
         assert_eq!(r.data.len(), r.stride as usize * r.height as usize);
@@ -116,9 +125,9 @@ fn dark_requests_come_back_coloured_for_dark_mode() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
     let dark = PageKey {
         dark: true,
-        ..key(1, 0, 8)
+        ..key(1, 0, at(1.0))
     };
-    pdf.send(want([key(1, 0, 8), dark]));
+    pdf.send(want([key(1, 0, at(1.0)), dark]));
     let light = rendered(&rx);
     let darkened = rendered(&rx);
     assert_eq!(darkened.key, dark);
@@ -198,7 +207,7 @@ fn dark_pages_come_out_as_before() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
     // Pages of text, a table and coloured links, at scale 1 and fit width on a HiDPI screen; and
     // their dark bitmaps coloured again, whose pixels are other greys and colours.
-    for (page, scale_q) in [(0, 8), (5, 8), (11, 21), (19, 21)] {
+    for (page, scale_q) in [(0, at(1.0)), (5, at(1.0)), (11, at(2.625)), (19, at(2.625))] {
         let dark = PageKey {
             dark: true,
             ..key(1, page, scale_q)
@@ -236,8 +245,8 @@ fn dark_pages_come_out_as_before() {
 #[test]
 fn latest_want_wins_when_sent_back_to_back() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
-    let old: Vec<_> = (0..20).map(|p| key(1, p, 8)).collect();
-    let new: Vec<_> = (20..23).map(|p| key(1, p, 8)).collect();
+    let old: Vec<_> = (0..20).map(|p| key(1, p, at(1.0))).collect();
+    let new: Vec<_> = (20..23).map(|p| key(1, p, at(1.0))).collect();
     pdf.send(want(old));
     pdf.send(want(new.clone()));
     let mut stale = 0;
@@ -262,14 +271,14 @@ fn latest_want_wins_when_sent_back_to_back() {
 #[test]
 fn latest_want_wins_mid_queue() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
-    pdf.send(want((0..20).map(|p| key(1, p, 16))));
-    assert_eq!(rendered(&rx).key, key(1, 0, 16));
+    pdf.send(want((0..20).map(|p| key(1, p, at(2.0)))));
+    assert_eq!(rendered(&rx).key, key(1, 0, at(2.0)));
     // The worker is now rendering (or about to render) page 1; at most that page may still arrive.
-    pdf.send(want([key(1, 21, 8)]));
+    pdf.send(want([key(1, 21, at(1.0))]));
     let mut stale = 0;
     loop {
         let r = rendered(&rx);
-        if r.key == key(1, 21, 8) {
+        if r.key == key(1, 21, at(1.0)) {
             break;
         }
         assert!(r.key.page < 20, "unexpected {r:?}");
@@ -294,11 +303,11 @@ fn stale_generations_are_dropped() {
         pdf: fixture("pdf/test.pdf"),
     });
     pdf.send(want([
-        key(1, 0, 8),
-        key(2, 0, 8),
-        key(1, 1, 8),
-        key(2, 1, 8),
-        key(2, 2, 8),
+        key(1, 0, at(1.0)),
+        key(2, 0, at(1.0)),
+        key(1, 1, at(1.0)),
+        key(2, 1, at(1.0)),
+        key(2, 2, at(1.0)),
     ]));
     match next(&rx) {
         PdfEvent::Opened {
@@ -308,7 +317,7 @@ fn stale_generations_are_dropped() {
         other => panic!("expected Opened, got {other:?}"),
     }
     for page in 0..3 {
-        assert_eq!(rendered(&rx).key, key(2, page, 8));
+        assert_eq!(rendered(&rx).key, key(2, page, at(1.0)));
     }
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
 }
@@ -316,12 +325,12 @@ fn stale_generations_are_dropped() {
 #[test]
 fn reopening_drops_the_old_generations_queue() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
-    pdf.send(want((0..23).map(|p| key(1, p, 16))));
+    pdf.send(want((0..23).map(|p| key(1, p, at(2.0)))));
     pdf.send(PdfCmd::Open {
         generation: 2,
         pdf: fixture("pdf/stress.pdf"),
     });
-    pdf.send(want([key(2, 5, 8)]));
+    pdf.send(want([key(2, 5, at(1.0))]));
     let mut old = 0;
     loop {
         match next(&rx) {
@@ -331,7 +340,7 @@ fn reopening_drops_the_old_generations_queue() {
         }
     }
     assert!(old <= 1, "{old} pages of generation 1 were rendered");
-    assert_eq!(rendered(&rx).key, key(2, 5, 8));
+    assert_eq!(rendered(&rx).key, key(2, 5, at(1.0)));
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
 }
 
@@ -357,8 +366,12 @@ fn failed_open_keeps_the_current_document() {
         next(&rx),
         PdfEvent::OpenFailed { generation: 3, .. }
     ));
-    pdf.send(want([key(3, 0, 8), key(2, 0, 8), key(1, 3, 8)]));
-    assert_eq!(rendered(&rx).key, key(1, 3, 8));
+    pdf.send(want([
+        key(3, 0, at(1.0)),
+        key(2, 0, at(1.0)),
+        key(1, 3, at(1.0)),
+    ]));
+    assert_eq!(rendered(&rx).key, key(1, 3, at(1.0)));
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");
 }
 
@@ -367,16 +380,16 @@ fn large_pages_are_rendered_as_tiles() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
     // 3x letter is 17.4 MB, over the 16 MiB threshold: the whole-page request becomes 5
     // full-width bands.
-    let (cols, rows) = tile_grid(LETTER, 24).expect("3x letter is tiled");
+    let (cols, rows) = tile_grid(LETTER, at(3.0)).expect("3x letter is tiled");
     assert_eq!((cols, rows), (1, 5));
-    pdf.send(want([key(1, 2, 24)]));
-    let (w, h) = page_pixels(LETTER, 24);
+    pdf.send(want([key(1, 2, at(3.0))]));
+    let (w, h) = page_pixels(LETTER, at(3.0));
     let mut area = 0i64;
     for row in 0..rows {
         for col in 0..cols {
             let r = rendered(&rx);
             assert_eq!(r.key.tile, Some((col, row)));
-            let (x, y, tw, th) = tile_rect(LETTER, 24, (col, row));
+            let (x, y, tw, th) = tile_rect(LETTER, at(3.0), (col, row));
             assert_eq!((r.width, r.height), (tw, th));
             assert_eq!(tw, w, "a full-width band");
             assert!(x + tw <= w && y + th <= h);
@@ -390,9 +403,9 @@ fn large_pages_are_rendered_as_tiles() {
     // full-page bitmap.
     let tile = PageKey {
         tile: Some((0, 1)),
-        ..key(1, 4, 16)
+        ..key(1, 4, at(2.0))
     };
-    pdf.send(want([key(1, 4, 16), tile]));
+    pdf.send(want([key(1, 4, at(2.0)), tile]));
     let full = rendered(&rx);
     let part = rendered(&rx);
     assert_eq!(part.key, tile);
@@ -642,7 +655,7 @@ fn a_reload_shows_at_once_and_reports_the_sizes_it_reads() {
         } => assert_eq!(page_sizes, sizes),
         other => panic!("expected PageSizes, got {other:?}"),
     }
-    handle.send(want([key(2, 30, 8)]));
+    handle.send(want([key(2, 30, at(1.0))]));
     let page = rendered(&rx);
     assert_eq!((page.width, page.height), (500, 700));
     // Another file: every page is read before it shows.
@@ -659,8 +672,12 @@ fn a_reload_shows_at_once_and_reports_the_sizes_it_reads() {
         } => assert_eq!(page_sizes, [(595.0, 842.0); 40]),
         other => panic!("expected Opened, got {other:?}"),
     }
-    handle.send(want([key(3, 0, 8)]));
-    assert_eq!(rendered(&rx).key, key(3, 0, 8), "no PageSizes before it");
+    handle.send(want([key(3, 0, at(1.0))]));
+    assert_eq!(
+        rendered(&rx).key,
+        key(3, 0, at(1.0)),
+        "no PageSizes before it"
+    );
     assert!(handle.shutdown_and_join(TIMEOUT), "the pdf thread stops");
 }
 
@@ -742,7 +759,7 @@ fn trim_keeps_sync_working() {
 fn queries_without_a_document_are_answered() {
     let (tx, rx) = async_channel::unbounded();
     let pdf = lemma_pdf::spawn(tx);
-    pdf.send(want([key(0, 0, 8)]));
+    pdf.send(want([key(0, 0, at(1.0))]));
     pdf.send(PdfCmd::Forward {
         file: fixture("proj/main.tex"),
         line: 66,
@@ -756,7 +773,7 @@ fn queries_without_a_document_are_answered() {
 #[test]
 fn shutdown_and_dropped_handles_stop_the_thread() {
     let (pdf, rx, _) = open("pdf/test.pdf", 1);
-    pdf.send(want((0..3).map(|p| key(1, p, 8))));
+    pdf.send(want((0..3).map(|p| key(1, p, at(1.0)))));
     pdf.send(PdfCmd::Shutdown);
     // The thread drops its event sender when it exits, which closes the channel.
     loop {
@@ -784,7 +801,7 @@ fn shutdown_and_dropped_handles_stop_the_thread() {
 fn shutdown_and_join_waits_for_the_thread() {
     let (pdf, rx, _) = open("pdf/stress.pdf", 1);
     let clone = pdf.clone();
-    pdf.send(want((0..23).map(|p| key(1, p, 16))));
+    pdf.send(want((0..23).map(|p| key(1, p, at(2.0)))));
     assert!(pdf.shutdown_and_join(TIMEOUT));
     // The thread has ended: its event sender is gone (at most the page being rendered when
     // Shutdown arrived was still sent), and further commands from any handle are ignored.
@@ -805,10 +822,10 @@ fn perf_render() {
     let (pdf, rx, sizes) = open("pdf/stress.pdf", 1);
     let n = sizes.len() as u32;
     // Warm up fonts and caches.
-    pdf.send(want([key(1, 0, 16)]));
+    pdf.send(want([key(1, 0, at(2.0))]));
     rendered(&rx);
     let t = Instant::now();
-    pdf.send(want((0..n).map(|p| key(1, p, 16))));
+    pdf.send(want((0..n).map(|p| key(1, p, at(2.0)))));
     for _ in 0..n {
         rendered(&rx);
     }
@@ -853,17 +870,17 @@ fn squares_under(
 
 /// A page too large for one bitmap costs a poppler pass over its whole content per tile, so its
 /// full-width bands must cost well under the 512² tiles that tiled it before. The stress pages at
-/// scale_q 26 (1989 × 2574 px, a fit-width page on a HiDPI pane about 1000 px wide), measured on
+/// scale 3.25 (1989 × 2574 px, a fit-width page on a HiDPI pane about 1000 px wide), measured on
 /// a loaded machine: 5 bands 23–29 ms, 24 tiles 77–93 ms, the whole page 10–12 ms. Zoomed in far
-/// (scale_q 96, 7344 × 9504 px), the tiles of about 1024² under a 1800 × 2000 px view must cost
+/// (scale 12, 7344 × 9504 px), the tiles of about 1024² under a 1800 × 2000 px view must cost
 /// well under the 512² ones too: 9 tiles (33 MiB) 31–34 ms, 25 tiles (25 MiB) 77–78 ms.
 #[test]
 #[ignore = "perf: run with cargo test --release -- --ignored perf"]
 fn perf_tiled_page() {
-    const Q: u16 = 26;
+    const Q: u16 = 13 * SCALE_STEPS / 4;
     let (pdf, rx, sizes) = open("pdf/stress.pdf", 1);
     let n = sizes.len() as u32;
-    let (cols, rows) = tile_grid(LETTER, Q).expect("tiled at scale_q 26");
+    let (cols, rows) = tile_grid(LETTER, Q).expect("tiled at scale 3.25");
     let bands = usize::from(cols) * usize::from(rows);
     // Warm up fonts and caches.
     pdf.send(want([key(1, 0, Q)]));
@@ -912,11 +929,11 @@ fn perf_tiled_page() {
 
     // Zoomed in far: a 900 × 1000 view at device scale 2 in the middle of the page, off the
     // edges of tiles and squares.
-    const ZOOMED_Q: u16 = 96;
+    const ZOOMED_Q: u16 = 12 * SCALE_STEPS;
     let (w, h) = page_pixels(LETTER, ZOOMED_Q);
     let view = ((w - 1800) / 2 + 37, (h - 2000) / 2 + 41, 1800, 2000);
     let tiles: Vec<(i32, i32, i32, i32)> = tiles_covering(LETTER, ZOOMED_Q, view)
-        .expect("tiled at scale_q 96")
+        .expect("tiled at scale 12")
         .into_iter()
         .map(|tile| tile_rect(LETTER, ZOOMED_Q, tile))
         .collect();
@@ -995,9 +1012,9 @@ fn render_light(page: &poppler::Page, scale_q: u16) -> Vec<u8> {
 }
 
 /// Dark pages cost little more than light ones. Colouring a page takes a fraction of what it took
-/// without the fast paths for white and grey pixels, at scale_q 10 (fit width at scale 1) and 21
+/// without the fast paths for white and grey pixels, at scale 1.25 (fit width at device scale 1) and 2.625
 /// (fit width on a HiDPI screen), on the stress pages and pdf50's (when built); and through the
-/// PDF thread a dark stress page at scale_q 21 costs at most half again a light one. Measured at
+/// PDF thread a dark stress page at scale 2.625 costs at most half again a light one. Measured at
 /// load 4–9: 2.5–2.7 → 0.4 ms and 11.3–11.6 → 2.4 ms a page; through the thread 18.6 ms a dark
 /// page before, against 7.9 light.
 #[test]
@@ -1008,7 +1025,7 @@ fn perf_dark_pages() {
     for pdf in &pdfs {
         let bytes = glib::Bytes::from_owned(std::fs::read(pdf).unwrap());
         let doc = poppler::Document::from_bytes(&bytes, None).unwrap();
-        for scale_q in [10u16, 21] {
+        for scale_q in [at(1.25), at(2.625)] {
             let (mut before, mut after) = (Vec::new(), Vec::new());
             for p in 0..4 {
                 let light = render_light(&doc.page(p).unwrap(), scale_q);
@@ -1041,7 +1058,7 @@ fn perf_dark_pages() {
     }
 
     // Through the PDF thread, light and dark in turn.
-    const Q: u16 = 21;
+    const Q: u16 = 21 * SCALE_STEPS / 8;
     let (pdf, rx, sizes) = open("pdf/stress.pdf", 1);
     let n = sizes.len() as u32;
     let per_page = |dark: bool| {
@@ -1094,11 +1111,11 @@ fn opened(rx: &Receiver<PdfEvent>, generation: u64) {
     }
 }
 
-/// Asks for the first three pages of `generation` at scale_q 10 (a view at fit width) and
+/// Asks for the first three pages of `generation` at scale 1.25 (a view at fit width) and
 /// returns how long the first one took to come, once all three have.
 fn first_of_three_pages(pdf: &PdfHandle, rx: &Receiver<PdfEvent>, generation: u64) -> f64 {
     let t = Instant::now();
-    pdf.send(want((0..3).map(|p| key(generation, p, 10))));
+    pdf.send(want((0..3).map(|p| key(generation, p, at(1.25)))));
     let mut first = None;
     let mut pages = 0;
     while pages < 3 {
@@ -1167,7 +1184,7 @@ fn perf_first_sync_after_a_rebuild() {
             x_bp: 200.0,
             y_bp: 300.0,
         });
-        handle.send(want((0..3).map(|p| key(generation, p, 10))));
+        handle.send(want((0..3).map(|p| key(generation, p, at(1.25)))));
         let (mut first, mut inverse, mut pages) = (None, None, 0);
         while pages < 3 || inverse.is_none() {
             match next(&rx) {

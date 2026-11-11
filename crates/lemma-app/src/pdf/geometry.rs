@@ -2,7 +2,7 @@
 //! visibility and the dark-mode colour transforms. No GTK here, so everything is unit-tested.
 
 use lemma_pdf::dark::{HUE_180, INK as DARK_INK, PAPER as DARK_PAPER};
-use lemma_pdf::{PageLayout, scale_of, tile_grid, tile_rect, tile_size};
+use lemma_pdf::{PageLayout, page_pixels, scale_of, tile_grid, tile_rect, tile_size};
 use std::ops::Range;
 
 /// The smallest zoom the view allows (1.0 = 1 bp per logical pixel).
@@ -141,6 +141,49 @@ pub fn tile_view_rect(
     } else {
         0.0
     };
+    Rect::new(
+        page_rect.x + f64::from(x) * k,
+        page_rect.y + f64::from(y) * k,
+        f64::from(w) * k,
+        f64::from(h) * k,
+    )
+}
+
+/// Where the view draws a bitmap rendered at `scale_q` of the page at `page_rect` (its rectangle
+/// at the current zoom, the origin on the device pixel grid) on a surface of `device_scale`:
+/// `tile` of it, or the whole page for `None`.
+///
+/// A bitmap whose scale puts every point of the page within a device pixel of where the zoom puts
+/// it (one rendered for the current zoom) is drawn pixel for pixel, on the device pixel grid.
+/// Stretched to the page's exact size instead, even by a fraction of a percent, it is resampled:
+/// the glyphs that fall between pixels blur while the others stay sharp. A bitmap of another scale
+/// (an earlier zoom, while its re-render waits) is stretched to the page, like [`tile_view_rect`].
+pub fn bitmap_view_rect(
+    size_bp: (f64, f64),
+    scale_q: u16,
+    tile: Option<(u16, u16)>,
+    page_rect: Rect,
+    device_scale: f64,
+) -> Rect {
+    // Device pixels between where the bitmap and the zoom put the far corner of the page.
+    let drift = |zoom_scale: f64| (scale_of(scale_q) - zoom_scale).abs() * size_bp.0.max(size_bp.1);
+    let exact = size_bp.0 > 0.0
+        && device_scale > 0.0
+        && drift(page_rect.width / size_bp.0 * device_scale) <= 1.0;
+    if !exact {
+        return match tile {
+            Some(tile) => tile_view_rect(size_bp, scale_q, tile, page_rect),
+            None => page_rect,
+        };
+    }
+    let (x, y, w, h) = match tile {
+        Some(tile) => tile_rect(size_bp, scale_q, tile),
+        None => {
+            let (w, h) = page_pixels(size_bp, scale_q);
+            (0, 0, w, h)
+        }
+    };
+    let k = 1.0 / device_scale;
     Rect::new(
         page_rect.x + f64::from(x) * k,
         page_rect.y + f64::from(y) * k,
@@ -303,6 +346,7 @@ pub fn light_color_transform() -> ([f32; 16], [f32; 4]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lemma_pdf::{SCALE_STEPS, scale_q};
 
     const A4: (f64, f64) = (595.276, 841.89);
 
@@ -375,13 +419,13 @@ mod tests {
 
     /// Scale 4 (zoom 2 at device scale 2): an A4 page is 2382×3368 px, 8 full-width bands of
     /// 421 rows, 210.5 logical px each.
-    const BANDS_Q: u16 = 32;
+    const BANDS_Q: u16 = 4 * SCALE_STEPS;
     fn banded_page() -> Rect {
         Rect::new(100.0, 50.0, A4.0 * 2.0, A4.1 * 2.0)
     }
     /// Scale 15 (zoom 7.5 at device scale 2): 8930×12629 px, wider than a band can be, so 9 × 12
     /// tiles of 993 × 1053 px, that is 496.5 × 526.5 logical px.
-    const COLUMNS_Q: u16 = 120;
+    const COLUMNS_Q: u16 = 15 * SCALE_STEPS;
     fn wide_page() -> Rect {
         Rect::new(12.0, 12.0, A4.0 * 7.5, A4.1 * 7.5)
     }
@@ -406,7 +450,66 @@ mod tests {
         let viewport = Rect::new(100.0, 50.0, 300.0, 300.0);
         assert_eq!(visible_tiles(A4, q, page, viewport), vec![(0, 0), (0, 1)]);
         // Pages below the tiling threshold have no tiles.
-        assert!(visible_tiles(A4, 8, page, page).is_empty());
+        assert!(visible_tiles(A4, SCALE_STEPS, page, page).is_empty());
+    }
+
+    /// The current zoom's bitmap is drawn pixel for pixel: an A4 page at a fit-width zoom whose
+    /// scale is no multiple of the quantization step (the letter of the bug report, 1.4853 at
+    /// device scale 1) and on a HiDPI surface.
+    #[test]
+    fn the_current_bitmap_is_drawn_pixel_for_pixel() {
+        for (zoom, ds) in [(1.4853, 1.0), (1.2378, 1.0), (1.4853, 2.0), (0.7311, 1.5)] {
+            let page = Rect::new(37.0, 12.0, A4.0 * zoom, A4.1 * zoom);
+            let q = scale_q(zoom, ds);
+            let (w, h) = page_pixels(A4, q);
+            let r = bitmap_view_rect(A4, q, None, page, ds);
+            assert_eq!((r.x, r.y), (page.x, page.y), "{zoom} × {ds}");
+            assert_eq!((r.width * ds, r.height * ds), (f64::from(w), f64::from(h)));
+            // Its content lies within a device pixel of where the zoom puts it, so overlays
+            // still line up; the bitmap is rounded up to whole pixels.
+            assert!(
+                (scale_of(q) - zoom * ds).abs() * A4.1 <= 1.0,
+                "{zoom} × {ds}"
+            );
+            for (drawn, zoomed) in [(r.width, page.width), (r.height, page.height)] {
+                let over = (drawn - zoomed) * ds;
+                assert!((-1.0..2.0).contains(&over), "{r:?} for {page:?}");
+            }
+        }
+        // Tiles too, each on the device pixel grid.
+        let page = banded_page();
+        for tile in visible_tiles(A4, BANDS_Q, page, page) {
+            let r = bitmap_view_rect(A4, BANDS_Q, Some(tile), page, 2.0);
+            let (x, y, w, h) = tile_rect(A4, BANDS_Q, tile);
+            let device = |v: f64| v * 2.0;
+            assert_eq!(device(r.x - page.x), f64::from(x));
+            assert_eq!(device(r.y - page.y), f64::from(y));
+            assert_eq!(
+                (device(r.width), device(r.height)),
+                (f64::from(w), f64::from(h))
+            );
+        }
+    }
+
+    /// A bitmap of another zoom (while the re-render waits) is stretched to the page.
+    #[test]
+    fn a_bitmap_of_another_zoom_is_stretched_to_the_page() {
+        let page = Rect::new(37.0, 12.0, A4.0 * 1.4853, A4.1 * 1.4853);
+        let old = scale_q(1.5, 1.0);
+        assert_eq!(bitmap_view_rect(A4, old, None, page, 1.0), page);
+        let page = banded_page();
+        let older = scale_q(1.9, 2.0);
+        let tiles = visible_tiles(A4, older, page, page);
+        assert!(!tiles.is_empty());
+        for tile in tiles {
+            assert_eq!(
+                bitmap_view_rect(A4, older, Some(tile), page, 2.0),
+                tile_view_rect(A4, older, tile, page)
+            );
+        }
+        // A page without a size, or no device scale, is stretched as well (no division by 0).
+        assert_eq!(bitmap_view_rect((0.0, 0.0), old, None, page, 1.0), page);
+        assert_eq!(bitmap_view_rect(A4, old, None, page, 0.0), page);
     }
 
     /// Every tile of the grid that intersects the viewport, by brute force.
@@ -493,7 +596,7 @@ mod tests {
         // A 2e7 bp page at the smallest zoom: 2442 × 2442 tiles, of which a 800 × 700 view
         // sees a few.
         let size = (2e7, 2e7);
-        let q = 1;
+        let q = SCALE_STEPS / 8;
         let zoom = MIN_ZOOM;
         let page = Rect::new(12.0, 12.0, size.0 * zoom, size.1 * zoom);
         let viewport = Rect::new(1e6, 1e6, 800.0, 700.0);
