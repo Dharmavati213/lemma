@@ -45,6 +45,12 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 
 ### Fixed
 
+- The tips of slanted and curved arrows in TikZ diagrams (tikz-cd among them) no longer vanish
+  when the PDF is zoomed out, below about 250% on a display at scale 1. poppler widens a line
+  thinner than a pixel to one pixel, but in the rotated coordinate system that pgf draws such a
+  tip in, the width came out too small, down to nothing at 45°. Lemma now finds these strokes
+  and draws them a pixel wide like the other thin lines. Below that zoom a page takes about
+  twice as long to render (17 ms instead of 9 for a page of a thesis).
 - The PDF pane no longer switches to an older PDF after a build. Opening a document looks for
   the PDF of an earlier build; when that search ended after the first build had already shown
   its PDF, it opened the PDF it had found, which could be an old `main.pdf` beside `main.tex`

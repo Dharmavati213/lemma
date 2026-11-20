@@ -201,6 +201,147 @@ impl std::fmt::Display for RenderError {
     }
 }
 
+/// Below this render scale (device pixels per bp), strokes that poppler drew too thin are drawn
+/// again (see [`page_image`]): a line 0.4 pt wide, TeX's rule and TikZ's default line, is a
+/// pixel wide at scale 2.51, and poppler draws wider lines as they are. A thinner line that
+/// poppler loses at a larger scale stays lost.
+const THIN_STROKE_SCALE: f64 = 2.6;
+
+/// How poppler draws a page into a bitmap (see [`page_image`]).
+#[derive(Clone, Copy)]
+enum Pass {
+    /// For the screen: strokes thinner than a device pixel are widened to one, and their
+    /// horizontal and vertical segments moved onto the pixel grid.
+    Screen,
+    /// As for printing: every stroke at its own width.
+    Unadjusted,
+    /// As for the screen, but every stroke a device pixel wide, whatever its width.
+    Hairline,
+}
+
+/// A transparent `size` (device pixels) image of what `pass` draws of `page` through `transform`
+/// (which maps bp to device pixels).
+fn draw(
+    page: &poppler::Page,
+    (width, height): (i32, i32),
+    transform: &dyn Fn(&cairo::Context),
+    pass: Pass,
+) -> Result<cairo::ImageSurface, RenderError> {
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+    let cr = cairo::Context::new(&surface)?;
+    transform(&cr);
+    match pass {
+        Pass::Screen => page.render(&cr),
+        Pass::Unadjusted => page.render_for_printing(&cr),
+        Pass::Hairline => {
+            cr.set_hairline(true);
+            page.render(&cr);
+        }
+    }
+    cr.status()?;
+    Ok(surface)
+}
+
+/// The alpha of one ARGB32 pixel (four bytes in native order).
+fn alpha(pixel: &[u8; 4]) -> u8 {
+    (u32::from_ne_bytes(*pixel) >> 24) as u8
+}
+
+/// True when `unadjusted` has more ink than `screen` in some pixel (both ARGB32 on a transparent
+/// background, of one size): a stroke that poppler widened for the screen came out thinner than
+/// it is, or beside where it is.
+fn lost_ink(screen: &[u8], unadjusted: &[u8]) -> bool {
+    let (screen, unadjusted) = (screen.as_chunks::<4>().0, unadjusted.as_chunks::<4>().0);
+    screen
+        .iter()
+        .zip(unadjusted)
+        .any(|(s, u)| alpha(u) > alpha(s))
+}
+
+/// Puts the strokes that `screen` lost back from `hairline` (three ARGB32 bitmaps on a
+/// transparent background, `row` pixels a row, drawn by the [`Pass`]es they are named after):
+/// the pixels where both `unadjusted` and `hairline` have more ink than `screen`, and `hairline`
+/// has more than `screen` in a pixel beside them and in one above or below them as well.
+///
+/// `hairline` alone is not to be trusted: cairo measures the dashes of a hairline in device
+/// pixels (a dashed arrow comes out with other dashes, at any scale), and it draws wide strokes
+/// thin. `unadjusted` has every stroke where it belongs, so it tells which of `screen`'s pixels
+/// lack ink, and `hairline` has those strokes a pixel wide, as `screen` has the others.
+///
+/// The last condition leaves the horizontal and vertical lines alone. poppler moves their ends
+/// onto the pixel grid, by up to half a pixel, and the dashes with them, so `unadjusted` has a
+/// sliver of each dash where `screen` has a gap, and `hairline` may have one of its own dashes
+/// there. But such a line is one row or column of pixels in `hairline` too, with nothing beside
+/// it, and a stroke that `screen` lost is slanted or curved: it shades the pixels around it.
+fn restore_strokes(screen: &mut [u8], unadjusted: &[u8], hairline: &[u8], row: usize) {
+    let (screen, unadjusted, hairline) = (
+        screen.as_chunks_mut::<4>().0,
+        unadjusted.as_chunks::<4>().0,
+        hairline.as_chunks::<4>().0,
+    );
+    let pixels = screen.len().min(unadjusted.len()).min(hairline.len());
+    let row = row.max(1);
+    let more = |i: usize| alpha(&hairline[i]) > alpha(&screen[i]);
+    let lost: Vec<usize> = (0..pixels)
+        .filter(|&i| alpha(&unadjusted[i]) > alpha(&screen[i]) && more(i))
+        .filter(|&i| {
+            let x = i % row;
+            let beside = (x > 0 && more(i - 1)) || (x + 1 < row && i + 1 < pixels && more(i + 1));
+            let above_or_below = (i >= row && more(i - row)) || (i + row < pixels && more(i + row));
+            beside && above_or_below
+        })
+        .collect();
+    for i in lost {
+        screen[i] = hairline[i];
+    }
+}
+
+/// `page` drawn through `transform` (bp to device pixels, by `scale` pixels per bp) on white
+/// paper, `size` device pixels large.
+///
+/// poppler widens a stroke thinner than a device pixel to one pixel, so that a rule does not
+/// fade as the page is zoomed out. It measures that pixel along the axes of the stroke's own
+/// coordinate system (`CairoOutputDev::updateLineWidth`), so in one turned by 45° the width comes
+/// out as nothing: the tip of a slanted or curved TikZ arrow, which pgf draws in a system turned
+/// with the arrow, thins and disappears below [`THIN_STROKE_SCALE`], while the arrow's line
+/// stays. Such strokes are found by drawing the page as for printing too, with no stroke widened,
+/// and taken from a third bitmap with every stroke a pixel wide ([`restore_strokes`]). A page
+/// with no thin stroke costs the second pass, one with thin strokes all three: the 42 pages of a
+/// thesis with TikZ diagrams on 29 of them take 710 ms instead of 380 at scale 1.36, and 950
+/// instead of 470 at scale 2.4.
+///
+/// The page is drawn on a transparent bitmap and the paper laid under it, as pdftocairo and
+/// Evince do: the alpha tells ink from paper, and a blend mode at the top level of a page has
+/// no paper to blend with (the page is a transparency group of its own).
+fn page_image(
+    page: &poppler::Page,
+    size: (i32, i32),
+    scale: f64,
+    transform: &dyn Fn(&cairo::Context),
+) -> Result<cairo::ImageSurface, RenderError> {
+    let mut surface = draw(page, size, transform, Pass::Screen)?;
+    if scale < THIN_STROKE_SCALE {
+        let mut unadjusted = draw(page, size, transform, Pass::Unadjusted)?;
+        let unadjusted = unadjusted.data()?;
+        if lost_ink(&surface.data()?, &unadjusted) {
+            let mut hairline = draw(page, size, transform, Pass::Hairline)?;
+            let row = surface.stride() as usize / 4;
+            restore_strokes(&mut surface.data()?, &unadjusted, &hairline.data()?, row);
+        }
+    }
+    lay_paper(&surface)?;
+    Ok(surface)
+}
+
+/// Lays white paper under what is drawn on `surface`.
+fn lay_paper(surface: &cairo::ImageSurface) -> Result<(), RenderError> {
+    let cr = cairo::Context::new(surface)?;
+    cr.set_operator(cairo::Operator::DestOver);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.paint()?;
+    Ok(())
+}
+
 /// Renders `key` (the whole page, or the tile `key.tile`) of `page` on a white background into an
 /// ARGB32 image (B8g8r8a8 premultiplied on little-endian), coloured for dark mode when `key.dark`.
 pub(crate) fn render(page: &poppler::Page, key: PageKey) -> Result<Rendered, RenderError> {
@@ -215,20 +356,14 @@ pub(crate) fn render(page: &poppler::Page, key: PageKey) -> Result<Rendered, Ren
     if width == 0 || height == 0 {
         return Err(RenderError::EmptyTile);
     }
-    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    {
-        let cr = cairo::Context::new(&surface)?;
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.paint()?;
+    let s = scale_of(key.scale_q);
+    let mut surface = page_image(page, (width, height), s, &|cr| {
         cr.translate(-f64::from(x), -f64::from(y));
-        let s = scale_of(key.scale_q);
         cr.scale(s, s);
-        page.render(&cr);
-        cr.status()?;
-    }
+    })?;
     let stride = surface.stride();
-    // The context is gone, so the surface is uniquely owned and neither data nor take_data can fail
-    // with NonExclusive.
+    // The contexts are gone, so the surface is uniquely owned and neither data nor take_data can
+    // fail with NonExclusive.
     if key.dark {
         crate::dark::darken_bgra(&mut surface.data()?);
     }
@@ -260,17 +395,14 @@ pub(crate) fn render_thumbnail(
     let size = page.size();
     let width = i32::from(req.width.max(1));
     let height = height_for_width(size, req.width.max(1));
-    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    {
-        let cr = cairo::Context::new(&surface)?;
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.paint()?;
-        if size.0 > 0.0 && size.1 > 0.0 {
-            cr.scale(f64::from(width) / size.0, f64::from(height) / size.1);
-            page.render(&cr);
-        }
-        cr.status()?;
-    }
+    let mut surface = if size.0 > 0.0 && size.1 > 0.0 {
+        let (sx, sy) = (f64::from(width) / size.0, f64::from(height) / size.1);
+        page_image(page, (width, height), sx.min(sy), &|cr| cr.scale(sx, sy))?
+    } else {
+        let blank = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+        lay_paper(&blank)?;
+        blank
+    };
     let stride = surface.stride();
     if req.dark {
         crate::dark::darken_bgra(&mut surface.data()?);
@@ -431,6 +563,187 @@ mod tests {
         assert_eq!(tile_rect(LETTER, at(2.0), (0, 1)), (0, 792, 1224, 792));
         assert_eq!(tile_rect(LETTER, at(2.0), (0, 2)).3, 0);
         assert_eq!(tile_rect(LETTER, at(2.0), (1, 0)).2, 0);
+    }
+
+    /// A one-page PDF, 200 bp square, with `content` as its content stream.
+    fn pdf(content: &str) -> poppler::Document {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> \
+             /Contents 4 0 R >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        let bytes = glib::Bytes::from_owned(pdf.into_bytes());
+        poppler::Document::from_bytes(&bytes, None).unwrap()
+    }
+
+    /// A thin dashed line whose middle lies 0.045 px above a pixel row at scale 1.5 (so its own
+    /// width reaches into the next row, where the screen's line, moved onto the grid, has no
+    /// ink), and a line 3 bp wide.
+    const LINES: &str =
+        "0.4 w [3 3] 0 d 20 50.03 m 180 50.03 l S\n[] 0 d 3 w 20 150 m 180 150 l S\n";
+
+    /// A thin line in a coordinate system turned by 45°, as pgf draws the tip of a slanted
+    /// arrow: from the middle of the page towards its top right corner.
+    const TURNED: &str = "q 0.4 w 0.7071 0.7071 -0.7071 0.7071 100 100 cm 0 0 m 40 0 l S Q\n";
+
+    /// The whole first page of `doc` at render scale `scale`.
+    fn page_at(doc: &poppler::Document, scale: f64) -> Rendered {
+        let key = PageKey {
+            generation: 1,
+            page: 0,
+            scale_q: at(scale),
+            tile: None,
+            dark: false,
+        };
+        render(&doc.page(0).unwrap(), key).unwrap()
+    }
+
+    /// The green level of the pixel `(x, y)`: 255 on white paper, 0 in black ink.
+    fn level(bitmap: &Rendered, x: usize, y: usize) -> u8 {
+        let at = y * bitmap.stride as usize + x * 4;
+        let pixel: [u8; 4] = bitmap.data[at..at + 4].try_into().unwrap();
+        (u32::from_ne_bytes(pixel) >> 8) as u8
+    }
+
+    #[test]
+    fn a_thin_stroke_in_a_turned_system_keeps_its_ink() {
+        // 0.4 bp at scale 1.5 is 0.6 px: poppler widens the line to a pixel, measured along the
+        // turned axes, which makes it nothing. It runs along the diagonals of the pixels
+        // (150 + k, 149 - k).
+        let doc = pdf(&format!("{LINES}{TURNED}"));
+        let bitmap = page_at(&doc, 1.5);
+        for k in [5, 20, 38] {
+            assert!(
+                level(&bitmap, 150 + k, 149 - k) < 64,
+                "pixel {k} of the line"
+            );
+        }
+        // A pixel wide, like the other thin lines: nothing two pixels beside it.
+        assert_eq!(level(&bitmap, 172, 129), 255);
+        assert_eq!(level(&bitmap, 168, 129), 255);
+        // And nowhere else: beyond its end, and before its start.
+        assert_eq!(level(&bitmap, 150 + 70, 149 - 70), 255);
+        assert_eq!(level(&bitmap, 140, 159), 255);
+        // The thumbnail of the page (300 px wide: the same scale) has it too.
+        let req = ThumbReq {
+            generation: 1,
+            page: 0,
+            width: 300,
+            dark: false,
+        };
+        let thumb = render_thumbnail(&doc.page(0).unwrap(), req).unwrap();
+        let at = 129 * thumb.stride as usize + 170 * 4;
+        assert!(thumb.data[at + 1] < 64);
+    }
+
+    #[test]
+    fn other_strokes_are_drawn_as_poppler_draws_them() {
+        // Dashes of 4.5 px from x = 30 on row 224: cairo would draw a hairline's dashes 3 px
+        // long, with ink at x = 36..39, in the line's first gap.
+        let doc = pdf(LINES);
+        let bitmap = page_at(&doc, 1.5);
+        assert_eq!(level(&bitmap, 31, 224), 0);
+        for x in 35..39 {
+            assert_eq!(level(&bitmap, x, 224), 255, "x {x}");
+        }
+        assert_eq!(level(&bitmap, 41, 224), 0);
+        // The row below has no ink, though the line's own width reaches into it.
+        assert_eq!(level(&bitmap, 31, 225), 255);
+        // The wide line is 4.5 px wide around y = 75.
+        assert_eq!(level(&bitmap, 100, 71), 255);
+        assert_eq!(level(&bitmap, 100, 75), 0);
+        assert_eq!(level(&bitmap, 100, 78), 255);
+
+        // Pixel for pixel what poppler draws for the screen, with and without the turned line
+        // on the page (beside that line), below the scale that looks for lost strokes and above.
+        let turned = pdf(&format!("{LINES}{TURNED}"));
+        for scale in [0.8, 1.5, 3.0] {
+            let page = doc.page(0).unwrap();
+            let size = page_pixels(page.size(), at(scale));
+            let s = scale_of(at(scale));
+            let mut screen = draw(&page, size, &|cr| cr.scale(s, s), Pass::Screen).unwrap();
+            lay_paper(&screen).unwrap();
+            let screen = screen.data().unwrap().to_vec();
+            assert!(page_at(&doc, scale).data[..] == screen[..], "scale {scale}");
+            if scale < THIN_STROKE_SCALE {
+                // The lower half of the page, where the turned line is not.
+                let half = screen.len() / 2;
+                assert!(
+                    page_at(&turned, scale).data[half..] == screen[half..],
+                    "scale {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lost_strokes_come_from_the_hairlines() {
+        // Rows of black ARGB32 pixels of the alphas given, five pixels a row.
+        let px = |rows: [[u8; 5]; 3]| -> Vec<u8> {
+            rows.as_flattened()
+                .iter()
+                .flat_map(|&a| (u32::from(a) << 24).to_ne_bytes())
+                .collect()
+        };
+        // A slanted stroke from the bottom left to the top right that the screen lost but for
+        // a trace in the middle, under a pixel of a wide stroke (top left).
+        let screen = px([[255, 0, 0, 0, 0], [0, 0, 20, 0, 0], [0, 0, 0, 0, 0]]);
+        let unadjusted = px([[255, 0, 0, 60, 90], [0, 60, 120, 60, 0], [90, 60, 0, 0, 0]]);
+        let hairline = px([
+            [90, 0, 40, 200, 230],
+            [40, 200, 230, 200, 40],
+            [230, 200, 40, 0, 0],
+        ]);
+        assert!(lost_ink(&screen, &unadjusted));
+        assert!(!lost_ink(&screen, &screen));
+        assert!(!lost_ink(&unadjusted, &screen));
+        let mut restored = screen.clone();
+        restore_strokes(&mut restored, &unadjusted, &hairline, 5);
+        // Its pixels with ink of its own come back; the hairline's faint edge does not, and the
+        // wide stroke stays.
+        assert_eq!(
+            restored,
+            px([
+                [255, 0, 0, 200, 230],
+                [0, 200, 230, 200, 0],
+                [230, 200, 0, 0, 0]
+            ])
+        );
+
+        // A horizontal dashed line: the screen's dash is the two pixels on the left, the
+        // unadjusted one half a pixel further right, and the hairline's dashes are others. In
+        // the row below, the unadjusted line's own width.
+        let screen = px([[0; 5], [255, 255, 0, 0, 0], [0; 5]]);
+        let unadjusted = px([[0; 5], [40, 80, 40, 0, 0], [20, 40, 20, 0, 0]]);
+        let hairline = px([[0; 5], [255, 0, 255, 255, 0], [0; 5]]);
+        assert!(lost_ink(&screen, &unadjusted));
+        let mut restored = screen.clone();
+        restore_strokes(&mut restored, &unadjusted, &hairline, 5);
+        assert_eq!(restored, screen);
     }
 
     #[test]

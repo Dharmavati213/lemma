@@ -325,6 +325,7 @@ Rules:
   - **Zoom:** Ctrl+wheel or `GestureZoom`, anchored at the pointer. Existing textures are stretched immediately and re-rendered after 120 ms idle at `scale_q = round(zoom × surface.scale() × 8)`. `Surface::scale()` (v4_12) exists [S]. The user's eDP-1 runs at scale 1; fractional scales are **[U]**.
   - **Tiles:** pages larger than 16 MB are rendered in tiles of at most 4 MiB: full-width bands, or squares of about 1024² on a page over 4096 px wide (§11, PDF view, 2026-10-25).
   - **Render queue:** visible pages from the centre outward, then ±1 page. Older generations are dropped.
+  - **Thin strokes:** poppler widens a stroke thinner than a device pixel to one pixel, measured along the axes of the stroke's coordinate system, so in a rotated one (the tip of a slanted TikZ arrow) the width comes out too small, nothing at 45°. Below a render scale of 2.6 (0.4 pt is a pixel at 2.51) `lemma_pdf::render` draws the page a second time as for printing, with no stroke widened, and where that has ink the first pass lacks, a third time with every stroke a cairo hairline, and takes the lost strokes' pixels from it (`restore_strokes`). The three passes are on transparent bitmaps (the alpha is the ink), and the white paper is laid under the result.
   - **Textures:** `glib::Bytes::from_owned` → `MemoryTexture` (B8g8r8a8Premultiplied), with no copy [V].
   - **Cache:** a `ByteLru` capped at 48 MiB.
   - **Reload:** old textures stay on screen until new ones arrive; the `Anchor{page, frac, x}` is preserved and clamped if the page count changes.
