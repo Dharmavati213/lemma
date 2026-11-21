@@ -142,6 +142,58 @@ struct Tracked {
 thread_local! {
     static TRACKED: RefCell<Vec<Tracked>> = const { RefCell::new(Vec::new()) };
     static CONTROLLERS: RefCell<Vec<Weak<Inner>>> = const { RefCell::new(Vec::new()) };
+    /// The review events of reviews dropped before the agent heard of them (the tab of a file
+    /// whose hunks were all decided closed, a file read again), oldest first: [`drain_feedback`]
+    /// delivers them with the documents' own.
+    static DROPPED_EVENTS: RefCell<Vec<(PathBuf, ReviewEvent)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Most events [`DROPPED_EVENTS`] keeps (the oldest go): with no agent to take them, they would
+/// pile up for the whole session.
+const DROPPED_EVENTS_MAX: usize = 500;
+
+/// Keeps the `events` of `path`'s review, which is being dropped, for [`drain_feedback`]. The
+/// texts of a reject are kept only as far as the feedback quotes them.
+fn keep_dropped_events(path: &Path, events: Vec<ReviewEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    let shorten = |text: &mut String| {
+        if text.len() > 2 * FEEDBACK_QUOTE_MAX {
+            let mut end = 2 * FEEDBACK_QUOTE_MAX;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+    };
+    DROPPED_EVENTS.with(|dropped| {
+        let mut dropped = dropped.borrow_mut();
+        for mut event in events {
+            if let ReviewEvent::Rejected { proposed, kept, .. } = &mut event {
+                shorten(proposed);
+                shorten(kept);
+            }
+            dropped.push((path.to_path_buf(), event));
+        }
+        let over = dropped.len().saturating_sub(DROPPED_EVENTS_MAX);
+        dropped.drain(..over);
+    });
+}
+
+/// Takes the events of dropped reviews of files under `root` (see [`keep_dropped_events`]).
+fn take_dropped_events(root: &Path) -> Vec<(PathBuf, ReviewEvent)> {
+    DROPPED_EVENTS.with(|dropped| {
+        let mut dropped = dropped.borrow_mut();
+        if dropped.is_empty() {
+            return Vec::new();
+        }
+        let (taken, kept) = std::mem::take(&mut *dropped)
+            .into_iter()
+            .partition(|(path, _)| path.starts_with(root));
+        *dropped = kept;
+        taken
+    })
 }
 
 /// Runs `f` on the bookkeeping entry of `doc`, if it is tracked.
@@ -196,9 +248,13 @@ pub fn adopt_review(doc: &DocRef, mut review: FileReview) {
     recompute(doc);
 }
 
-/// Stops reviewing `doc` (its review is dropped) and refreshes the review UI.
+/// Stops reviewing `doc` (its review is dropped) and refreshes the review UI. The events the
+/// agent has not heard of yet (a reject before the tab closed) are kept for [`drain_feedback`].
 pub fn drop_review(doc: &DocRef) {
-    doc.review.replace(None);
+    let review = doc.review.replace(None);
+    if let Some(mut review) = review {
+        keep_dropped_events(doc.path(), review.drain_events());
+    }
     TRACKED.with(|tracked| {
         let mut tracked = tracked.borrow_mut();
         if let Some(i) = tracked
@@ -342,38 +398,43 @@ pub fn summary(ws: &Workspace) -> (usize, usize) {
     (docs.len(), hunks)
 }
 
-/// Takes the queued review events of every document in `ws` and formats them for the agent as a
-/// `<review_feedback>` block (lines 1-based). `None` when nothing happened.
+/// Takes the queued review events of every document in `ws`, and those of reviews of its files
+/// dropped since ([`drop_review`]), and formats them for the agent as a `<review_feedback>`
+/// block (lines 1-based; files named with `/` on every system, as in the tools' replies).
+/// `None` when nothing happened.
 ///
 /// The block goes with the next prompt, so it is kept small: per file, the first
 /// [`FEEDBACK_EVENTS_PER_FILE`] events are listed (texts quoted up to [`FEEDBACK_QUOTE_MAX`]
 /// bytes) and the others are counted in one line; past [`FEEDBACK_MAX_BYTES`], files are only
 /// counted.
 pub fn drain_feedback(ws: &Workspace) -> Option<String> {
-    let root = ws.root().path().to_path_buf();
-    let mut docs = ws.documents();
-    docs.sort_by(|a, b| a.path().cmp(b.path()));
-    let mut out = String::new();
-    let (mut unlisted, mut unlisted_files) = (0, 0);
-    for doc in docs {
+    let root = ws.root();
+    // Per file (sorted by path), oldest first: what dropped reviews left, then the reviews'.
+    let mut files: BTreeMap<PathBuf, Vec<ReviewEvent>> = BTreeMap::new();
+    for (path, event) in take_dropped_events(root.path()) {
+        files.entry(path).or_default().push(event);
+    }
+    for doc in ws.documents() {
         let events = match doc.review.borrow_mut().as_mut() {
             Some(review) => review.drain_events(),
             None => continue,
         };
-        if events.is_empty() {
-            continue;
+        if !events.is_empty() {
+            files
+                .entry(doc.path().to_path_buf())
+                .or_default()
+                .extend(events);
         }
+    }
+    let mut out = String::new();
+    let (mut unlisted, mut unlisted_files) = (0, 0);
+    for (path, events) in files {
         if out.len() >= FEEDBACK_MAX_BYTES {
             unlisted += events.len();
             unlisted_files += 1;
             continue;
         }
-        let name = doc
-            .path()
-            .strip_prefix(&root)
-            .unwrap_or(doc.path())
-            .display()
-            .to_string();
+        let name = root.agent_name(&path);
         let mut rest = Vec::new();
         for (i, event) in events.into_iter().enumerate() {
             let line = feedback_line(&name, &event);
@@ -491,9 +552,14 @@ pub struct ReviewController {
 struct Inner {
     state: Weak<WindowState>,
     reading: Cell<bool>,
-    /// Recent decisions, oldest first, for Alt+U: the documents each one changed (several for
-    /// Accept/Reject in all files, which Alt+U reverts as one).
-    decisions: RefCell<Vec<Vec<PathBuf>>>,
+    /// Recent decisions, oldest first, for Alt+U: each one's number and the documents it changed
+    /// (several for Accept/Reject in all files, which Alt+U reverts as one).
+    decisions: RefCell<Vec<(u64, Vec<PathBuf>)>>,
+    /// The number of the decision being made: the next one [`Inner::record_decision`] records.
+    next_decision: Cell<u64>,
+    /// Files the agent created that a reject sent to the trash, oldest first, for Alt+U of that
+    /// decision.
+    trashed: RefCell<Vec<Trashed>>,
     refresh_queued: Cell<bool>,
     /// The banner was answered (Review clicked) and stays hidden until more hunks arrive.
     banner_dismissed: Cell<bool>,
@@ -609,10 +675,10 @@ impl Inner {
                 plural(summary.files, "file", "files"),
                 plural(hunks, "hunk", "hunks")
             );
-            let text = match self.named_origin(&summary) {
-                Some(Some(name)) => format!("{name} · {counts}"),
-                Some(None) => format!("Changes to review · {counts}"),
-                None => format!(
+            let text = match self.source(&summary) {
+                Source::Named(name) => format!("{name} · {counts}"),
+                Source::Several => format!("Changes to review · {counts}"),
+                Source::Agent => format!(
                     "{} changed {counts}",
                     crate::agent::bridge::agent_label(
                         state.config.agent.backend,
@@ -634,13 +700,13 @@ impl Inner {
         review_persist::changed(&state);
     }
 
-    /// Who made everything under review when it is not the agent: `Some(Some(name))` when every
-    /// hunk belongs to named turns ([`begin_named_turn`]) of one name, `Some(None)` for several
-    /// names, `None` when some hunk is the agent's (or made outside any turn).
-    fn named_origin(&self, summary: &ReviewSummary) -> Option<Option<String>> {
+    /// Who made everything under review: the agent (its turns, or its edits outside any turn),
+    /// one named change ([`begin_named_turn`], [`begin_named_change`]), or several sources (also
+    /// changes of no one's turn: another program's change to a file under review). The banner
+    /// names the agent only for its own changes.
+    fn source(&self, summary: &ReviewSummary) -> Source {
         let turns = self.turns.borrow();
-        let mut first: Option<String> = None;
-        let mut one = true;
+        let mut found: Option<Source> = None;
         for doc in &summary.docs {
             let review = doc.review.borrow();
             let Some(review) = review.as_ref() else {
@@ -648,19 +714,22 @@ impl Inner {
             };
             for hunk in review.hunks() {
                 if hunk.turns.is_empty() {
-                    return None;
+                    return Source::Several;
                 }
                 for turn in &hunk.turns {
-                    let name = turns.get(turn).and_then(|info| info.name.as_deref())?;
-                    match &first {
-                        None => first = Some(name.to_owned()),
-                        Some(f) => one &= f == name,
+                    let source = match turns.get(turn).and_then(|info| info.name.as_deref()) {
+                        Some(name) => Source::Named(name.to_owned()),
+                        None => Source::Agent,
+                    };
+                    match &found {
+                        None => found = Some(source),
+                        Some(f) if *f == source => {}
+                        Some(_) => return Source::Several,
                     }
                 }
             }
         }
-        let first = first?;
-        Some(one.then_some(first))
+        found.unwrap_or(Source::Agent)
     }
 
     fn record_decision(&self, docs: &[&Document]) {
@@ -671,8 +740,47 @@ impl Inner {
         if decisions.len() == DECISIONS_KEPT {
             decisions.remove(0);
         }
-        decisions.push(docs.iter().map(|d| d.path().to_path_buf()).collect());
+        let number = self.next_decision.replace(self.next_decision.get() + 1);
+        decisions.push((
+            number,
+            docs.iter().map(|d| d.path().to_path_buf()).collect(),
+        ));
     }
+
+    fn keep_trashed(&self, trashed: Trashed) {
+        let mut list = self.trashed.borrow_mut();
+        if list.len() == DECISIONS_KEPT {
+            list.remove(0);
+        }
+        list.push(trashed);
+    }
+
+    /// Alt+U could not bring `trashed`'s file back for a reason that may pass (a file of that
+    /// name exists, the move to the trash is still running, the file could not be made): its
+    /// decision is the last one again, for another Alt+U, unless a later decision waits for
+    /// Alt+U by now (one made while the restore ran).
+    fn retry_trashed(&self, trashed: Trashed) {
+        {
+            let mut decisions = self.decisions.borrow_mut();
+            match decisions.last_mut() {
+                Some((number, _)) if *number > trashed.decision => return,
+                // Another file of the same decision is back already.
+                Some((number, paths)) if *number == trashed.decision => {
+                    paths.push(trashed.path.clone());
+                }
+                _ => decisions.push((trashed.decision, vec![trashed.path.clone()])),
+            }
+        }
+        self.keep_trashed(trashed);
+    }
+}
+
+/// Who made the changes under review (see [`Inner::source`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source {
+    Agent,
+    Named(String),
+    Several,
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -761,6 +869,8 @@ pub fn install(state: &Rc<WindowState>) -> ReviewController {
         state: Rc::downgrade(state),
         reading: Cell::new(false),
         decisions: RefCell::new(Vec::new()),
+        next_decision: Cell::new(0),
+        trashed: RefCell::new(Vec::new()),
         refresh_queued: Cell::new(false),
         banner_dismissed: Cell::new(false),
         last_total: Cell::new(0),
@@ -949,6 +1059,9 @@ pub struct TurnInfo {
     /// ([`begin_named_turn`]: "Replace “a” → “b”"; its `label` is 0); `None` for the agent's
     /// turns.
     pub name: Option<String>,
+    /// A named change made apart from the turns ([`begin_named_change`]: a restore from
+    /// History, an added citation), which Undo Last Turn leaves alone.
+    pub outside: bool,
 }
 
 /// How hunks are grouped in the Changes panel.
@@ -1039,6 +1152,15 @@ pub fn review_summary(state: &WindowState) -> ReviewSummary {
     let mut groups: BTreeMap<GroupKind, Vec<GroupFile>> = BTreeMap::new();
     let mut hunks = 0;
     let mut latest: Option<u32> = None;
+    // Undo Last Turn leaves the changes made apart from the turns alone.
+    let outside: HashSet<u32> = controller(state).map_or_else(HashSet::new, |c| {
+        c.turns
+            .borrow()
+            .iter()
+            .filter(|(_, info)| info.outside)
+            .map(|(t, _)| *t)
+            .collect()
+    });
     for doc in &docs {
         let review = doc.review.borrow();
         let Some(review) = review.as_ref() else {
@@ -1047,7 +1169,13 @@ pub fn review_summary(state: &WindowState) -> ReviewSummary {
         let mut by_group: BTreeMap<GroupKind, GroupFile> = BTreeMap::new();
         for h in review.hunks() {
             hunks += 1;
-            latest = latest.max(h.turns.iter().copied().filter(|t| *t > 0).max());
+            latest = latest.max(
+                h.turns
+                    .iter()
+                    .copied()
+                    .filter(|t| *t > 0 && !outside.contains(t))
+                    .max(),
+            );
             let file = by_group
                 .entry(GroupKind::of(&h.turns))
                 .or_insert_with(|| GroupFile {
@@ -1181,6 +1309,7 @@ pub fn on_turn_started(state: &Rc<WindowState>, turn: u32) {
             started_unix: unix_now(),
             this_session: true,
             name: None,
+            outside: false,
         },
     );
     for doc in state.workspace.documents() {
@@ -1214,6 +1343,17 @@ pub fn on_turn_ended(state: &Rc<WindowState>, turn: u32) {
 /// Reject Turn ([`decide_turn`]) and Alt+U then work on it as on an agent turn. 0 when the
 /// window has no review controller.
 pub fn begin_named_turn(state: &Rc<WindowState>, name: &str) -> u32 {
+    begin_named(state, name, false)
+}
+
+/// [`begin_named_turn`] for a change the user makes apart from the turns (a restore from
+/// History, an added citation): its hunks are named after it in the Changes panel and the
+/// banner, but Undo Last Turn, which takes back the last turn's work, leaves it alone.
+pub fn begin_named_change(state: &Rc<WindowState>, name: &str) -> u32 {
+    begin_named(state, name, true)
+}
+
+fn begin_named(state: &Rc<WindowState>, name: &str, outside: bool) -> u32 {
     let Some(inner) = controller(state) else {
         return 0;
     };
@@ -1253,6 +1393,7 @@ pub fn begin_named_turn(state: &Rc<WindowState>, name: &str) -> u32 {
             started_unix: unix_now(),
             this_session: true,
             name: Some(name.to_owned()),
+            outside,
         },
     );
     inner.queue_refresh();
@@ -1260,8 +1401,8 @@ pub fn begin_named_turn(state: &Rc<WindowState>, name: &str) -> u32 {
 }
 
 /// Runs `f`, which changes `doc` with `Origin::Agent` edits, with `doc`'s review attributing
-/// them to review turn `turn` (a [`begin_named_turn`]); the agent's later edits go to its own
-/// turn again.
+/// them to review turn `turn` (a [`begin_named_turn`] or [`begin_named_change`]); the agent's
+/// later edits go to its own turn again.
 pub fn in_turn<R>(doc: &Document, turn: u32, f: impl FnOnce() -> R) -> R {
     let previous = doc.review.borrow_mut().as_mut().map(|review| {
         let previous = review.turn();
@@ -1271,23 +1412,6 @@ pub fn in_turn<R>(doc: &Document, turn: u32, f: impl FnOnce() -> R) -> R {
     let out = f();
     if let (Some(previous), Some(review)) = (previous, doc.review.borrow_mut().as_mut()) {
         review.set_turn(previous);
-    }
-    out
-}
-
-/// Runs `f`, which changes `doc` with `Origin::Agent` edits that no agent turn made (a restore
-/// from History, which shows the old text as reviewable hunks), with `doc`'s review attributing
-/// them to turn 0: they are "Other changes", never part of the last turn (Keep/Reject Turn and
-/// Undo Last Turn leave them alone).
-pub fn outside_turn<R>(doc: &Document, f: impl FnOnce() -> R) -> R {
-    let turn = doc.review.borrow_mut().as_mut().map(|review| {
-        let turn = review.turn();
-        review.set_turn(0);
-        turn
-    });
-    let out = f();
-    if let (Some(turn), Some(review)) = (turn, doc.review.borrow_mut().as_mut()) {
-        review.set_turn(turn);
     }
     out
 }
@@ -1371,6 +1495,9 @@ fn unix_now() -> u64 {
 pub struct TurnOutcome {
     /// Hunks that were decided (or that a reject of the turn's own edits in them resolved).
     pub decided: usize,
+    /// Hunks that also held other changes, out of which a reject took the turn's own edits: the
+    /// other changes stay, to be decided one by one.
+    pub partly: usize,
     /// Files they were in.
     pub files: usize,
     /// Hunks with edits of the turn that were left alone: those the turn shares with other
@@ -1392,49 +1519,64 @@ pub fn decide_turn(state: &Rc<WindowState>, turn: u32, decision: Decision) -> Tu
     }
     let mut decided_docs = Vec::new();
     for doc in reviewed_documents(&state.workspace) {
-        let n = decide_picked(state, &doc, Pick::Turn(turn), decision);
+        let picked = decide_picked(state, &doc, Pick::Turn(turn), decision);
         // What is left of the turn: hunks other turns' edits share, or that hold more than the
         // turn's own change.
         outcome.mixed += doc.review.borrow().as_ref().map_or(0, |r| {
             r.hunks().iter().filter(|h| h.turns.contains(&turn)).count()
         });
-        if n > 0 {
-            outcome.decided += n;
+        if picked.decided + picked.partly > 0 {
+            outcome.decided += picked.decided;
+            outcome.partly += picked.partly;
             outcome.files += 1;
             decided_docs.push(doc);
         }
     }
     let docs: Vec<&Document> = decided_docs.iter().map(|d| &**d).collect();
     record_decision(state, &docs);
+    // Those hunks are neither kept nor rejected: they stay to be decided.
     let shared = match outcome.mixed {
         0 => String::new(),
         n => format!(
-            " · {} shared with other edits {} kept",
+            " · {} shared with other edits {} left to review",
             plural(n, "change", "changes"),
-            if n == 1 { "was" } else { "were" }
+            if n == 1 { "is" } else { "are" }
         ),
     };
-    let message = match (outcome.decided, decision) {
-        (0, _) if outcome.mixed > 0 => format!(
+    let files = plural(outcome.files, "file", "files");
+    let message = match (outcome.decided, outcome.partly, decision) {
+        (0, 0, _) if outcome.mixed > 0 => format!(
             "{label} has no changes of its own: its {} shared with other edits; decide {} one by one",
             plural(outcome.mixed, "change is", "changes are"),
             if outcome.mixed == 1 { "it" } else { "them" }
         ),
-        (0, _) => format!("{label} has no pending changes"),
-        (n, Decision::Accept) => format!(
-            "Kept {}: {} in {}{shared}",
+        (0, 0, _) => format!("{label} has no pending changes"),
+        (n, _, Decision::Accept) => format!(
+            "Kept {}: {} in {files}{shared}",
             label_in_sentence(&label),
             plural(n, "change", "changes"),
-            plural(outcome.files, "file", "files")
         ),
-        (n, Decision::Reject) => format!(
-            "Rejected {}: {} in {}{shared}",
+        (n, 0, Decision::Reject) => format!(
+            "Rejected {}: {} in {files}{shared}",
             label_in_sentence(&label),
             plural(n, "change", "changes"),
-            plural(outcome.files, "file", "files")
+        ),
+        // Changes that also held other edits: only the turn's part of them went.
+        (0, p, Decision::Reject) => format!(
+            "Rejected {}'s part of {} in {files} (the other edits there are left to \
+             review){shared}",
+            label_in_sentence(&label),
+            plural(p, "change", "changes"),
+        ),
+        (n, p, Decision::Reject) => format!(
+            "Rejected {}: {}, and its part of {} more (the other edits there are left to \
+             review), in {files}{shared}",
+            label_in_sentence(&label),
+            plural(n, "change", "changes"),
+            p,
         ),
     };
-    if outcome.decided > 0 {
+    if outcome.decided + outcome.partly > 0 {
         let toast = adw::Toast::builder()
             .title(message)
             .use_markup(false)
@@ -1469,7 +1611,8 @@ pub fn undo_last_turn(state: &Rc<WindowState>) -> TurnOutcome {
 
 /// Keeps or rejects the hunks `ids` of `doc` as one decision (a row of the Changes panel).
 pub fn decide_hunks(state: &Rc<WindowState>, doc: &DocRef, ids: &[HunkId], decision: Decision) {
-    if decide_picked(state, doc, Pick::Hunks(ids), decision) > 0 {
+    let picked = decide_picked(state, doc, Pick::Hunks(ids), decision);
+    if picked.decided + picked.partly > 0 {
         record_decision(state, &[&**doc]);
     }
 }
@@ -1482,9 +1625,20 @@ enum Pick<'a> {
     Hunks(&'a [HunkId]),
 }
 
+/// What [`decide_picked`] did in a document.
+#[derive(Clone, Copy, Debug, Default)]
+struct Picked {
+    /// Hunks decided (gone).
+    decided: usize,
+    /// Hunks a reject of a turn took the turn's own edits out of, and that stay with the other
+    /// changes they held (see `FileReview::reject_turn`).
+    partly: usize,
+}
+
 /// Keeps or rejects the picked hunks of `doc` as one journalled decision (without recording it
-/// for Alt+U at the window level); returns how many hunks it decided.
-fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: Decision) -> usize {
+/// for Alt+U at the window level); says how many hunks it decided, and how many it took the
+/// turn's part out of.
+fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: Decision) -> Picked {
     // Decisions need hunks that describe the text exactly (typing may be 50 ms ahead).
     recompute_if_stale(doc);
     if decision == Decision::Reject {
@@ -1493,13 +1647,24 @@ fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: De
         doc.settle_user_action();
     }
     let before = hunk_count(doc);
+    // The turn's own hunks: those a reject of the turn leaves to the turn (it could not tell
+    // what the turn changed there) still count as the turn's afterwards.
+    let own = |doc: &Document| match pick {
+        Pick::Turn(turn) => doc
+            .review
+            .borrow()
+            .as_ref()
+            .map_or(0, |r| r.hunks_of_turn(turn).len()),
+        Pick::Hunks(_) => 0,
+    };
+    let own_before = own(doc);
     let text = doc.text();
     match decision {
         Decision::Accept => {
             {
                 let mut review = doc.review.borrow_mut();
                 let Some(review) = review.as_mut() else {
-                    return 0;
+                    return Picked::default();
                 };
                 match pick {
                     Pick::Turn(turn) => {
@@ -1516,7 +1681,7 @@ fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: De
             let (edits, touched) = {
                 let mut review = doc.review.borrow_mut();
                 let Some(review) = review.as_mut() else {
-                    return 0;
+                    return Picked::default();
                 };
                 // A set: Reject Turn (Replace in Project's Undo) can pick thousands of hunks.
                 let ids: HashSet<HunkId> = match pick {
@@ -1538,15 +1703,26 @@ fn decide_picked(state: &Rc<WindowState>, doc: &DocRef, pick: Pick, decision: De
             {
                 recompute(doc);
                 state.toast(&format!("Could not reject the changes: {e}"));
-                return 0;
+                return Picked::default();
             }
             recompute(doc);
             if !edits.is_empty() {
-                finish_reject(state, doc, touched);
+                finish_reject(state, doc, touched, &text);
+                let decided = before.saturating_sub(hunk_count(doc));
+                // A hunk that held more than the turn's change stays, without the turn.
+                let partly = own_before.saturating_sub(decided + own(doc));
+                return Picked {
+                    decided,
+                    // Something was taken back, if only part of a hunk.
+                    partly: if decided + partly == 0 { 1 } else { partly },
+                };
             }
         }
     }
-    before.saturating_sub(hunk_count(doc))
+    Picked {
+        decided: before.saturating_sub(hunk_count(doc)),
+        partly: 0,
+    }
 }
 
 /// `win.review-keep-turn(u)`, `win.review-reject-turn(u)` (review turn numbers, as the Changes
@@ -1699,11 +1875,20 @@ pub fn decide(
                     return Err(format!("Could not reject the change: {e}"));
                 }
             };
+            if edit.range.is_empty() && edit.text.is_empty() {
+                // The hunk held no change any more (typed back, the recompute 50 ms after
+                // typing still to come): nothing was rejected, and nothing is journalled, so
+                // no decision is recorded either (the next Alt+U reverted an older one).
+                recompute(doc);
+                return Ok(());
+            }
             doc.apply_edits(&[edit], Origin::Review)
                 .map_err(|e| format!("Could not reject the change: {e}"))?;
-            record_decision(state, &[&**doc]);
             recompute(doc);
-            finish_reject(state, doc, touched);
+            // Recorded after `finish_reject`, as every decision is: a file it trashes belongs
+            // to this decision (see `trash_new_file`).
+            finish_reject(state, doc, touched, &text);
+            record_decision(state, &[&**doc]);
         }
     }
     Ok(())
@@ -1716,22 +1901,32 @@ fn record_decision(state: &WindowState, docs: &[&Document]) {
     }
 }
 
-/// After rejected hunks were restored in `doc`: save it (or trash a file the agent created that
-/// is now empty again) and, if the user had edited a rejected hunk, offer Undo.
-fn finish_reject(state: &Rc<WindowState>, doc: &DocRef, touched: bool) {
+/// After rejected hunks were restored in `doc`, whose text was `before` the reject: save it (or
+/// trash a file the agent created that is now empty again) and, if the user had edited a
+/// rejected hunk, offer Undo.
+fn finish_reject(state: &Rc<WindowState>, doc: &DocRef, touched: bool, before: &str) {
     let clean = doc
         .review
         .borrow()
         .as_ref()
         .is_some_and(FileReview::is_clean);
-    if clean && is_new_file(doc) && doc.with_text(str::is_empty) {
-        trash_new_file(state, doc);
+    let trashed = clean && is_new_file(doc) && doc.with_text(str::is_empty);
+    if trashed {
+        trash_new_file(state, doc, before);
     } else {
         save_quietly(state, doc);
     }
     if touched {
+        let title = if trashed {
+            format!(
+                "Rejected {}: the new file went to the trash with your edits in it",
+                doc.display_name()
+            )
+        } else {
+            "Rejected — your edits in this hunk were discarded".to_owned()
+        };
         let toast = adw::Toast::builder()
-            .title("Rejected — your edits in this hunk were discarded")
+            .title(title)
             .use_markup(false)
             .button_label("_Undo")
             .action_name("win.review-undo")
@@ -1756,15 +1951,41 @@ fn save_quietly(state: &Rc<WindowState>, doc: &DocRef) {
     });
 }
 
-/// A file the agent created and the user rejected entirely: close its tab, drop it from the
-/// workspace and move the file to the trash. Runs from an idle callback, since a decision may
-/// come from inside the Vim context's key handling.
-fn trash_new_file(state: &Rc<WindowState>, doc: &DocRef) {
-    let (state, doc) = (Rc::downgrade(state), doc.clone());
+/// A file the agent created and the user rejected entirely (its text was `before` the reject):
+/// close its tab, drop it from the workspace and move the file to the trash (on a file system
+/// without a trash, delete it). Its review is kept
+/// for Alt+U, which brings the file back with that text under review ([`restore_trashed`]), and
+/// the text goes to the local history first (the user's typing in it may never have been saved).
+/// Runs from an idle callback, since a decision may come from inside the Vim context's key
+/// handling. The file belongs to the decision being made, which is recorded once it is made.
+fn trash_new_file(state: &Rc<WindowState>, doc: &DocRef, before: &str) {
+    let decision = controller(state).map_or(0, |inner| inner.next_decision.get());
+    let (state, doc, before) = (Rc::downgrade(state), doc.clone(), before.to_owned());
     glib::idle_add_local_once(move || {
         let Some(state) = state.upgrade() else {
             return;
         };
+        let done = Rc::new(Cell::new(None));
+        let review = doc.review.replace(None);
+        if let Some(mut review) = review {
+            keep_dropped_events(doc.path(), review.drain_events());
+            if let Some(inner) = controller(&state) {
+                inner.keep_trashed(Trashed {
+                    decision,
+                    path: doc.path().to_path_buf(),
+                    review,
+                    done: done.clone(),
+                });
+            }
+        }
+        if !before.is_empty() {
+            crate::agent::history::record(
+                &state,
+                doc.path(),
+                &before,
+                crate::agent::history::HistoryReason::Reject,
+            );
+        }
         drop_review(&doc);
         match state.editor_for(&doc) {
             Some(editor) => state.close_editor(&editor, true),
@@ -1773,15 +1994,121 @@ fn trash_new_file(state: &Rc<WindowState>, doc: &DocRef) {
         let path = doc.path().to_path_buf();
         glib::spawn_future_local(async move {
             let file = gio::File::for_path(&path);
-            if let Err(e) = file.trash_future(glib::Priority::DEFAULT).await {
-                state.toast(&format!(
-                    "Could not move {} to the trash: {}",
-                    path.display(),
-                    e.message()
-                ));
-            }
+            let trashed = file.trash_future(glib::Priority::DEFAULT).await;
+            let gone = match &trashed {
+                Ok(()) => true,
+                // No trash on this file system (a container's volume, some network mounts,
+                // a memory file system). The rejected file must not stay, with the agent's
+                // text in it and no longer under review: it is deleted. Its text is in the
+                // local history, and Alt+U brings the file back as from the trash.
+                Err(e) if e.matches(gio::IOErrorEnum::NotSupported) => {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            let name = path.file_name().map_or_else(
+                                || path.display().to_string(),
+                                |n| n.to_string_lossy().into_owned(),
+                            );
+                            let toast = adw::Toast::builder()
+                                .title(format!("{name} was deleted: this folder has no trash"))
+                                .use_markup(false)
+                                .button_label("_Undo")
+                                .action_name("win.review-undo")
+                                .build();
+                            state.toasts.add_toast(toast);
+                            true
+                        }
+                        Err(e) => {
+                            state.toast(&format!("Could not delete {}: {e}", path.display()));
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    state.toast(&format!(
+                        "Could not move {} to the trash: {}",
+                        path.display(),
+                        e.message()
+                    ));
+                    false
+                }
+            };
+            done.set(Some(gone));
         });
     });
+}
+
+/// A file the agent created whose reject sent it to the trash ([`trash_new_file`]), for Alt+U.
+struct Trashed {
+    /// The number of the decision that rejected it (see [`Inner::decisions`]).
+    decision: u64,
+    path: PathBuf,
+    /// Its review, whose journal holds the reject.
+    review: FileReview,
+    /// Whether the move to the trash went well, once it is over.
+    done: Rc<Cell<Option<bool>>>,
+}
+
+/// Alt+U of the reject that sent `trashed`'s file to the trash: the file comes back (in a tab)
+/// with its review and the text the reject took, which is under review again as it was (the
+/// user's edits in it too). A file of that name that another program made meanwhile is left
+/// alone; once it is gone, Alt+U tries again (see [`Inner::retry_trashed`]).
+async fn restore_trashed(state: Rc<WindowState>, trashed: Trashed) {
+    let path = trashed.path.clone();
+    let name = relative_name(&state, &path);
+    let retry = |state: &WindowState, trashed: Trashed, why: String| {
+        state.toast(&format!("Cannot undo the last decision: {why}"));
+        if let Some(inner) = controller(state) {
+            inner.retry_trashed(trashed);
+        }
+    };
+    // The move to the trash may still run (an Alt+U right after the reject).
+    let started = std::time::Instant::now();
+    while trashed.done.get().is_none() && started.elapsed() < Duration::from_secs(5) {
+        glib::timeout_future(Duration::from_millis(10)).await;
+    }
+    let done = trashed.done.get();
+    if done.is_none() {
+        let why = format!("{name} is still being moved to the trash");
+        retry(&state, trashed, why);
+        return;
+    }
+    // A file that could not go to the trash is still the one the reject left.
+    if state.workspace.get(&path).is_some() || (done == Some(true) && path.exists()) {
+        retry(&state, trashed, format!("{name} exists again"));
+        return;
+    }
+    // An empty file, as the reject left it: the undo puts the text back.
+    let created = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, ""));
+    if let Err(e) = created {
+        retry(&state, trashed, format!("{name}: {e}"));
+        return;
+    }
+    let review = trashed.review;
+    let editor = match state.open_file(&path).await {
+        Ok(editor) => editor,
+        Err(e) => {
+            state.toast(&format!("Cannot undo the last decision: {e}"));
+            return;
+        }
+    };
+    let doc = editor.document().clone();
+    if doc.review.borrow().is_some() || !doc.with_text(str::is_empty) {
+        state.toast(&format!(
+            "Cannot undo the last decision: {name} was edited since"
+        ));
+        return;
+    }
+    adopt_review(&doc, review);
+    // A file the agent created again: rejecting all of it trashes it again.
+    start_review(&doc, true);
+    match undo_in(&state, &doc) {
+        Some(Some(line)) => show_line(&state, &doc, line),
+        Some(None) => {}
+        None => state.toast(&format!("Cannot undo the last decision in {name}")),
+    }
 }
 
 /// [`decide`], then move the cursor to the next hunk (in this file, else in the next file).
@@ -1873,7 +2200,7 @@ fn decide_all_in(state: &Rc<WindowState>, doc: &DocRef, decision: Decision) -> b
                 return false;
             }
             recompute(doc);
-            finish_reject(state, doc, touched);
+            finish_reject(state, doc, touched, &text);
         }
     }
     true
@@ -1897,20 +2224,22 @@ pub fn decide_everything(state: &Rc<WindowState>, decision: Decision) {
 }
 
 /// Alt+U: reverts the most recent accept or reject (§4.4) in every file it changed, and moves
-/// the cursor to the first hunk that came back. Only the most recent decision is ever reverted:
-/// when it cannot be (its file left the review, or its text was edited since), a toast says so
-/// and older decisions stay as they are.
+/// the cursor to the first hunk that came back; a file the agent created that the reject sent
+/// to the trash comes back with its tab ([`restore_trashed`]). Only the most recent decision is
+/// ever reverted: when it cannot be (its file left the review, or its text was edited since), a
+/// toast says so and older decisions stay as they are.
 pub fn undo_last(state: &Rc<WindowState>) {
     let Some(inner) = controller(state) else {
         return;
     };
-    let Some(paths) = inner.decisions.borrow_mut().pop() else {
+    let Some((number, paths)) = inner.decisions.borrow_mut().pop() else {
         state.toast("Nothing to undo");
         return;
     };
     let mut first_restored = None;
     let mut gone = Vec::new();
     let mut stuck = Vec::new();
+    let mut untrashed = false;
     for path in &paths {
         let doc = state
             .workspace
@@ -1918,7 +2247,22 @@ pub fn undo_last(state: &Rc<WindowState>) {
             .into_iter()
             .find(|d| d.path() == path);
         let Some(doc) = doc.filter(|d| d.review.borrow().is_some()) else {
-            gone.push(relative_name(state, path));
+            // A file the agent created that this decision sent to the trash comes back (not one
+            // an earlier decision trashed: the agent may have created it again since).
+            let trashed = {
+                let mut trashed = inner.trashed.borrow_mut();
+                let at = trashed
+                    .iter()
+                    .rposition(|t| t.decision == number && t.path == *path);
+                at.map(|at| trashed.remove(at))
+            };
+            match trashed {
+                Some(trashed) => {
+                    untrashed = true;
+                    glib::spawn_future_local(restore_trashed(state.clone(), trashed));
+                }
+                None => gone.push(relative_name(state, path)),
+            }
             continue;
         };
         match undo_in(state, &doc) {
@@ -1933,15 +2277,17 @@ pub fn undo_last(state: &Rc<WindowState>) {
     if let Some((doc, Some(line))) = &first_restored {
         show_line(state, doc, *line);
     }
+    // A file coming back from the trash says itself when it cannot.
+    let restored = first_restored.is_some() || untrashed;
     let message = match (gone.as_slice(), stuck.as_slice()) {
         ([], []) => return,
-        ([name], []) if first_restored.is_none() => {
+        ([name], []) if !restored => {
             format!("Cannot undo the last decision: {name} is no longer under review")
         }
-        ([], [name]) if first_restored.is_none() => {
+        ([], [name]) if !restored => {
             format!("Cannot undo the last decision: {name} was edited since")
         }
-        _ if first_restored.is_none() => "Cannot undo the last decision".to_owned(),
+        _ if !restored => "Cannot undo the last decision".to_owned(),
         _ => {
             let names: Vec<String> = gone.into_iter().chain(stuck).collect();
             format!("The last decision was not undone in {}", names.join(", "))
@@ -2130,7 +2476,9 @@ pub fn set_reading_mode(state: &Rc<WindowState>, on: bool) {
     }
 }
 
-/// The path of `doc` relative to the project root, for display.
+/// The path of `doc` relative to the project root, for display: what the user sees, in the
+/// system's spelling (`chapters\intro.tex` on Windows). What the agent is told names files with
+/// `/` on every system instead: [`lemma_core::ProjectRoot::agent_name`].
 pub fn relative_name(state: &WindowState, path: &Path) -> String {
     let root = state.workspace.root();
     root.relative(path).unwrap_or(path).display().to_string()

@@ -258,27 +258,41 @@ pub fn lexical_join(dir: &Path, rel: impl AsRef<Path>) -> PathBuf {
     out
 }
 
-/// The `.bib` files `file` (at `path`) names with `\bibliography`/`\addbibresource`, as the
-/// project index keys them.
+/// The bibliography files `file` (at `path`) names, as the build reads them and the project
+/// index keys them: `\bibliography{refs}` names `refs.bib` (BibTeX adds `.bib`), while
+/// `\addbibresource{refs}` names `refs` (biber reads the name as written: biblatex wants the
+/// full file name). `.bib` is added to the path as it is: a directory whose name is not UTF-8
+/// stays itself.
 pub fn bibliographies(path: &Path, file: &FileIndex) -> Vec<PathBuf> {
     let dir = path.parent().unwrap_or(Path::new("/"));
     file.includes
         .iter()
-        .filter(|i| i.kind == IncludeKind::Bibliography)
-        .map(|i| i.target.trim())
-        .filter(|target| !target.is_empty())
-        .map(|target| {
-            let bib = lexical_join(dir, target);
-            if bib
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("bib"))
+        .filter(|i| matches!(i.kind, IncludeKind::Bibliography | IncludeKind::BibResource))
+        .filter(|i| !i.target.trim().is_empty())
+        .map(|i| {
+            let bib = lexical_join(dir, i.target.trim());
+            if i.kind == IncludeKind::BibResource
+                || bib
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("bib"))
             {
                 bib
             } else {
-                PathBuf::from(format!("{}.bib", bib.display()))
+                let mut name = bib.into_os_string();
+                name.push(".bib");
+                PathBuf::from(name)
             }
         })
         .collect()
+}
+
+/// Whether the bibliography file at `path` is read as BibTeX: a `.bib` file or one without an
+/// extension. biblatex reads other formats from a data source named with their extension
+/// (`\addbibresource[datatype=biblatexml]{refs.xml}`); those are not read, so their citations are
+/// not checked.
+pub fn is_bibtex_file(path: &Path) -> bool {
+    path.extension()
+        .is_none_or(|e| e.eq_ignore_ascii_case("bib"))
 }
 
 /// Whether citations of `index` can be checked: it names at least one bibliography and has
@@ -1026,8 +1040,10 @@ pub enum FileKind {
     Tex,
     /// An image (`\includegraphics`, …): opened in another application.
     Graphics,
-    /// A bibliography.
+    /// A BibTeX database (`\bibliography`): `.bib` is added.
     Bib,
+    /// A biblatex data source (`\addbibresource`): named in full.
+    BibResource,
     /// A package (`\usepackage`): a local `.sty`.
     Package,
     /// A class (`\documentclass`): a local `.cls`.
@@ -1044,7 +1060,8 @@ pub fn file_kind(cmd: &str) -> Option<FileKind> {
         | "subimport" | "inputfrom" | "includefrom" | "subinputfrom" | "subincludefrom"
         | "includestandalone" | "InputIfFileExists" | "externaldocument" => FileKind::Tex,
         "includegraphics" | "includesvg" | "includepdf" => FileKind::Graphics,
-        "bibliography" | "addbibresource" | "addglobalbib" => FileKind::Bib,
+        "bibliography" => FileKind::Bib,
+        "addbibresource" | "addglobalbib" => FileKind::BibResource,
         "usepackage" | "RequirePackage" => FileKind::Package,
         "documentclass" | "LoadClass" => FileKind::Class,
         "verbatiminput" | "lstinputlisting" | "inputminted" => FileKind::Other,
@@ -1071,8 +1088,10 @@ pub fn file_names(kind: FileKind, target: &str) -> Vec<String> {
             .iter()
             .map(|e| format!("{target}.{e}"))
             .collect(),
-        (FileKind::Bib, Some("bib")) => vec![target.to_owned()],
+        (FileKind::Bib | FileKind::BibResource, Some("bib")) => vec![target.to_owned()],
         (FileKind::Bib, _) => vec![format!("{target}.bib"), target.to_owned()],
+        // The file biber reads first, then the one a `.bib` was left out of.
+        (FileKind::BibResource, _) => vec![target.to_owned(), format!("{target}.bib")],
         (FileKind::Package, _) => vec![format!("{target}.sty")],
         (FileKind::Class, _) => vec![format!("{target}.cls")],
         (FileKind::Other, _) => vec![target.to_owned()],
@@ -1836,6 +1855,12 @@ mod tests {
         assert_eq!(file_names(FileKind::Package, "defs"), ["defs.sty"]);
         assert_eq!(file_names(FileKind::Class, "mine"), ["mine.cls"]);
         assert_eq!(file_names(FileKind::Bib, "refs"), ["refs.bib", "refs"]);
+        assert_eq!(file_kind("addbibresource"), Some(FileKind::BibResource));
+        assert_eq!(
+            file_names(FileKind::BibResource, "refs"),
+            ["refs", "refs.bib"]
+        );
+        assert_eq!(file_names(FileKind::BibResource, "refs.bib"), ["refs.bib"]);
         assert_eq!(file_names(FileKind::Graphics, "f.png"), ["f.png"]);
         assert_eq!(file_names(FileKind::Graphics, "f")[0], "f.pdf");
         assert_eq!(
@@ -1843,6 +1868,40 @@ mod tests {
             ["figs/", "../img/"]
         );
         assert!(graphics_paths("nothing").is_empty());
+    }
+
+    /// `\bibliography` names BibTeX's `.bib` files, `\addbibresource` biblatex's data sources as
+    /// written; `.bib` is added to the path as it is: a directory whose name is not UTF-8 stays
+    /// itself.
+    #[test]
+    fn bibliographies_named_by_a_file() {
+        let file = index_file(
+            "\\bibliography{refs,more.BIB,v.2}\n\\addbibresource{x.bib}\n\\addbibresource{lit}\n\
+             \\addglobalbib[datatype=biblatexml]{data.xml}",
+        );
+        let dir = PathBuf::from("/p");
+        assert_eq!(
+            bibliographies(&dir.join("main.tex"), &file),
+            [
+                dir.join("refs.bib"),
+                dir.join("more.BIB"),
+                dir.join("v.2.bib"),
+                dir.join("x.bib"),
+                dir.join("lit"),
+                dir.join("data.xml"),
+            ]
+        );
+        assert!(is_bibtex_file(&dir.join("more.BIB")) && is_bibtex_file(&dir.join("lit")));
+        assert!(!is_bibtex_file(&dir.join("data.xml")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = Path::new(std::ffi::OsStr::from_bytes(b"/p/caf\xe9"));
+            assert_eq!(
+                bibliographies(&dir.join("main.tex"), &file)[0],
+                dir.join("refs.bib")
+            );
+        }
     }
 
     #[test]

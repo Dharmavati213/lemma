@@ -34,8 +34,7 @@ const CHILD_ENV: &str = "LEMMA_REGRESS2_F_CHILD";
 fn main() -> ExitCode {
     // Nothing of these tests (or of the `lemma` runs they start) may reach the user's settings,
     // state or data directories.
-    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-regress2-f-xdg-{}", std::process::id()));
+    let home = common::target_tmpdir().join(format!("lemma-regress2-f-xdg-{}", std::process::id()));
     for (var, sub) in [
         ("XDG_DATA_HOME", "data"),
         ("XDG_STATE_HOME", "state"),
@@ -321,6 +320,7 @@ fn regress2_closed_doc_older_own_write_reads_disk() {
 /// Neovim write a symlinked file in place (backupcopy), which changes the target in the dotfiles
 /// directory: the reload must still happen.
 fn regress2_symlinked_config_reloads() {
+    common::require_symlinks();
     let dir = common::temp_dir("settings-symlink");
     let (conf, dots) = (dir.join("conf"), dir.join("dotfiles"));
     std::fs::create_dir_all(&conf).unwrap();
@@ -779,7 +779,18 @@ fn rss_kb() -> i64 {
 /// Opening the 60k-line `large.tex` costs tens of MiB; once its tab is closed most of that goes
 /// back to the system (the view and buffer are finalized, and the allocator trims its free
 /// pages). Before, every closed tab kept its view, buffer and the heap they had used.
+///
+/// The process's memory is a noisy measure: how far the highlighter and the line heights got
+/// while the tab was open changes what opening takes by a third, and about one run in ten gives
+/// back a little less than half. So the tab is opened and closed up to three times, and one time
+/// that gives back more than half is enough; a tab that keeps its view and buffer gives back
+/// next to nothing every time.
 fn regress2_closed_large_tab_gives_memory_back() {
+    if !cfg!(target_os = "linux") {
+        println!("  SKIP: the memory is measured in Linux's /proc");
+        return;
+    }
+    const ATTEMPTS: usize = 3;
     let large = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/large.tex"
@@ -791,28 +802,37 @@ fn regress2_closed_large_tab_gives_memory_back() {
     );
     let _main = f.open("main.tex");
     common::pump_for(Duration::from_millis(300));
-    // Free heap pages go back to the system (malloc_trim on glibc).
-    lemma_app::heap::trim();
-    let base = rss_kb();
-    let editor = f.open("large.tex");
-    let drawn = Rc::new(Cell::new(false));
-    let flag = drawn.clone();
-    editor.after_first_frame(move |_| flag.set(true));
-    common::pump_until(TIMEOUT, || drawn.get());
-    common::pump_for(Duration::from_millis(500));
-    let open = rss_kb();
-    f.state.close_editor(&editor, true);
-    drop(editor);
-    common::pump_for(lemma_app::window::CLOSED_TAB_TRIM_DELAY + Duration::from_millis(700));
-    let closed = rss_kb();
-    println!(
-        "  RSS: +{:.1} MiB with large.tex open, +{:.1} MiB after its tab closed",
-        (open - base) as f64 / 1024.0,
-        (closed - base) as f64 / 1024.0
-    );
-    assert!(open - base > 8 << 10, "opening large.tex costs memory");
+    let mut gave_back = false;
+    for attempt in 1..=ATTEMPTS {
+        // Free heap pages go back to the system (malloc_trim on glibc).
+        lemma_app::heap::trim();
+        let base = rss_kb();
+        let editor = f.open("large.tex");
+        let drawn = Rc::new(Cell::new(false));
+        let flag = drawn.clone();
+        editor.after_first_frame(move |_| flag.set(true));
+        common::pump_until(TIMEOUT, || drawn.get());
+        common::pump_for(Duration::from_millis(500));
+        let open = rss_kb();
+        f.state.close_editor(&editor, true);
+        drop(editor);
+        common::pump_for(lemma_app::window::CLOSED_TAB_TRIM_DELAY + Duration::from_millis(700));
+        let closed = rss_kb();
+        println!(
+            "  RSS: +{:.1} MiB with large.tex open, +{:.1} MiB after its tab closed",
+            (open - base) as f64 / 1024.0,
+            (closed - base) as f64 / 1024.0
+        );
+        if attempt == 1 {
+            assert!(open - base > 8 << 10, "opening large.tex costs memory");
+        }
+        if (closed - base) * 2 < open - base {
+            gave_back = true;
+            break;
+        }
+    }
     assert!(
-        (closed - base) * 2 < open - base,
-        "closing the tab gave back less than half of what opening it took"
+        gave_back,
+        "closing the tab gave back less than half of what opening it took, {ATTEMPTS} times"
     );
 }

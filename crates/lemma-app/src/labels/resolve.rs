@@ -321,7 +321,7 @@ pub fn find_file(
     let mut bases: Vec<PathBuf> = match kind {
         // `\subfile` and `\import` are relative to the including file; `\bibliography` as the
         // project index reads it.
-        FileKind::Bib => vec![from_dir.clone(), root_dir.clone()],
+        FileKind::Bib | FileKind::BibResource => vec![from_dir.clone(), root_dir.clone()],
         _ => vec![root_dir.clone(), from_dir.clone()],
     };
     if let Some(dir) = dir {

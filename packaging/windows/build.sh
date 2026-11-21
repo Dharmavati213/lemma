@@ -18,7 +18,8 @@
 # Options:
 #   --skip-build    package the existing release build
 #   --no-installer  only the folder and the zip
-#   --test          run the tests of the crates without GTK windows (on Linux under Wine)
+#   --test          run the tests: the crates without GTK windows and, on Linux with xvfb-run
+#                   installed, the GUI tests that pass under Wine, on displays of their own
 #   --smoke         start the packaged app on a test project and save a snapshot of its
 #                   window in dist/smoke (on Linux under Wine, on your desktop's display)
 #
@@ -43,7 +44,7 @@ for arg in "$@"; do
     --no-installer) INSTALLER=0 ;;
     --test) TEST=1 ;;
     --smoke) SMOKE=1 ;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) die "unknown option $arg (see --help)" ;;
   esac
 done
@@ -123,18 +124,22 @@ else
   if [ ! -f "$WINEPREFIX/system.reg" ]; then
     echo "creating the Wine prefix $WINEPREFIX"
     "$WINE" wineboot -i >/dev/null 2>&1 || die "wine could not start"
-    # Wine has none of Windows' fonts. Poppler draws a PDF's standard fonts that are not
-    # embedded with Arial, Times New Roman and Courier New (a test needs it): the Liberation
-    # fonts have their metrics, where the system has them.
-    fonts="$WINEPREFIX/drive_c/windows/Fonts"
-    for pair in arial:LiberationSans-Regular arialbd:LiberationSans-Bold \
-      times:LiberationSerif-Regular timesbd:LiberationSerif-Bold cour:LiberationMono-Regular; do
-      file="$(fc-list -f '%{file}\n' 2>/dev/null | grep -m 1 "/${pair#*:}\.ttf$" || true)"
-      [ -z "$file" ] || cp "$file" "$fonts/${pair%%:*}.ttf"
-    done
   fi
+  # Wine has none of Windows' fonts. Poppler draws a PDF's standard fonts that are not
+  # embedded with Arial, Times New Roman and Courier New (a test needs it): the Liberation
+  # fonts have their metrics, where the system has them. Checked on every run, so that fonts
+  # installed after the prefix was made still arrive.
+  fonts="$WINEPREFIX/drive_c/windows/Fonts"
+  for pair in arial:LiberationSans-Regular arialbd:LiberationSans-Bold \
+    times:LiberationSerif-Regular timesbd:LiberationSerif-Bold cour:LiberationMono-Regular; do
+    [ ! -f "$fonts/${pair%%:*}.ttf" ] || continue
+    file="$(fc-list -f '%{file}\n' 2>/dev/null | grep -m 1 "/${pair#*:}\.ttf$" || true)"
+    [ -z "$file" ] || cp "$file" "$fonts/${pair%%:*}.ttf"
+  done
   # Windows programs from the bundle find their DLLs next to them; these find MSYS2's.
-  export WINEPATH="$("$WINE" winepath -w "$PREFIX/bin" 2>/dev/null);$("$WINE" winepath -w "$SDK/$LLVM_MINGW/x86_64-w64-mingw32/bin" 2>/dev/null)"
+  WINEPATH="$("$WINE" winepath -w "$PREFIX/bin" 2>/dev/null)"
+  WINEPATH="$WINEPATH;$("$WINE" winepath -w "$SDK/$LLVM_MINGW/x86_64-w64-mingw32/bin" 2>/dev/null)"
+  export WINEPATH
 
   rustup target add x86_64-pc-windows-gnullvm >/dev/null
   TRIPLE=x86_64-pc-windows-gnullvm
@@ -162,6 +167,18 @@ fi
 [ -f "$RELEASE/lemma.exe" ] && [ -f "$RELEASE/lemma-mcp.exe" ] \
   || die "no release build in $RELEASE"
 
+# The GUI test programs of lemma-app that pass under Wine (--test, on Linux), in the order of
+# crates/lemma-app/Cargo.toml. Not here: gtk_review, gtk_goto, gtk_session and gtk_qol, each
+# with a test or two that fail under Wine, and gtk_git_gutter, which finds no git there;
+# docs/testing.md says why.
+GUI_TESTS=(gtk_document gtk_vim gtk_app gtk_window gtk_snippets gtk_pdf gtk_regress_d
+  gtk_regress_a gtk_regress_b gtk_regress_c gtk_line_states gtk_shell_m2 gtk_agent_tools
+  gtk_agent_panel gtk_agent_backends gtk_review_persist gtk_highlight gtk_completion
+  gtk_autosnippets gtk_typing gtk_spell gtk_keys gtk_e2e_agent gtk_regress2_f gtk_regress2_e2
+  gtk_regress2_b gtk_regress2_c gtk_regress2_e1 gtk_regress2_d gtk_shell_m3 gtk_outline
+  gtk_labels gtk_math_preview gtk_pdf_m3 gtk_palette gtk_prefs gtk_search gtk_lint gtk_pairs
+  gtk_envtools gtk_improve_editor)
+
 TESTS_FAILED=0
 if [ "$TEST" = 1 ]; then
   step "tests of the crates without GTK windows"
@@ -186,6 +203,37 @@ if [ "$TEST" = 1 ]; then
     -p lemma-agent -p lemma-pdf -p lemma-preview "${THREADS[@]}" || TESTS_FAILED=1
   cargo test --locked --no-fail-fast "${CARGO_TARGET[@]}" -p lemma-app --lib "${THREADS[@]}" \
     || TESTS_FAILED=1
+
+  # The GUI test programs (crates/lemma-app/tests/gtk_*.rs) that pass under Wine: each opens
+  # windows, so each runs on an Xvfb display of its own, never on the desktop's, and with a
+  # time limit (a Wine dialog nobody answers would wait for ever).
+  if [ -n "${MSYSTEM:-}" ]; then
+    echo "The GUI tests (gtk_*) are not run on Windows: they are unverified there."
+  elif ! command -v xvfb-run >/dev/null; then
+    echo "Skipped the GUI tests (gtk_*): they need xvfb-run (Arch: xorg-server-xvfb; Debian," \
+      "Ubuntu: xvfb)."
+  else
+    step "GUI tests under Wine, each on an Xvfb display of its own"
+    for name in "${GUI_TESTS[@]}"; do
+      status=0
+      # A Linux desktop's GDK_BACKEND and WAYLAND_DISPLAY would reach the programs through Wine.
+      env -u WAYLAND_DISPLAY -u GDK_BACKEND xvfb-run -a -s "-screen 0 1600x1000x24" \
+        timeout -k 10 1200 cargo test --locked "${CARGO_TARGET[@]}" -p lemma-app --test "$name" \
+        > "$TARGET_DIR/$TRIPLE/gui-test-$name.log" 2>&1 || status=$?
+      result="$(grep -a '^test result' "$TARGET_DIR/$TRIPLE/gui-test-$name.log" | tail -n 1 || true)"
+      if [ "$status" = 0 ]; then
+        echo "ok   $name: ${result#test result: }"
+      else
+        echo "FAIL $name (exit $status): ${result:-no result}; see" \
+          "$TARGET_DIR/$TRIPLE/gui-test-$name.log"
+        grep -a -A 12 -e 'panicked at' -e 'GLib logged' "$TARGET_DIR/$TRIPLE/gui-test-$name.log" \
+          | grep -a -v -e 'gdk_frame_clock_presented' -e '^$' | head -n 60 || true
+        TESTS_FAILED=1
+        # A program that ran into the time limit leaves its Wine processes behind.
+        [ "$status" != 124 ] || "$SDK/$WINE_BUILD/bin/wineserver" -k 2>/dev/null || true
+      fi
+    done
+  fi
 fi
 
 step "the app folder: $APP"
@@ -237,13 +285,23 @@ cp -R data/templates "$APP/share/lemma/templates"
 step "licences"
 mkdir -p "$APP/share/licenses/lemma"
 cp LICENSE "$APP/share/licenses/lemma/LICENSE"
+# The SyncTeX parser compiled into lemma.exe: its licence asks for its notice to go with it.
+sh packaging/synctex-notice.sh > "$APP/share/licenses/lemma/LICENSE.synctex"
+# The Rust crates compiled into lemma.exe and lemma-mcp.exe: their licences' notices and texts
+# (xtask runs on this machine and lists the crates of the Windows programs).
+cargo run -q --locked -p xtask -- licenses "${CARGO_TARGET[@]}" \
+  > "$APP/share/licenses/lemma/LICENSE.crates"
 # The MSYS2 package of every file in the folder, and that package's licence files.
 owners="$(mktemp)"
 if [ -n "${MSYSTEM:-}" ]; then
+  # Lemma's own files and the caches made at install time (icon-theme.cache, loaders.cache) have
+  # no owner: they add no line (an empty one would copy every licence of MSYS2), and the loop
+  # must not end on a failed test (with pipefail, that would stop the script here).
   (cd "$APP" && find bin lib etc share -type f) | while read -r f; do
-    [ -e "$PREFIX/$f" ] && printf '%s\n' "$(pacman -Qqo "$PREFIX/$f" 2>/dev/null)"
+    if [ -e "$PREFIX/$f" ]; then pacman -Qqo "$PREFIX/$f" 2>/dev/null || true; fi
   done | sort -u > "$owners"
-  pacman -Q $(cat "$owners") > "$APP/share/licenses/msys2-packages.txt"
+  mapfile -t owner_names < "$owners"
+  pacman -Q "${owner_names[@]}" > "$APP/share/licenses/msys2-packages.txt"
 else
   (cd "$APP" && find bin lib etc share -type f) | sed 's|^|clang64/|' \
     | awk -F'\t' 'NR == FNR { want[$0] = 1; next } ($1 in want) { print $2 }' - \
@@ -265,8 +323,10 @@ To build documents, install a TeX distribution: MiKTeX or TeX Live.
 More: https://github.com/dharmavati213/lemma
 
 Lemma is free software under the GNU General Public License v3.0 or later
-(share\\licenses\\lemma\\LICENSE). It comes with GTK and other libraries from MSYS2
-(share\\licenses\\msys2-packages.txt lists them; their licences are in share\\licenses).
+(share\\licenses\\lemma\\LICENSE). It contains the SyncTeX parser
+(share\\licenses\\lemma\\LICENSE.synctex) and Rust crates (share\\licenses\\lemma\\LICENSE.crates),
+and comes with GTK and other libraries from MSYS2 (share\\licenses\\msys2-packages.txt lists
+them; their licences are in share\\licenses).
 EOF
 sed -i 's/$/\r/' "$APP/README.txt"
 du -sh "$APP" | cut -f1 | sed 's/^/size: /'

@@ -3,7 +3,10 @@
 //! - **Store:** `paths.history_dir()/<fnv(root) as 16 hex>/`, with `objects/<hash>.zst` (ruzstd;
 //!   or `objects/<hash>` when compressing does not make it smaller) and `index.jsonl`, one line
 //!   per entry: `{"path": "/abs/file.tex", "hash": "<16 hex>", "unix": 1760000000, "reason":
-//!   "save" | "turn:<n>" | "reject"}`. The hash is `fnv1a64` of the text's UTF-8 bytes.
+//!   "save" | "turn:<n>" | "reject"}`. The hash is `fnv1a64` of the text's UTF-8 bytes. Every
+//!   process that writes the index (appends, and the collection's rewrite) holds an exclusive
+//!   lock on `index.lock` meanwhile ([`lock_index`]): several Lemma windows (one process each)
+//!   on one project lose no entries (on a file system without locks it writes without one).
 //! - **Triggers:** every save of a project document (through [`crate::saver::connect_saved`]),
 //!   at most one entry per file per `history.min_interval_s`: a save within that time is written
 //!   when the interval is over (with the newest text), so the last version of a burst of saves
@@ -41,7 +44,9 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Why a snapshot was taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,8 +119,24 @@ impl IndexLine {
     }
 }
 
+/// What the review calls a restore's changes (the banner, the Changes panel).
+pub const RESTORE_NAME: &str = "Restore from History";
+
 const INDEX: &str = "index.jsonl";
 const OBJECTS: &str = "objects";
+/// The file every writer of a project's index locks (see [`lock_index`]).
+const LOCK: &str = "index.lock";
+/// How long a writer waits for another process's hold on a project's index before it gives up
+/// (a collection holds it for a moment; a process that hangs must not stall this one's history
+/// for good).
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a window's close waits for the local history in all: for the job the jobs thread
+/// runs (a write, or a collection, which holds the index's lock), then for the lock if another
+/// process holds it. The main thread is blocked meanwhile, and the snapshots not written by then
+/// are given up (mostly of a version just saved, which the file itself holds): a few seconds
+/// are plenty for writes and collections, which take milliseconds, and more would freeze the
+/// window for a copy in the history.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// Objects nothing refers to are deleted at start-up once they are this old (younger ones may
 /// belong to an entry another window is writing).
 const ORPHAN_AGE: Duration = Duration::from_secs(3600);
@@ -168,7 +189,30 @@ struct Store {
     /// Saves within the interval: the newest text, written when the interval is over.
     waiting: RefCell<HashMap<PathBuf, (String, glib::SourceId)>>,
     jobs: async_channel::Sender<Job>,
+    /// The other end of `jobs`, for [`Store::close`]: it writes what is still queued itself.
+    queue: async_channel::Receiver<Job>,
+    /// How many jobs that take the index's lock (writes and collections) the jobs thread is
+    /// running now.
+    busy: Arc<AtomicUsize>,
     saved_hook: Cell<Option<HookId>>,
+}
+
+/// Counts a job of the jobs thread in [`Store::busy`] until it ends.
+struct Busy(Arc<AtomicUsize>);
+
+impl Busy {
+    /// Counted from here, on the main thread, so that a close never misses it.
+    fn start(store: &Weak<Store>) -> Option<Self> {
+        let busy = store.upgrade()?.busy.clone();
+        busy.fetch_add(1, Ordering::SeqCst);
+        Some(Self(busy))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 thread_local! {
@@ -208,6 +252,8 @@ pub fn install(state: &Rc<WindowState>) {
         last_save: RefCell::new(HashMap::new()),
         waiting: RefCell::new(HashMap::new()),
         jobs,
+        queue: queue.clone(),
+        busy: Arc::default(),
         saved_hook: Cell::new(None),
     });
     STORES.with(|s| {
@@ -294,6 +340,23 @@ pub fn load(
     }
 }
 
+/// The snapshot in `state`'s project history whose text hashes to `hash` (`fnv1a64` of its
+/// UTF-8 bytes, as review states and documents hash their texts), of whatever file: `None` when
+/// the history does not have it.
+pub fn text_with_hash(
+    state: &WindowState,
+    hash: u64,
+) -> impl Future<Output = Option<String>> + use<> {
+    let dir = store_of(state).and_then(|s| s.dir.borrow().clone());
+    async move {
+        let dir = dir?;
+        gio::spawn_blocking(move || read_object(&dir, hash).ok())
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
 /// Records `text` as the content of `path` now, unless the file's newest entry has the same
 /// content (for other modules: e.g. `reason = Reject` before a reject writes the file).
 pub fn record(state: &Rc<WindowState>, path: &Path, text: &str, reason: HistoryReason) {
@@ -350,24 +413,31 @@ pub fn flush(state: &Rc<WindowState>) -> impl Future<Output = ()> + use<> {
     }
 }
 
-/// Writes every save still waiting for its interval now (tests; window close).
+/// Writes every save still waiting for its interval now (tests).
 pub fn write_waiting(state: &Rc<WindowState>) {
     if let Some(store) = store_of(state) {
         store.write_waiting();
     }
 }
 
+/// What the window's `destroy` runs (tests): see [`Store::close`].
+pub fn close(state: &Rc<WindowState>) {
+    if let Some(store) = store_of(state) {
+        store.close();
+    }
+}
+
 /// Restores `entry` into `doc` as reviewable hunks: the review's baseline is the current text
-/// (unless a review already runs), the old text is applied with `Origin::Agent { call: 0 }`
-/// outside any agent turn ([`review_ui::outside_turn`]) and saved. Resolves to the number of
-/// hunks of the document afterwards.
+/// (unless a review already runs), the old text is applied with `Origin::Agent { call: 0 }` as
+/// a named change apart from the agent's turns ([`review_ui::begin_named_change`], named
+/// [`RESTORE_NAME`]) and saved. Resolves to the number of hunks of the document afterwards.
 pub fn restore(
     state: &Rc<WindowState>,
     doc: &DocRef,
     entry: &HistoryEntry,
 ) -> impl Future<Output = Result<usize, String>> + use<> {
     let text = load(state, entry);
-    let doc = doc.clone();
+    let (state, doc) = (state.clone(), doc.clone());
     async move {
         let old = text.await?;
         // Computed and applied without yielding, so the text cannot change in between.
@@ -376,9 +446,13 @@ pub fn restore(
             return Ok(review_ui::hunk_count(&doc));
         }
         review_ui::start_review(&doc, false);
-        // The user's restore, not the last agent turn's change (turn 0: "Other changes").
-        review_ui::outside_turn(&doc, || doc.apply_edits(&edits, Origin::Agent { call: 0 }))
-            .map_err(|e| format!("cannot restore {}: {e}", doc.display_name()))?;
+        // The user's restore, not the agent's change: the banner and the Changes panel name it,
+        // and Undo Last Turn leaves it alone.
+        let turn = review_ui::begin_named_change(&state, RESTORE_NAME);
+        review_ui::in_turn(&doc, turn, || {
+            doc.apply_edits(&edits, Origin::Agent { call: 0 })
+        })
+        .map_err(|e| format!("cannot restore {}: {e}", doc.display_name()))?;
         review_ui::recompute(&doc);
         doc.save()
             .await
@@ -522,11 +596,32 @@ impl Store {
         }
     }
 
-    /// The window closes: saves still waiting for their interval are written now (the main
-    /// loop may not run again).
+    /// The window closes: the snapshots still queued for the jobs thread, and the saves still
+    /// waiting for their interval, are written now (the main loop may not run again: the save
+    /// right before the window closed would otherwise leave no snapshot), within [`CLOSE_WAIT`].
     fn close(&self) {
         if let Some(id) = self.saved_hook.take() {
             crate::saver::disconnect_saved(id);
+        }
+        let deadline = Instant::now() + CLOSE_WAIT;
+        // A job the jobs thread runs now ends first (the process may end right after this): a
+        // write, or a collection, which holds the index's lock.
+        while self.busy.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut newest = self.newest.borrow().clone();
+        while let Ok(job) = self.queue.try_recv() {
+            // The other jobs only read, or collect garbage, which the next window does again.
+            if let Job::Write { dir, entries } = job {
+                match write_entries_until(&dir, entries, &newest, Some(deadline)) {
+                    Ok(written) => {
+                        for entry in written {
+                            newest.insert(entry.path, entry.hash);
+                        }
+                    }
+                    Err(e) => tracing::warn!("local history: {e}"),
+                }
+            }
         }
         let waiting: Vec<(PathBuf, (String, glib::SourceId))> =
             self.waiting.borrow_mut().drain().collect();
@@ -545,11 +640,11 @@ impl Store {
                 }
             })
             .collect();
-        if !entries.is_empty() && self.enabled() {
-            let newest = self.newest.borrow().clone();
-            if let Err(e) = write_entries(&dir, entries, &newest) {
-                tracing::warn!("local history: {e}");
-            }
+        if !entries.is_empty()
+            && self.enabled()
+            && let Err(e) = write_entries_until(&dir, entries, &newest, Some(deadline))
+        {
+            tracing::warn!("local history: {e}");
         }
     }
 }
@@ -563,9 +658,12 @@ async fn run_jobs(store: Weak<Store>, queue: async_channel::Receiver<Job>) {
                 max_bytes,
                 max_age,
             } => {
-                let opened =
-                    gio::spawn_blocking(move || open_dir(&dir, max_bytes, max_age, unix_now()))
-                        .await;
+                let busy = Busy::start(&store);
+                let opened = gio::spawn_blocking(move || {
+                    let _busy = busy;
+                    open_dir(&dir, max_bytes, max_age, unix_now())
+                })
+                .await;
                 match (store.upgrade(), opened) {
                     (Some(store), Ok(Ok(newest))) => {
                         let mut known = store.newest.borrow_mut();
@@ -583,7 +681,9 @@ async fn run_jobs(store: Weak<Store>, queue: async_channel::Receiver<Job>) {
                 max_bytes,
                 max_age,
             } => {
+                let busy = Busy::start(&store);
                 let _ = gio::spawn_blocking(move || {
+                    let _busy = busy;
                     sweep(&history_dir, &current, max_bytes, max_age, unix_now());
                 })
                 .await;
@@ -592,8 +692,12 @@ async fn run_jobs(store: Weak<Store>, queue: async_channel::Receiver<Job>) {
                 let Some(known) = store.upgrade().map(|s| s.newest.borrow().clone()) else {
                     return;
                 };
-                let written =
-                    gio::spawn_blocking(move || write_entries(&dir, entries, &known)).await;
+                let busy = Busy::start(&store);
+                let written = gio::spawn_blocking(move || {
+                    let _busy = busy;
+                    write_entries(&dir, entries, &known)
+                })
+                .await;
                 match (store.upgrade(), written) {
                     (Some(store), Ok(Ok(written))) => {
                         let mut newest = store.newest.borrow_mut();
@@ -629,23 +733,151 @@ fn object_path(dir: &Path, hash: u64, compressed: bool) -> PathBuf {
     dir.join(OBJECTS).join(name)
 }
 
-fn read_index(dir: &Path) -> Vec<IndexLine> {
-    let Ok(text) = std::fs::read_to_string(dir.join(INDEX)) else {
-        return Vec::new();
+/// The lines of `dir`'s index (none when it has none). A line that does not parse is left out,
+/// and so is a byte that is not UTF-8 (an append cut by a full disk): one damaged line must not
+/// hide the others, whose objects the collection would then take for garbage.
+fn read_index(dir: &Path) -> std::io::Result<Vec<IndexLine>> {
+    let bytes = match std::fs::read(dir.join(INDEX)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    text.lines()
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
         .filter_map(|line| serde_json::from_str::<IndexLine>(line).ok())
         .filter(|line| line.entry().is_some())
-        .collect()
+        .collect())
 }
 
-/// Writes `bytes` to `path` through a temporary file and a rename.
+/// Writes `bytes` to `path` through a private temporary file, flushed to the disk before it is
+/// renamed: after a crash of the machine an object is whole or missing (one left empty would
+/// never be written again, its name being its hash) and the index is the old one or the new.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fsutil::private_file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_data()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
+/// The lock on a project's index that [`lock_index`] took (none on a file system without locks);
+/// released when dropped.
+struct IndexLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Takes the lock on `dir`'s index (an exclusive `File::try_lock` of `index.lock`: `flock`,
+/// `LockFileEx`), creating the directory if needed; waits up to [`LOCK_WAIT`] while another
+/// process (another Lemma on the same project) holds it. Every writer of the index takes it:
+/// appends ([`write_entries`]) and the collection's rewrite ([`open_dir`], [`sweep`]) never
+/// overlap. Without it, a line appended while the collection rewrote the index went to the
+/// index the rename replaced (the entry was lost), and an object an append found and referred
+/// to could be deleted as garbage meanwhile. Blocking.
+fn lock_index(dir: &Path) -> Result<IndexLock, String> {
+    lock_index_until(dir, Instant::now() + LOCK_WAIT)
+}
+
+/// [`lock_index`], waiting for another process's hold until `deadline` (once it has passed, the
+/// lock is tried once). On a file system that has no locks (an NFS home without its lock daemon
+/// answers `ENOLCK`; some network and FUSE file systems have none) the index is written without
+/// the lock, as it was before there was one, rather than not at all: the history is kept, and
+/// only two Lemmas on one project there can lose an entry, as they could then.
+fn lock_index_until(dir: &Path, deadline: Instant) -> Result<IndexLock, String> {
+    let path = dir.join(LOCK);
+    loop {
+        // The texts of the user's documents: private, as the review state and the recovery
+        // copies are (a project directory made before it was private is made so).
+        super::tools::create_private_dir(dir)?;
+        let file = loop {
+            let opened = crate::fsutil::private_file_options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path);
+            match opened {
+                Ok(file) => break file,
+                Err(e) if open_may_pass(&e) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
+            }
+        };
+        loop {
+            match try_lock(&file) {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "{} is held by another Lemma; nothing was written",
+                        path.display()
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    static TOLD: AtomicBool = AtomicBool::new(false);
+                    if !TOLD.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "local history: cannot lock {} ({e}); writing without the lock",
+                            path.display()
+                        );
+                    }
+                    return Ok(IndexLock { _file: None });
+                }
+            }
+        }
+        // The sweep of another process removes the lock file of a project left empty before it
+        // lets go: a lock on that file guards nothing, so the one there now is taken.
+        if is_same_file(&file, &path) {
+            return Ok(IndexLock { _file: Some(file) });
+        }
+    }
+}
+
+/// Whether the lock file could not be opened for a reason that passes in a moment: on Windows a
+/// lock file that another process removed stays, and cannot be opened, until its last handle is
+/// closed.
+fn open_may_pass(e: &std::io::Error) -> bool {
+    cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// `file.try_lock()`; tests make it fail as a file system without locks does.
+fn try_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    #[cfg(test)]
+    if tests::UNSUPPORTED_LOCKS.get() {
+        return Err(std::fs::TryLockError::Error(tests::no_locks_error()));
+    }
+    file.try_lock()
+}
+
+/// Whether `path` still names the file `file` was opened from.
+fn is_same_file(file: &std::fs::File, path: &Path) -> bool {
+    let Ok(now) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        file.metadata()
+            .is_ok_and(|m| (m.dev(), m.ino()) == (now.dev(), now.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        // No stable file identity in std here: a lock file removed and made again by a third
+        // process in the moment this one waited is not told apart.
+        let _ = (file, now);
+        true
+    }
 }
 
 /// Appends the entries whose text differs from the file's newest entry (`known`, then the
@@ -655,13 +887,31 @@ fn write_entries(
     entries: Vec<Pending>,
     known: &HashMap<PathBuf, u64>,
 ) -> Result<Vec<HistoryEntry>, String> {
+    write_entries_until(dir, entries, known, None)
+}
+
+/// [`write_entries`], given up at `deadline` (the window closes, see [`Store::close`]): the lock
+/// is waited for until then, and the entries not written by then are left out.
+fn write_entries_until(
+    dir: &Path,
+    entries: Vec<Pending>,
+    known: &HashMap<PathBuf, u64>,
+    deadline: Option<Instant>,
+) -> Result<Vec<HistoryEntry>, String> {
+    let _lock = lock_index_until(dir, deadline.unwrap_or_else(|| Instant::now() + LOCK_WAIT))?;
     let objects = dir.join(OBJECTS);
-    std::fs::create_dir_all(&objects)
+    crate::fsutil::private_dir_builder()
+        .create(&objects)
         .map_err(|e| format!("cannot create {}: {e}", objects.display()))?;
     let mut newest = known.clone();
     let mut lines = String::new();
     let mut written = Vec::new();
+    let mut left_out = 0;
     for pending in entries {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            left_out += 1;
+            continue;
+        }
         let hash = fnv1a64(&[pending.text.as_bytes()]);
         if newest.get(&pending.path) == Some(&hash) {
             continue;
@@ -699,20 +949,43 @@ fn write_entries(
             reason: pending.reason,
         });
     }
+    if left_out > 0 {
+        tracing::warn!("local history: {left_out} snapshots not written before the window closed");
+    }
     if !lines.is_empty() {
         // One write of whole lines with O_APPEND: other windows' appends do not interleave.
-        std::fs::OpenOptions::new()
+        crate::fsutil::private_file_options()
             .create(true)
             .append(true)
+            .read(true)
             .open(dir.join(INDEX))
-            .and_then(|mut f| f.write_all(lines.as_bytes()))
+            .and_then(|mut f| {
+                // An append cut short (a full disk) left no line break: the first new line would
+                // continue the damaged one, and be lost with it.
+                if !ends_with_line_break(&mut f)? {
+                    lines.insert(0, '\n');
+                }
+                f.write_all(lines.as_bytes())
+            })
             .map_err(|e| format!("cannot write the history index: {e}"))?;
     }
     Ok(written)
 }
 
+/// Whether `file` is empty or ends with `\n`.
+fn ends_with_line_break(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
 /// Garbage collection (age, then size, then unreferenced objects) and the newest hash of every
-/// file.
+/// file, holding the index's lock ([`lock_index`]).
 fn open_dir(
     dir: &Path,
     max_bytes: u64,
@@ -722,7 +995,20 @@ fn open_dir(
     if !dir.exists() {
         return Ok(HashMap::new());
     }
-    let lines = read_index(dir);
+    let _lock = lock_index(dir)?;
+    collect(dir, max_bytes, max_age, now)
+}
+
+/// [`open_dir`] while its caller holds the index's lock.
+fn collect(
+    dir: &Path,
+    max_bytes: u64,
+    max_age: u64,
+    now: u64,
+) -> Result<HashMap<PathBuf, u64>, String> {
+    // An index that cannot be read leaves everything as it is (its objects are not garbage).
+    let lines =
+        read_index(dir).map_err(|e| format!("cannot read the index of {}: {e}", dir.display()))?;
     let total_lines = lines.len();
     let indexed: HashSet<String> = lines.iter().map(|l| l.hash.clone()).collect();
     let mut keep: Vec<IndexLine> = lines
@@ -812,7 +1098,15 @@ fn sweep(history_dir: &Path, current: &Path, max_bytes: u64, max_age: u64, now: 
         if !ours || path == current || !dir.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        if let Err(e) = open_dir(&path, max_bytes, max_age, now) {
+        // Another Lemma may have that project open and write to it meanwhile.
+        let lock = match lock_index(&path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!("local history: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = collect(&path, max_bytes, max_age, now) {
             tracing::warn!("local history: {e}");
             continue;
         }
@@ -822,6 +1116,11 @@ fn sweep(history_dir: &Path, current: &Path, max_bytes: u64, max_age: u64, now: 
         if empty_index && no_objects {
             let _ = std::fs::remove_file(path.join(INDEX));
             let _ = std::fs::remove_dir(path.join(OBJECTS));
+            // The lock file goes while it is held (a writer that waited for it then takes a new
+            // one, see `lock_index`), and the directory once it is let go (a file open there
+            // keeps it from going on Windows).
+            let _ = std::fs::remove_file(path.join(LOCK));
+            drop(lock);
             if std::fs::remove_dir(&path).is_ok() {
                 tracing::info!("local history: removed the empty {}", path.display());
             }
@@ -831,6 +1130,7 @@ fn sweep(history_dir: &Path, current: &Path, max_bytes: u64, max_age: u64, now: 
 
 fn read_entries(dir: &Path, path: &Path) -> Vec<HistoryEntry> {
     let mut entries: Vec<HistoryEntry> = read_index(dir)
+        .unwrap_or_default()
         .iter()
         .filter_map(IndexLine::entry)
         .filter(|e| e.path == path)
@@ -967,9 +1267,25 @@ async fn show_restore_dialog(state: Rc<WindowState>) {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Locks fail on this thread as on a file system without them (see [`try_lock`]).
+        pub(super) static UNSUPPORTED_LOCKS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// What `flock` says on an NFS mount whose lock daemon does not run.
+    pub(super) fn no_locks_error() -> std::io::Error {
+        #[cfg(unix)]
+        {
+            std::io::Error::from_raw_os_error(libc::ENOLCK)
+        }
+        #[cfg(not(unix))]
+        {
+            std::io::ErrorKind::Unsupported.into()
+        }
+    }
+
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lemma-history-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir(&format!("lemma-history-{name}-")).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1117,6 +1433,236 @@ mod tests {
         );
         assert!(unrelated.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The store holds the text of every save: like the review state and the copies of unsaved
+    /// changes, only the user can read it, also in a directory made before it was private.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = temp("private");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let texts: Vec<String> = (0..2).map(|i| format!("{i}").repeat(4000)).collect();
+        let entries = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| pending(&format!("/p/{i}.tex"), t, 10 + i as u64))
+            .collect();
+        write_entries(&dir, entries, &HashMap::new()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(OBJECTS)), 0o700);
+        assert_eq!(mode(&dir.join(INDEX)), 0o600);
+        for text in &texts {
+            assert_eq!(
+                mode(&object_path(&dir, fnv1a64(&[text.as_bytes()]), true)),
+                0o600
+            );
+        }
+        // The index written again by the collection.
+        open_dir(&dir, u64::MAX, 0, 11).unwrap();
+        assert_eq!(read_entries(&dir, Path::new("/p/0.tex")).len(), 0);
+        assert_eq!(mode(&dir.join(INDEX)), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged line in the index (an append cut inside a multi-byte character) costs that
+    /// line, not the whole history: the index was read as empty then, and the collection deleted
+    /// every object older than an hour.
+    #[test]
+    fn a_damaged_index_line_keeps_the_others() {
+        let dir = temp("damaged-index");
+        write_entries(
+            &dir,
+            vec![pending("/p/a.tex", "kept", 100)],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut index = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(INDEX))
+            .unwrap();
+        index.write_all(b"{\"path\":\"/p/caf\xc3").unwrap();
+        drop(index);
+        let object = object_path(&dir, fnv1a64(&[b"kept"]), false);
+        std::fs::File::options()
+            .write(true)
+            .open(&object)
+            .unwrap()
+            .set_modified(SystemTime::now() - ORPHAN_AGE * 2)
+            .unwrap();
+        let newest = open_dir(&dir, u64::MAX, u64::MAX, 200).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert!(object.exists(), "the object of an intact line was deleted");
+        assert_eq!(read_entries(&dir, Path::new("/p/a.tex")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The append after a damaged line (one a full disk cut, without its line break) starts on a
+    /// line of its own: it went on the damaged line, which then still did not parse, and the
+    /// new entry was lost (its object deleted as unreferenced later).
+    #[test]
+    fn an_append_after_a_damaged_line_is_kept() {
+        let dir = temp("damaged-append");
+        write_entries(
+            &dir,
+            vec![pending("/p/a.tex", "first", 100)],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut index = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(INDEX))
+            .unwrap();
+        index.write_all(b"{\"path\":\"/p/caf\xc3").unwrap();
+        drop(index);
+        write_entries(
+            &dir,
+            vec![pending("/p/a.tex", "second", 200)],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let entries = read_entries(&dir, Path::new("/p/a.tex"));
+        assert_eq!(
+            entries.iter().map(|e| e.unix).collect::<Vec<_>>(),
+            [200, 100]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a file system without locks (an NFS home without its lock daemon: `ENOLCK`), the
+    /// history is written without the lock, as it was before there was one: every write and
+    /// every collection failed, and nothing was recorded.
+    #[test]
+    fn a_file_system_without_locks_still_gets_the_history() {
+        let dir = temp("no-locks");
+        UNSUPPORTED_LOCKS.set(true);
+        let written = write_entries(&dir, vec![pending("/p/a.tex", "a", 1)], &HashMap::new());
+        let opened = open_dir(&dir, u64::MAX, u64::MAX, 2);
+        UNSUPPORTED_LOCKS.set(false);
+        assert_eq!(written.map(|w| w.len()), Ok(1));
+        assert_eq!(opened.map(|newest| newest.len()), Ok(1));
+        assert_eq!(read_entries(&dir, Path::new("/p/a.tex")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past its deadline (the window closes), a writer does not wait for the lock another
+    /// process holds, and writes no more entries.
+    #[test]
+    fn writes_stop_at_their_deadline() {
+        let dir = temp("deadline");
+        let held = lock_index(&dir).unwrap();
+        let started = Instant::now();
+        let refused = write_entries_until(
+            &dir,
+            vec![pending("/p/a.tex", "a", 1)],
+            &HashMap::new(),
+            Some(started),
+        );
+        assert!(refused.is_err());
+        assert!(started.elapsed() < LOCK_WAIT / 2, "{:?}", started.elapsed());
+        drop(held);
+        // The lock is free now (tried once: refused if anything holds it this very moment), and
+        // nothing is written either way.
+        let written = write_entries_until(
+            &dir,
+            vec![pending("/p/a.tex", "a", 1), pending("/p/b.tex", "b", 2)],
+            &HashMap::new(),
+            Some(Instant::now()),
+        );
+        assert!(written.as_ref().map_or(true, Vec::is_empty), "{written:?}");
+        assert!(read_entries(&dir, Path::new("/p/a.tex")).is_empty());
+        assert!(read_entries(&dir, Path::new("/p/b.tex")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two Lemma processes on one project (here two threads, each with its own handles): one
+    /// collects the history (and rewrites the index, an entry having expired) while the other
+    /// appends entries. The rewrite read the index, and an append that came before its rename
+    /// went to the old index: the entry was lost, and its object deleted as garbage later.
+    #[test]
+    fn appends_survive_a_concurrent_collection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = temp("concurrent");
+        let day = 86_400;
+        let now = 1000 * day;
+        write_entries(
+            &dir,
+            vec![pending("/p/a.tex", "seed", now)],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = {
+            let (dir, stop) = (dir.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut rounds = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    open_dir(&dir, u64::MAX, 30 * day, now).unwrap();
+                    rounds += 1;
+                }
+                rounds
+            })
+        };
+        const APPENDS: usize = 150;
+        for i in 0..APPENDS {
+            // An expired entry makes the next collection rewrite the index.
+            let entries = vec![
+                pending("/p/old.tex", &format!("old {i}"), day),
+                pending("/p/a.tex", &format!("young {i}"), now),
+            ];
+            write_entries(&dir, entries, &HashMap::new()).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let rounds = collector.join().unwrap();
+        open_dir(&dir, u64::MAX, 30 * day, now).unwrap();
+        let kept = read_entries(&dir, Path::new("/p/a.tex"));
+        assert_eq!(
+            kept.len(),
+            APPENDS + 1,
+            "{} entries lost to {rounds} collections",
+            APPENDS + 1 - kept.len()
+        );
+        for i in 0..APPENDS {
+            let text = format!("young {i}");
+            assert_eq!(
+                read_object(&dir, fnv1a64(&[text.as_bytes()])).unwrap(),
+                text
+            );
+        }
+        assert!(read_entries(&dir, Path::new("/p/old.tex")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While another process holds the index (its collection runs), a writer waits for it, and
+    /// takes a lock file that the other's sweep removed in the meantime anew.
+    #[test]
+    fn writers_wait_for_the_lock() {
+        let dir = temp("lock-wait");
+        let held = lock_index(&dir).unwrap();
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                write_entries(&dir, vec![pending("/p/a.tex", "a", 1)], &HashMap::new())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !writer.is_finished(),
+            "the writer did not wait for the lock"
+        );
+        // The sweep of an emptied project removes the lock file before it lets go.
+        std::fs::remove_file(dir.join(LOCK)).unwrap();
+        drop(held);
+        assert_eq!(writer.join().unwrap().unwrap().len(), 1);
+        // On Windows the removed file stays until the writer, which had it open, closes it, and
+        // nothing tells the two apart there (`is_same_file`): the writer wrote under that lock.
+        #[cfg(unix)]
+        assert!(dir.join(LOCK).exists(), "the writer locked a removed file");
+        assert_eq!(read_entries(&dir, Path::new("/p/a.tex")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

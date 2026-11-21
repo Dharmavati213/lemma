@@ -13,5 +13,9 @@ workspace = true
 # data/raw/umath_map.tsv and data/completion/* into crates/lemma-complete/src/generated.rs and
 # packages.zst. The inputs are line-based text files; the packed tables are zstd frames (ruzstd,
 # which lemma-complete decodes them with).
+#
+# `cargo run -p xtask -- licenses` prints the licences of the crates compiled into the programs,
+# for the packages; it reads `cargo metadata`'s JSON.
 [dependencies]
 ruzstd = { workspace = true }
+serde_json = { workspace = true }

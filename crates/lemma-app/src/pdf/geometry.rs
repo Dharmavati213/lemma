@@ -192,6 +192,18 @@ pub fn bitmap_view_rect(
     )
 }
 
+/// `rect` with each of its edges moved to the nearest edge of a device pixel of a surface of
+/// `device_scale`. Rectangles that share an edge still do: tiles stretched to another zoom (whose
+/// edges fall between device pixels) neither leave a seam nor overlap, which moving only their
+/// origins to the grid did. A rectangle on the grid already ([`bitmap_view_rect`] of the current
+/// zoom's bitmaps) keeps its size, so it is still drawn pixel for pixel.
+pub fn snap_to_pixels(rect: Rect, device_scale: f64) -> Rect {
+    let snap = |v: f64| (v * device_scale).round() / device_scale;
+    let (x0, y0) = (snap(rect.x), snap(rect.y));
+    let (x1, y1) = (snap(rect.x + rect.width), snap(rect.y + rect.height));
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
 /// The tile grid of a page tiled at `scale_q` in logical pixels, for a page drawn at `page_rect`:
 /// `(columns, rows)` and the width and height of a tile (see `tile_view_rect`). `None` when the page
 /// is not tiled at this scale, or has no size.
@@ -510,6 +522,65 @@ mod tests {
         // A page without a size, or no device scale, is stretched as well (no division by 0).
         assert_eq!(bitmap_view_rect((0.0, 0.0), old, None, page, 1.0), page);
         assert_eq!(bitmap_view_rect(A4, old, None, page, 0.0), page);
+    }
+
+    /// Tiles of an earlier zoom stretched to the page while the re-render waits have edges
+    /// between device pixels: snapped, each tile ends where the next begins, on the grid. (Their
+    /// origins alone moved to the grid, with their widths kept, left gaps of a fraction of a
+    /// pixel between some of them, where the paper or the pane showed through as a thin line.)
+    /// The current zoom's tiles, on the grid already, keep their size.
+    #[test]
+    fn stretched_tiles_leave_no_seams() {
+        let origin_only = |r: Rect, ds: f64| {
+            let snap = |v: f64| (v * ds).round() / ds;
+            Rect::new(snap(r.x), snap(r.y), r.width, r.height)
+        };
+        let mut gaps = 0;
+        for (q, zoom, ds) in [
+            (BANDS_Q, 2.13, 2.0),
+            (BANDS_Q, 1.87, 1.5),
+            (COLUMNS_Q, 7.21, 2.0),
+            (COLUMNS_Q, 7.77, 1.0),
+        ] {
+            let page = Rect::new(100.0, 50.0, A4.0 * zoom, A4.1 * zoom);
+            let (columns, rows) = tile_grid(A4, q).unwrap();
+            let drawn = |c: u16, r: u16| {
+                snap_to_pixels(bitmap_view_rect(A4, q, Some((c, r)), page, ds), ds)
+            };
+            let on_grid = |v: f64| ((v * ds).round() - v * ds).abs() < 1e-6;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let tile = drawn(column, row);
+                    assert!(on_grid(tile.x) && on_grid(tile.y), "{tile:?}");
+                    assert!(on_grid(tile.x + tile.width) && on_grid(tile.y + tile.height));
+                    if row + 1 < rows {
+                        let below = drawn(column, row + 1);
+                        assert!((tile.y + tile.height - below.y).abs() < 1e-9, "{q} {zoom}");
+                        let stretched = |r| tile_view_rect(A4, q, (column, r), page);
+                        let (a, b) = (
+                            origin_only(stretched(row), ds),
+                            origin_only(stretched(row + 1), ds),
+                        );
+                        if a.y + a.height < b.y - 1e-9 {
+                            gaps += 1;
+                        }
+                    }
+                    if column + 1 < columns {
+                        let right = drawn(column + 1, row);
+                        assert!((tile.x + tile.width - right.x).abs() < 1e-9, "{q} {zoom}");
+                    }
+                }
+            }
+        }
+        assert!(gaps > 0, "origin-only snapping left no gap to close");
+        // The current zoom's tiles keep their pixel size.
+        let page = banded_page();
+        for tile in visible_tiles(A4, BANDS_Q, page, page) {
+            let exact = bitmap_view_rect(A4, BANDS_Q, Some(tile), page, 2.0);
+            let snapped = snap_to_pixels(exact, 2.0);
+            assert!((snapped.width - exact.width).abs() < 1e-9);
+            assert!((snapped.height - exact.height).abs() < 1e-9);
+        }
     }
 
     /// Every tile of the grid that intersects the viewport, by brute force.

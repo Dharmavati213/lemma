@@ -1,0 +1,51 @@
+# Runs scripts/ci.sh (formatting, the generated tables, clippy and every test; the GTK tests on
+# an offscreen Broadway display) in an Arch Linux container, as a user without a home
+# configuration, a session bus or a runtime directory. Arch is the distribution the tests are
+# written on, so its packages are the versions they are known to pass with.
+#
+# Started by hand only (Actions, "Tests", "Run workflow"): from day to day the tests run on the
+# developer's machine with the same script, and commits skip CI. This run is the check on a
+# machine that is not the developer's: what it finds is something the tests took from that
+# machine (a program, a font, a setting, a directory).
+name: Tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: scripts/ci.sh on Arch Linux
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 150
+    steps:
+      # The libraries of packaging/PKGBUILD, then what the tests run or look at: TeX (latexmk,
+      # pdflatex, lualatex, biber, chktex, texcount, kpsewhich), pdftotext and pdfinfo
+      # (poppler), an English dictionary, node (the agents' adapters are looked for, never
+      # run), ripgrep, the fonts GTK asks for, and the two linters ci.sh runs when it finds them.
+      - name: Build tools, libraries and the programs the tests use
+        run: >
+          pacman -Syu --noconfirm --needed base-devel git rust python
+          gtk4 libadwaita gtksourceview5 libspelling libsynctex poppler-glib poppler
+          gsettings-desktop-schemas adwaita-icon-theme shared-mime-info
+          adwaita-fonts noto-fonts ttf-liberation
+          hunspell hunspell-en_us nodejs ripgrep shellcheck actionlint
+          texlive-basic texlive-bin texlive-binextra texlive-latex texlive-latexrecommended
+          texlive-latexextra texlive-fontsrecommended texlive-bibtexextra texlive-luatex
+          texlive-mathscience texlive-pictures texlive-langenglish biber
+      - uses: actions/checkout@v7
+      # Not as root: root may write everywhere, and the tests about files that cannot be
+      # written would fail. A login shell, for the PATH of /etc/profile (biber is in
+      # /usr/bin/vendor_perl).
+      - name: scripts/ci.sh
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+          su -l builder -c "cd '$PWD' && export LANG=C.UTF-8 && scripts/build-fixtures.sh && scripts/ci.sh --no-fail-fast"

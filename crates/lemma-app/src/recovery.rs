@@ -3,8 +3,9 @@
 //! Auto-save is off by default, and a crash, `SIGTERM` (a shutdown), `SIGHUP` (the terminal
 //! closed) or a logout ends the process without the "Save changes?" dialog. So while
 //! `[editor] recovery` is on (the default), each edited document keeps a copy of its unsaved
-//! text in `Paths::recovery_dir()/<fnv(path) as 16 hex>.json`
-//! (`$XDG_STATE_HOME/lemma/recovery/…`, [`file_for`]): a [`RecoveryFile`] with the document's
+//! text in `Paths::recovery_dir()/<fnv(path) as 16 hex>.<pid>-<token>.json`
+//! (`$XDG_STATE_HOME/lemma/recovery/…`, [`file_for`]; one per process, see below): a
+//! [`RecoveryFile`] with the document's
 //! path, the hash of the file on disk the text is based on (the saver's `disk_hash`), the time of
 //! the copy and the text, byte for byte (its line breaks are in it; the charset is the file's,
 //! which the document reads again when it opens). The file is private to the user (0600 in a 0700
@@ -47,9 +48,18 @@
 //! but the document's is removed, and one of another file (whose path hashes the same) is
 //! ignored. So is the copy of a document that another Lemma still has open with unsaved changes
 //! (Lemma runs one process per window, and two can show the same file): every process that
-//! writes recovery files holds a lock on `<pid>.lock` in the directory while it runs
+//! writes recovery files holds a lock on `<pid>-<token>.lock` in the directory while it runs
 //! ([`lock_file`]), and a file whose writer still holds its lock is not left by a crash
-//! ([`is_running`]).
+//! ([`is_running`]). A process is named by its pid and a random token chosen when it starts
+//! ([`writer_id`]): in PID namespaces of their own (containers, Flatpak sandboxes, where every
+//! instance may be pid 2) two processes that share the state directory can have the same pid.
+//! Each process writes its own file of a document ([`file_of`]), so two that have it open with
+//! unsaved changes keep both copies: neither writes over the other's, nor removes it when it
+//! saves. A document that opens reads the files of every process ([`files_of`]: also those of
+//! the builds before the token, `<fnv(path)>.<pid>.json` with the lock `<pid>.lock`, and the one
+//! file all processes shared in Lemma 0.2, `<fnv(path)>.json`) and offers the texts of those
+//! whose writers ended, newest first, each once; its process's own file then holds them, and
+//! the files they came from go once it is written.
 //!
 //! **Signals** (Unix): the app ([`connect_termination`], for runs that do not quit by themselves)
 //! writes every edited document's file on `SIGTERM`, `SIGHUP` and `SIGINT` (Ctrl+C in the
@@ -67,8 +77,8 @@
 //! the user throws changes away; [`directory`] and [`is_left`] for the session, which restores
 //! the tab of a file that is gone (a New File never saved) when a crash left its text. Tests:
 //! [`set_enabled`], [`set_delays`], [`is_scheduled`], [`copy_now`], [`offered`], [`shown`],
-//! [`review`], [`discard_offered`], [`flush`], [`file_for`], [`lock_file`], [`encode`],
-//! [`parse`], [`decide`], [`offer_text`].
+//! [`review`], [`discard_offered`], [`flush`], [`file_for`], [`file_of`], [`files_of`],
+//! [`lock_file`], [`writer_id`], [`encode`], [`parse`], [`decide`], [`offer_text`].
 
 use crate::document::{self, DocRef, Document, ObserverId};
 use crate::editor::Editor;
@@ -129,9 +139,13 @@ pub struct RecoveryFile {
     /// When the text was copied (Unix time, seconds).
     #[serde(default)]
     pub saved_at: u64,
-    /// The process that wrote it (see [`is_running`]).
+    /// The process that wrote it.
     #[serde(default)]
     pub pid: Option<u32>,
+    /// The writer's [`writer_id`], which names its lock (see [`is_running`]); `None` in the files
+    /// of the builds before it, whose lock `pid` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
     /// The document's text.
     pub text: String,
     /// Older texts of the document that this file held, which were offered and not answered yet
@@ -155,6 +169,13 @@ pub struct RecoveredText {
 }
 
 impl RecoveryFile {
+    /// The name of the lock its writer holds while it runs ([`lock_file`]).
+    pub fn writer_lock(&self) -> Option<String> {
+        self.writer
+            .clone()
+            .or_else(|| self.pid.map(|pid| pid.to_string()))
+    }
+
     /// The file's texts, newest first: `text`, then the `earlier` ones.
     pub fn into_texts(self) -> Vec<RecoveredText> {
         let newest = RecoveredText {
@@ -166,17 +187,77 @@ impl RecoveryFile {
     }
 }
 
-/// The recovery file of the document at `path` (normalized): `recovery_dir/<fnv1a64(path) as 16
-/// hex>.json`.
-pub fn file_for(recovery_dir: &Path, path: &Path) -> PathBuf {
-    let hash = fnv1a64(&[path.as_os_str().as_encoded_bytes()]);
-    recovery_dir.join(format!("{hash:016x}.json"))
+/// This process's name among the writers of recovery files: `<pid>-<token>`, the token 8 random
+/// hex digits chosen when it starts. The pid alone does not tell processes apart that live in PID
+/// namespaces of their own (a container, a Flatpak sandbox, where every instance may be pid 2)
+/// and share the state directory.
+pub fn writer_id() -> &'static str {
+    static ID: LazyLock<String> =
+        LazyLock::new(|| format!("{}-{:08x}", std::process::id(), glib::random_int()));
+    &ID
 }
 
-/// The lock file that the process `pid` holds in `recovery_dir` while it runs:
-/// `recovery_dir/<pid>.lock`.
-pub fn lock_file(recovery_dir: &Path, pid: u32) -> PathBuf {
-    recovery_dir.join(format!("{pid}.lock"))
+/// This process's recovery file of the document at `path` (normalized):
+/// `recovery_dir/<fnv1a64(path) as 16 hex>.<writer_id>.json` ([`file_of`]).
+pub fn file_for(recovery_dir: &Path, path: &Path) -> PathBuf {
+    file_of(recovery_dir, path, writer_id())
+}
+
+/// The recovery file that the process `writer` ([`writer_id`], or the pid of a build before it)
+/// writes for the document at `path` (normalized): `recovery_dir/<fnv1a64(path) as 16
+/// hex>.<writer>.json`. Each process writes its own, so two Lemmas that have the same document
+/// open with unsaved changes never write over each other's copy, nor remove it when one of them
+/// saves.
+pub fn file_of(recovery_dir: &Path, path: &Path, writer: &str) -> PathBuf {
+    recovery_dir.join(format!("{}.{writer}.json", path_hash(path)))
+}
+
+/// Whether `name` names a writer: a [`writer_id`], or the pid of a build before it.
+fn is_writer(name: &str) -> bool {
+    let (pid, token) = match name.split_once('-') {
+        Some((pid, token)) => (pid, Some(token)),
+        None => (name, None),
+    };
+    pid.parse::<u32>().is_ok()
+        && token.is_none_or(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The name of a document's recovery file without the process: `<fnv1a64(path) as 16 hex>`.
+fn path_hash(path: &Path) -> String {
+    format!("{:016x}", fnv1a64(&[path.as_os_str().as_encoded_bytes()]))
+}
+
+/// The recovery files in `recovery_dir` of the document at `path` (normalized), of every process
+/// ([`file_of`], also those named by a pid alone), and the one file that Lemma 0.2 and earlier
+/// shared between processes, `<fnv1a64(path) as 16 hex>.json`. Blocking.
+pub fn files_of(recovery_dir: &Path, path: &Path) -> Vec<PathBuf> {
+    let hash = path_hash(path);
+    let Ok(entries) = std::fs::read_dir(recovery_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let Some(rest) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(hash.as_str()))
+                .and_then(|n| n.strip_suffix(".json"))
+            else {
+                return false;
+            };
+            rest.is_empty() || rest.strip_prefix('.').is_some_and(is_writer)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// The lock file that the process `writer` ([`writer_id`], or the pid of a build before it)
+/// holds in `recovery_dir` while it runs: `recovery_dir/<writer>.lock`.
+pub fn lock_file(recovery_dir: &Path, writer: &str) -> PathBuf {
+    recovery_dir.join(format!("{writer}.lock"))
 }
 
 /// The bytes of the recovery file of the document at `path` (a [`RecoveryFile`] written by this
@@ -196,6 +277,7 @@ pub fn encode(
         disk_hash: Option<u64>,
         saved_at: u64,
         pid: u32,
+        writer: &'a str,
         text: &'a str,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         earlier: Vec<&'a RecoveredText>,
@@ -206,6 +288,7 @@ pub fn encode(
         disk_hash,
         saved_at,
         pid: std::process::id(),
+        writer: writer_id(),
         text,
         earlier: earlier.iter().map(|t| &**t).collect(),
     })
@@ -350,13 +433,14 @@ fn read_file(file: &Path) -> Result<Option<RecoveryFile>, String> {
     }
 }
 
-/// True when the process `pid`, another than this one, holds its lock in `recovery_dir`
-/// ([`lock_file`]): a Lemma that still runs, whose recovery files are copies of documents it has
-/// open. The lock goes with the process however it ends, so a crash, a kill or a reboot leaves
-/// none, and a new process that got the same `pid` does not hold it. Blocking.
-pub fn is_running(recovery_dir: &Path, pid: u32) -> bool {
-    pid != std::process::id()
-        && std::fs::File::open(lock_file(recovery_dir, pid))
+/// True when the process `writer` ([`RecoveryFile::writer_lock`]), another than this one, holds
+/// its lock in `recovery_dir` ([`lock_file`]): a Lemma that still runs, whose recovery files are
+/// copies of documents it has open. The lock goes with the process however it ends, so a crash,
+/// a kill or a reboot leaves none, and a new process that got the same pid does not hold it.
+/// Blocking.
+pub fn is_running(recovery_dir: &Path, writer: &str) -> bool {
+    writer != writer_id()
+        && std::fs::File::open(lock_file(recovery_dir, writer))
             .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
 }
 
@@ -364,13 +448,40 @@ pub fn is_running(recovery_dir: &Path, pid: u32) -> bool {
 /// (normalized) that no running Lemma keeps: one a crash, a kill or a logout left, which the
 /// document offers when it opens. Blocking.
 pub fn is_left(recovery_dir: &Path, path: &Path) -> bool {
-    read_file(&file_for(recovery_dir, path))
-        .ok()
-        .flatten()
-        .is_some_and(|file| {
+    files_of(recovery_dir, path).iter().any(|file| {
+        read_file(file).ok().flatten().is_some_and(|file| {
             file.path == path.to_string_lossy()
-                && !file.pid.is_some_and(|pid| is_running(recovery_dir, pid))
+                && !file
+                    .writer_lock()
+                    .is_some_and(|writer| is_running(recovery_dir, &writer))
         })
+    })
+}
+
+/// A recovery file of a document as [`read_files`] found it: its contents and whether its
+/// writer, another Lemma, still runs ([`is_running`]), or why it could not be read.
+type ReadFile = (PathBuf, Result<(RecoveryFile, bool), String>);
+
+/// Reads every recovery file of the document at `path` in `recovery_dir` ([`files_of`]).
+/// Blocking.
+fn read_files(recovery_dir: &Path, path: &Path) -> Vec<ReadFile> {
+    files_of(recovery_dir, path)
+        .into_iter()
+        .filter_map(|file| {
+            let read = match read_file(&file) {
+                // Removed meanwhile.
+                Ok(None) => return None,
+                Ok(Some(found)) => {
+                    let runs = found
+                        .writer_lock()
+                        .is_some_and(|writer| is_running(recovery_dir, &writer));
+                    Ok((found, runs))
+                }
+                Err(e) => Err(e),
+            };
+            Some((file, read))
+        })
+        .collect()
 }
 
 /// This process's lock in each recovery directory it writes to (`None` when it could not be
@@ -385,7 +496,7 @@ fn hold_lock(dir: &Path) {
     if locks.contains_key(dir) {
         return;
     }
-    let file = lock_file(dir, std::process::id());
+    let file = lock_file(dir, writer_id());
     let held = crate::fsutil::private_file_options()
         .write(true)
         .create(true)
@@ -434,10 +545,31 @@ enum Op {
 /// runs, so a copy on its way never replaces a newer copy or brings back a removed file.
 #[derive(Default)]
 struct Writer {
-    /// Per recovery file, the newest operation not done yet.
-    queued: Mutex<HashMap<PathBuf, Op>>,
+    /// Per recovery file, what is still to do.
+    queued: Mutex<HashMap<PathBuf, Pending>>,
     /// Held while operations run.
     running: Mutex<()>,
+}
+
+/// What the writer still has to do to one of this process's recovery files.
+#[derive(Default)]
+struct Pending {
+    /// The newest operation not done yet.
+    op: Option<Op>,
+    /// Recovery files of processes that ended, to remove once an operation on this file is done:
+    /// the window took their texts over (this file holds them now, or they were answered), or
+    /// they held nothing to recover. They stay until then, so a crash in between loses nothing.
+    replaced: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+impl Pending {
+    fn new(op: Op) -> Self {
+        Self {
+            op: Some(op),
+            replaced: Vec::new(),
+        }
+    }
 }
 
 static WRITER: LazyLock<Writer> = LazyLock::new(Writer::default);
@@ -449,10 +581,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Writer {
-    /// Queues `op` on `file` (replacing an operation queued before it) and runs it on the jobs
-    /// thread; `failed` hears about an error.
-    fn queue(&'static self, file: PathBuf, op: Op, failed: impl FnOnce(String) + 'static) {
-        lock(&self.queued).insert(file.clone(), op);
+    /// Queues `op` on `file` (replacing an operation queued before it), and the removal of the
+    /// files `replaced` once an operation on `file` is done (see [`Pending::replaced`]), and runs
+    /// it on the jobs thread; `failed` hears about an error.
+    fn queue(
+        &'static self,
+        file: PathBuf,
+        op: Op,
+        replaced: Vec<PathBuf>,
+        failed: impl FnOnce(String) + 'static,
+    ) {
+        {
+            let mut queued = lock(&self.queued);
+            let pending = queued.entry(file.clone()).or_default();
+            pending.op = Some(op);
+            pending.replaced.extend(replaced);
+        }
         glib::spawn_future_local(async move {
             let error = match gio::spawn_blocking(move || self.run(&file)).await {
                 Ok(Ok(())) => return,
@@ -466,19 +610,51 @@ impl Writer {
     /// Runs the operation queued on `file`, if a flush has not run it already.
     fn run(&self, file: &Path) -> Result<(), String> {
         let _running = lock(&self.running);
-        let op = lock(&self.queued).remove(file);
-        op.map_or(Ok(()), |op| perform(file, op))
+        let pending = {
+            let mut queued = lock(&self.queued);
+            match queued.get(file) {
+                Some(Pending { op: Some(_), .. }) => queued.remove(file),
+                _ => None,
+            }
+        };
+        pending.map_or(Ok(()), |pending| self.perform(file, pending))
     }
 
     /// Runs every queued operation now, on this thread.
     fn flush(&self) {
         let _running = lock(&self.running);
-        let ops: Vec<(PathBuf, Op)> = lock(&self.queued).drain().collect();
-        for (file, op) in ops {
-            if let Err(e) = perform(&file, op) {
+        let ops: Vec<(PathBuf, Pending)> = lock(&self.queued)
+            .extract_if(|_, pending| pending.op.is_some())
+            .collect();
+        for (file, pending) in ops {
+            if let Err(e) = self.perform(&file, pending) {
                 tracing::warn!("recovery: {e}");
             }
         }
+    }
+
+    /// Does `pending`'s operation on `file`, then removes the files it replaces; when the
+    /// operation fails, they wait for the next one.
+    fn perform(&self, file: &Path, pending: Pending) -> Result<(), String> {
+        let Pending { op, replaced } = pending;
+        let done = op.map_or(Ok(()), |op| perform(file, op));
+        if done.is_err() {
+            if !replaced.is_empty() {
+                let mut queued = lock(&self.queued);
+                let pending = queued.entry(file.to_path_buf()).or_default();
+                pending.replaced.extend(replaced);
+            }
+            return done;
+        }
+        for other in replaced {
+            match std::fs::remove_file(&other) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!("recovery: cannot remove {}: {e}", other.display());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1153,6 +1329,11 @@ impl Recovery {
     /// Queues the recovery file of the document at `path` without a copy of the document's text:
     /// with the texts the bar offers for it, or its removal when it offers none.
     fn queue_without_own(&self, path: &Path) {
+        self.queue_without_own_replacing(path, Vec::new());
+    }
+
+    /// [`Recovery::queue_without_own`], and the removal of the files `replaced` once it is done.
+    fn queue_without_own_replacing(&self, path: &Path, replaced: Vec<PathBuf>) {
         let offered = self.offered_texts(path);
         let op = if offered.is_empty() {
             Op::Remove
@@ -1163,7 +1344,7 @@ impl Recovery {
                 offered,
             })
         };
-        self.queue(path, op);
+        self.queue_replacing(path, op, replaced);
     }
 
     /// The texts the bar offers for the document at `path`, newest first.
@@ -1211,8 +1392,14 @@ impl Recovery {
         }
     }
 
-    /// Queues `op` on the recovery file of the document at `path`.
+    /// Queues `op` on this process's recovery file of the document at `path`.
     fn queue(&self, path: &Path, op: Op) {
+        self.queue_replacing(path, op, Vec::new());
+    }
+
+    /// Queues `op` on this process's recovery file of the document at `path`, and the removal of
+    /// the files `replaced` once it is done (see [`Pending::replaced`]).
+    fn queue_replacing(&self, path: &Path, op: Op, replaced: Vec<PathBuf>) {
         let Some(dir) = self
             .state
             .upgrade()
@@ -1221,7 +1408,7 @@ impl Recovery {
             return;
         };
         let (weak, path) = (self.state.clone(), path.to_path_buf());
-        WRITER.queue(file_for(&dir, &path), op, move |error| {
+        WRITER.queue(file_for(&dir, &path), op, replaced, move |error| {
             if let Some(state) = weak.upgrade()
                 && let Some(rec) = recovery(&state)
             {
@@ -1244,81 +1431,96 @@ impl Recovery {
         }
     }
 
-    /// Reads `doc`'s recovery file on the jobs thread, and whether its writer still runs (see
+    /// Reads `doc`'s recovery files on the jobs thread, and whether their writers still run (see
     /// [`Recovery::checked`]).
     fn check(self: &Rc<Self>, state: &WindowState, doc: &DocRef) {
         let Some(dir) = state.paths.as_ref().map(Paths::recovery_dir) else {
             return;
         };
-        let file = file_for(&dir, doc.path());
+        let own = file_for(&dir, doc.path());
         self.entries
             .borrow_mut()
             .insert(doc.path().to_path_buf(), Entry::Checking);
         let (weak, weak_doc) = (Rc::downgrade(self), Rc::downgrade(doc));
+        let path = doc.path().to_path_buf();
         glib::spawn_future_local(async move {
-            let shown = file.display().to_string();
-            let read = gio::spawn_blocking(move || {
-                let found = read_file(&file)?;
-                Ok(found.map(|found| {
-                    let runs = found.pid.is_some_and(|pid| is_running(&dir, pid));
-                    (found, runs)
-                }))
-            })
-            .await
-            .unwrap_or_else(|_| Err("the reader panicked".to_owned()));
+            let read = gio::spawn_blocking(move || read_files(&dir, &path))
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!("recovery: the reader panicked");
+                    Vec::new()
+                });
             if let (Some(rec), Some(doc)) = (weak.upgrade(), weak_doc.upgrade()) {
-                rec.checked(&doc, &shown, read);
+                rec.checked(&doc, &own, read);
             }
         });
     }
 
-    /// `doc`'s recovery file was read: offers it, removes it, or leaves it alone.
-    fn checked(
-        self: &Rc<Self>,
-        doc: &DocRef,
-        shown: &str,
-        read: Result<Option<(RecoveryFile, bool)>, String>,
-    ) {
+    /// `doc`'s recovery files were read (`own` is this process's): the texts that the files of
+    /// processes that ended hold and the document does not are offered, newest first, each once;
+    /// this process's file takes them over, and those files go once it is written. Files of
+    /// Lemmas that still run, of other documents, or that cannot be read are left alone.
+    fn checked(self: &Rc<Self>, doc: &DocRef, own: &Path, read: Vec<ReadFile>) {
         // Closed (or read again) meanwhile.
         if !matches!(self.entries.borrow().get(doc.path()), Some(Entry::Checking)) {
             return;
         }
         self.entries.borrow_mut().remove(doc.path());
-        let found = match read {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::warn!("recovery: ignoring {shown}: {e}");
-                None
-            }
-        };
-        if let Some((file, writer_runs)) = found {
-            let (pid, owner) = (file.pid, file.path.clone());
-            let found = doc.with_text(|text| decide(file, doc.path(), text, writer_runs));
-            match found {
-                Found::Offer(texts) => {
+        let mut texts: Vec<RecoveredText> = Vec::new();
+        let mut taken: Vec<PathBuf> = Vec::new();
+        for (file, read) in read {
+            let shown = file.display();
+            let (found, writer_runs) = match read {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!("recovery: ignoring {shown}: {e}");
+                    continue;
+                }
+            };
+            let (writer, owner) = (found.writer_lock(), found.path.clone());
+            match doc.with_text(|text| decide(found, doc.path(), text, writer_runs)) {
+                Found::Offer(offered) => {
                     tracing::info!(
                         "recovery: offering {} text(s) of {shown} for {}",
-                        texts.len(),
+                        offered.len(),
                         doc.path().display()
                     );
-                    self.offers.borrow_mut().insert(
-                        doc.path().to_path_buf(),
-                        Offer {
-                            doc: Rc::downgrade(doc),
-                            texts: texts.into_iter().map(Arc::new).collect(),
-                            reviewed: false,
-                        },
-                    );
-                    self.refresh_bar();
+                    texts.extend(offered);
+                    taken.push(file);
                 }
-                Found::Remove => self.queue(doc.path(), Op::Remove),
+                Found::Remove => taken.push(file),
                 Found::Ignore if writer_runs => {
-                    tracing::info!("recovery: {shown} is kept by process {pid:?}");
+                    tracing::info!("recovery: {shown} is kept by process {writer:?}");
                 }
                 Found::Ignore => tracing::info!("recovery: {shown} belongs to {owner}"),
             }
         }
-        // Changes made while the file was read were not copied.
+        // Several processes that ended may have copied the same text.
+        texts.sort_by_key(|t| std::cmp::Reverse(t.saved_at));
+        let mut offered: Vec<Arc<RecoveredText>> = Vec::with_capacity(texts.len());
+        for t in texts {
+            if offered.iter().all(|o| o.text != t.text) {
+                offered.push(Arc::new(t));
+            }
+        }
+        if !offered.is_empty() {
+            self.offers.borrow_mut().insert(
+                doc.path().to_path_buf(),
+                Offer {
+                    doc: Rc::downgrade(doc),
+                    texts: offered,
+                    reviewed: false,
+                },
+            );
+            self.refresh_bar();
+        }
+        if !taken.is_empty() {
+            // This process's file holds the offered texts (or goes, with none) before the files
+            // they came from go.
+            taken.retain(|file| file != own);
+            self.queue_without_own_replacing(doc.path(), taken);
+        }
+        // Changes made while the files were read were not copied.
         if doc.is_dirty() {
             self.changed();
         }
@@ -1568,10 +1770,12 @@ mod tests {
                 disk_hash: Some(u64::MAX - 1),
                 saved_at: 1_700_000_000,
                 pid: Some(std::process::id()),
+                writer: Some(writer_id().to_owned()),
                 text: text.into(),
                 earlier: Vec::new(),
             }
         );
+        assert_eq!(file.writer_lock().as_deref(), Some(writer_id()));
         assert!(!String::from_utf8(bytes).unwrap().contains("earlier"));
         // A new file that was never saved has no hash.
         let new = parse(&encode(path, None, 1, "x", &[]).unwrap()).unwrap();
@@ -1579,9 +1783,18 @@ mod tests {
         // Only the path and the text are required.
         let bare = parse(br#"{"path": "/a.tex", "text": "t"}"#).unwrap();
         assert_eq!(
-            (bare.version, bare.saved_at, bare.disk_hash, bare.pid),
-            (0, 0, None, None)
+            (
+                bare.version,
+                bare.saved_at,
+                bare.disk_hash,
+                bare.pid,
+                bare.writer_lock()
+            ),
+            (0, 0, None, None, None)
         );
+        // A file of a build before the writer's token: its pid names the lock.
+        let old = parse(br#"{"path": "/a.tex", "text": "t", "pid": 42}"#).unwrap();
+        assert_eq!(old.writer_lock().as_deref(), Some("42"));
         assert!(bare.earlier.is_empty());
         assert!(parse(b"{\"path\": \"/a.tex\"}").is_err());
         assert!(parse(b"not json").is_err());
@@ -1610,7 +1823,19 @@ mod tests {
         let a = file_for(dir, path);
         assert_eq!(a.parent(), Some(dir));
         assert_eq!(a.extension().and_then(|e| e.to_str()), Some("json"));
-        assert_eq!(a.file_stem().map(|s| s.len()), Some(16));
+        // The path's hash, then the process: its pid and its token.
+        let name = a.file_name().unwrap().to_str().unwrap();
+        let (hash, writer) = name.strip_suffix(".json").unwrap().split_once('.').unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(writer, writer_id());
+        let (pid, token) = writer.split_once('-').unwrap();
+        assert_eq!(pid, std::process::id().to_string());
+        assert!(token.len() == 8 && token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, file_of(dir, path, writer_id()));
+        assert_ne!(a, file_of(dir, path, "1"));
+        // Not the name of the builds before the token, even with the same pid.
+        assert_ne!(a, file_of(dir, path, &std::process::id().to_string()));
         assert_ne!(a, file_for(dir, Path::new("/home/u/thesis/other.tex")));
     }
 
@@ -1623,6 +1848,7 @@ mod tests {
             disk_hash: Some(7),
             saved_at: 5,
             pid: Some(1),
+            writer: None,
             text: "unsaved".into(),
             earlier: Vec::new(),
         };
@@ -1770,24 +1996,24 @@ mod tests {
             })
         };
         let writer = Writer::default();
-        lock(&writer.queued).insert(file.clone(), snapshot("old"));
-        lock(&writer.queued).insert(file.clone(), snapshot("new"));
+        lock(&writer.queued).insert(file.clone(), Pending::new(snapshot("old")));
+        lock(&writer.queued).insert(file.clone(), Pending::new(snapshot("new")));
         writer.run(&file).unwrap();
         assert_eq!(parse(&std::fs::read(&file).unwrap()).unwrap().text, "new");
         // Run again (the job of the replaced operation): nothing is queued, nothing happens.
         writer.run(&file).unwrap();
         assert!(file.exists());
         // A removal queued after a copy wins over it, also when the copy's job runs first.
-        lock(&writer.queued).insert(file.clone(), snapshot("newer"));
-        lock(&writer.queued).insert(file.clone(), Op::Remove);
+        lock(&writer.queued).insert(file.clone(), Pending::new(snapshot("newer")));
+        lock(&writer.queued).insert(file.clone(), Pending::new(Op::Remove));
         writer.run(&file).unwrap();
         assert!(!file.exists());
         writer.run(&file).unwrap();
         assert!(!file.exists());
         // Removing a file that is not there is fine; a flush runs what is queued.
-        lock(&writer.queued).insert(file.clone(), Op::Remove);
+        lock(&writer.queued).insert(file.clone(), Pending::new(Op::Remove));
         writer.flush();
-        lock(&writer.queued).insert(file.clone(), snapshot("flushed"));
+        lock(&writer.queued).insert(file.clone(), Pending::new(snapshot("flushed")));
         writer.flush();
         assert_eq!(
             parse(&std::fs::read(&file).unwrap()).unwrap().text,
@@ -1819,10 +2045,10 @@ mod tests {
             let read = parse(&std::fs::read(file).unwrap()).unwrap();
             read.into_texts().into_iter().map(|t| t.text).collect()
         };
-        lock(&writer.queued).insert(file.clone(), offered(Some("typed")));
+        lock(&writer.queued).insert(file.clone(), Pending::new(offered(Some("typed"))));
         writer.flush();
         assert_eq!(texts(&file), ["typed", "newer", "older"]);
-        lock(&writer.queued).insert(file.clone(), offered(None));
+        lock(&writer.queued).insert(file.clone(), Pending::new(offered(None)));
         writer.flush();
         assert_eq!(texts(&file), ["newer", "older"]);
         let none = Op::Write(Snapshot {
@@ -1830,10 +2056,10 @@ mod tests {
             own: None,
             offered: Vec::new(),
         });
-        lock(&writer.queued).insert(file.clone(), none);
+        lock(&writer.queued).insert(file.clone(), Pending::new(none));
         writer.flush();
         assert!(!file.exists());
-        lock(&writer.queued).insert(file.clone(), snapshot("flushed"));
+        lock(&writer.queued).insert(file.clone(), Pending::new(snapshot("flushed")));
         writer.flush();
         // Private to the user, with no temporary file left behind.
         #[cfg(unix)]
@@ -1854,7 +2080,7 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         names.sort();
-        let own = lock_file(dir, std::process::id());
+        let own = lock_file(dir, writer_id());
         assert_eq!(names, [file.clone(), own.clone()]);
         let probe = std::fs::File::open(&own).unwrap();
         assert!(matches!(
@@ -1866,18 +2092,150 @@ mod tests {
     #[test]
     fn running_writers_are_known_by_their_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let pid = std::process::id().wrapping_add(1);
-        assert!(!is_running(dir.path(), pid), "no lock file");
-        let held = std::fs::File::create(lock_file(dir.path(), pid)).unwrap();
-        assert!(!is_running(dir.path(), pid), "a lock file nobody holds");
-        held.lock().unwrap();
-        assert!(is_running(dir.path(), pid));
-        drop(held);
-        assert!(!is_running(dir.path(), pid), "the process ended");
+        let other = format!("{}-0badc0de", std::process::id().wrapping_add(1));
+        // A writer of today, and one of the builds before the token (named by its pid).
+        for writer in [other.as_str(), "4242"] {
+            assert!(!is_running(dir.path(), writer), "no lock file");
+            let held = std::fs::File::create(lock_file(dir.path(), writer)).unwrap();
+            assert!(!is_running(dir.path(), writer), "a lock file nobody holds");
+            held.lock().unwrap();
+            assert!(is_running(dir.path(), writer));
+            drop(held);
+            assert!(!is_running(dir.path(), writer), "the process ended");
+        }
         // This process's own copies are never another's.
-        let own = std::fs::File::create(lock_file(dir.path(), std::process::id())).unwrap();
+        let own = std::fs::File::create(lock_file(dir.path(), writer_id())).unwrap();
         own.lock().unwrap();
-        assert!(!is_running(dir.path(), std::process::id()));
+        assert!(!is_running(dir.path(), writer_id()));
+    }
+
+    /// Another Lemma with this process's pid, in a PID namespace of its own (a container, a
+    /// Flatpak sandbox) that shares the state directory: its copy is not this process's file, and
+    /// while it holds its lock it runs. With the pid alone in the names, both processes wrote
+    /// and removed the same file, and each took the other's copy of a document it has open for
+    /// one a crash left.
+    #[test]
+    fn a_writer_with_this_pid_in_another_namespace_is_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::new("/p/main.tex");
+        let theirs = format!("{}-0badc0de", std::process::id());
+        assert_ne!(theirs, writer_id());
+        let their_file = file_of(dir.path(), path, &theirs);
+        assert_ne!(file_for(dir.path(), path), their_file);
+        assert_ne!(
+            lock_file(dir.path(), &theirs),
+            lock_file(dir.path(), writer_id())
+        );
+        let held = std::fs::File::create(lock_file(dir.path(), &theirs)).unwrap();
+        held.lock().unwrap();
+        assert!(is_running(dir.path(), &theirs));
+        // And a build before the token with this pid, which holds `<pid>.lock`.
+        let pid = std::process::id().to_string();
+        let old = std::fs::File::create(lock_file(dir.path(), &pid)).unwrap();
+        old.lock().unwrap();
+        assert!(is_running(dir.path(), &pid));
+        drop(old);
+        assert!(
+            !is_running(dir.path(), &pid),
+            "it ended: its copy is left by a crash"
+        );
+    }
+
+    #[test]
+    fn a_document_has_a_file_per_process_and_the_shared_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::new("/p/main.tex");
+        assert_eq!(files_of(dir.path(), path), Vec::<PathBuf>::new());
+        assert_eq!(
+            files_of(&dir.path().join("missing"), path),
+            Vec::<PathBuf>::new()
+        );
+        let own = file_for(dir.path(), path);
+        let other = file_of(dir.path(), path, "4243-0badc0de");
+        // A build's before the writer's token, named by its pid alone.
+        let before = file_of(dir.path(), path, "4242");
+        // Lemma 0.2's, shared by every process.
+        let shared = dir.path().join(format!("{}.json", path_hash(path)));
+        let not_it = [
+            file_for(dir.path(), Path::new("/p/other.tex")),
+            own.with_extension(format!("json.{}.0.tmp", std::process::id())),
+            dir.path().join(format!("{}.x.json", path_hash(path))),
+            dir.path().join(format!("{}.12-.json", path_hash(path))),
+            dir.path().join(format!("{}.12-xyz.json", path_hash(path))),
+            dir.path()
+                .join(format!("{}.-0badc0de.json", path_hash(path))),
+            dir.path().join(format!("{}.12.json.bak", path_hash(path))),
+            lock_file(dir.path(), "4242"),
+            lock_file(dir.path(), "4243-0badc0de"),
+        ];
+        for file in not_it.iter().chain([&own, &other, &before, &shared]) {
+            std::fs::write(file, "x").unwrap();
+        }
+        let mut expected = vec![own, other, before, shared];
+        expected.sort();
+        assert_eq!(files_of(dir.path(), path), expected);
+    }
+
+    #[test]
+    fn replaced_files_go_once_the_operation_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = dir.path().join("recovery");
+        let file = recovery.join("0123456789abcdef.1.json");
+        let (a, b) = (
+            recovery.join("0123456789abcdef.2.json"),
+            recovery.join("0123456789abcdef.json"),
+        );
+        std::fs::create_dir_all(&recovery).unwrap();
+        for f in [&a, &b] {
+            std::fs::write(f, "theirs").unwrap();
+        }
+        let write = |text: &str| {
+            Op::Write(Snapshot {
+                path: PathBuf::from("/p/main.tex"),
+                own: None,
+                offered: vec![Arc::new(RecoveredText {
+                    disk_hash: None,
+                    saved_at: 1,
+                    text: text.into(),
+                })],
+            })
+        };
+        let writer = Writer::default();
+        // A failed write keeps them, until the next operation is done.
+        std::fs::create_dir(&file).unwrap();
+        lock(&writer.queued).insert(
+            file.clone(),
+            Pending {
+                op: Some(write("taken over")),
+                replaced: vec![a.clone(), b.clone()],
+            },
+        );
+        assert!(writer.run(&file).is_err());
+        assert!(a.exists() && b.exists());
+        // Nothing queued: kept still.
+        writer.run(&file).unwrap();
+        writer.flush();
+        assert!(a.exists() && b.exists());
+        std::fs::remove_dir(&file).unwrap();
+        lock(&writer.queued).get_mut(&file).unwrap().op = Some(write("taken over"));
+        writer.run(&file).unwrap();
+        assert!(!a.exists() && !b.exists());
+        assert_eq!(
+            parse(&std::fs::read(&file).unwrap()).unwrap().text,
+            "taken over"
+        );
+        // A removal of the file replaces them too; one already gone is fine.
+        std::fs::write(&a, "theirs").unwrap();
+        lock(&writer.queued).insert(
+            file.clone(),
+            Pending {
+                op: Some(Op::Remove),
+                replaced: vec![a.clone(), b.clone()],
+            },
+        );
+        writer.flush();
+        assert!(!a.exists() && !file.exists());
+        assert!(lock(&writer.queued).is_empty());
     }
 
     #[test]
@@ -1886,7 +2244,10 @@ mod tests {
         let fresh = dir.path().join("0000000000000001.json");
         let tmp = dir.path().join("0000000000000001.json.123.0.tmp");
         let other = dir.path().join("notes.txt");
-        let (ended, running) = (lock_file(dir.path(), 123), lock_file(dir.path(), 124));
+        let (ended, running) = (
+            lock_file(dir.path(), "123"),
+            lock_file(dir.path(), "124-0badc0de"),
+        );
         for file in [&fresh, &tmp, &other, &ended, &running] {
             std::fs::write(file, "x").unwrap();
         }

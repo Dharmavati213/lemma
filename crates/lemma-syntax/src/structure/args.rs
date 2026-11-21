@@ -469,7 +469,8 @@ pub(crate) fn control_sequence(b: &[u8], i: usize) -> Option<(Range<usize>, usiz
     Some((start..j.min(b.len()), j.min(b.len())))
 }
 
-fn utf8_len(lead: u8) -> usize {
+/// Length of the UTF-8 sequence that starts with `lead` (1 for any other byte).
+pub(crate) fn utf8_len(lead: u8) -> usize {
     match lead {
         0xf0..=0xff => 4,
         0xe0..=0xef => 3,

@@ -755,6 +755,15 @@ impl<S: Sink> Lexer<'_, S> {
         self.take_to(p, self.content_kind());
     }
 
+    /// Skips spaces (not tabs), as LaTeX does before the delimiter of `\verb`.
+    fn skip_spaces(&mut self) {
+        let mut p = self.pos;
+        while p < self.end && self.line[p] == b' ' {
+            p += 1;
+        }
+        self.take_to(p, self.content_kind());
+    }
+
     /// Handles `b` while a command may still receive arguments. Returns false (and stops
     /// expecting) when `b` does not start one.
     fn expected_arg(&mut self, b: u8) -> bool {
@@ -1152,11 +1161,19 @@ impl<S: Sink> Lexer<'_, S> {
     /// The arguments of `\verb`, `\lstinline`, `\mintinline`, `\url` and `\href`.
     fn inline_verbatim(&mut self, style: VerbStyle) -> Option<Stop> {
         use VerbStyle::{Href, Listing, Minted, Url, Verb};
+        // LaTeX skips spaces (not tabs) before the delimiter of `\verb` and `\verb*` (its
+        // `\@sverb`; so in `\verb *x*` the star is the delimiter) and of `\lstinline`.
+        if matches!(style, Verb | Listing) {
+            self.skip_spaces();
+        }
         if matches!(style, Listing | Minted)
             && self.peek() == Some(b'[')
             && !self.delimited(b']', TokenKind::Bracket, TokenKind::KeyArg)
         {
             return Some(Stop::Verbatim);
+        }
+        if style == Listing {
+            self.skip_spaces();
         }
         if matches!(style, Minted | Url | Href) {
             self.skip_blanks();

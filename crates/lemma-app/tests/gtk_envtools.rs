@@ -49,6 +49,10 @@ fn main() -> ExitCode {
             "editing_commands_only_in_latex_documents",
             editing_other_files,
         ),
+        (
+            "bib_comments_follow_the_backend_of_a_closed_document",
+            bib_backend_of_a_closed_document,
+        ),
         // Final review (M5)
         (
             "regress5_live_rename_then_environment_completion",
@@ -58,6 +62,15 @@ fn main() -> ExitCode {
             "regress5_failing_latexindent_keeps_format_and_explains",
             regress5_failing_latexindent,
         ),
+        // Improvement pass
+        (
+            "latexindent_giving_back_nothing_keeps_the_text",
+            latexindent_gives_back_nothing,
+        ),
+        (
+            "format_only_in_latex_and_bibtex_documents",
+            format_only_where_latexindent_applies,
+        ),
     ])
 }
 
@@ -66,8 +79,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Points the XDG directories, the config file and the temporary directory (latexindent's
 /// working directories) into a directory under `target`. Runs before GTK starts any thread.
 fn isolate_environment() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-envtools-env-{}", std::process::id()));
+    let root = common::target_tmpdir().join(format!("lemma-envtools-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("tmp")).unwrap();
     // SAFETY: single-threaded: GTK is not initialised yet and no thread was spawned.
@@ -101,6 +113,7 @@ fn fixture(name: &str, text: &str, latexindent: Option<&str>) -> Fixture {
     std::fs::write(dir.join("main.tex"), text).unwrap();
     let program = match latexindent {
         Some(script) => {
+            common::require_shell_scripts();
             let path = dir.join("fake-latexindent");
             std::fs::write(&path, script).unwrap();
             #[cfg(unix)]
@@ -636,16 +649,70 @@ fn editing_other_files() {
     std::fs::write(&notes, "Some notes\n").unwrap();
     let editor = block_on(f.state.open_file(&notes)).expect("open");
     let doc = editor.document().clone();
-    assert!(editing::toggle_comment_in(&editor).is_err());
+    assert!(editing::toggle_comment_in(&f.state, &editor).is_err());
     assert!(editing::style_in(&editor, Style::Bold).is_err());
     assert_eq!(doc.text(), "Some notes\n");
-    // BibTeX files have `%` comments too.
+    // A `.bib` file has `%` comments only for biber: BibTeX still reads an entry whose lines
+    // start with `%`. Here no document loads biblatex (BibTeX reads `\bibliography`).
     let bib = f.dir.join("refs.bib");
     std::fs::write(&bib, "@misc{a, title = {A}}\n").unwrap();
     let editor = block_on(f.state.open_file(&bib)).expect("open");
-    editing::toggle_comment_in(&editor).unwrap();
+    let error = editing::toggle_comment_in(&f.state, &editor).unwrap_err();
+    assert!(error.contains("biber"), "{error}");
+    assert_eq!(editor.document().text(), "@misc{a, title = {A}}\n");
+    // With biblatex (and biber, its default backend) it comments the lines out.
+    let main = f.state.workspace.get(&f.dir.join("main.tex")).unwrap();
+    let preamble = "\\usepackage{biblatex}\n";
+    main.apply_edits(&[TextEdit::insert(0, preamble)], Origin::User)
+        .unwrap();
+    editing::toggle_comment_in(&f.state, &editor).unwrap();
     assert_eq!(editor.document().text(), "% @misc{a, title = {A}}\n");
+    editing::toggle_comment_in(&f.state, &editor).unwrap();
+    assert_eq!(editor.document().text(), "@misc{a, title = {A}}\n");
+    // biblatex with its BibTeX backend: BibTeX reads the file again.
+    let options = "[backend=bibtex]";
+    let at = "\\usepackage".len();
+    main.apply_edits(&[TextEdit::insert(at, options)], Origin::User)
+        .unwrap();
+    assert!(editing::toggle_comment_in(&f.state, &editor).is_err());
+    assert_eq!(editor.document().text(), "@misc{a, title = {A}}\n");
     assert!(editing::style_in(&editor, Style::Bold).is_err());
+}
+
+/// Toggle Comment in a `.bib` reads the backend option of the document that loads biblatex also
+/// when that document is not open (the project index knows only that it loads biblatex): with
+/// `backend=bibtex` in a closed main.tex the lines were commented out, which BibTeX ignores.
+fn bib_backend_of_a_closed_document() {
+    let preamble = |options: &str| {
+        format!(
+            "\\documentclass{{article}}\n\\usepackage{options}{{biblatex}}\n\
+             \\begin{{document}}\n\\input{{ch}}\n\\end{{document}}\n"
+        )
+    };
+    let f = fixture("bib-closed-main", &preamble("[backend=bibtex]"), None);
+    std::fs::write(f.dir.join("ch.tex"), "A chapter.\n").unwrap();
+    let bib = f.dir.join("refs.bib");
+    std::fs::write(&bib, "@misc{a, title = {A}}\n").unwrap();
+    // A chapter is open (the build finds main.tex as its root and indexes it), main.tex is not.
+    block_on(f.state.open_file(&f.dir.join("ch.tex"))).expect("open");
+    common::pump_until(TIMEOUT, || {
+        f.state
+            .workspace
+            .index
+            .borrow()
+            .packages()
+            .iter()
+            .any(|p| p == "biblatex")
+    });
+    assert!(f.state.workspace.get(&f.dir.join("main.tex")).is_none());
+    let editor = block_on(f.state.open_file(&bib)).expect("open");
+    let error = editing::toggle_comment_in(&f.state, &editor).unwrap_err();
+    assert!(error.contains("biber"), "{error}");
+    assert_eq!(editor.document().text(), "@misc{a, title = {A}}\n");
+    // With biber (the default backend) it comments the lines out.
+    std::fs::write(f.dir.join("main.tex"), preamble("")).unwrap();
+    editing::toggle_comment_in(&f.state, &editor).unwrap();
+    assert_eq!(editor.document().text(), "% @misc{a, title = {A}}\n");
 }
 
 /// A fake latexindent: `--version` succeeds; formatting indents `\item` lines and strips
@@ -767,4 +834,74 @@ fn regress5_failing_latexindent() {
     let error = block_on(format::format_in(&f.state, &editor, false)).unwrap_err();
     assert!(error.contains("YAML/Tiny.pm"), "{error}");
     assert_eq!(editor.document().text(), LIST_DOC);
+}
+
+// ----- improvement pass -----
+
+/// A latexindent that reads the text and writes nothing, yet succeeds, empties neither the
+/// document nor (the document being saved) its file: formatting fails and says why.
+fn latexindent_gives_back_nothing() {
+    let silent = "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'fake latexindent'; exit 0; fi\ncat >/dev/null\n";
+    let f = fixture("silent-latexindent", LIST_DOC, Some(silent));
+    assert!(wait_for_detection(&f));
+    let editor = f.open();
+    let doc = editor.document().clone();
+    let error = block_on(format::format_in(&f.state, &editor, false)).unwrap_err();
+    assert!(error.contains("no text"), "{error}");
+    assert_eq!(doc.text(), LIST_DOC);
+    assert_eq!(review_ui::hunk_count(&doc), 0);
+    assert_eq!(
+        std::fs::read_to_string(f.dir.join("main.tex")).unwrap(),
+        LIST_DOC
+    );
+    // A selection too.
+    let buffer = editor.buffer();
+    let a = doc.iter_at_byte(offset_of(&editor, "One", 0)).unwrap();
+    let b = doc.iter_at_byte(offset_of(&editor, "Two", 1)).unwrap();
+    buffer.select_range(&a, &b);
+    assert!(block_on(format::format_in(&f.state, &editor, true)).is_err());
+    assert_eq!(doc.text(), LIST_DOC);
+}
+
+/// Format Document and Format Selection are offered only in the documents latexindent formats,
+/// LaTeX sources and `.bib` files: in a Markdown tab they are disabled (the palette greys them
+/// out and says why), and running one there changes nothing.
+fn format_only_where_latexindent_applies() {
+    let f = fixture("format-kinds", LIST_DOC, Some(FAKE));
+    assert!(wait_for_detection(&f));
+    let enabled = |name: &str| f.state.window.lookup_action(name).unwrap().is_enabled();
+    let both = || enabled("format-document") && enabled("format-selection");
+    let neither = || !enabled("format-document") && !enabled("format-selection");
+    let main = f.open();
+    assert!(both());
+    let notes = f.dir.join("notes.md");
+    std::fs::write(&notes, "\\item One   \n").unwrap();
+    let md = block_on(f.state.open_file(&notes)).expect("open");
+    assert!(neither());
+    let commands = lemma_app::palette::commands(&f.state);
+    for name in ["win.format-document", "win.format-selection"] {
+        let command = commands.iter().find(|c| c.name == name).unwrap();
+        assert!(!command.enabled, "{name}");
+        assert_eq!(
+            command.reason.as_deref(),
+            Some("Formatting works in LaTeX and BibTeX documents"),
+            "{name}"
+        );
+    }
+    let error = block_on(format::format_in(&f.state, &md, false)).unwrap_err();
+    assert!(error.contains("LaTeX and BibTeX"), "{error}");
+    assert_eq!(md.document().text(), "\\item One   \n");
+    assert_eq!(review_ui::hunk_count(md.document()), 0);
+    // A `.bib` file is formatted.
+    let bib = f.dir.join("refs.bib");
+    std::fs::write(&bib, "@misc{a,\n  title = {A},   \n}\n").unwrap();
+    let bib = block_on(f.state.open_file(&bib)).expect("open");
+    assert!(both());
+    block_on(format::format_in(&f.state, &bib, false)).unwrap();
+    assert_eq!(bib.document().text(), "@misc{a,\n  title = {A},\n}\n");
+    // Back to the Markdown tab, then to the LaTeX one.
+    f.state.show_document(md.document());
+    assert!(neither());
+    f.state.show_document(main.document());
+    assert!(both());
 }

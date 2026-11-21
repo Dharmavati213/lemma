@@ -33,9 +33,10 @@
 //!     tracked, else a toast says it "changed outside review". A file larger than
 //!     `agent.snapshot_cap_mib` (at least 4 MiB) is not read or reviewed (a toast says so).
 //! - **Otherwise**, for documents in the workspace: a clean one reloads (one undoable change
-//!   with `Origin::Reload`; a review with nothing left to decide is dropped first, so the other
-//!   program's change never shows as agent hunks, and a closed document without pending hunks
-//!   simply leaves the workspace, to be read again when needed), a dirty one is put on the
+//!   with `Origin::Reload`; with a review that has nothing left to decide, the other program's
+//!   change never shows as agent hunks: an open document takes it as the user's own change,
+//!   `Origin::User`, and keeps the review for the buffer's undo, and a closed document drops the
+//!   review and leaves the workspace, to be read again when needed), a dirty one is put on the
 //!   window's conflict bar ("Reload" / "Keep mine"; Keep mine makes the next save overwrite the
 //!   other program's version without asking), and a deleted one is marked modified with a toast
 //!   (saving writes it again). Files that are not loaded are not read here. A document on the
@@ -667,8 +668,10 @@ impl Watcher {
     }
 
     /// Whether a change of `path` may matter: a document of the workspace, a project source
-    /// file, a new directory to watch, or a directory that went (moved out of the project, its
-    /// files get no events of their own: the project index drops them).
+    /// file, a file the project index read whatever its name (a bibliography named `refs`, as
+    /// `\addbibresource{refs}` names it), a new directory to watch, or a directory that went
+    /// (moved out of the project, its files get no events of their own: the project index drops
+    /// them).
     fn interesting(&self, state: &WindowState, path: &Path, event: gio::FileMonitorEvent) -> bool {
         if state.workspace.get(path).is_some() {
             return true;
@@ -677,6 +680,11 @@ impl Watcher {
             return false;
         }
         workspace::is_source_file(path)
+            || state
+                .workspace
+                .index
+                .try_borrow()
+                .is_ok_and(|index| index.bibs.contains_key(path) || index.files.contains_key(path))
             || (matches!(
                 event,
                 gio::FileMonitorEvent::Created
@@ -807,7 +815,7 @@ impl Watcher {
                 return;
             }
         }
-        let Some(mut disk) = read_disk(&file, &path).await else {
+        let Some(mut disk) = read_disk(&path).await else {
             return;
         };
         // Bytes that are not the document's own write may still be: a save that was running
@@ -822,7 +830,7 @@ impl Watcher {
             if hash.is_some_and(|h| doc.is_own_write(h)) {
                 break;
             }
-            let Some(again) = read_disk(&file, &path).await else {
+            let Some(again) = read_disk(&path).await else {
                 return;
             };
             let stable = again.hash() == hash;
@@ -960,24 +968,30 @@ impl Watcher {
         if !doc.is_dirty() {
             tracing::info!("{rel} changed on disk; reloading it");
             // Not the agent's change: a review with nothing left to decide (kept only for
-            // undo) must not turn it into hunks. A closed document is then read again when
-            // it is needed.
+            // undo) must not turn it into hunks. A closed one goes, and the document is read
+            // again when it is needed. An open one stays, for the buffer's undo of the edits it
+            // recorded (dropped, a reject's undo back past the reload put the rejected text into
+            // the next review's baseline), and the change is the user's own, as the conflict
+            // bar's Reload makes it.
             let decided = doc
                 .review
                 .borrow()
                 .as_ref()
                 .is_some_and(|r| r.hunks().is_empty());
-            if decided {
+            if decided && !doc.is_open() {
                 review_ui::drop_review(doc);
-                if !doc.is_open() {
-                    state.workspace.release(doc);
-                    return;
-                }
+                state.workspace.release(doc);
+                return;
             } else if !doc.is_open() && doc.review.borrow().is_none() {
                 state.workspace.release(doc);
                 return;
             }
-            if let Err(e) = replace_text(doc, new_text, Origin::Reload) {
+            let origin = if decided {
+                Origin::User
+            } else {
+                Origin::Reload
+            };
+            if let Err(e) = replace_text(doc, new_text, origin) {
                 state.toast(&format!("Cannot reload {rel}: {e}"));
                 return;
             }
@@ -1213,7 +1227,7 @@ impl Watcher {
 
     async fn resolve_document(&self, doc: &DocRef, resolution: Resolution) -> Result<(), String> {
         let name = doc.display_name();
-        let disk = match gio::File::for_path(doc.path()).load_contents_future().await {
+        let disk = match workspace::load_file(doc.path()).await {
             Ok((bytes, etag)) => Disk::Present { bytes, etag },
             Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Disk::Absent,
             Err(e) => return Err(format!("cannot read {name}: {}", e.message())),
@@ -1259,9 +1273,9 @@ fn review_cap(state: &WindowState) -> u64 {
         .max(workspace::DEFAULT_SNAPSHOT_CAP as u64)
 }
 
-/// What `file` (at `path`) holds now; `None` when it cannot be read.
-async fn read_disk(file: &gio::File, path: &Path) -> Option<Disk> {
-    match file.load_contents_future().await {
+/// What the file at `path` holds now; `None` when it cannot be read (or is not a regular file).
+async fn read_disk(path: &Path) -> Option<Disk> {
+    match workspace::load_file(path).await {
         Ok((bytes, etag)) => Some(Disk::Present { bytes, etag }),
         Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Some(Disk::Absent),
         Err(e) => {
@@ -1352,19 +1366,9 @@ fn apply_as_agent(doc: &DocRef, text: &str, charset: Option<String>, disk: DiskS
 /// tracked), read on the jobs thread.
 async fn git_head_text(root: PathBuf, rel: String) -> Option<String> {
     gio::spawn_blocking(move || {
-        let out = lemma_core::process::command("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("show")
-            .arg(format!("HEAD:./{}", crate::git_gutter::git_path(&rel)))
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        saver::decode(&out.stdout, None).ok().map(|d| d.text)
+        // With the git gutter's precautions: the repository is not trusted.
+        let bytes = crate::git_gutter::head_bytes(&root, &rel)?;
+        saver::decode(&bytes, None).ok().map(|d| d.text)
     })
     .await
     .ok()

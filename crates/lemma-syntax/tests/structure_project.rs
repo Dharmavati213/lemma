@@ -162,6 +162,37 @@ fn project_files_follow_latex_resolution() {
     );
 }
 
+/// The directory each file's own paths are relative to: the root's, except below a
+/// `\subfile` or an `\import`, whose files resolve against their import directory.
+#[test]
+fn project_files_with_the_directories_of_their_paths() {
+    let idx = synthetic();
+    let dirs: Vec<(PathBuf, PathBuf)> = idx.project_files_with_dirs(Path::new("/r/main.tex"));
+    let dir_of = |file: &str| {
+        dirs.iter()
+            .find(|(path, _)| path == Path::new(file))
+            .map(|(_, dir)| dir.clone())
+            .unwrap_or_else(|| panic!("{file} in {dirs:?}"))
+    };
+    for (file, dir) in [
+        ("/r/main.tex", "/r"),
+        ("/r/a.tex", "/r"),
+        ("/r/chapters/e.tex", "/r"),
+        ("/r/chapters/b.tex", "/r"),
+        ("/r/parts/c.tex", "/r/parts"),
+        ("/r/parts/sub/x.tex", "/r/parts/sub"),
+        ("/r/imp/d.tex", "/r/imp"),
+        ("/r/imp/local.tex", "/r/imp"),
+        ("/r/imp/deeper/f.tex", "/r/imp/deeper"),
+    ] {
+        assert_eq!(dir_of(file), PathBuf::from(dir), "{file}");
+    }
+    assert_eq!(
+        dirs.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        idx.project_files(Path::new("/r/main.tex"))
+    );
+}
+
 #[test]
 fn includers_use_every_include_kind() {
     let idx = synthetic();

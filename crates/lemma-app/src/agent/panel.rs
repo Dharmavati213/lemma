@@ -40,6 +40,10 @@
 //!   the widgets of a long session; a code block or an open thought is a column of labels of a
 //!   few lines each, so a frame lays out its last lines only, and a table keeps its cells'
 //!   labels, so a frame sets the cells that changed and attaches the rows that came.
+//! - The transcript keeps the last [`TRANSCRIPT_MAX_TURNS`] turns, and only as many of them as
+//!   hold about [`TRANSCRIPT_MAX_BYTES`] of text and image previews (the last turn always
+//!   stays): when a turn starts, the oldest leave it with all they hold, and a note at its top
+//!   counts them. The agent's conversation is not touched.
 //! - The prompt box: Enter sends, Shift+Enter is a newline; `/` and `@` show suggestions (Up,
 //!   Down, Tab, Enter, Esc). Up and Down recall the last [`HISTORY_LEN`] prompts sent from it
 //!   (per window, in memory) when it is empty or shows a recalled prompt unedited and the cursor
@@ -131,6 +135,13 @@ const MAX_SUGGESTIONS: usize = 8;
 pub const HISTORY_LEN: usize = 50;
 /// Lines of npm output kept in the set-up card.
 const MAX_LOG_LINES: usize = 400;
+/// Turns the transcript keeps: when a turn starts, the oldest leave it (with everything they
+/// showed), and a note at its top counts them, so a long session's transcript does not grow
+/// without bound. The agent's conversation is not touched.
+pub const TRANSCRIPT_MAX_TURNS: usize = 100;
+/// About as many bytes of text and image previews as the transcript keeps: past this the oldest
+/// turns leave it too (all but the last one).
+pub const TRANSCRIPT_MAX_BYTES: usize = 8 << 20;
 /// How long a permission card that took the focus by itself (from the empty prompt box) does
 /// not take `y`, `Y` or `n`: keys typed in that moment were meant for the prompt box.
 pub const AUTO_FOCUS_GRACE: Duration = Duration::from_millis(500);
@@ -278,6 +289,13 @@ pub fn get(state: &WindowState) -> Option<Panel> {
     Some(Panel { inner })
 }
 
+/// The backend of `state`'s agent: the configured one, except while a session that was running
+/// when `config.toml` chose another one goes on (the one the panel shows, see
+/// `Inner::config_backend_changed`). Ctrl+K and the editor's menu speak of that one.
+pub fn backend(state: &WindowState) -> AgentBackend {
+    get(state).map_or(state.config.agent.backend, |panel| panel.inner.backend())
+}
+
 /// Fills `state.agent.slot` (see the module docs).
 pub fn install(state: &Rc<WindowState>) {
     let Some(controller) = state.agent_controller().cloned() else {
@@ -314,7 +332,7 @@ pub fn send_prompt(
     if is_busy(&controller) {
         state.toast(&format!(
             "{} is still working on the last request; wait for it or press Stop",
-            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
+            super::bridge::agent_label(backend(state), &state.config.agent)
         ));
         return false;
     }
@@ -735,6 +753,48 @@ impl TranscriptItem {
         matches!(*self.imp().entry.borrow(), Entry::Agent { .. })
     }
 
+    /// About how many bytes the entry holds on to: its texts (an agent message's twice: its rows'
+    /// Markdown blocks hold them again) and its image previews.
+    fn weight(&self) -> usize {
+        let entry = self.imp().entry.borrow();
+        let size = match &*entry {
+            Entry::User {
+                heading,
+                text,
+                attachments,
+                images,
+                ..
+            } => {
+                heading.len()
+                    + text.len()
+                    + attachments.iter().map(String::len).sum::<usize>()
+                    + images
+                        .iter()
+                        .map(|t| {
+                            usize::try_from(t.width()).unwrap_or(0)
+                                * usize::try_from(t.height()).unwrap_or(0)
+                                * 4
+                        })
+                        .sum::<usize>()
+            }
+            Entry::Agent { text } => 2 * text.len(),
+            Entry::Thought { text, .. } | Entry::Notice(text) | Entry::Error(text) => text.len(),
+            Entry::Tool(card) => card.id.len() + card.title.len() + card.kind.len(),
+            Entry::Plan(steps) => steps.iter().map(|(a, b)| a.len() + b.len()).sum(),
+            Entry::Permission(card) => {
+                card.title.len()
+                    + card
+                        .options
+                        .iter()
+                        .map(|o| o.id.len() + o.name.len())
+                        .sum::<usize>()
+            }
+            Entry::Summary { .. } => 0,
+        };
+        // The objects themselves.
+        size + 200
+    }
+
     /// Updates the bound rows of a (non-agent) entry that changed.
     fn notify_changed(&self) {
         let rows = self.imp().rows.borrow().clone();
@@ -1004,10 +1064,12 @@ struct Cells {
     grid: gtk::Grid,
     /// The labels of each row, the header first, with the markup each shows.
     rows: Vec<Vec<(gtk::Label, String)>>,
+    /// The pane, whose rules the cells' links follow ([`connect_links`]).
+    panel: Weak<Inner>,
 }
 
 impl Cells {
-    fn new() -> Self {
+    fn new(panel: &Weak<Inner>) -> Self {
         // At the start both ways: a widget aligned in one direction only is measured for the
         // height it is given, which is less than the height of its cells wrapped to their
         // narrowest, and GTK warns ("Trying to measure GtkGrid … for height of 36, but it
@@ -1022,6 +1084,7 @@ impl Cells {
         Self {
             grid,
             rows: Vec::new(),
+            panel: panel.clone(),
         }
     }
 
@@ -1043,6 +1106,7 @@ impl Cells {
                     }
                 } else {
                     let label = table_cell(markup, r == 0);
+                    connect_links(&label, &self.panel);
                     self.grid.attach(&label, c as i32, r as i32, 1, 1);
                     shown.push((label, markup.clone()));
                 }
@@ -1365,7 +1429,7 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
             }
         }
         Block::Table { header, rows } => {
-            let mut cells = Cells::new();
+            let mut cells = Cells::new(panel);
             cells.set(header, rows);
             BlockWidget {
                 root: cells.grid.clone().upcast(),
@@ -1383,8 +1447,10 @@ fn block_widget(block: &Block, panel: &Weak<Inner>) -> BlockWidget {
     }
 }
 
-/// Links in agent messages: web links open in the browser (on click only); anything else is
-/// taken as a project file, optionally with `:line` or `#Lline`.
+/// Links in agent messages: web and mail links open in the browser or the mail program (on
+/// click only); anything else is taken as a project file, optionally with `:line` or `#Lline`.
+/// Every label of a message that can hold a link (paragraphs, quotes, list items, table cells)
+/// needs it: GtkLabel's own handler would launch a link of any scheme.
 fn connect_links(label: &gtk::Label, panel: &Weak<Inner>) {
     let panel = panel.clone();
     label.connect_activate_link(move |label, uri| {
@@ -1985,6 +2051,10 @@ pub(crate) struct Inner {
     plan: RefCell<Option<TranscriptItem>>,
     /// The latest "N changes to review" entry, which follows the review.
     summary: RefCell<Option<TranscriptItem>>,
+    /// The note at the top that counts the turns the transcript let go, and how many
+    /// ([`TRANSCRIPT_MAX_TURNS`]).
+    trim_note: RefCell<Option<TranscriptItem>>,
+    trimmed: Cell<usize>,
     turn: Cell<u32>,
     /// Every hunk at the last edit tool's reply (or the turn's start), with its shape.
     known_hunks: RefCell<HashMap<(PathBuf, u64), HunkShape>>,
@@ -2342,6 +2412,8 @@ impl Inner {
             permissions: RefCell::new(Vec::new()),
             plan: RefCell::new(None),
             summary: RefCell::new(None),
+            trim_note: RefCell::new(None),
+            trimmed: Cell::new(0),
             turn: Cell::new(0),
             known_hunks: RefCell::new(HashMap::new()),
             edit_links: RefCell::new(VecDeque::new()),
@@ -2799,6 +2871,7 @@ impl Inner {
         self.show_setup(SetupState::Failed {
             message: message.to_owned(),
             toolchain: toolchain.and_then(Result::err),
+            crashed: self.session_up.get(),
         });
     }
 
@@ -2867,6 +2940,8 @@ impl Inner {
         self.permissions.replace(Vec::new());
         self.plan.replace(None);
         self.summary.replace(None);
+        self.trim_note.replace(None);
+        self.trimmed.set(0);
         self.stick.set(true);
         for item in keep {
             self.append_item(&item);
@@ -2911,7 +2986,7 @@ impl Inner {
                 self.show_setup(SetupState::Starting);
             }
             AgentState::Failed(message) => {
-                self.finish_turn_items();
+                self.finish_turn_items(false);
                 self.restore_pending_prompt();
                 self.show_failure(message);
             }
@@ -2923,7 +2998,7 @@ impl Inner {
                 self.maybe_show_hint();
             }
             AgentState::Stopped => {
-                self.finish_turn_items();
+                self.finish_turn_items(false);
                 // A prompt that was still being prepared was not sent.
                 self.restore_pending_prompt();
                 if self.install_cancel.borrow().is_none() && !self.starting.get() {
@@ -3014,11 +3089,18 @@ impl Inner {
                     .set_text("Its memory is freed. It starts again with your next prompt.");
                 s.start.set_visible(true);
             }
-            SetupState::Failed { message, toolchain } => {
+            SetupState::Failed {
+                message,
+                toolchain,
+                crashed,
+            } => {
                 s.icon.set_icon_name(Some("dialog-warning-symbolic"));
                 s.icon.set_visible(true);
-                s.title
-                    .set_text(&format!("{} could not start", self.backend_name()));
+                s.title.set_text(&if crashed {
+                    format!("{} stopped unexpectedly", self.backend_name())
+                } else {
+                    format!("{} could not start", self.backend_name())
+                });
                 let state = self.state.upgrade();
                 let detail = match &toolchain {
                     Some(install::ToolchainError::CodexAdapter { found, wanted }) => {
@@ -3319,7 +3401,7 @@ impl Inner {
                 }
             }
             AgentEvent::Exited(code) => {
-                self.finish_turn_items();
+                self.finish_turn_items(false);
                 // An exit during the start is the start's failure, which the card shows.
                 if !self.user_stopped.get() && self.session_up.get() {
                     let text = match code {
@@ -3341,6 +3423,7 @@ impl Inner {
     }
 
     fn on_prompt(self: &Rc<Self>, prompt: &SentPrompt) {
+        self.trim_transcript();
         self.pending_prompt.replace(None);
         self.pending_attachments.replace(Vec::new());
         self.backend_ui.turn_cost.set(0);
@@ -3451,6 +3534,113 @@ impl Inner {
             Some(lines) => format!("{name} (lines {})", lines.replace("-L", "–")),
             None => name,
         }
+    }
+
+    /// A turn is about to start: while the transcript holds [`TRANSCRIPT_MAX_TURNS`] turns or
+    /// more, or more than [`TRANSCRIPT_MAX_BYTES`], its oldest turns leave it (the last one always
+    /// stays), with what their entries hold on to; the note at its top counts them.
+    fn trim_transcript(&self) {
+        let items = self.items();
+        let note = self.trim_note.borrow().clone();
+        let skip = usize::from(note.as_ref().is_some_and(|n| items.first() == Some(n)));
+        let items = &items[skip..];
+        // Where each turn starts: its prompt (entries before the first go with it).
+        let mut starts: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(*item.imp().entry.borrow(), Entry::User { .. }))
+            .map(|(k, _)| k)
+            .collect();
+        if let Some(first) = starts.first_mut() {
+            *first = 0;
+        }
+        let weights: Vec<usize> = items.iter().map(|item| item.weight()).collect();
+        let mut bytes: usize = weights.iter().sum();
+        let mut gone = 0;
+        let mut turns = starts.len();
+        while turns > 1 && (turns >= TRANSCRIPT_MAX_TURNS || bytes > TRANSCRIPT_MAX_BYTES) {
+            let end = starts[starts.len() - turns + 1];
+            // A request still waiting for an answer stays (and so does what follows it).
+            let waiting = items[gone..end].iter().any(|item| {
+                matches!(&*item.imp().entry.borrow(), Entry::Permission(card)
+                    if card.answer == PermissionAnswer::Pending)
+            });
+            if waiting {
+                break;
+            }
+            bytes -= weights[gone..end].iter().sum::<usize>();
+            gone = end;
+            turns -= 1;
+        }
+        if gone == 0 {
+            return;
+        }
+        let dropped: HashSet<TranscriptItem> = items[..gone].iter().cloned().collect();
+        let rows: usize = items[..gone]
+            .iter()
+            .map(|item| {
+                let rows = item.imp().rows.take();
+                for row in &rows {
+                    row.imp().observer.replace(None);
+                }
+                rows.len()
+            })
+            .sum();
+        let note_rows = note.as_ref().map_or(0, |n| n.imp().rows.borrow().len());
+        let (rows, at) = (
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(note_rows).unwrap_or(0),
+        );
+        self.rows.splice(at, rows, &[] as &[RowItem]);
+        self.store.splice(
+            u32::try_from(skip).unwrap_or(0),
+            u32::try_from(gone).unwrap_or(u32::MAX),
+            &[] as &[TranscriptItem],
+        );
+        self.tools
+            .borrow_mut()
+            .retain(|_, item| !dropped.contains(item));
+        self.permissions
+            .borrow_mut()
+            .retain(|item| !dropped.contains(item));
+        self.dirty.borrow_mut().retain(|item| {
+            let kept = !dropped.contains(item);
+            if !kept {
+                item.imp().dirty.set(false);
+            }
+            kept
+        });
+        for slot in [&self.summary, &self.plan, &self.stream] {
+            if slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|item| dropped.contains(item))
+            {
+                slot.replace(None);
+            }
+        }
+        let trimmed = self.trimmed.get() + starts.len() - turns;
+        self.trimmed.set(trimmed);
+        let text = match trimmed {
+            1 => "An earlier turn is no longer shown here.".to_owned(),
+            n => format!("{n} earlier turns are no longer shown here."),
+        };
+        match note {
+            Some(note) if skip == 1 => {
+                note.with_entry(|e| *e = Entry::Notice(text));
+                note.notify_changed();
+            }
+            _ => {
+                let note = TranscriptItem::new(Entry::Notice(text));
+                self.store.insert(0, &note);
+                let row = RowItem::new(&note, None);
+                note.imp().rows.replace(vec![row.clone()]);
+                self.rows.insert(0, &row);
+                self.trim_note.replace(Some(note));
+            }
+        }
+        // The rows' widgets go once the list view has caught up; then give the freed heap back.
+        glib::timeout_add_local_once(Duration::from_millis(500), crate::heap::trim);
     }
 
     /// Appends `item` (and shows the transcript).
@@ -4246,8 +4436,9 @@ impl Inner {
         self.dismiss_permission_toast(false);
     }
 
-    /// Ends the visible state of a turn: thoughts are done, open permission cards cancelled.
-    fn finish_turn_items(&self) {
+    /// Ends the visible state of a turn: thoughts are done, open permission cards cancelled, and
+    /// tool cards stop spinning. `ended` is true for a turn that ended by itself (`EndTurn`).
+    fn finish_turn_items(&self, ended: bool) {
         if let Some(stream) = self.stream.take() {
             stream.with_entry(|e| {
                 if let Entry::Thought { done, .. } = e {
@@ -4277,10 +4468,34 @@ impl Inner {
                 item.notify_changed();
             }
         }
+        // A tool the turn left running gets no last report from the agent: its card stops
+        // spinning. After Stop, a crash or a stopped agent the tool did not finish; after a turn
+        // that ended by itself it ended with the turn (some adapters never report the end of
+        // some calls), and is not shown as failed.
+        let status = if ended {
+            ToolStatus::Completed
+        } else {
+            ToolStatus::Failed
+        };
+        let tools: Vec<TranscriptItem> = self.tools.borrow().values().cloned().collect();
+        for item in tools {
+            let changed = item.with_entry(|e| match e {
+                Entry::Tool(card)
+                    if matches!(card.status, ToolStatus::Pending | ToolStatus::InProgress) =>
+                {
+                    card.status = status;
+                    true
+                }
+                _ => false,
+            });
+            if changed {
+                item.notify_changed();
+            }
+        }
     }
 
     fn turn_ended(&self, reason: StopReason) {
-        self.finish_turn_items();
+        self.finish_turn_items(reason == StopReason::EndTurn);
         let note = match reason {
             StopReason::EndTurn => None,
             StopReason::Cancelled => Some("Stopped.".to_owned()),
@@ -4750,8 +4965,8 @@ impl Inner {
         });
     }
 
-    /// Puts an unsent prompt (and its attachments) back into the empty box after its turn
-    /// failed to start.
+    /// Puts an unsent prompt (and its attachments) back into the empty box: its turn failed to
+    /// start, the agent refused it (busy), or the agent stopped before it went out.
     fn restore_pending_prompt(self: &Rc<Self>) {
         if let Some(text) = self.pending_prompt.take()
             && self.prompt_text().is_empty()
@@ -5247,10 +5462,19 @@ impl Inner {
             );
             return;
         }
-        // A project file, maybe with a line: `main.tex:12`, `main.tex#L12`, `file:///…`.
-        let path = glib::filename_from_uri(uri)
+        // A project file, maybe with a line: `main.tex:12`, `main.tex#L12`, `file:///…#L12`
+        // (GLib takes no file URI with a fragment: it is split off first).
+        let (base, fragment) = match uri.split_once('#') {
+            Some((base, fragment)) => (base, Some(fragment)),
+            None => (uri, None),
+        };
+        let mut path = glib::filename_from_uri(base)
             .map(|(p, _)| p.display().to_string())
-            .unwrap_or_else(|_| uri.to_owned());
+            .unwrap_or_else(|_| base.to_owned());
+        if let Some(fragment) = fragment {
+            path.push('#');
+            path.push_str(fragment);
+        }
         let (path, line) = split_line(&path);
         let resolved = state.workspace.root().resolve(Path::new(path));
         match resolved {
@@ -5276,6 +5500,8 @@ enum SetupState {
     Failed {
         message: String,
         toolchain: Option<install::ToolchainError>,
+        /// The agent had started: it stopped unexpectedly (crashed, or was killed).
+        crashed: bool,
     },
     Installing,
     InstallFailed(String),
@@ -5300,6 +5526,9 @@ struct BackendUi {
     shown: Cell<AgentBackend>,
     /// `config.toml` names another backend than the session that keeps running here.
     deferred: Cell<bool>,
+    /// The backend the transcript said `config.toml` selects while `deferred` (said once:
+    /// `config.toml` is written again for any other setting too).
+    deferred_to: Cell<Option<AgentBackend>>,
     /// The pane was shown: the key row may look the key up (the keyring may ask to be
     /// unlocked, so not while the window is built).
     key_wanted: Cell<bool>,
@@ -5433,6 +5662,7 @@ fn build_backend_ui() -> BackendUi {
         key_gen: Cell::new(0),
         shown: Cell::new(AgentBackend::Claude),
         deferred: Cell::new(false),
+        deferred_to: Cell::new(None),
         key_wanted: Cell::new(false),
         syncing: Cell::new(false),
         relabel_pending: Cell::new(false),
@@ -5564,6 +5794,14 @@ impl Inner {
         ui.syncing.set(false);
         self.refresh_key_status();
         self.refresh_header();
+        self.backend_shown();
+    }
+
+    /// The editor's menu names the backend the panel now shows ([`backend`]).
+    fn backend_shown(&self) {
+        if let Some(state) = self.state.upgrade() {
+            super::quick::agent_changed(&state);
+        }
     }
 
     /// Gives the picker the labels of the configuration (`[agent.<backend>] name` may have
@@ -5622,7 +5860,12 @@ impl Inner {
             return;
         }
         if self.session_live() {
-            self.backend_ui.deferred.set(true);
+            let told = self.backend_ui.deferred.replace(true)
+                && self.backend_ui.deferred_to.get() == Some(backend);
+            self.backend_ui.deferred_to.set(Some(backend));
+            if told {
+                return;
+            }
             self.push(Entry::Notice(format!(
                 "config.toml now selects {new}. {old} goes on here; {new} starts after you stop \
                  it or start a new session.",
@@ -5753,6 +5996,7 @@ impl Inner {
         )));
         self.refresh_header();
         self.refresh_key_status();
+        self.backend_shown();
     }
 
     /// Shows the API key row for the API backend and looks up where the key comes from (off the
@@ -6113,12 +6357,19 @@ pub fn mentions(text: &str) -> Vec<String> {
 /// The resource block for the mention `rel` (live text when the file is loaded); `Ok(None)` for
 /// a mention that is no project file (an e-mail address, `@misc`, …).
 async fn attachment(state: &Rc<WindowState>, rel: &str) -> Result<Option<PromptBlock>, String> {
-    let path = match state.workspace.root().resolve(Path::new(rel)) {
-        Ok(path) if path.is_file() => path,
-        _ => return Ok(None),
+    let (path, size) = match state.workspace.root().resolve(Path::new(rel)) {
+        Ok(path) => match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => (path, meta.len()),
+            _ => return Ok(None),
+        },
+        Err(_) => return Ok(None),
     };
     let text = match state.workspace.get(&path) {
         Some(doc) => doc.text(),
+        // Refused before it is read: `@data.csv` of some GB would be read whole first.
+        None if size > MAX_ATTACHMENT as u64 => {
+            return Err(format!("{rel} is too large to attach"));
+        }
         None => {
             let file = gio::File::for_path(&path);
             let (bytes, _) = file
@@ -6140,7 +6391,7 @@ async fn attachment(state: &Rc<WindowState>, rel: &str) -> Result<Option<PromptB
     Ok(Some(PromptBlock::Resource {
         uri: glib::filename_to_uri(&path, None)
             .map(|u| u.to_string())
-            .unwrap_or_else(|_| format!("file://{}", path.display())),
+            .unwrap_or_else(|_| format!("file://{}", lemma_core::agent_path(&path))),
         mime: mime_for(&path).into(),
         text,
     }))
@@ -6157,12 +6408,14 @@ pub fn mime_for(path: &Path) -> &'static str {
 }
 
 /// The project's text files (relative paths, sorted), skipping hidden directories, `.build` and
-/// `node_modules`; at most `MAX_FILES`.
+/// `node_modules`; at most `MAX_FILES`. They are what `@` suggests and puts into the prompt,
+/// which the agent reads: so they are written with `/` on every system
+/// ([`lemma_core::agent_path`]), as every path the agent is shown.
 pub fn list_project_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
-    while let Some(dir) = stack.pop() {
+    'walk: while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -6171,7 +6424,8 @@ pub fn list_project_files(root: &Path) -> Vec<String> {
         for entry in entries {
             visited += 1;
             if visited > MAX_FILES * 10 || out.len() >= MAX_FILES {
-                return out;
+                // Sorted too.
+                break 'walk;
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -6191,7 +6445,7 @@ pub fn list_project_files(root: &Path) -> Vec<String> {
                     .is_some_and(|e| TEXT_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
                 && let Ok(rel) = path.strip_prefix(root)
             {
-                out.push(rel.display().to_string());
+                out.push(lemma_core::agent_path(rel));
             }
         }
     }
@@ -6200,8 +6454,11 @@ pub fn list_project_files(root: &Path) -> Vec<String> {
 }
 
 /// The best matches of `query` among `files` (fuzzy, frizbee); the first files for an empty
-/// query.
+/// query. `files` are written with `/` ([`list_project_files`]); on Windows the user may type
+/// `\` as well.
 pub fn match_files(files: &[String], query: &str) -> Vec<String> {
+    #[cfg(windows)]
+    let query = &query.replace('\\', "/");
     if query.is_empty() {
         let mut first: Vec<&String> = files.iter().collect();
         // .tex files first.
@@ -6512,6 +6769,10 @@ mod tests {
         assert_eq!(split_line("main.tex:12"), ("main.tex", Some(12)));
         assert_eq!(split_line("a/b.tex#L3-L5"), ("a/b.tex", Some(3)));
         assert_eq!(split_line("a/b.tex"), ("a/b.tex", None));
+        // A drive's colon is no line, whichever way the agent wrote the path.
+        assert_eq!(split_line("C:/p/a.tex"), ("C:/p/a.tex", None));
+        assert_eq!(split_line("C:/p/a.tex:12"), ("C:/p/a.tex", Some(12)));
+        assert_eq!(split_line(r"C:\p\a.tex:12"), (r"C:\p\a.tex", Some(12)));
         assert_eq!(group_digits(41250), "41,250");
         assert_eq!(group_digits(200000), "200,000");
         assert_eq!(group_digits(999), "999");
@@ -6528,5 +6789,16 @@ mod tests {
         assert_eq!(match_files(&files, "yon")[0], "chapters/yoneda.tex");
         assert_eq!(match_files(&files, "bib")[0], "refs.bib");
         assert!(match_files(&files, "zzzzq").is_empty());
+        // The files are listed with `/` on every system; on Windows the user may type `\`.
+        assert_eq!(
+            match_files(&files, "chapters/yon")[0],
+            "chapters/yoneda.tex"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                match_files(&files, r"chapters\yon")[0],
+                "chapters/yoneda.tex"
+            );
+        }
     }
 }

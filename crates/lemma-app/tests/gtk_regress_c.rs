@@ -9,6 +9,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use gtk::{graphene, gsk};
 use lemma_app::pdf::pdf_view::{self, PdfView};
@@ -417,7 +419,7 @@ fn reload_with_wider_page_keeps_stale_render_scale() {
 // ----- The real window, controller and PDF thread -----
 
 fn fixture(rel: &str) -> PathBuf {
-    common::fixtures().join(rel).canonicalize().unwrap()
+    common::fixtures().join(rel).canonical().unwrap()
 }
 
 fn config() -> Config {

@@ -13,6 +13,7 @@
 //! be taken back ([`per_turn`]).
 
 mod batch;
+mod check;
 mod ids;
 mod journal;
 mod model;
@@ -22,6 +23,7 @@ mod segments;
 #[cfg(test)]
 mod tests;
 mod turns;
+mod user;
 
 use crate::diff::{LineDiff, LineHunk, WORD_TIMEOUT};
 use crate::edits::minimal_edits;
@@ -32,13 +34,14 @@ use crate::{
 };
 use journal::{Accepted, Entry, Journal};
 use lemma_core::{Origin, TextEdit, fnv1a64};
-use records::{Kind, Records, Step};
+use records::{Kind, Records, Step, covers};
 use segments::{Parked, Segment, Segments};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use turns::Attribution;
+use user::UserEdits;
 
 /// Bookkeeping kept next to each [`Hunk`] (same index in `FileReview::meta`).
 #[derive(Clone, Debug)]
@@ -99,6 +102,8 @@ pub struct FileReview {
     events: Vec<ReviewEvent>,
     journal: Journal,
     records: Records,
+    /// Where each change of the buffer's history went, for its undo and redo (see [`Stepped`]).
+    steps: Steps,
     /// Hunk ids as of the last `recompute`, in text order; `HunkDelta` is relative to them.
     published: Vec<HunkId>,
     /// Per `pair_hash`, an occurrence below which every number is taken by a hunk id (see
@@ -111,6 +116,15 @@ pub struct FileReview {
     /// the baseline, removed its text (current and baseline offset): a History insertion there
     /// next is that change being undone.
     folded_deletion: Option<(usize, usize)>,
+    /// Where the last change, if it was a User or History deletion (or replacement) that went
+    /// into a hunk's proposal, removed its text: a History insertion there next is that change
+    /// being undone, and goes back into the proposal.
+    inside_deletion: Option<usize>,
+    /// The way the buffer's undo or redo step went that made `folded_deletion` or
+    /// `inside_deletion` (true: a redo), if it was such a step and its caller said so.
+    deletion_step: Option<bool>,
+    /// The user's own edits, and where they went, for the buffer's undo and redo of them.
+    user_edits: UserEdits,
     turn: u64,
     /// The agent turn new agent edits are attributed to ([`FileReview::set_turn`]).
     attr_turn: u32,
@@ -133,7 +147,53 @@ pub struct FileReview {
     /// While [`FileReview::on_edits`] (or Alt+U of several regions) runs: what `on_edit` consults
     /// instead of the whole hunk list (see `batch`).
     batch: Option<batch::Batch>,
+    /// Every change checks the invariants as the unit tests' do (see `check`).
+    checking: bool,
 }
+
+/// A change of the texts, with where it went: which pieces of the text it took out went out of
+/// the baseline too, and which of those it put in went into it, where. The buffer's undo and redo
+/// are last in, first out: the undo of a change finds the texts as the change left them, the redo
+/// as its undo left them, so each goes back exactly where the change went, and Ctrl+Z, Ctrl+Shift+Z
+/// gives back both texts as they were, whatever decided where the change went (an accept since
+/// changed the baseline outside the buffer's history: those that came before it are not known).
+#[derive(Clone, Debug)]
+struct Stepped {
+    /// `[at, at + removed)` became the text of `inserted` bytes hashing to `hash`.
+    at: usize,
+    removed: usize,
+    inserted: usize,
+    hash: u64,
+    went: Went,
+    /// [`Steps::epoch`] then.
+    epoch: u64,
+}
+
+/// Where a change went (see [`Stepped`]).
+#[derive(Clone, Debug)]
+enum Went {
+    /// Into the current text only.
+    Proposal,
+    /// Into both texts, at this offset of the baseline.
+    Both(usize),
+    /// Piece by piece.
+    Pieces(Box<records::Placement>),
+}
+
+/// Changes of the buffer's history, newest last (see [`Stepped`]): those its undo reverses
+/// (`done`), and those its redo reverses (`undone`).
+#[derive(Clone, Debug, Default)]
+struct Steps {
+    done: VecDeque<Stepped>,
+    undone: Vec<Stepped>,
+    /// Counts the changes to the baseline outside the buffer's history (decisions in a row
+    /// once, so that accepting hunks one by one leaves it as accepting them at once does).
+    epoch: u64,
+    decided: bool,
+}
+
+/// Changes kept for the buffer's undo at most.
+const MAX_STEPS: usize = 4096;
 
 impl FileReview {
     /// A review whose baseline is `baseline` (the file just before the agent's first edit). It has
@@ -150,9 +210,13 @@ impl FileReview {
             events: Vec::new(),
             journal: Journal::default(),
             records: Records::default(),
+            steps: Steps::default(),
             published: Vec::new(),
             free_hints: HashMap::new(),
             folded_deletion: None,
+            inside_deletion: None,
+            deletion_step: None,
+            user_edits: UserEdits::default(),
             turn: 0,
             attr_turn: 0,
             attribution: Attribution::default(),
@@ -163,6 +227,7 @@ impl FileReview {
             generation: 0,
             created_unix,
             batch: None,
+            checking: false,
         }
     }
 
@@ -236,6 +301,138 @@ impl FileReview {
     /// ([`undo_review_action`](Self::undo_review_action)).
     pub fn set_in_buffer(&mut self, in_buffer: bool) {
         self.records.set_closed(!in_buffer);
+        self.baseline_changed();
+        self.user_edits.clear();
+        // A new buffer's history starts empty.
+        self.steps.done.clear();
+        self.steps.undone.clear();
+    }
+
+    /// A decision changed the baseline outside the buffer's history: where its changes went is
+    /// not known any more (see [`Stepped`]).
+    fn baseline_changed(&mut self) {
+        if !self.steps.decided {
+            self.steps.epoch += 1;
+            self.steps.decided = true;
+        }
+    }
+
+    /// The buffer's undo or redo of the change `[a, b) → text` (`Origin::History`): where the
+    /// change it reverses went, the reverse way, if that is known (see [`Stepped`]).
+    fn reversing(&mut self, a: usize, b: usize, text: &str) -> Option<records::Placement> {
+        let (redo, told) = self.records.stepping_redo();
+        let last = if !told {
+            None
+        } else if redo {
+            self.steps.undone.pop()
+        } else {
+            self.steps.done.pop_back()
+        };
+        // None: a change from before the review (or a buffer whose history it does not follow).
+        let last = last?;
+        let reverses = last.at == a
+            && last.removed == text.len()
+            && last.inserted == b - a
+            && self
+                .current_text(&(a..b))
+                .is_some_and(|t| fnv1a64(&[t.as_bytes()]) == last.hash);
+        if !reverses {
+            // The history is not the one followed: what came before is not known.
+            self.steps.done.clear();
+            self.steps.undone.clear();
+            return None;
+        }
+        if last.epoch != self.steps.epoch {
+            return None;
+        }
+        // The change that put `[at, at + inserted)` in, reversed.
+        let placed = match last.went {
+            Went::Proposal => records::Placement::default(),
+            Went::Both(base) => Self::whole(last.removed, last.inserted, Some(base)),
+            Went::Pieces(p) => *p,
+        };
+        Some(records::Placement {
+            deleted: placed.inserted,
+            deleted_at: placed.inserted_at,
+            inserted: placed.deleted,
+            inserted_at: placed.deleted_at,
+        })
+    }
+
+    /// The placement of a change that took out `removed` bytes and put in `inserted`, which went
+    /// into both texts at `base`, or into the current text only.
+    fn whole(removed: usize, inserted: usize, base: Option<usize>) -> records::Placement {
+        let mut p = records::Placement::default();
+        if let Some(base) = base {
+            if removed > 0 {
+                p.deleted.push(0..removed);
+                p.deleted_at.push(Some(base));
+            }
+            if inserted > 0 {
+                p.inserted.push(0..inserted);
+                p.inserted_at.push(Some(base));
+            }
+        }
+        p
+    }
+
+    /// Where a change that took out `removed` bytes and put in `inserted` went, as `placed` says.
+    fn went(removed: usize, inserted: usize, placed: records::Placement) -> Went {
+        if placed.is_empty() {
+            return Went::Proposal;
+        }
+        match placed.deleted_at.iter().chain(&placed.inserted_at).next() {
+            Some(&Some(base)) if placed == Self::whole(removed, inserted, Some(base)) => {
+                Went::Both(base)
+            }
+            _ => Went::Pieces(Box::new(placed)),
+        }
+    }
+
+    /// Notes where the change `[at, at + removed) → inserted` went (see [`Stepped`]).
+    fn stepped(&mut self, origin: Origin, at: usize, removed: usize, inserted: &str, went: Went) {
+        self.steps.decided = false;
+        let step = Stepped {
+            at,
+            removed,
+            inserted: inserted.len(),
+            hash: fnv1a64(&[inserted.as_bytes()]),
+            went,
+            epoch: self.steps.epoch,
+        };
+        if origin == Origin::History {
+            match self.records.stepping_redo() {
+                (true, true) => self.steps.done.push_back(step),
+                (false, true) => self.steps.undone.push(step),
+                _ => {}
+            }
+        } else {
+            self.steps.undone.clear();
+            self.steps.done.push_back(step);
+        }
+        if self.steps.done.len() > MAX_STEPS {
+            self.steps.done.pop_front();
+        }
+    }
+
+    /// Tells the review that the buffer starts to undo (`redo` false) or to redo one action: the
+    /// `Origin::History` edits from now on, until the next call, are that step's. Call it from
+    /// the buffer's `undo` and `redo` handlers, before their changes.
+    ///
+    /// One History edit can undo one of Lemma's edits and redo another (the agent took back an
+    /// edit of its own, or a reject took back the agent's text): without this, the review takes
+    /// it the way the user stepped last, so Ctrl+Z then Ctrl+Shift+Z is taken for two undos. The
+    /// records of both edits then look undone, the next change drops them, and undoing further
+    /// is no longer recognized (the agent's text can go into the baseline).
+    pub fn begin_history_step(&mut self, redo: bool) {
+        // A step the same way as the one whose deletion the review noted steps an older action:
+        // its insertion there is not that deletion taken back (it took a reject's undo for
+        // the user's own and put the rejected text into the baseline).
+        if self.deletion_step == Some(redo) {
+            self.folded_deletion = None;
+            self.inside_deletion = None;
+        }
+        self.records.begin_history_step(redo);
     }
 
     /// How many records of its own edits the review keeps (to recognize the buffer's undo and
@@ -523,11 +720,20 @@ impl FileReview {
     /// to record, or one recorded long ago) counts the same way: a History insertion, at a pure
     /// deletion, of exactly the deleted text.
     ///
-    /// The user's own undo is recognized too: a History insertion right where the previous change
-    /// (a User or History deletion or replacement folded into the baseline) removed text puts that
-    /// text back into the baseline where it was, even at the start of a hunk or next to a pure
-    /// deletion, so `dd` + `u` next to a hunk changes nothing. Any other History edit is classified
-    /// like a User edit. The returned class always follows the formula above.
+    /// The user's own undo is recognized too. Each User edit is recorded with where it went (into
+    /// the baseline, or into a hunk's proposal), and a History edit that undoes or redoes the
+    /// newest of them (or several, which the buffer merges into one step: keys typed one by one,
+    /// Backspace held) goes the same way, wherever the hunks lie by then (see `user`): typing over
+    /// a selection that ran past the end of a hunk, then Ctrl+Z, gives the text, the baseline
+    /// and the hunks back. Without such a record, a History insertion right where the previous
+    /// change (a User or History deletion or replacement folded into the baseline) removed text
+    /// puts that text back into the baseline where it was, even at the start of a hunk or next to
+    /// a pure deletion, so `dd` + `u` next to a hunk changes nothing. Likewise a History insertion
+    /// right where the previous change (a User or History deletion or replacement inside a hunk)
+    /// took text out of the proposal puts it back into the proposal, even at the hunk's end or at
+    /// the pure deletion the hunk became, so `dd` + `u` of a hunk's last line changes nothing
+    /// either. Any other History edit is classified like a User edit. The returned class always
+    /// follows the formula above.
     pub fn on_edit(&mut self, e: &TextEdit, origin: Origin) -> EditClass {
         let (a, b) = (e.range.start, e.range.end);
         if a > b
@@ -550,15 +756,66 @@ impl FileReview {
             Some((at, base_at)) if at == a && a == b && origin == Origin::History => Some(base_at),
             _ => None,
         };
+        // And one right where the previous change took text out of a hunk's proposal puts it back
+        // there, where the Inside rule may not see a hunk (at the end of what is left of it).
+        let undoes_inside =
+            self.inside_deletion.take() == Some(a) && a == b && origin == Origin::History;
+        let own = own_undo.is_some() || undoes_inside;
+        let (redo, told) = self.records.stepping_redo();
+        self.deletion_step = (origin == Origin::History && told).then_some(redo);
+        // The buffer's undo or redo of the user's own edits goes back where they went (see
+        // `user`), unless it is the step of one of Lemma's own edits that the buffer steps first.
+        let user_step = match origin {
+            Origin::History => {
+                let (redo, told) = self.records.stepping_redo();
+                self.user_edits
+                    .matching(a, b, &e.text, redo, told)
+                    .filter(|step| self.current_text_is(&(a..b), &step.removed))
+            }
+            _ => {
+                self.user_edits.new_action();
+                None
+            }
+        };
+        // A step the buffer merged is taken apart below, unless it is the step of one of Lemma's
+        // own edits that the buffer steps first.
+        let user_step = user_step.filter(|step| {
+            step.parts.len() == 1 || !self.records.steps_first(a, b, &e.text, step.when)
+        });
+        if let Some(step) = user_step.as_ref().filter(|step| step.parts.len() > 1) {
+            // A step the buffer merged (keys typed one by one, Backspace held): it is those edits
+            // taken back or made again one after the other, each the step of one of them, which
+            // keeps the records of Lemma's edits they cut or took in as exact as they were.
+            for part in step.parts.clone() {
+                let range = part.at..part.at + part.len;
+                let text = part.text;
+                self.on_edit(&TextEdit { range, text }, origin);
+            }
+            return class;
+        }
+        // What the user's edit replaces, to record it.
+        let replaced = (origin == Origin::User)
+            .then(|| self.current_text(&(a..b)))
+            .flatten();
         self.journal.track(a, b, e.text.len());
+        // Whether the text the edit takes out is the agent's (not accepted), for the user's
+        // edit's undo (see `user`): before the attribution follows the edit.
+        let agents = a < b && self.attribution.wrote_inside(a, b);
         self.attribution.shift(a, b, e.text.len());
         self.unknown.shift(a, b, e.text.len());
-        let (mut claim, context) = self
-            .records
-            .observe(a, b, &e.text, origin, own_undo.is_none());
+        let rival = user_step
+            .as_ref()
+            .map(|step| (step.when, step.enclosing.as_slice()));
+        let (mut claim, mut context) =
+            self.records
+                .observe(a, b, &e.text, origin, !own || rival.is_some(), rival);
+        // Or the text lay in an agent edit's that took the edit in.
+        let agents = agents || (a < b && self.records.hold_agent_text(context.enclosing()));
+        let user_step = user_step.filter(|_| claim.is_none());
         if claim.is_none()
             && origin == Origin::History
-            && own_undo.is_none()
+            && !own
+            && user_step.is_none()
             && self.reinserted_deletion(a, b, &e.text).is_some()
         {
             claim = Some(records::Claim {
@@ -570,50 +827,372 @@ impl FileReview {
                 turn: None,
             });
         }
+        // A step of the buffer's history that neither a record nor the user's edits take (the
+        // undo or redo of an action whose record is gone: an agent edit whose text was accepted
+        // is the user's own change now) is kept as a step of the user's edits, so that the
+        // buffer's next step of that action goes where this one went, and the records this one
+        // cut come back: the redo of an accepted agent edit, after its undo had cut the record
+        // of the agent's later edit there, left that edit's redo to go into the baseline.
+        let replaced = replaced.or_else(|| {
+            (origin == Origin::History
+                && user_step.is_none()
+                && claim.is_none_or(|c| c.record.is_none()))
+            .then(|| self.current_text(&(a..b)))
+            .flatten()
+        });
+        // What the edit takes out, and where the change it reverses went (see `Stepped`).
+        let forced = (origin == Origin::History)
+            .then(|| self.reversing(a, b, &e.text))
+            .flatten();
+        let whole = |base: Option<usize>| base.map_or(Went::Proposal, Went::Both);
+        let pieces = |placed: records::Placement| Self::went(b - a, e.text.len(), placed);
+        // The buffer's undo or redo of a recorded edit whose change an accept took goes, piece
+        // by piece, where the user's own change would: into both texts, and the rest (text of
+        // the agent's no accept took) into the current text only (see `Records::placed`). A step
+        // all of whose pieces go into both is the user's own change.
+        let placement = match claim {
+            Some(c) if c.record.is_some() => {
+                let placement = self.records.take_placement();
+                forced.clone().or(placement)
+            }
+            _ => None,
+        };
+        let mut actual = Went::Proposal;
+        let accepted = placement.as_ref().is_some_and(|p| {
+            covers(&p.deleted, &(0..b - a)) && covers(&p.inserted, &(0..e.text.len()))
+        });
+        // What of the text the edit deletes the baseline holds, for its record or its claimer's.
+        let aligned = if a < b
+            && (claim.is_some_and(|c| c.record.is_some())
+                || matches!(
+                    origin,
+                    Origin::Agent { .. } | Origin::Reload | Origin::User | Origin::History
+                )) {
+            self.aligned(a, b)
+        } else {
+            Vec::new()
+        };
         // Before the model changes: segments read the text the edit replaces.
-        let vanished = self.edit_segments(a, b, &e.text, origin, claim.as_ref(), class);
+        let vanished = self.edit_segments(
+            a,
+            b,
+            &e.text,
+            origin,
+            claim.as_ref().filter(|_| !accepted),
+            class,
+        );
         let grown = offset(self.current_len, e.delta());
         let changed = a..a + e.text.len();
-        if let Some(base_at) = own_undo
+        // `current_len` follows once the hunks have changed: `growth_before` counts on it being
+        // the baseline's length plus their growth.
+        if let Some(step) = &user_step {
+            // The user's edit it takes back (or makes again) goes where it went, or, should the
+            // texts no longer say where that is (or a decision changed the baseline since), where
+            // the Inside rule puts it, and its next step the same way.
+            let part = &step.parts[0];
+            // Of an edit whose place an accept made unknown, the step bringing back text that
+            // lay in the agent's (the user had deleted it in a hunk the accept then took
+            // without it) brings back a proposal.
+            let agents = !part.placed && a == b && part.agents;
+            let mut forced_went = None;
+            let went = match (part.placed, part.base) {
+                // Where the change it reverses went.
+                _ if forced.is_some() => {
+                    let f = forced.as_ref().expect("a placement");
+                    if f.is_empty() {
+                        self.edit_inside_touching(a, b, &e.text);
+                        forced_went = Some(None);
+                    } else {
+                        let (placed, _) = self.edit_placed(a, b, &e.text, f);
+                        let all = covers(&placed.deleted, &(0..b - a))
+                            && covers(&placed.inserted, &(0..e.text.len()));
+                        let base = placed.deleted_at.iter().chain(&placed.inserted_at).next();
+                        forced_went = Some(base.copied().flatten().filter(|_| all));
+                        actual = pieces(placed);
+                    }
+                    true
+                }
+                (true, Some(base)) => {
+                    let went = self.fold_both(a, b, base, &e.text);
+                    if went {
+                        actual = whole(Some(base));
+                    }
+                    went
+                }
+                (true, None) => {
+                    self.edit_inside_touching(a, b, &e.text);
+                    true
+                }
+                (false, _) if agents => {
+                    self.edit_inside_touching(a, b, &e.text);
+                    true
+                }
+                // Text its edit took out of the proposal comes back there, but for what the
+                // baseline held of it, which an accept since took out of the baseline with the
+                // hunk (unless a hunk there still holds it): that goes back into both.
+                (false, None) if a == b => {
+                    let (first, end) = self.touching(a, a);
+                    let held: records::Pieces = part
+                        .held
+                        .iter()
+                        .filter(|x| {
+                            e.text.get((*x).clone()).is_some_and(|piece| {
+                                self.hunks[first..end]
+                                    .iter()
+                                    .all(|h| !h.old_text.contains(piece))
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    if held.is_empty() {
+                        self.edit_inside_touching(a, b, &e.text);
+                    } else {
+                        let p = records::Placement {
+                            inserted_at: vec![None; held.len()],
+                            inserted: held,
+                            ..Default::default()
+                        };
+                        let (placed, _) = self.edit_placed(a, b, &e.text, &p);
+                        actual = pieces(placed);
+                        forced_went = Some(None);
+                    }
+                    true
+                }
+                (false, _) => false,
+            };
+            // Otherwise into both texts where they hold the same there (the user's own text),
+            // else where the Inside rule puts it.
+            let placed = (!went).then(|| {
+                let at = offset(a, -self.growth_before(self.first_ending_after(a)));
+                if self.fold_both(a, b, at, &e.text) {
+                    Some(at)
+                } else {
+                    self.edit_as_classified(a, b, &e.text)
+                }
+            });
+            if let Some(base) = placed {
+                actual = whole(base);
+            }
+            self.current_len = grown;
+            // The records the edits it takes back had cut come back; it keeps those it cuts.
+            let now = self.records.tick();
+            let kept = self.records.keep_for_user(std::mem::take(&mut context));
+            for had in self.user_edits.take(step, now, kept) {
+                self.records.bring_back(had);
+            }
+            if let Some(base) = forced_went {
+                self.user_edits.place_last(step.redo, base);
+            } else if !part.placed {
+                self.user_edits
+                    .place_last(step.redo, placed.unwrap_or_default());
+            }
+            self.records.stepped(step.redo);
+        }
+        if user_step.is_none()
+            && forced.is_none()
+            && let Some(base_at) = own_undo
             && self.fold_back(a, base_at, &e.text)
         {
             self.current_len = grown;
+            self.stepped(origin, a, b - a, &e.text, whole(Some(base_at)));
+            if let Some(replaced) = replaced {
+                let context = std::mem::take(&mut context);
+                self.record_user_edit(
+                    origin,
+                    a,
+                    replaced,
+                    &e.text,
+                    Some(base_at),
+                    context,
+                    agents,
+                    aligned.clone(),
+                );
+            }
             self.refresh_turns_near(&changed);
             return class;
         }
-        // `current_len` follows once the hunks have changed: `growth_before` counts on it being
-        // the baseline's length plus their growth.
         match (claim, origin, class) {
+            _ if user_step.is_some() => {}
+            // Where the change it reverses went.
+            (None, Origin::History, _) if forced.is_some() => {
+                let f = forced.as_ref().expect("a placement");
+                let (placed, _) = self.edit_placed(a, b, &e.text, f);
+                self.current_len = grown;
+                let all = !placed.is_empty()
+                    && covers(&placed.deleted, &(0..b - a))
+                    && covers(&placed.inserted, &(0..e.text.len()));
+                let base = placed.deleted_at.iter().chain(&placed.inserted_at).next();
+                let base = base.copied().flatten().filter(|_| all);
+                actual = pieces(placed);
+                if let Some(replaced) = replaced {
+                    let context = std::mem::take(&mut context);
+                    self.record_user_edit(
+                        origin,
+                        a,
+                        replaced,
+                        &e.text,
+                        base,
+                        context,
+                        agents,
+                        aligned.clone(),
+                    );
+                }
+            }
+            (None, Origin::History, EditClass::Outside) if undoes_inside => {
+                self.edit_inside_touching(a, b, &e.text);
+                self.current_len = grown;
+                if let Some(replaced) = replaced {
+                    let context = std::mem::take(&mut context);
+                    self.record_user_edit(
+                        origin,
+                        a,
+                        replaced,
+                        &e.text,
+                        None,
+                        context,
+                        agents,
+                        aligned.clone(),
+                    );
+                }
+            }
             (None, Origin::User | Origin::History, EditClass::Outside) => {
                 if let Some(at) = self.fold_into_baseline(first, a, b, &e.text) {
+                    actual = whole(Some(at));
                     self.current_len = grown;
                     if a < b {
                         self.folded_deletion = Some((a, at));
                     }
+                    if let Some(replaced) = replaced {
+                        let context = std::mem::take(&mut context);
+                        self.record_user_edit(
+                            origin,
+                            a,
+                            replaced,
+                            &e.text,
+                            Some(at),
+                            context,
+                            agents,
+                            aligned.clone(),
+                        );
+                    }
+                }
+            }
+            // Inside hunks that hold no change any more (their texts became equal, and the next
+            // recompute drops them), the edit is outside every change: it goes into both texts,
+            // as it would after that recompute. The undo of an agent edit whose text was
+            // accepted is the user's own change, and the undo of the agent's later edit next to
+            // it left such a hunk there: the accepted text went out of the proposal only. Not
+            // the undo of a deletion that took a hunk's text out of its proposal (see above).
+            (None, Origin::User | Origin::History, EditClass::Inside(_))
+                if !undoes_inside && self.inside_unchanged(first, a, b) =>
+            {
+                let at = offset(a, -self.growth_before(first));
+                if self.fold_both(a, b, at, &e.text) {
+                    actual = whole(Some(at));
+                    self.current_len = grown;
+                    if a < b {
+                        self.folded_deletion = Some((a, at));
+                    }
+                    if let Some(replaced) = replaced {
+                        let context = std::mem::take(&mut context);
+                        self.record_user_edit(
+                            origin,
+                            a,
+                            replaced,
+                            &e.text,
+                            Some(at),
+                            context,
+                            agents,
+                            aligned.clone(),
+                        );
+                    }
+                } else {
+                    self.edit_inside(first, a, b, &e.text);
+                    self.current_len = grown;
                 }
             }
             (None, Origin::User | Origin::History, EditClass::Inside(_)) => {
                 self.edit_inside(first, a, b, &e.text);
                 self.current_len = grown;
+                if a < b {
+                    self.inside_deletion = Some(a);
+                }
+                if let Some(replaced) = replaced {
+                    let context = std::mem::take(&mut context);
+                    self.record_user_edit(
+                        origin,
+                        a,
+                        replaced,
+                        &e.text,
+                        None,
+                        context,
+                        agents,
+                        aligned.clone(),
+                    );
+                }
+            }
+            // Piece by piece where the user's own change would go, the rest as a proposal.
+            (Some(c), _, _) if placement.is_some() => {
+                let placement = placement.as_ref().expect("a placement");
+                let (placed, index) = self.edit_placed(a, b, &e.text, placement);
+                self.current_len = grown;
+                if let Some(index) = index.filter(|_| !accepted) {
+                    let removed = String::new();
+                    self.apply_claim(c, &model::Merged { index, removed });
+                }
+                self.records.placed(&placed, &aligned);
+                actual = pieces(placed);
             }
             _ => {
                 let merged = self.edit_proposal(a, b, &e.text);
                 self.current_len = grown;
                 if let Some(claim) = claim {
                     self.apply_claim(claim, &merged);
+                    // Its record's step went into the current text only.
+                    if claim.record.is_some() {
+                        self.records
+                            .placed(&records::Placement::default(), &aligned);
+                    }
                 }
-                if let Origin::Agent { .. } = origin {
-                    self.attribute_agent_edit(merged.index, a, &e.text, &merged.removed);
-                    let range = a..a + e.text.len();
-                    let turn = self.attr_turn;
-                    self.records
-                        .push_agent(range, merged.removed, e.text.clone(), context, turn);
+                // The undo of a deletion no record covers (see above).
+                if let Some(replaced) = replaced {
+                    let context = std::mem::take(&mut context);
+                    self.record_user_edit(
+                        origin,
+                        a,
+                        replaced,
+                        &e.text,
+                        None,
+                        context,
+                        agents,
+                        aligned.clone(),
+                    );
+                }
+                let range = a..a + e.text.len();
+                match origin {
+                    Origin::Agent { .. } => {
+                        self.attribute_agent_edit(merged.index, a, &e.text, &merged.removed);
+                        let turn = Some(self.attr_turn);
+                        let (removed, text) = (merged.removed, e.text.clone());
+                        self.records
+                            .push_agent(range, removed, text, context, turn, aligned);
+                    }
+                    // A reload is one action of the buffer's: its undo takes the other
+                    // program's change back out of the proposal, and its redo puts it back
+                    // (without a record both went by the Inside rule, partly into the baseline).
+                    Origin::Reload => {
+                        let (removed, text) = (merged.removed, e.text.clone());
+                        self.records
+                            .push_agent(range, removed, text, context, None, aligned);
+                    }
+                    _ => {}
                 }
             }
         }
-        if let Some(claim) = claim.filter(|c| c.done) {
+        if let Some(claim) = claim.filter(|c| c.done && !accepted) {
             self.turn_step(&claim);
         }
+        self.stepped(origin, a, b - a, &e.text, actual);
         // The turn's own edits took each other back there: it changed nothing there, whatever the
         // hunk around holds (another turn's change it deleted and wrote again, say). Its
         // intervals there go, whole, unless another change of the turn is in them.
@@ -630,7 +1209,7 @@ impl FileReview {
         }
         self.forget_unchanged_near(&changed);
         self.refresh_turns_near(&changed);
-        if claim.is_some_and(|c| c.done) {
+        if claim.is_some_and(|c| c.done) || user_step.is_some() {
             // Records cut by this step's edit may have come back. They match the text when the
             // buffer's undo replays strictly in order; drop any that do not. Every other record
             // followed the text edit by edit.
@@ -639,34 +1218,45 @@ impl FileReview {
             self.records = records;
         }
         // The unit tests check every record after every change (`on_edits` once its batch is
-        // back together).
-        #[cfg(test)]
-        if self.batch.is_none() {
-            self.check_records(|| format!("{e:?} ({origin:?})"));
+        // back together), and so do tests that ask for it.
+        if self.checks()
+            && self.batch.is_none()
+            && let Err(error) = self.check_records()
+        {
+            panic!("{error} after {e:?} ({origin:?})");
         }
         class
     }
 
-    /// Panics when a record does not hold the text at its range (or what they take is counted
-    /// wrong); `after` names the change. In text order, so that the hunk list is walked once.
-    #[cfg(test)]
-    pub(super) fn check_records(&self, after: impl Fn() -> String) {
-        self.records.check_costs();
-        let (mut i, mut grown) = (0, 0);
-        for (range, content) in self.records.in_text_order() {
-            while self
-                .hunks
-                .get(i)
-                .is_some_and(|h| h.cur_bytes.end <= range.start)
-            {
-                grown += model::growth(&self.hunks[i]);
-                i += 1;
-            }
-            assert!(
-                self.text_is_at(&range, content, i, grown),
-                "the record at {range:?} ({content:?}) does not match the text after {}",
-                after()
-            );
+    /// Records the user's edit `[a, b)` (which held `replaced`) → `text`, which went into the
+    /// baseline at `base` or into the proposal, with what it did to the records (`context`); or,
+    /// for `Origin::History`, a step of the buffer's history that nothing recognized, as a step
+    /// of such an edit (see `user`). `agents`: the text it replaced was the agent's.
+    #[allow(clippy::too_many_arguments)]
+    fn record_user_edit(
+        &mut self,
+        origin: Origin,
+        a: usize,
+        replaced: String,
+        text: &str,
+        base: Option<usize>,
+        context: records::Context,
+        agents: bool,
+        held: records::Pieces,
+    ) {
+        let now = self.records.tick();
+        let kept = self.records.keep_for_user(context);
+        let text = text.to_owned();
+        // What the baseline held of the text it took out matters where that went into the
+        // proposal only.
+        let held = if base.is_none() { held } else { Vec::new() };
+        if origin == Origin::History {
+            let redo = self.records.stepping_redo().0;
+            self.user_edits
+                .push_step(a, replaced, text, base, now, kept, redo, agents, held);
+        } else {
+            self.user_edits
+                .push(a, replaced, text, base, now, kept, agents, held);
         }
     }
 
@@ -820,6 +1410,8 @@ impl FileReview {
             self.current_len = current.len();
             self.hunks.clear();
             self.meta.clear();
+            self.inside_deletion = None;
+            self.user_edits.clear();
             self.records.clear();
             self.attribution.clear();
             self.parked.clear();
@@ -1088,6 +1680,9 @@ impl FileReview {
 
     /// Moves hunk `k` into the baseline and removes it.
     fn accept_at(&mut self, k: usize) -> (Accepted, ReviewEvent) {
+        // The baseline changes outside the buffer's history (see `user`).
+        self.user_edits.forget_places();
+        self.baseline_changed();
         let base = self.hunks[k].base_bytes.clone();
         let (region, event) = self.take_accepted(k, None);
         self.forget_free_hints();
@@ -1111,6 +1706,9 @@ impl FileReview {
     /// an Accept all of 5000 hunks in `large.tex` and 0.5 s for 20 000.
     fn accept_many(&mut self, picked: &[usize], current: &str) {
         debug_assert!(picked.windows(2).all(|w| w[0] < w[1]), "{picked:?}");
+        // The baseline changes outside the buffer's history (see `user`).
+        self.user_edits.forget_places();
+        self.baseline_changed();
         let growth: isize = picked.iter().map(|&k| model::growth(&self.hunks[k])).sum();
         let mut baseline = String::with_capacity(offset(self.baseline.len(), growth));
         let (mut pos, mut delta, mut lines) = (0, 0, 0);
@@ -1152,8 +1750,18 @@ impl FileReview {
         let parked = self.park_around(k, &anchor, current);
         let hunk = self.hunks.remove(k);
         let meta = self.meta.remove(k);
-        // Undoing the agent's edits here is now the user's own change to the baseline.
-        self.records.forget_touching(&hunk.cur_bytes);
+        // Undoing the agent's edits here is now the user's own change to the baseline, and so is
+        // undoing the user's own deletion in it. Bringing back the agent's text that the hunk
+        // no longer held (a reject's undo, an agent edit's redo) is not.
+        let records = self
+            .records
+            .accept_overlapping(&hunk.cur_bytes, &meta.new_text);
+        if self
+            .inside_deletion
+            .is_some_and(|at| hunk.cur_bytes.start <= at && at <= hunk.cur_bytes.end)
+        {
+            self.inside_deletion = None;
+        }
         // The text is no change any more; Alt+U gives the turns back with the hunk.
         let turns = self.attribution.subtract(&hunk.cur_bytes, None);
         self.prune_near(&hunk.cur_bytes, None);
@@ -1170,6 +1778,7 @@ impl FileReview {
             turns,
             parked,
             valid: true,
+            records,
         };
         (region, event)
     }
@@ -1220,13 +1829,24 @@ impl FileReview {
         self.unaccept_each(regions, current)
     }
 
+    /// After regions were put back (`any`): the baseline changed outside the buffer's history
+    /// (see `user`). Only then, and once: an Alt+U that reverts nothing changes nothing (the
+    /// Ctrl+Z of the user's typing after one went by the Inside rule into the hunk next to it).
+    fn unaccepted(&mut self, any: bool) -> bool {
+        if any {
+            self.user_edits.forget_places();
+            self.baseline_changed();
+        }
+        any
+    }
+
     /// [`unaccept`](Self::unaccept) of `regions` (descending) one after the other.
     fn unaccept_each(&mut self, regions: Vec<Accepted>, current: &str) -> bool {
         let mut any = false;
         for region in regions {
             any |= self.unaccept_region(region, current).is_some();
         }
-        any
+        self.unaccepted(any)
     }
 
     /// Puts `old_text` back into the baseline under an accepted region and re-creates its hunk.
@@ -1285,6 +1905,7 @@ impl FileReview {
         }
         self.put_back(&r.parked, &(s..e));
         self.refresh_turns_near(&(s..e));
+        self.records.unaccept(&r.records);
         Some((delta, lines))
     }
 }

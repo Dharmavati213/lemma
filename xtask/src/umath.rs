@@ -1,6 +1,6 @@
 //! Unicode glyphs for LaTeX math commands.
 //!
-//! Two inputs, both optional:
+//! Two inputs (`gen-completion` requires the first):
 //!
 //! - `data/raw/umath_map.tsv`: the unicode-math table (`unicode-math-table.tex`) mapped to the
 //!   commands a pdfLaTeX user types (made by `data/raw/umath*.py`). Columns: `codepoint`,

@@ -396,6 +396,9 @@ struct Counter {
     popover: gtk::Popover,
     content: gtk::Box,
     last: RefCell<Option<(PathBuf, WordCount)>>,
+    /// Why the last count of the document failed (texcount failed or printed something else
+    /// than a count), until one succeeds.
+    failed: RefCell<Option<String>>,
     /// A count runs (stop it with its [`Stop`]); `again` asks for another one after it (of that
     /// root; `true` for an automatic one).
     running: RefCell<Option<Arc<Stop>>>,
@@ -462,6 +465,7 @@ pub fn install(state: &Rc<WindowState>) {
         popover: popover.clone(),
         content,
         last: RefCell::new(None),
+        failed: RefCell::new(None),
         running: RefCell::new(None),
         again: RefCell::new(None),
         asked: RefCell::new(Vec::new()),
@@ -774,10 +778,8 @@ impl Counter {
                         words_label(count.total)
                     )));
                     counter.offer.replace(None);
+                    counter.failed.replace(None);
                     counter.last.replace(Some((root, count)));
-                    if counter.popover.is_visible() {
-                        counter.fill_popover();
-                    }
                 }
                 Err(CountError::TooLarge) => {
                     if counter
@@ -799,13 +801,20 @@ impl Counter {
                     counter.available.set(false);
                 }
                 Err(CountError::Cancelled) => {}
-                Err(e) => tracing::warn!("word count of {}: {e}", root.display()),
+                Err(e) => {
+                    tracing::warn!("word count of {}: {e}", root.display());
+                    counter.failed.replace(Some(e.to_string()));
+                }
             }
             if let Some(state) = counter.state.upgrade() {
                 counter.refresh_visibility(&state);
             }
             if let Some((next, automatic)) = counter.again.take() {
                 counter.count(next, automatic);
+            }
+            // A popover opened meanwhile said "Counting words…": it shows how this one ended.
+            if counter.popover.is_visible() {
+                counter.fill_popover();
             }
         });
     }
@@ -865,13 +874,18 @@ impl Counter {
         let last = self.last.borrow();
         let Some((root, count)) = last.as_ref() else {
             let text = if self.running.borrow().is_some() {
-                "Counting words…"
+                "Counting words…".to_owned()
+            } else if let Some(error) = self.failed.borrow().as_ref() {
+                format!("Could not count the words: {error}")
             } else {
-                "Not counted yet"
+                "Not counted yet".to_owned()
             };
             self.content.append(
                 &gtk::Label::builder()
                     .label(text)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .max_width_chars(40)
                     .css_classes(["dim-label"])
                     .build(),
             );
@@ -1111,7 +1125,7 @@ mod tests {
     #[test]
     fn a_selection_count_is_stopped() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("lemma-count-text-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-count-text-").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("texcount");
         std::fs::write(&program, "#!/bin/sh\ncat > /dev/null\nexec sleep 60\n").unwrap();

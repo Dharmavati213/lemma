@@ -49,6 +49,17 @@ impl Rotation {
         }
     }
 
+    /// The point `(x, y)` of TeX's page space (top-left origin) on the page as displayed, whose
+    /// size is `display` (bp): the inverse of [`Rotation::point_from_display`].
+    pub(crate) fn point_to_display(self, (x, y): (f64, f64), display: (f64, f64)) -> (f64, f64) {
+        let (dw, dh) = display;
+        match self {
+            Self::Upright => (x, y),
+            Self::Quarter => (dw - y, x),
+            Self::ThreeQuarters => (y, dh - x),
+        }
+    }
+
     /// The point `(x, y)` of the page as displayed, whose size is `display` (bp), in TeX's page
     /// space.
     pub(crate) fn point_from_display(self, (x, y): (f64, f64), display: (f64, f64)) -> (f64, f64) {
@@ -184,6 +195,7 @@ mod tests {
                 f64::from(d.v_top + d.height / 2.0),
             );
             assert_eq!(r.point_from_display(centre, display(r)), (222.0, 182.0));
+            assert_eq!(r.point_to_display((222.0, 182.0), display(r)), centre);
             let corners = [(72.0, 172.0), (372.0, 172.0), (72.0, 192.0), (372.0, 192.0)];
             let corner = r.point_from_display((f64::from(d.h), f64::from(d.v_top)), display(r));
             assert!(corners.contains(&corner), "{r:?}: {corner:?}");

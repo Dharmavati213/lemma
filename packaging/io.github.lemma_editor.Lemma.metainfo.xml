@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: what GNOME Software, KDE Discover and the like show for Lemma.
+     Check it with `appstreamcli validate packaging/io.github.lemma_editor.Lemma.metainfo.xml`.
+     Add a <release> for each release (newest first). -->
+<component type="desktop-application">
+  <id>io.github.lemma_editor.Lemma</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Lemma</name>
+  <summary>Write LaTeX and review an AI agent's edits inline</summary>
+  <developer id="io.github.dharmavati213">
+    <name>Dharmavati213</name>
+  </developer>
+  <description>
+    <p>
+      Lemma is a LaTeX editor built around reviewing an AI agent's edits. When the agent changes
+      your document, every change shows up inline as a red and green hunk that you accept or
+      reject on its own, like a code review, before anything is final.
+    </p>
+    <p>It is also a complete LaTeX editor without the agent:</p>
+    <ul>
+      <li>Continuous PDF preview with SyncTeX in both directions, dark mode and search</li>
+      <li>Errors, warnings and bad boxes explained in plain English, with quick fixes</li>
+      <li>Completion for commands, environments, labels and citations; snippets; spell checking</li>
+      <li>Hover previews of references, citations and rendered math</li>
+      <li>Project outline, command palette, quick open, search and replace across the project</li>
+      <li>Session restore, recovery of unsaved changes, local history and a git gutter</li>
+      <li>Optional Vim mode</li>
+    </ul>
+    <p>
+      Building documents needs a TeX distribution with latexmk. The agent is optional: Lemma works
+      with Claude Code, Codex and other agents that speak the Agent Client Protocol, or with the
+      Anthropic API and your own key.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.lemma_editor.Lemma.desktop</launchable>
+  <url type="homepage">https://github.com/dharmavati213/lemma</url>
+  <url type="bugtracker">https://github.com/dharmavati213/lemma/issues</url>
+  <url type="vcs-browser">https://github.com/dharmavati213/lemma</url>
+  <categories>
+    <category>Office</category>
+    <category>Publishing</category>
+  </categories>
+  <keywords>
+    <keyword>LaTeX</keyword>
+    <keyword>TeX</keyword>
+    <keyword>math</keyword>
+    <keyword>paper</keyword>
+    <keyword>editor</keyword>
+    <keyword>agent</keyword>
+  </keywords>
+  <provides>
+    <binary>lemma</binary>
+    <mediatype>text/x-tex</mediatype>
+    <mediatype>text/x-bibtex</mediatype>
+  </provides>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>An agent's edits as hunks to accept or reject, beside the agent pane</caption>
+      <image type="source" width="1024" height="768">https://raw.githubusercontent.com/dharmavati213/lemma/main/docs/images/review.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.2.0" date="2026-10-25">
+      <url type="details">https://github.com/dharmavati213/lemma/releases/tag/zeta</url>
+      <description>
+        <p>
+          The zeta release: recovery of unsaved changes, find and replace in the file, more
+          errors explained, and much faster large documents, projects and reviews. It is the
+          first release for Windows.
+        </p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-10-20">
+      <url type="details">https://github.com/dharmavati213/lemma/releases/tag/epsilon</url>
+      <description>
+        <p>The epsilon release, Lemma's first.</p>
+      </description>
+    </release>
+  </releases>
+</component>

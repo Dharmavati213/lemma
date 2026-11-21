@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         ),
         ("highlight_follows_the_cursor", highlight_follows_cursor),
         ("highlight_follows_edits_and_undo", highlight_follows_edits),
+        ("pasted_highlights_go", pasted_highlights_go),
         ("unmatched_delimiters_are_tinted", unmatched),
         ("highlight_side_follows_the_vim_mode", vim_mode_side),
         ("tags_follow_the_style_scheme", style_scheme),
@@ -65,8 +66,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Points the XDG directories and the config file into a temporary directory, so nothing reads
 /// or writes the user's. Runs before GTK starts any thread.
 fn isolate_environment() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-pairs-env-{}", std::process::id()));
+    let root = common::target_tmpdir().join(format!("lemma-pairs-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     // SAFETY: single-threaded: GTK is not initialised yet and no thread was spawned.
@@ -511,6 +511,42 @@ fn highlight_follows_edits() {
     assert!(!buffer.is_modified());
 }
 
+/// Copying a highlighted pair and pasting it in the same document (GTK copies the tags of
+/// text pasted from the same buffer) leaves no highlight behind once the cursor moves on.
+fn pasted_highlights_go() {
+    let f = fixture("highlight-paste", &[("main.tex", DOC)]);
+    let editor = f.open("main.tex");
+    let buffer = editor.buffer();
+    let begin = offset_of(&editor, "\\begin{theorem}", 0);
+    let end = offset_of(&editor, "\\end{theorem}", 13);
+    // The cursor ends the selection right after `\end{theorem}`: the pair is highlighted.
+    buffer.select_range(
+        &editor.iter_near(end).unwrap(),
+        &editor.iter_near(begin).unwrap(),
+    );
+    pairs::refresh_now(&editor);
+    assert_eq!(
+        tagged_texts(&editor, MATCH_TAG),
+        ["\\begin{theorem}", "\\end{theorem}"]
+    );
+    let view = editor.view();
+    buffer.copy_clipboard(&view.clipboard());
+    let plain = offset_of(&editor, "Plain", 0);
+    buffer.place_cursor(&editor.iter_near(plain).unwrap());
+    view.emit_paste_clipboard();
+    common::pump_until(TIMEOUT, || {
+        editor.document().text().matches("\\begin{theorem}").count() == 2
+    });
+    cursor_to(&editor, offset_of(&editor, "Plain", 2));
+    common::pump_for(Duration::from_millis(50));
+    assert!(
+        tagged(&editor, MATCH_TAG).is_empty(),
+        "{:?}",
+        tagged_texts(&editor, MATCH_TAG)
+    );
+    assert!(tagged(&editor, UNMATCHED_TAG).is_empty());
+}
+
 fn unmatched() {
     let doc = "\\begin{document}\n\
                A {group and $x$ (see\n\
@@ -551,7 +587,7 @@ fn vim_mode_side() {
     assert!(tagged(&editor, MATCH_TAG).is_empty());
     // Insert mode: the character before the cursor counts too.
     let im = editor.vim().unwrap();
-    vim::feed_key(&im, editor.view(), gdk::Key::i, gdk::ModifierType::empty());
+    common::feed_vim_key(&im, editor.view(), gdk::Key::i, gdk::ModifierType::empty());
     assert_eq!(editor.vim_status().unwrap().mode, VimMode::Insert);
     cursor_to(&editor, after);
     assert_eq!(tagged_texts(&editor, MATCH_TAG), ["{", "}"]);
@@ -688,7 +724,7 @@ fn vim_percent() {
         editor.place_cursor_at(on_brace);
         for k in keys_before {
             assert_eq!(key(&editor, *k), glib::Propagation::Proceed);
-            vim::feed_key(&im, editor.view(), *k, none);
+            common::feed_vim_key(&im, editor.view(), *k, none);
         }
         assert!(!editor.vim_status().unwrap().command.is_empty(), "{what}");
         assert_eq!(
@@ -701,14 +737,14 @@ fn vim_percent() {
     for invisible in [gdk::Key::y, gdk::Key::r] {
         editor.place_cursor_at(on_brace);
         assert_eq!(key(&editor, invisible), glib::Propagation::Proceed);
-        vim::feed_key(&im, editor.view(), invisible, none);
+        common::feed_vim_key(&im, editor.view(), invisible, none);
         assert_eq!(
             key(&editor, gdk::Key::percent),
             glib::Propagation::Proceed,
             "{invisible:?}"
         );
         assert_eq!(editor.cursor_offset(), on_brace);
-        vim::feed_key(&im, editor.view(), gdk::Key::Escape, none);
+        common::feed_vim_key(&im, editor.view(), gdk::Key::Escape, none);
     }
     // After those, a plain `%` jumps again.
     editor.place_cursor_at(on_brace);
@@ -723,11 +759,11 @@ fn vim_percent() {
     assert_eq!(key(&editor, gdk::Key::percent), glib::Propagation::Stop);
     assert_eq!(editor.cursor_offset(), at);
     // Insert mode: `%` is a character.
-    vim::feed_key(&im, editor.view(), gdk::Key::i, none);
+    common::feed_vim_key(&im, editor.view(), gdk::Key::i, none);
     assert_eq!(key(&editor, gdk::Key::percent), glib::Propagation::Proceed);
     // Visual mode: Vim's own `%`.
-    vim::feed_key(&im, editor.view(), gdk::Key::Escape, none);
-    vim::feed_key(&im, editor.view(), gdk::Key::v, none);
+    common::feed_vim_key(&im, editor.view(), gdk::Key::Escape, none);
+    common::feed_vim_key(&im, editor.view(), gdk::Key::v, none);
     assert_eq!(editor.vim_status().unwrap().mode, VimMode::Visual);
     assert_eq!(key(&editor, gdk::Key::percent), glib::Propagation::Proceed);
 }
@@ -769,7 +805,7 @@ fn ctrl_percent() {
     let im = editor.vim().unwrap();
     let begin = offset_of(&editor, "\\begin{theorem}", 0);
     editor.place_cursor_at(begin);
-    vim::feed_key(&im, editor.view(), gdk::Key::v, gdk::ModifierType::empty());
+    common::feed_vim_key(&im, editor.view(), gdk::Key::v, gdk::ModifierType::empty());
     assert_eq!(editor.vim_status().unwrap().mode, VimMode::Visual);
     assert_eq!(pairs::jump_in(&editor), Jump::Moved);
     let (a, b) = editor.buffer().selection_bounds().expect("a selection");

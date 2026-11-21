@@ -41,7 +41,7 @@ use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Why a build was requested.
@@ -68,6 +68,21 @@ pub const LATEXMK_MISSING: &str = "latexmk was not found: install TeX Live, MacT
 
 const CSS: &str = ".lemma-build-indicator { padding: 2px 6px; }";
 
+/// Answers "Choose the Main Document" instead of the file dialog (see [`set_root_dialog_hook`]):
+/// the file chosen, `None` for Cancel.
+pub type RootDialogHook = dyn Fn() -> Option<PathBuf>;
+
+thread_local! {
+    static ROOT_DIALOG_HOOK: RefCell<Option<Rc<RootDialogHook>>> = const { RefCell::new(None) };
+}
+
+/// Makes F5 without a main document ask `hook` which file is the main document instead of
+/// showing the file dialog (tests, also in windows that quit by themselves); `None` shows the
+/// dialog again.
+pub fn set_root_dialog_hook(hook: Option<Box<RootDialogHook>>) {
+    ROOT_DIALOG_HOOK.with_borrow_mut(|h| *h = hook.map(Rc::from));
+}
+
 /// Directory levels above a document that are searched for its root document.
 const ROOT_SEARCH_LEVELS: usize = 2;
 /// At most this many files are read to find the root and the `\include` directories.
@@ -77,8 +92,27 @@ const MAX_INDEXED_BYTES: u64 = 1 << 20;
 
 /// What a build thread reports.
 enum BuildMsg {
-    Started(Canceller),
+    /// A latexmk started (the build's, or `latexmk -c` before it).
+    Started,
     Finished(Box<Finished>),
+}
+
+/// The latexmk a build thread runs, shared with the main thread: a Stop reaches it even before
+/// the main thread has heard that it started. A window closed right after a save's build began
+/// (Ctrl+S, then Ctrl+Q) may never run its main loop again, so a canceller that only came
+/// through the channel would never be used, and latexmk would outlive Lemma.
+#[derive(Default)]
+struct StopSlot {
+    /// Stop was asked for: a latexmk that starts from now on is stopped at once.
+    stopped: bool,
+    /// The canceller of the latexmk that runs (or ran last).
+    canceller: Option<Canceller>,
+}
+
+type SharedStop = Arc<Mutex<StopSlot>>;
+
+fn lock_stop(slot: &SharedStop) -> MutexGuard<'_, StopSlot> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct Finished {
@@ -94,7 +128,8 @@ struct Running {
     reason: Reason,
     /// `latexmk -c` runs first (Clean Build Files and Rebuild).
     clean: bool,
-    canceller: Option<Canceller>,
+    /// The latexmk the build thread runs, and whether it is to be stopped.
+    stop: SharedStop,
     stop_requested: bool,
     /// The edits made since the build's sources were saved.
     journal: Option<EditJournal>,
@@ -134,6 +169,8 @@ struct Inner {
     /// Root detections run on the jobs thread (tests).
     detections: Cell<u64>,
     last: RefCell<Option<BuildOutcome>>,
+    /// The root of the last finished build (`remembered_root` may already be a newer request's).
+    last_root: RefCell<Option<PathBuf>>,
     finished: RefCell<Vec<Rc<FinishedFn>>>,
     /// The toast of the last build or failed request, while it is shown or waits to be.
     toast: RefCell<Option<adw::Toast>>,
@@ -189,6 +226,13 @@ impl BuildController {
     /// The outcome of the last finished build.
     pub fn last_outcome(&self) -> Option<BuildOutcome> {
         self.inner.last.borrow().clone()
+    }
+
+    /// The root document of the last finished build, whose outcome the observers of
+    /// [`Self::connect_finished`] get. [`Self::root`] can already be the root of a build
+    /// requested since.
+    pub fn last_root(&self) -> Option<PathBuf> {
+        self.inner.last_root.borrow().clone()
     }
 
     /// Calls `f` after every finished build, after the diagnostics and the PDF were updated.
@@ -281,7 +325,7 @@ impl Inner {
     /// build's line numbers can be mapped to the text when it finishes.
     ///
     /// Without a detectable root, only a manual build (F5) asks which file is the main
-    /// document; other builds just say so in the status bar.
+    /// document (Cancel says nothing); other builds just say so in the status bar.
     async fn prepare(
         self: &Rc<Self>,
         reason: Reason,
@@ -320,10 +364,7 @@ impl Inner {
                     .set_text("Not built: no main document (F5 to choose one)");
                 return Err(None);
             }
-            let chosen = self
-                .ask_root(&state)
-                .await
-                .ok_or_else(|| Some("Could not find the main document to build".to_owned()))?;
+            let chosen = self.ask_root(&state).await?;
             if let Some(dir) = state
                 .active_editor()
                 .and_then(|e| e.document().path().parent().map(Path::to_path_buf))
@@ -448,10 +489,15 @@ impl Inner {
         Ok(detection)
     }
 
-    /// Asks the user once which file is the main document (interactive runs only).
-    async fn ask_root(&self, state: &Rc<WindowState>) -> Option<PathBuf> {
+    /// Asks the user once which file is the main document (interactive runs only). Cancel is
+    /// no error: `Err(None)`, nothing to report.
+    async fn ask_root(&self, state: &Rc<WindowState>) -> Result<PathBuf, Option<String>> {
+        let not_found = || Some("Could not find the main document to build".to_owned());
+        if let Some(hook) = ROOT_DIALOG_HOOK.with_borrow(Clone::clone) {
+            return hook().ok_or(None);
+        }
         if state.scripted {
-            return None;
+            return Err(not_found());
         }
         let filter = gtk::FileFilter::new();
         filter.set_name(Some("LaTeX Documents"));
@@ -469,8 +515,19 @@ impl Inner {
             .default_filter(&filter)
             .initial_folder(&gio::File::for_path(folder))
             .build();
-        let file = dialog.open_future(Some(&state.window)).await.ok()?;
-        file.path()
+        match dialog.open_future(Some(&state.window)).await {
+            Ok(file) => file.path().ok_or_else(not_found),
+            Err(e)
+                if e.matches(gtk::DialogError::Dismissed)
+                    || e.matches(gtk::DialogError::Cancelled) =>
+            {
+                Err(None)
+            }
+            Err(e) => Err(Some(format!(
+                "Could not choose the main document: {}",
+                e.message()
+            ))),
+        }
     }
 
     fn enqueue(self: &Rc<Self>, request: BuildRequest, reason: Reason, journal: EditJournal) {
@@ -503,11 +560,12 @@ impl Inner {
             request.engine,
             if clean { ", cleaned first" } else { "" }
         );
+        let stop = SharedStop::default();
         self.running.replace(Some(Running {
             request: request.clone(),
             reason,
             clean,
-            canceller: None,
+            stop: stop.clone(),
             stop_requested: false,
             journal,
         }));
@@ -523,7 +581,7 @@ impl Inner {
             });
         let spawned = std::thread::Builder::new()
             .name("build".into())
-            .spawn(move || run_build(&thread_request, clean, options, &tx));
+            .spawn(move || run_build(&thread_request, clean, options, &stop, &tx));
         if let Err(e) = spawned {
             let outcome = BuildOutcome::spawn_failed(&e);
             self.finish(Finished {
@@ -540,7 +598,7 @@ impl Inner {
                     return;
                 };
                 match message {
-                    BuildMsg::Started(canceller) => inner.started(canceller),
+                    BuildMsg::Started => inner.started(),
                     BuildMsg::Finished(finished) => {
                         inner.finish(*finished);
                         return;
@@ -550,20 +608,14 @@ impl Inner {
         });
     }
 
-    /// A latexmk of the running build started (the build's, or `latexmk -c` before it).
-    fn started(&self, canceller: Canceller) {
+    /// A latexmk of the running build started (the build's, or `latexmk -c` before it). The
+    /// build thread stopped it already if a Stop came first ([`StopSlot`]).
+    fn started(&self) {
         // A latexmk runs, so a missing one is worth explaining again. Only a start says so: a
         // build that ends without one (no build thread, an output directory that cannot be
         // created, a latexmk that cannot be executed) says nothing about whether it is
         // installed.
         self.latexmk_missing_told.set(false);
-        let mut running = self.running.borrow_mut();
-        if let Some(running) = running.as_mut() {
-            if running.stop_requested {
-                canceller.cancel();
-            }
-            running.canceller = Some(canceller);
-        }
     }
 
     fn stop(&self) {
@@ -578,7 +630,9 @@ impl Inner {
             let mut running = self.running.borrow_mut();
             if let Some(running) = running.as_mut() {
                 running.stop_requested = true;
-                if let Some(canceller) = &running.canceller {
+                let mut slot = lock_stop(&running.stop);
+                slot.stopped = true;
+                if let Some(canceller) = &slot.canceller {
                     canceller.cancel();
                 }
             }
@@ -604,9 +658,18 @@ impl Inner {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let (root, reason, journal) = match running {
-            Some(running) => (running.request.root, running.reason, running.journal),
-            None => (PathBuf::new(), Reason::Manual, None),
+        let (root, timeout, reason, journal) = match running {
+            Some(running) => {
+                // Its root, for what the outcome's files belong to (`last_root`).
+                self.last_root.replace(Some(running.request.root.clone()));
+                (
+                    running.request.root,
+                    running.request.timeout,
+                    running.reason,
+                    running.journal,
+                )
+            }
+            None => (PathBuf::new(), Duration::ZERO, Reason::Manual, None),
         };
         tracing::info!(
             "build of {} finished: {:?} in {:.1?}",
@@ -629,7 +692,7 @@ impl Inner {
         }
         self.last.replace(Some(outcome.clone()));
         let next = self.queue.borrow_mut().finished();
-        self.show_result(&state, &outcome, &root, reason, copy_error);
+        self.show_result(&state, &outcome, &root, timeout, reason, copy_error);
         let observers = self.finished.borrow().clone();
         for observer in observers {
             observer(&outcome);
@@ -760,11 +823,14 @@ impl Inner {
         button.set_action_name(Some("win.stop-build"));
     }
 
+    /// Shows the outcome of the build of `root`, which ran with `timeout`, in the indicator, the
+    /// status bar and a toast.
     fn show_result(
         self: &Rc<Self>,
         state: &Rc<WindowState>,
         outcome: &BuildOutcome,
         root: &Path,
+        timeout: Duration,
         reason: Reason,
         copy_error: Option<String>,
     ) {
@@ -839,10 +905,11 @@ impl Inner {
                 },
                 true,
             )),
+            // The build's own timeout: `[build] timeout_s` may have changed while it ran.
             BuildStatus::TimedOut => Some((
                 format!(
                     "Build timed out after {} s and was stopped",
-                    state.config.build.timeout_s
+                    timeout.as_secs()
                 ),
                 false,
             )),
@@ -932,9 +999,10 @@ fn earlier_pdf_text(modified: Option<SystemTime>) -> String {
     }
 }
 
-/// The build thread: runs `latexmk -c` first when `clean` is set, starts latexmk, reports its
-/// canceller (the clean-up's first), waits, and maps the diagnostics to problems (which touches
-/// the file system, so it happens here rather than on the main thread). A failed clean-up is the
+/// The build thread: runs `latexmk -c` first when `clean` is set, starts latexmk, puts its
+/// canceller (the clean-up's first) into `stop` and reports the start, waits, and maps the
+/// diagnostics to problems (which touches the file system, so it happens here rather than on the
+/// main thread). A latexmk that starts after a Stop is stopped at once. A failed clean-up is the
 /// build's outcome: the files it was to remove would make the build fail again. A stopped one
 /// ends the build (and removes the precompiled preamble). With `copy_pdf`, a PDF the build wrote
 /// is copied next to the root document.
@@ -947,11 +1015,19 @@ fn run_build(
     request: &BuildRequest,
     clean: bool,
     options: ThreadOptions,
+    stop: &SharedStop,
     tx: &async_channel::Sender<BuildMsg>,
 ) {
-    // The receiver only goes away with the window; the build is still waited for.
-    let started = |canceller| {
-        let _ = tx.send_blocking(BuildMsg::Started(canceller));
+    let started = |canceller: Canceller| {
+        {
+            let mut slot = lock_stop(stop);
+            if slot.stopped {
+                canceller.cancel();
+            }
+            slot.canceller = Some(canceller);
+        }
+        // The receiver only goes away with the window; the build is still waited for.
+        let _ = tx.send_blocking(BuildMsg::Started);
     };
     let run = |build: io::Result<Build>| match build {
         Ok(build) => {
@@ -1359,6 +1435,7 @@ pub fn install(state: &Rc<WindowState>) -> BuildController {
         tab_detections: RefCell::new(TabDetections::default()),
         detections: Cell::new(0),
         last: RefCell::new(None),
+        last_root: RefCell::new(None),
         finished: RefCell::new(Vec::new()),
         toast: RefCell::new(None),
         clean_next: Cell::new(false),
@@ -1533,8 +1610,7 @@ mod tests {
 
     #[test]
     fn detection_finds_the_root_engine_and_include_dirs() {
-        let dir = std::env::temp_dir().join(format!("lemma-detect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-detect-").unwrap();
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
         let dir = lemma_core::canonicalize(&dir).unwrap();
         let main = "\\documentclass{book}\n\\usepackage{fontspec}\n\\begin{document}\n\
@@ -1614,8 +1690,7 @@ mod tests {
 
     #[test]
     fn detection_reads_only_regular_files_lossily_and_bounded() {
-        let dir = std::env::temp_dir().join(format!("lemma-read-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-read-").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let latin1 = dir.join("latin1.tex");
         std::fs::write(&latin1, b"\\input{caf\xe9}\n").unwrap();
@@ -1656,8 +1731,7 @@ mod tests {
 
     #[test]
     fn a_chosen_root_applies_below_its_directory_only() {
-        let dir = std::env::temp_dir().join(format!("lemma-chosen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-chosen-").unwrap();
         for sub in ["a/notes", "b"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }

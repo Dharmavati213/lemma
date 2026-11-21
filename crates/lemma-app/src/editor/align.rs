@@ -3,7 +3,8 @@
 //! - **Align Columns** (`win.align-columns`, Ctrl+Shift+A, palette): in the innermost
 //!   environment of the `&` family around the cursor ([`ALIGN_FAMILY`]: align, alignat,
 //!   aligned, flalign, eqnarray, split, cases, tabular and friends, array, the matrices), pads
-//!   the cells of every row line so that the `&` line up, and the `\\` of the full rows too.
+//!   the cells of every row line so that the `&` line up, and the `\\` of the full rows too
+//!   (by display width: a CJK character or an emoji takes two columns, a combining mark none).
 //!   A row line is a body line (between the `\begin` and `\end` lines) with an `&` outside
 //!   braces, nested environments and comments; `\&`, `\\`, `\%` and `\{` are escapes. Lines
 //!   without `&` (`\hline`, a row continued from the line before), lines inside a nested
@@ -25,6 +26,7 @@ use super::pairs::{self, EnvSpan};
 use crate::app::{self, ShortcutGroup};
 use crate::window::WindowState;
 use adw::prelude::*;
+use glib::Unichar;
 use lemma_core::{Origin, TextEdit};
 use std::ops::Range;
 use std::rc::Rc;
@@ -174,6 +176,26 @@ fn split_line<'a>(line: &'a str, depth: &mut i32) -> Line<'a> {
     }
 }
 
+/// The columns `s` takes in a monospace font, as terminals and editors count them: two for a
+/// wide character (CJK ideographs, kana, Hangul, fullwidth forms, most emoji), none for a
+/// combining mark or another character that takes no room of its own (GLib's
+/// `g_unichar_iszerowidth`: accents written as a separate code point, zero-width joiners,
+/// variation selectors), one for the rest. A tab counts as one column, as before: rows take the
+/// same indentation, and a tab inside a cell is rare.
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            if c.is_zero_width() {
+                0
+            } else if c.is_wide() {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 /// The aligned form of the body lines `lines` (`None` for each line left as it is).
 pub fn align_lines(lines: &[&str]) -> Vec<Option<String>> {
     let mut depth = 0;
@@ -213,7 +235,7 @@ pub fn align_lines(lines: &[&str]) -> Vec<Option<String>> {
         let full = row.len() == columns && parsed[rows[k]].tail.is_some();
         for (i, c) in row.iter().enumerate() {
             if i + 1 < row.len() || full {
-                widths[i] = widths[i].max(c.chars().count());
+                widths[i] = widths[i].max(display_width(c));
             }
         }
     }
@@ -225,7 +247,7 @@ pub fn align_lines(lines: &[&str]) -> Vec<Option<String>> {
         for (i, c) in row.iter().enumerate() {
             let last = i + 1 == row.len();
             let width = if !last || full { widths[i] } else { 0 };
-            let pad = width.saturating_sub(c.chars().count());
+            let pad = width.saturating_sub(display_width(c));
             s.push_str(c);
             s.extend(std::iter::repeat_n(' ', pad));
             if !last {
@@ -621,6 +643,23 @@ mod tests {
                 "tabular",
                 "\\begin{tabular}{ll}\nα & x \\\\\nabc & y \\\\\n\\end{tabular}",
                 "\\begin{tabular}{ll}\nα   & x \\\\\nabc & y \\\\\n\\end{tabular}",
+            ),
+            // CJK characters and emoji take two columns, combining marks none (`é` written as
+            // `e` and U+0301 takes one column, as the precomposed `é` does).
+            (
+                "tabular",
+                "\\begin{tabular}{ll}\n数学 & x \\\\\nabcde & y \\\\\n\\end{tabular}",
+                "\\begin{tabular}{ll}\n数学  & x \\\\\nabcde & y \\\\\n\\end{tabular}",
+            ),
+            (
+                "tabular",
+                "\\begin{tabular}{ll}\n🙂 & x \\\\\nab & y \\\\\nabc & z \\\\\n\\end{tabular}",
+                "\\begin{tabular}{ll}\n🙂  & x \\\\\nab  & y \\\\\nabc & z \\\\\n\\end{tabular}",
+            ),
+            (
+                "align",
+                "\\begin{align}\n  e\u{301}t\u{e9} &= 1 \\\\\n  abcd &= 2\n\\end{align}",
+                "\\begin{align}\n  e\u{301}t\u{e9}  &= 1 \\\\\n  abcd &= 2\n\\end{align}",
             ),
         ];
         for &(name, text, want) in cases {

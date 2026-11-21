@@ -6,9 +6,12 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_agent::{EditorRequest, ToolReply};
 use lemma_app::agent::AgentState;
+use lemma_app::agent::history::{self, HistoryReason};
 use lemma_app::agent_edits;
 use lemma_app::document::DocRef;
 use lemma_app::editor::Editor;
@@ -18,7 +21,7 @@ use lemma_app::testmode::{self, review::reply_text};
 use lemma_app::window::{PAGE_CHANGES, WindowState};
 use lemma_app::workspace::Workspace;
 use lemma_config::{Config, Paths};
-use lemma_core::{ProjectRoot, fnv1a64};
+use lemma_core::{Origin, ProjectRoot, TextEdit, fnv1a64};
 use lemma_review::HunkId;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -28,25 +31,51 @@ use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     // Rejecting a file the agent created moves it to the trash: keep that out of the user's.
-    let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-persist-data-{}", std::process::id()));
+    let data = common::target_tmpdir().join(format!("lemma-persist-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
     common::run(&[
         ("turn_groups_and_counts_agree", groups_and_counts),
         ("keep_turn_and_reject_turn", keep_and_reject_turn),
+        (
+            "reject_turn_takes_back_part_of_a_hunk",
+            reject_turn_takes_back_part_of_a_hunk,
+        ),
+        ("rejected_new_file_comes_back", rejected_new_file_comes_back),
+        (
+            "a_rejected_new_file_without_a_trash_is_deleted_and_comes_back",
+            rejected_new_file_without_a_trash,
+        ),
+        (
+            "a_trashed_file_comes_back_only_for_its_own_decision",
+            trashed_file_of_its_own_decision,
+        ),
+        ("banner_names_the_source", banner_names_the_source),
         ("undo_last_turn_and_alt_u", undo_last_turn),
         ("running_turn_is_not_decided", running_turn),
         ("turn_ex_commands", turn_ex_commands),
         ("close_and_reopen_restores_the_hunks", close_and_reopen),
         ("mismatched_disk_hash_restores_nothing", mismatched_hash),
+        (
+            "changed_outside_between_sessions",
+            changed_outside_between_sessions,
+        ),
+        (
+            "changed_outside_then_edited_first",
+            changed_outside_then_edited_first,
+        ),
+        (
+            "changed_outside_then_edited_during_the_history_lookup",
+            changed_outside_then_edited_during_the_lookup,
+        ),
         ("unsaved_typing_keeps_the_saved_entry", unsaved_typing),
         (
             "restored_turns_come_before_this_session",
             turns_after_restore,
         ),
         ("writes_are_debounced_and_cleared", debounced_writes),
+        ("writes_while_typing_goes_on", writes_while_typing_goes_on),
         ("bare_list_files_are_read", bare_list_file),
         ("persistence_is_off_for_scripted_runs", scripted_runs),
         ("snapshot_two_turns", snapshot_two_turns),
@@ -388,6 +417,313 @@ fn keep_and_reject_turn() {
     f.close();
 }
 
+/// Reject Turn on a hunk that also holds a change of no turn (another program changed the next
+/// line, and the open document reloaded it): only the turn's edit is taken back. The toast said
+/// the turn had no pending changes, without an Undo, and Alt+U did not bring the edit back (the
+/// decision was not recorded).
+fn reject_turn_takes_back_part_of_a_hunk() {
+    let paths = temp_paths("partial");
+    let f = window(&two_file_project("partial"), &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.edit("a.tex", "a 5\n", "a five\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    let doc = f.doc("a.tex");
+    let at = doc.text().find("a 6\n").unwrap();
+    doc.apply_edits(
+        &[TextEdit {
+            range: at..at + 3,
+            text: "a SIX".into(),
+        }],
+        Origin::Reload,
+    )
+    .unwrap();
+    review_ui::recompute(&doc);
+    assert_eq!(f.turns("a.tex"), [vec![1]], "one hunk, lines 5–6");
+    let outcome = review_ui::decide_turn(&f.state, 1, Decision::Reject);
+    let reloaded = lines("a", 20).replace("a 6\n", "a SIX\n");
+    common::pump_until(TIMEOUT, || f.disk("a.tex") == reloaded);
+    assert_eq!(doc.text(), reloaded);
+    assert_eq!(f.turns("a.tex"), [Vec::<u32>::new()], "the reload is left");
+    assert_eq!((outcome.decided, outcome.partly, outcome.files), (0, 1, 1));
+    let toasts = toast_titles(&f.state);
+    assert!(
+        toasts.iter().any(|t| t
+            == "Rejected turn 1's part of 1 change in 1 file (the other edits there are left \
+                to review)"),
+        "{toasts:?}"
+    );
+    assert!(
+        toasts.iter().any(|t| t == "_Undo" || t == "Undo"),
+        "{toasts:?}"
+    );
+    // One Alt+U brings the turn's edit back.
+    f.action("review-undo", None);
+    assert_eq!(
+        doc.text(),
+        lines("a", 20).replace("a 5\na 6\n", "a five\na SIX\n")
+    );
+    assert_eq!(f.turns("a.tex"), [vec![1]]);
+    f.close();
+}
+
+/// A file the agent created and the user typed in, rejected whole: it goes to the trash, and the
+/// toast's Undo (Alt+U) brings it back with its tab, the agent's text and the user's, under
+/// review as it was. That Undo did nothing ("no longer under review"): the file's document and
+/// review were gone. The text before the reject is in the local history too (the typing was
+/// never saved, and the trash has the file as it was last saved).
+fn rejected_new_file_comes_back() {
+    common::require_private_trash();
+    let paths = temp_paths("untrash");
+    let f = window(&two_file_project("untrash"), &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.write("notes/new.tex", "fresh\ntext\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    let editor = f.open("notes/new.tex");
+    let buffer = editor.buffer();
+    buffer.insert(&mut buffer.iter_at_offset(5), " mine");
+    let typed = "fresh mine\ntext\n";
+    let doc = f.doc("notes/new.tex");
+    review_ui::recompute_if_stale(&doc);
+    let ids = f.ids("notes/new.tex");
+    let touched = |doc: &DocRef| {
+        doc.review
+            .borrow()
+            .as_ref()
+            .is_some_and(|r| r.hunks().iter().all(|h| h.user_touched))
+    };
+    assert_eq!(ids.len(), 1);
+    assert!(touched(&doc));
+    review_ui::decide_document(&f.state, &doc, Decision::Reject);
+    let path = f.path("notes/new.tex");
+    common::pump_until(TIMEOUT, || !path.exists());
+    assert!(f.state.workspace.get(&path).is_none());
+    wait_toast(
+        &f.state,
+        "Rejected new.tex: the new file went to the trash with your edits in it",
+    );
+    block_on(history::flush(&f.state));
+    let entries = block_on(history::entries(&f.state, &path));
+    assert_eq!(
+        entries.first().map(|e| e.reason),
+        Some(HistoryReason::Reject),
+        "{entries:?}"
+    );
+    assert_eq!(
+        block_on(history::load(&f.state, &entries[0])).as_deref(),
+        Ok(typed)
+    );
+    // The toast's Undo.
+    f.action("review-undo", None);
+    common::pump_until(TIMEOUT, || {
+        f.state
+            .workspace
+            .get(&path)
+            .is_some_and(|d| review_ui::hunk_count(&d) > 0)
+    });
+    let doc = f.doc("notes/new.tex");
+    assert_eq!(doc.text(), typed);
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(&path).is_ok_and(|t| t == typed)
+    });
+    assert_eq!(f.ids("notes/new.tex"), ids, "the same change");
+    assert!(touched(&doc), "with the user's edits in it");
+    assert_eq!(f.turns("notes/new.tex"), [vec![1]]);
+    assert!(f.state.editor_for(&doc).is_some(), "its tab is back");
+    // Still a file the agent created: rejecting it again trashes it again.
+    review_ui::decide_document(&f.state, &doc, Decision::Reject);
+    common::pump_until(TIMEOUT, || !path.exists());
+    f.close();
+}
+
+/// A project on a file system without a trash (a container's volume, some network mounts;
+/// here the memory file system of `/dev/shm`, which GIO never trashes on). Rejecting a file the
+/// agent created deletes it there: it stayed on disk with the agent's text in it, no longer
+/// under review, and a toast said that it could not be moved to the trash. The toast says what
+/// happened, the text is in the local history, and Alt+U brings the file back for review.
+fn rejected_new_file_without_a_trash() {
+    let shm = Path::new("/dev/shm");
+    let dir = shm.join(format!("lemma-app-{}-no-trash", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if !cfg!(target_os = "linux") || std::fs::create_dir_all(&dir).is_err() {
+        println!("    SKIP: no /dev/shm to make a project in");
+        return;
+    }
+    let probe = dir.join("probe");
+    std::fs::write(&probe, "x").unwrap();
+    if gio::File::for_path(&probe)
+        .trash(None::<&gio::Cancellable>)
+        .is_ok()
+    {
+        println!("    SKIP: /dev/shm has a trash here");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    std::fs::remove_file(&probe).unwrap();
+    std::fs::write(dir.join("a.tex"), lines("a", 20)).unwrap();
+    let paths = temp_paths("no-trash");
+    let f = window(&dir, &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.write("notes/new.tex", "fresh\ntext\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    let path = f.path("notes/new.tex");
+    let doc = f.doc("notes/new.tex");
+    let ids = f.ids("notes/new.tex");
+    review_ui::decide_document(&f.state, &doc, Decision::Reject);
+    common::pump_until(TIMEOUT, || !path.exists());
+    assert!(f.state.workspace.get(&path).is_none());
+    wait_toast(&f.state, "new.tex was deleted: this folder has no trash");
+    assert!(
+        !toast_titles(&f.state)
+            .iter()
+            .any(|t| t.contains("Could not move")),
+        "{:?}",
+        toast_titles(&f.state)
+    );
+    block_on(history::flush(&f.state));
+    let entries = block_on(history::entries(&f.state, &path));
+    assert_eq!(
+        block_on(history::load(&f.state, &entries[0])).as_deref(),
+        Ok("fresh\ntext\n"),
+        "the rejected text is in the local history"
+    );
+    f.action("review-undo", None);
+    common::pump_until(TIMEOUT, || {
+        f.state
+            .workspace
+            .get(&path)
+            .is_some_and(|d| review_ui::hunk_count(&d) > 0)
+    });
+    assert_eq!(f.doc("notes/new.tex").text(), "fresh\ntext\n");
+    assert_eq!(f.ids("notes/new.tex"), ids, "the same change");
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(&path).is_ok_and(|t| t == "fresh\ntext\n")
+    });
+    f.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file the agent created, rejected (to the trash), created again and kept, its tab closed:
+/// Alt+U of the keep says the file left the review. It took the trashed first version for the
+/// keep's, and said "exists again" (with the file deleted meanwhile, it brought the rejected
+/// text back). Alt+U of the reject then comes to the trashed file; while a file of that name
+/// exists it cannot come back, and once that file is gone, the next Alt+U brings it back (the
+/// failed attempt used it up).
+fn trashed_file_of_its_own_decision() {
+    common::require_private_trash();
+    let paths = temp_paths("untrash-own");
+    let f = window(&two_file_project("untrash-own"), &paths);
+    f.open("a.tex");
+    let path = f.path("notes/new.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.write("notes/new.tex", "first\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    review_ui::decide_document(&f.state, &f.doc("notes/new.tex"), Decision::Reject);
+    common::pump_until(TIMEOUT, || {
+        !path.exists() && f.state.workspace.get(&path).is_none()
+    });
+    review_ui::on_turn_started(&f.state, 2);
+    f.write("notes/new.tex", "second\n");
+    review_ui::on_turn_ended(&f.state, 2);
+    let editor = f.open("notes/new.tex");
+    review_ui::decide_document(&f.state, editor.document(), Decision::Accept);
+    f.state.close_editor(&editor, false);
+    drop(editor);
+    common::pump_until(TIMEOUT, || f.state.workspace.get(&path).is_none());
+    // Alt+U of the keep.
+    f.action("review-undo", None);
+    wait_toast(
+        &f.state,
+        "Cannot undo the last decision: notes/new.tex is no longer under review",
+    );
+    common::pump_for(Duration::from_millis(200));
+    assert_eq!(f.disk("notes/new.tex"), "second\n");
+    assert!(f.state.workspace.get(&path).is_none());
+    // Alt+U of the reject: the file exists.
+    f.action("review-undo", None);
+    wait_toast(
+        &f.state,
+        "Cannot undo the last decision: notes/new.tex exists again",
+    );
+    assert_eq!(f.disk("notes/new.tex"), "second\n");
+    // Once it is gone, Alt+U again.
+    std::fs::remove_file(&path).unwrap();
+    f.action("review-undo", None);
+    common::pump_until(TIMEOUT, || {
+        f.state
+            .workspace
+            .get(&path)
+            .is_some_and(|d| review_ui::hunk_count(&d) > 0)
+    });
+    assert_eq!(f.doc("notes/new.tex").text(), "first\n");
+    f.close();
+}
+
+/// The banner names who made what is under review: a restore from History (the banner said
+/// "Claude changed …" of it), the agent, or several sources. Undo Last Turn takes back the
+/// agent's turn and leaves the restore alone.
+fn banner_names_the_source() {
+    let paths = temp_paths("source");
+    let f = window(&two_file_project("source"), &paths);
+    let editor = f.open("a.tex");
+    let doc = f.doc("a.tex");
+    let old = doc.text();
+    history::record(&f.state, &f.path("a.tex"), &old, HistoryReason::Save);
+    block_on(history::flush(&f.state));
+    // The user rewrites line 3 and saves; then restores the old version.
+    let buffer = editor.buffer();
+    let at = old.find("a 3").unwrap();
+    let (mut s, mut e) = (
+        doc.iter_at_byte(at).unwrap(),
+        doc.iter_at_byte(at + 3).unwrap(),
+    );
+    buffer.delete(&mut s, &mut e);
+    buffer.insert(&mut doc.iter_at_byte(at).unwrap(), "a three");
+    block_on(doc.save()).unwrap();
+    let entries = block_on(history::entries(&f.state, &f.path("a.tex")));
+    let entry = entries
+        .iter()
+        .find(|e| block_on(history::load(&f.state, e)).is_ok_and(|t| t == old))
+        .expect("the recorded entry");
+    block_on(history::restore(&f.state, &doc, entry)).unwrap();
+    assert_eq!(doc.text(), old);
+    let titles =
+        |f: &Fixture| -> Vec<String> { f.panel_groups().into_iter().map(|(t, _)| t).collect() };
+    assert_eq!(titles(&f), ["Restore from History · 1 change in 1 file"]);
+    assert_eq!(
+        f.state.banner.title(),
+        "Restore from History · 1 file · 1 hunk"
+    );
+    // An agent turn too: two sources.
+    review_ui::on_turn_started(&f.state, 1);
+    f.edit("b.tex", "b 7\n", "b seven\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    f.refresh();
+    assert_eq!(
+        f.state.banner.title(),
+        "Changes to review · 2 files · 2 hunks"
+    );
+    // Undo Last Turn takes back the agent's turn, not the restore.
+    review_ui::undo_last_turn(&f.state);
+    common::pump_until(TIMEOUT, || f.disk("b.tex") == lines("b", 20));
+    assert_eq!(doc.text(), old);
+    f.refresh();
+    assert_eq!(
+        f.state.banner.title(),
+        "Restore from History · 1 file · 1 hunk"
+    );
+    // The restore kept, the agent's change alone is the agent's.
+    review_ui::decide_document(&f.state, &doc, Decision::Accept);
+    review_ui::on_turn_started(&f.state, 2);
+    f.edit("b.tex", "b 9\n", "b nine\n");
+    review_ui::on_turn_ended(&f.state, 2);
+    f.refresh();
+    assert_eq!(f.state.banner.title(), "Claude changed 1 file · 1 hunk");
+    f.close();
+}
+
 fn undo_last_turn() {
     let paths = temp_paths("undo-turn");
     let f = window(&two_file_project("undo-turn"), &paths);
@@ -516,7 +852,7 @@ fn close_and_reopen() {
     // Closing wrote everything.
     let saved = read_state(&file);
     assert_eq!(saved.reviews.len(), 3);
-    assert_eq!(saved.root, dir.canonicalize().unwrap());
+    assert_eq!(saved.root, dir.canonical().unwrap());
     let saved_turns: Vec<u32> = saved.turns.iter().map(|t| t.turn).collect();
     assert_eq!(saved_turns, [1, 2]);
     assert!(
@@ -565,7 +901,9 @@ fn close_and_reopen() {
     assert!(titles[0].starts_with("Turn 2 · ") && titles[0].ends_with("2 changes in 2 files"));
     assert!(titles[1].starts_with("Turn 1 · ") && titles[1].ends_with("1 change in 1 file"));
     assert_eq!(titles[2], "Several turns · 1 change in 1 file");
-    // The restored new file is still trashed when it is rejected.
+    // The restored new file is still trashed when it is rejected. (The rest is left out where
+    // the tests have no trash of their own.)
+    common::require_private_trash();
     let new = g.doc("notes/new.tex");
     review_ui::decide_document(&g.state, &new, Decision::Reject);
     common::pump_until(TIMEOUT, || !g.path("notes/new.tex").exists());
@@ -585,8 +923,10 @@ fn mismatched_hash() {
     let file = f.state_file();
     f.close();
     assert_eq!(read_state(&file).reviews.len(), 2);
-    // Another program changes b.tex: its review no longer applies.
+    // Another program changes b.tex: its review no longer applies, and the local history that
+    // has the text it was saved with is gone too.
     std::fs::write(dir.join("b.tex"), lines("B", 20)).unwrap();
+    let _ = std::fs::remove_dir_all(paths.history_dir());
     let g = window(&dir, &paths);
     // Nothing is restored before a document is shown.
     common::pump_for(Duration::from_millis(200));
@@ -603,10 +943,247 @@ fn mismatched_hash() {
         g.state.banner.title(),
         "Restored 2 pending changes from your last session"
     );
+    // The user is told which file lost its pending changes, and why: what the agent changed
+    // there now passes for the user's own text (it was dropped without a word).
+    wait_toast(&g.state, "b.tex (it was changed outside Lemma)");
+    assert!(
+        toast_titles(&g.state)
+            .iter()
+            .any(|t| t.contains("no longer marked for review")),
+        "{:?}",
+        toast_titles(&g.state)
+    );
     // The file is rewritten without b.tex.
     wait_state(&file, |s| s.is_some_and(|s| s.reviews.len() == 1));
     assert_eq!(read_state(&file).reviews[0].review.path, Path::new("a.tex"));
     g.close();
+}
+
+/// Another program changed one reviewed file and deleted another between two sessions. The
+/// text the first review was saved with is in the local history: its review comes back on it
+/// and the other program's change is a change to review too (as it is when Lemma sees it
+/// happen), and a toast says so; the deleted file's loss is told.
+fn changed_outside_between_sessions() {
+    let paths = temp_paths("outside");
+    let dir = project(
+        "outside",
+        &[
+            ("a.tex", &lines("a", 20)),
+            ("b.tex", &lines("b", 20)),
+            ("c.tex", &lines("c", 20)),
+        ],
+    );
+    let f = window(&dir, &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.edit("a.tex", "a 2\n", "a two\n");
+    f.edit("b.tex", "b 7\n", "b seven\n");
+    f.edit("c.tex", "c 3\n", "c three\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    let b_ids = f.ids("b.tex");
+    block_on(history::flush(&f.state));
+    let file = f.state_file();
+    f.close();
+    assert_eq!(read_state(&file).reviews.len(), 3);
+    // Another program changes b.tex further down, and deletes c.tex.
+    let agent_b = std::fs::read_to_string(dir.join("b.tex")).unwrap();
+    std::fs::write(
+        dir.join("b.tex"),
+        agent_b.replace("b 15\n", "b fifteen (outside)\n"),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("c.tex")).unwrap();
+
+    let g = window(&dir, &paths);
+    g.open("a.tex");
+    g.wait_restored();
+    let b = g.doc("b.tex");
+    assert_eq!(
+        b.text(),
+        std::fs::read_to_string(dir.join("b.tex")).unwrap()
+    );
+    // The agent's change keeps its id and turn; the other program's is under review apart.
+    assert_eq!(g.ids("b.tex").len(), 2, "{:?}", g.turns("b.tex"));
+    assert_eq!(g.ids("b.tex")[0], b_ids[0]);
+    assert_eq!(g.turns("b.tex"), [vec![1], vec![]]);
+    // Toasts say both (one at a time: the first stays until it is dismissed).
+    common::pump_until(TIMEOUT, || !toast_titles(&g.state).is_empty());
+    let toasts: Vec<String> = toast_titles(&g.state)
+        .into_iter()
+        .chain(queued_toast_titles(&g.state))
+        .collect();
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t.contains("b.tex was changed outside Lemma")),
+        "{toasts:?}"
+    );
+    assert!(
+        toasts.iter().any(|t| t.contains("c.tex (it was deleted)")),
+        "nothing says that c.tex lost its pending changes: {toasts:?}"
+    );
+    // Rejecting the other program's change takes it back, in the buffer and on disk.
+    let outside = g.ids("b.tex")[1];
+    review_ui::decide_hunks(&g.state, &b, &[outside], Decision::Reject);
+    common::pump_until(TIMEOUT, || g.disk("b.tex").contains("\nb 15\n"));
+    assert!(g.disk("b.tex").contains("\nb seven\n"));
+    // The state written back has a.tex and b.tex.
+    wait_state(&file, |s| {
+        s.is_some_and(|s| {
+            let mut names: Vec<_> = s.reviews.iter().map(|r| r.review.path.clone()).collect();
+            names.sort();
+            names == [PathBuf::from("a.tex"), PathBuf::from("b.tex")]
+        })
+    });
+    g.close();
+}
+
+/// An agent edit to a file that another program changed between the sessions, before the
+/// restore reached it: the new review starts from the file as it is, and a toast says the saved
+/// changes are lost (they went without a word).
+fn changed_outside_then_edited_first() {
+    let paths = temp_paths("outside-edited");
+    let dir = two_file_project("outside-edited");
+    let f = window(&dir, &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.edit("a.tex", "a 2\n", "a two\n");
+    f.edit("b.tex", "b 7\n", "b seven\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    f.close();
+    std::fs::write(dir.join("b.tex"), lines("B", 20)).unwrap();
+    let g = window_then(&dir, Some(paths.clone()), false, |state| {
+        review_ui::on_turn_started(state, 1);
+    });
+    assert!(!review_persist::is_restored(&g.state));
+    g.edit("b.tex", "B 15\n", "B fifteen\n");
+    review_ui::on_turn_ended(&g.state, 1);
+    g.wait_restored();
+    assert_eq!(g.ids("b.tex").len(), 1, "only the new edit");
+    wait_toast(&g.state, "b.tex (it was changed outside Lemma)");
+    g.close();
+}
+
+/// The same edit, made while the restore looks the text b.tex's review was saved with up in the
+/// local history (that review is then in neither of the lists an agent edit looks in): the
+/// outcome is the one above, a new review from the file as it is and the same toast, as it
+/// would be with that review found by the edit (its text no longer matches the file).
+fn changed_outside_then_edited_during_the_lookup() {
+    let paths = temp_paths("outside-lookup");
+    let dir = two_file_project("outside-lookup");
+    let f = window(&dir, &paths);
+    f.open("a.tex");
+    review_ui::on_turn_started(&f.state, 1);
+    f.edit("a.tex", "a 2\n", "a two\n");
+    f.edit("b.tex", "b 7\n", "b seven\n");
+    review_ui::on_turn_ended(&f.state, 1);
+    block_on(history::flush(&f.state));
+    f.close();
+    let agent_b = std::fs::read_to_string(dir.join("b.tex")).unwrap();
+    std::fs::write(
+        dir.join("b.tex"),
+        agent_b.replace("b 15\n", "b fifteen (outside)\n"),
+    )
+    .unwrap();
+    let g = window_then(&dir, Some(paths.clone()), false, |state| {
+        review_ui::on_turn_started(state, 1);
+    });
+    assert!(g.state.workspace.is_empty());
+    // The restore starts; once it has loaded b.tex it waits for the history's answer.
+    review_persist::editor_attached(&g.state);
+    let b = g.path("b.tex");
+    let context = glib::MainContext::default();
+    let deadline = Instant::now() + TIMEOUT;
+    while g.state.workspace.get(&b).is_none() {
+        assert!(Instant::now() < deadline, "b.tex was never loaded");
+        assert!(!review_persist::is_restored(&g.state));
+        context.iteration(false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!review_persist::is_restored(&g.state));
+    let doc = g.doc("b.tex");
+    assert!(doc.review.borrow().is_none());
+    // The agent's edit, as `agent_edits` makes it (without the awaits of the tool).
+    review_ui::start_review(&doc, false);
+    doc.apply_edits(&[TextEdit::insert(0, "new\n")], Origin::Agent { call: 1 })
+        .unwrap();
+    review_ui::recompute(&doc);
+    review_ui::on_turn_ended(&g.state, 1);
+    g.wait_restored();
+    assert_eq!(g.ids("b.tex").len(), 1, "only the new edit");
+    wait_toast(&g.state, "b.tex (it was changed outside Lemma)");
+    g.close();
+}
+
+/// The texts of the toast `state` shows.
+fn toast_titles(state: &WindowState) -> Vec<String> {
+    fn labels(widget: &gtk::Widget, out: &mut Vec<String>) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.label().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            labels(&c, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    let mut child = state.toasts.first_child();
+    while let Some(c) = child {
+        if c.type_().name() == "AdwToastWidget" {
+            labels(&c, &mut out);
+        }
+        child = c.next_sibling();
+    }
+    out
+}
+
+/// The texts of the toasts waiting behind the one shown: each is shown in turn as the one before
+/// is dismissed (by its close button).
+fn queued_toast_titles(state: &WindowState) -> Vec<String> {
+    let mut out = Vec::new();
+    for _ in 0..8 {
+        let close = descendants(&state.toasts)
+            .into_iter()
+            .filter(|w| {
+                std::iter::successors(w.parent(), |p| p.parent())
+                    .any(|p| p.type_().name() == "AdwToastWidget")
+            })
+            .find_map(|w| w.downcast::<gtk::Button>().ok());
+        let Some(close) = close else {
+            break;
+        };
+        close.emit_clicked();
+        common::pump_for(Duration::from_millis(400));
+        out.extend(toast_titles(state));
+    }
+    out
+}
+
+fn descendants(widget: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+    let mut out = Vec::new();
+    let mut stack = vec![widget.as_ref().clone()];
+    while let Some(w) = stack.pop() {
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            out.push(c.clone());
+            stack.push(c);
+        }
+    }
+    out
+}
+
+/// Waits until the toast shown says `needle`.
+fn wait_toast(state: &WindowState, needle: &str) {
+    common::pump_until(TIMEOUT, || {
+        toast_titles(state).iter().any(|t| t.contains(needle))
+    });
+    assert!(
+        toast_titles(state).iter().any(|t| t.contains(needle)),
+        "no toast says {needle:?}: {:?}",
+        toast_titles(state)
+    );
 }
 
 fn unsaved_typing() {
@@ -704,13 +1281,49 @@ fn debounced_writes() {
     assert!(!file.exists());
 }
 
+/// Typing in a reviewed document refreshes the review every keystroke or so: the agent's edit
+/// meanwhile is written within `MAX_DELAY` all the same (each refresh put it off by another
+/// debounce, so nothing was written until the typing paused, and a crash lost the hunks).
+fn writes_while_typing_goes_on() {
+    let paths = temp_paths("typing");
+    let dir = two_file_project("typing");
+    let f = window(&dir, &paths);
+    let editor = f.open("a.tex");
+    f.wait_restored();
+    let file = f.state_file();
+    f.edit("a.tex", "a 5\n", "a five\n");
+    f.edit("b.tex", "b 7\n", "b seven\n");
+    let started = Instant::now();
+    let buffer = editor.buffer();
+    let deadline = review_persist::MAX_DELAY + Duration::from_millis(1500);
+    while started.elapsed() < deadline && !file.exists() {
+        // A keystroke after the last line, outside the hunk (its recompute refreshes the review).
+        buffer.insert(&mut buffer.end_iter(), "x");
+        common::pump_for(Duration::from_millis(120));
+    }
+    assert!(
+        file.exists(),
+        "nothing written after {:?} of typing",
+        started.elapsed()
+    );
+    let saved = read_state(&file);
+    let mut files: Vec<String> = saved
+        .reviews
+        .iter()
+        .map(|r| r.review.path.display().to_string())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["a.tex", "b.tex"]);
+    f.close();
+}
+
 fn bare_list_file() {
     let paths = temp_paths("bare");
     let dir = two_file_project("bare");
     // A file as ARCHITECTURE §4.5 describes it: a list of PersistedReview.
     let disk = lines("a", 20).replace("a 3\n", "a THREE\n");
     std::fs::write(dir.join("a.tex"), &disk).unwrap();
-    let root = dir.canonicalize().unwrap();
+    let root = dir.canonical().unwrap();
     let file = review_persist::file_for_root(&paths.review_dir(), &root);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     let entry = serde_json::json!([{

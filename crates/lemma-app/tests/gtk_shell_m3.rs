@@ -1317,7 +1317,7 @@ fn goto_vim() {
     let im = editor.vim().unwrap();
     let feed = |keyval: gdk::Key| {
         assert_eq!(key(&editor, keyval, none), glib::Propagation::Proceed);
-        lemma_app::editor::vim::feed_key(&im, editor.view(), keyval, none);
+        common::feed_vim_key(&im, editor.view(), keyval, none);
     };
     feed(gdk::Key::_2);
     common::pump_until(TIMEOUT, || {
@@ -1376,6 +1376,52 @@ fn goto_pointer() {
     assert_eq!(goto::link_range(editor.view()), None);
     assert_eq!(cursor(&editor).as_deref(), Some("text"));
     assert!(!editor.document().is_dirty(), "underlining is not an edit");
+    // Text that moves the underlined name while Ctrl is held (Ctrl+V or Ctrl+Z at a cursor
+    // before it on its line): once the pointer moves on, no character keeps the underline.
+    goto::pointer_moved(&editor, x, y, true);
+    assert!(goto::link_range(editor.view()).is_some());
+    let buffer = editor.buffer();
+    let line = DOC[..file].rfind('\n').map_or(0, |i| i + 1);
+    buffer.insert(&mut editor.iter_near(line).unwrap(), "xy");
+    goto::pointer_moved(&editor, x, y, false);
+    let mut at = buffer.start_iter();
+    assert!(
+        !at.starts_tag(Some(&tag)) && !at.forward_to_tag_toggle(Some(&tag)),
+        "the underline went entirely"
+    );
+    // Over the name again after the change: the name where it is now.
+    let (nx, ny) = point_of(&editor, file + 2 + 3);
+    goto::pointer_moved(&editor, nx, ny, true);
+    assert_eq!(
+        goto::link_range(editor.view()),
+        Some(file + 2..file + 2 + "chapters/a".len())
+    );
+    goto::pointer_moved(&editor, nx, ny, false);
+    buffer.delete(
+        &mut editor.iter_near(line).unwrap(),
+        &mut editor.iter_near(line + 2).unwrap(),
+    );
+    // Underlined text copied (Ctrl+C while the pointer rests on a name) and pasted into the
+    // same document later does not bring the underline along.
+    goto::pointer_moved(&editor, x, y, true);
+    assert!(goto::link_range(editor.view()).is_some());
+    buffer.select_range(
+        &editor.iter_near(line).unwrap(),
+        &editor.iter_near(file + "chapters/a".len() + 1).unwrap(),
+    );
+    buffer.copy_clipboard(&editor.view().clipboard());
+    goto::pointer_moved(&editor, x, y, false);
+    let len = DOC.len();
+    buffer.place_cursor(&buffer.end_iter());
+    editor.view().emit_paste_clipboard();
+    common::pump_until(TIMEOUT, || editor.document().text().len() > len);
+    let mut at = buffer.start_iter();
+    assert!(
+        !at.starts_tag(Some(&tag)) && !at.forward_to_tag_toggle(Some(&tag)),
+        "a pasted copy is not underlined"
+    );
+    buffer.delete(&mut editor.iter_near(len).unwrap(), &mut buffer.end_iter());
+    assert_eq!(editor.document().text(), DOC);
 
     // Ctrl+click.
     assert!(!goto::ctrl_click(
@@ -1395,6 +1441,7 @@ fn goto_targets() {
             ("chapters/a.tex", CHAPTER),
             ("fig.png", "not really a png"),
             ("tabs.tex", "x\ty\n\tz\n"),
+            ("crlf.tex", "a\r\n\r\n  \r\n  b\r\n"),
         ],
     );
     f.open("main.tex");
@@ -1463,6 +1510,21 @@ fn goto_targets() {
     wait_cursor(&f, "tabs.tex", 5);
     go(99, Some(0));
     wait_cursor(&f, "tabs.tex", 4);
+    // With Windows line breaks, a blank line's first non-blank character is its line break:
+    // the cursor goes before its `\r`, never between the `\r` and the `\n`.
+    f.open("crlf.tex");
+    for (line, offset) in [(1, 3), (2, 7), (3, 11)] {
+        block_on(goto::navigate(
+            &f.state,
+            GotoTarget::LineColumn {
+                path: f.path("crlf.tex"),
+                line,
+                column: None,
+            },
+        ))
+        .unwrap();
+        wait_cursor(&f, "crlf.tex", offset);
+    }
 
     // The PDF: an error until there is one.
     let e = block_on(goto::navigate(
@@ -1631,6 +1693,7 @@ fn edit_config() {
     std::fs::write(&target, original).unwrap();
     let config = f.dir.join("config/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    common::require_symlinks();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &config).unwrap();
     f.state

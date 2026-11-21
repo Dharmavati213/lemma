@@ -50,6 +50,11 @@ fn main() -> ExitCode {
         ("keyboard_hover_at_the_cursor", keyboard),
         ("live_preview_below_display_math", live),
         ("detach_removes_everything", detach),
+        (
+            "a_scripted_run_removes_its_formats",
+            scripted_run_removes_its_formats,
+        ),
+        ("quitting_stops_the_tex_run_going_on", quitting_stops_tex),
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_math_preview_hover_latency", perf_latency));
@@ -914,6 +919,130 @@ fn detach() {
         &other,
         offset_of(&other, "h_X(X) \\arrow", 1),
     ));
+}
+
+/// A scripted run keeps its formats in a temporary directory of its own, and removes it when it
+/// quits: a quit ends the process without destroying the window, and the directory (with a
+/// format of several MB) used to stay in the temporary folder after every run.
+fn scripted_run_removes_its_formats() {
+    let dir = common::temp_dir("scripted");
+    let proj = dir.join("proj");
+    for file in FIXTURE_FILES {
+        let to = proj.join(file);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(common::fixtures().join("proj").join(file), &to).unwrap();
+    }
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lemma"))
+        .arg(proj.join("chapters/yoneda.tex"))
+        .args(["--demo", "math-preview", "--quit-after-ms", "1"])
+        .env("LEMMA_CONFIG", "/dev/null")
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("run lemma");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    print!(
+        "{}",
+        stdout
+            .lines()
+            .map(|l| format!("    {l}\n"))
+            .collect::<String>()
+    );
+    // Without TeX the demo fails, but the pipeline and its directory were made all the same.
+    if tex_available() {
+        assert!(
+            out.status.success(),
+            "lemma failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("math-preview:"), "a formula was rendered");
+    }
+    let left: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left in the temporary folder: {left:?}");
+}
+
+/// Quitting while TeX runs for the preview stops it. TeX never ends by itself on a macro that
+/// expands to itself (`\def\x{\x}\x`), and its process went on after Lemma, using a whole
+/// processor. A `pdflatex` that never ends stands in for it (no TeX needed); the live preview
+/// starts it for the formula at the cursor.
+fn quitting_stops_tex() {
+    if !cfg!(unix) {
+        return;
+    }
+    let dir = common::temp_dir("quit-tex");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pid_file = dir.join("tex.pid");
+    let script = bin.join("pdflatex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let main = dir.join("main.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nA formula $x + y$ here.\n\\end{document}\n",
+    )
+    .unwrap();
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // The cursor in the formula; long enough for the preview to start in a debug build under
+    // load.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lemma"))
+        .arg(format!("{}:3:14", main.display()))
+        .args(["--quit-after-ms", "5000"])
+        .env("LEMMA_CONFIG", "/dev/null")
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("PATH", &path)
+        .output()
+        .expect("run lemma");
+    assert!(
+        out.status.success(),
+        "lemma failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid = std::fs::read_to_string(&pid_file).expect("the preview ran TeX before the quit");
+    let proc = PathBuf::from(format!("/proc/{}", pid.trim()));
+    if cfg!(target_os = "linux") {
+        // Gone (an orphan's zombie is reaped at once).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while proc.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if proc.exists() {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+            panic!("TeX outlived Lemma");
+        }
+    }
+    let left: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left in the temporary folder: {left:?}");
 }
 
 /// p50 ≤ 250 ms from the hover to the shown picture (a built format, distinct formulas).

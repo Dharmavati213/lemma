@@ -17,9 +17,11 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use gtk::{gdk, graphene};
-use lemma_app::build_ui::{LATEXMK_MISSING, Reason};
+use lemma_app::build_ui::{self, LATEXMK_MISSING, Reason};
 use lemma_app::diagnostics_panel::{ERROR_CATEGORY, ERROR_TAG};
 use lemma_app::pdf::pdf_view::{self, PdfView};
 use lemma_app::window::WindowState;
@@ -70,6 +72,14 @@ fn main() -> ExitCode {
             "forward_search_scrolls_to_and_flashes_the_box",
             forward_search,
         ),
+        (
+            "forward_searches_in_a_row_answer_each_its_own",
+            forward_searches_in_a_row,
+        ),
+        (
+            "forward_answers_go_with_the_search_they_answer",
+            forward_answers_match_their_searches,
+        ),
         ("ctrl_click_opens_the_source_line", inverse_search),
         ("the_sync_buttons_sync_both_ways", sync_buttons),
         (
@@ -83,8 +93,20 @@ fn main() -> ExitCode {
         ("save_builds_and_shows_diagnostics", save_build_diagnostics),
         ("stop_cancels_a_running_build", stop_cancels),
         ("build_toasts_replace_each_other", build_toasts_replace),
+        (
+            "f5_without_a_main_document_asks_and_cancel_says_nothing",
+            f5_asks_for_the_main_document,
+        ),
         ("a_missing_latexmk_is_explained_once", missing_latexmk),
         ("clean_build_files_and_rebuild", clean_and_rebuild),
+        (
+            "a_stop_reaches_a_build_that_just_started",
+            a_stop_reaches_a_build_that_just_started,
+        ),
+        (
+            "a_timed_out_build_names_its_own_timeout",
+            a_timed_out_build_names_its_own_timeout,
+        ),
         (
             "tab_switches_without_a_pdf_detect_the_root_once",
             tab_switches_detect_once,
@@ -181,14 +203,14 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    common::manifest_dir().join("../..")
 }
 
 /// `target/fixtures/pdf50.pdf`, if `scripts/build-fixtures.sh` has run.
 fn pdf50() -> Option<PathBuf> {
     let pdf = repo().join("target/fixtures/pdf50.pdf");
     if pdf.is_file() {
-        Some(pdf.canonicalize().expect("canonical fixture path"))
+        Some(pdf.canonical().expect("canonical fixture path"))
     } else {
         println!(
             "  SKIP: {} is missing; run scripts/build-fixtures.sh",
@@ -221,7 +243,7 @@ fn copy_proj(name: &str, with_pdf: bool) -> PathBuf {
     for file in files {
         std::fs::copy(src.join(file), dir.join(file)).unwrap();
     }
-    dir.canonicalize().unwrap()
+    dir.canonical().unwrap()
 }
 
 fn config() -> Config {
@@ -355,23 +377,31 @@ fn demo_snapshot() {
     let (width, height) = (texture.width(), texture.height());
     let mut pixels = vec![0; width as usize * height as usize * 4];
     texture.download(&mut pixels, width as usize * 4);
-    // Scan down the middle of the PDF pane (the right 45 % of the window) and count the runs
-    // that differ from the backdrop beside the pages: each page is one long run.
+    // Scan down the middle of the PDF pane (the right 45 % of the window) and count the pages:
+    // long runs of rows that are not the backdrop beside the pages. Between two pages lies the
+    // backdrop with the pages' shadows on it, which on a light backdrop (the light colour
+    // scheme) are darker than it by more than a row of small text is: so a gap is six rows or
+    // more that are the backdrop's or a little darker, and fewer such rows are text in a page.
     let x = (f64::from(width) * 0.775) as i32;
     let backdrop = lightness(&pixels, width, width - 40, height / 2);
     let mut pages = 0;
-    let mut run = 0;
+    let (mut page_rows, mut gap_rows) = (0, 0);
     for y in 100..height - 40 {
-        if (lightness(&pixels, width, x, y) - backdrop).abs() > 8.0 {
-            run += 1;
-        } else {
-            if run > 100 {
-                pages += 1;
+        let row = lightness(&pixels, width, x, y);
+        if row <= backdrop + 8.0 && row >= backdrop - 48.0 {
+            gap_rows += 1;
+            if gap_rows == 6 {
+                if page_rows > 100 {
+                    pages += 1;
+                }
+                page_rows = 0;
             }
-            run = 0;
+        } else {
+            gap_rows = 0;
+            page_rows += 1;
         }
     }
-    if run > 100 {
+    if page_rows > 100 {
         pages += 1;
     }
     println!("  {pages} pages in the snapshot (backdrop lightness {backdrop:.0})");
@@ -571,7 +601,12 @@ fn unchanged_pdf() {
     assert_eq!(view.generation(), shown);
     assert!(controller.shows_requested());
 
-    std::fs::copy(common::fixtures().join("proj/main.pdf"), &pdf).unwrap();
+    // Written again, as a build writes it (on Windows a copy would keep the time of its source).
+    std::fs::write(
+        &pdf,
+        std::fs::read(common::fixtures().join("proj/main.pdf")).unwrap(),
+    )
+    .unwrap();
     let rewritten = PdfStamp::of(&pdf);
     assert!(rewritten.is_some_and(|r| Some(r) != stamp), "{rewritten:?}");
     assert!(controller.open_if_changed(&pdf, rewritten));
@@ -858,11 +893,7 @@ fn zoom_out_renders_at_the_live_scale() {
 /// mode.
 fn show_stress(state: &WindowState) -> PdfView {
     let stress = common::fixtures().join("pdf/stress.pdf");
-    state
-        .pdf
-        .get()
-        .unwrap()
-        .open(&stress.canonicalize().unwrap());
+    state.pdf.get().unwrap().open(&stress.canonical().unwrap());
     wait_for_pages(state);
     let view = view(state);
     if view.is_dark() {
@@ -1376,6 +1407,89 @@ fn forward_search() {
     state.window.destroy();
 }
 
+/// Forward searches sent one after the other before the first is answered (Ctrl+Alt+J pressed
+/// twice, or the follow-cursor mode's search and the user's): each answer goes with its own
+/// search, so the line asked for last is highlighted and Source goes back to it. An answer that
+/// comes once another PDF is shown (a tab of another document was selected) is not for it: no
+/// highlight there (here the other PDF is a copy, with the same lines).
+fn forward_searches_in_a_row() {
+    let dir = copy_proj("forward-in-a-row", true);
+    let other = dir.join("other.pdf");
+    std::fs::copy(dir.join("main.pdf"), &other).unwrap();
+    std::fs::copy(dir.join("main.synctex.gz"), dir.join("other.synctex.gz")).unwrap();
+    let state = window(&dir, config());
+    let editor = open(&state, &dir.join("main.tex"));
+    wait_for_pages(&state);
+    let controller = state.pdf.get().unwrap();
+    let view = view(&state);
+    let buffer = editor.buffer();
+    buffer.place_cursor(&buffer.start_iter());
+    let cursor = |state: &WindowState| {
+        state.active_editor().map(|e| {
+            let buffer = e.buffer();
+            let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+            (e.document().path().to_path_buf(), line)
+        })
+    };
+    let main = dir.join("main.tex");
+    controller.forward_search(&dir.join("chapters/yoneda.tex"), 26);
+    controller.forward_search(&main, 90);
+    // The PDF's line of main.tex:90 is recorded as the line before it: Source goes back to
+    // line 90 only by the record of the search.
+    common::pump_until(TIMEOUT, || view.highlight().is_some());
+    common::pump_for(Duration::from_millis(300));
+    let before = cursor(&state);
+    activate(&state, "win.sync-inverse");
+    common::pump_until(TIMEOUT, || cursor(&state) != before);
+    assert_eq!(cursor(&state), Some((main.clone(), 89)));
+
+    // Another PDF is shown before the answer (the SyncTeX file is parsed again first).
+    state.trim_memory();
+    controller.forward_search(&main, 66);
+    controller.open(&other);
+    common::pump_until(TIMEOUT, || controller.pdf() == Some(other.clone()));
+    wait_for_pages(&state);
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(view.highlight(), None);
+    state.window.destroy();
+}
+
+/// An answer of the PDF thread that is not for the oldest search waiting (here a search sent
+/// past the queue; one whose answer a restart of the PDF thread lost leaves the queue out of
+/// step the other way) does not shift the answers of the searches after it: they were matched
+/// to the searches by their order alone, and from then on each went with the search before it.
+fn forward_answers_match_their_searches() {
+    let dir = copy_proj("forward-match", true);
+    let state = window(&dir, config());
+    let editor = open(&state, &dir.join("main.tex"));
+    wait_for_pages(&state);
+    let controller = state.pdf.get().unwrap();
+    let view = view(&state);
+    let buffer = editor.buffer();
+    buffer.place_cursor(&buffer.start_iter());
+    let cursor = |state: &WindowState| {
+        state.active_editor().map(|e| {
+            let buffer = e.buffer();
+            let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+            (e.document().path().to_path_buf(), line)
+        })
+    };
+    let main = dir.join("main.tex");
+    controller.send(lemma_pdf::PdfCmd::Forward {
+        file: dir.join("chapters/yoneda.tex"),
+        line: 26,
+    });
+    controller.forward_search(&main, 90);
+    common::pump_until(TIMEOUT, || view.highlight().is_some());
+    common::pump_for(Duration::from_millis(300));
+    // Source goes back to the line asked for (see `forward_searches_in_a_row`).
+    let before = cursor(&state);
+    activate(&state, "win.sync-inverse");
+    common::pump_until(TIMEOUT, || cursor(&state) != before);
+    assert_eq!(cursor(&state), Some((main.clone(), 89)));
+    state.window.destroy();
+}
+
 /// Acceptance: Ctrl+click in the PDF opens the source line (also in an `\input` file).
 fn inverse_search() {
     let dir = copy_proj("inverse", true);
@@ -1826,14 +1940,15 @@ fn stop_cancels() {
 
 // ----- with a fake latexmk -----
 
-/// A fake latexmk that appends its arguments to `calls.txt` next to it and "builds"
-/// `main.tex` into `.build`: it fails with one TeX error while a file `fail` lies next to it or
-/// `.build/main.aux` says `broken`, sleeps 30 s first while a file `slow` does, and with `-c`
-/// removes the `.aux`, the log and `slow` (after 300 ms, so the clean-up can be watched, and
-/// 30 s more while a file `slow-clean` lies next to it).
+/// A fake latexmk that appends its arguments to `calls.txt` next to it (and its process id to
+/// `pids.txt`) and "builds" `main.tex` into `.build`: it fails with one TeX error while a file
+/// `fail` lies next to it or `.build/main.aux` says `broken`, sleeps 30 s first while a file
+/// `slow` does, and with `-c` removes the `.aux`, the log and `slow` (after 300 ms, so the
+/// clean-up can be watched, and 30 s more while a file `slow-clean` lies next to it).
 const FAKE_LATEXMK: &str = r#"#!/bin/sh
 here="$(dirname "$0")"
 echo "$*" >> "$here/calls.txt"
+echo "$$" >> "$here/pids.txt"
 case " $* " in
   *" -c "*)
     sleep 0.3
@@ -1857,7 +1972,8 @@ const SIMPLE_DOC: &str = "\\documentclass{article}\n\\begin{document}\nx\n\\end{
 /// A project with `main.tex` and, in a directory of its own, the fake latexmk; returns the
 /// project and the fake.
 fn fake_latexmk_project(name: &str) -> (PathBuf, PathBuf) {
-    let dir = common::temp_dir(name).canonicalize().unwrap();
+    common::require_shell_scripts();
+    let dir = common::temp_dir(name).canonical().unwrap();
     std::fs::write(dir.join("main.tex"), SIMPLE_DOC).unwrap();
     let bin = common::temp_dir(&format!("{name}-bin"));
     // Copied into place by `cp`: had this process written it, a child forked meanwhile by a
@@ -1899,6 +2015,48 @@ fn count_dismissals(toast: &adw::Toast) -> Rc<Cell<u32>> {
     let seen = count.clone();
     toast.connect_dismissed(move |_| seen.set(seen.get() + 1));
     count
+}
+
+/// F5 when no main document is found asks which file it is ("Choose the Main Document", here
+/// answered by the test's hook): Cancel is no error, so nothing is toasted or written in the
+/// status bar, and nothing builds; a file chosen is built.
+fn f5_asks_for_the_main_document() {
+    let (project, latexmk) = fake_latexmk_project("ask-root");
+    let dir = common::temp_dir("ask-root-notes");
+    std::fs::write(
+        dir.join("notes.tex"),
+        "Just a fragment, no \\documentclass.\n",
+    )
+    .unwrap();
+    let mut config = config();
+    config.build.latexmk = latexmk.clone();
+    let state = window(&dir, config);
+    open(&state, &dir.join("notes.tex"));
+    let build = state.build.get().unwrap();
+    let outcomes = record_outcomes(&state);
+    let answer: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+    let asked = Rc::new(Cell::new(0));
+    let (chosen, count) = (answer.clone(), asked.clone());
+    build_ui::set_root_dialog_hook(Some(Box::new(move || {
+        count.set(count.get() + 1);
+        chosen.borrow().clone()
+    })));
+    let status = state.status.build.text();
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || asked.get() == 1);
+    common::pump_for(Duration::from_millis(300));
+    assert!(build.toast().is_none(), "Cancel is no error");
+    assert_eq!(state.status.build.text(), status);
+    assert!(outcomes.borrow().is_empty());
+    assert!(fake_calls(&latexmk).is_empty());
+    // A file chosen is built.
+    answer.replace(Some(project.join("main.tex")));
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 1);
+    assert_eq!(asked.get(), 2);
+    assert_eq!(fake_calls(&latexmk).len(), 1);
+    build_ui::set_root_dialog_hook(None);
+    state.window.destroy();
 }
 
 /// Each build's toast replaces the one before: failing builds leave one toast (with the latest
@@ -2132,5 +2290,86 @@ fn clean_and_rebuild() {
         "the clean-up was stopped"
     );
     std::fs::remove_file(&slow_clean).unwrap();
+    state.window.destroy();
+}
+
+/// Whether the process `pid` still runs (`kill -0`).
+fn process_runs(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A Stop right after a build started, before the main loop heard that latexmk runs, stops
+/// latexmk at once, without the main loop. A window closed then (a save's build, and Ctrl+Q at
+/// once) stops its build this way as its state goes, and the main loop may never run again (the
+/// application ends): latexmk must not outlive Lemma. (The test's window keeps its state, so
+/// the Stop is the action's.)
+fn a_stop_reaches_a_build_that_just_started() {
+    let (dir, latexmk) = fake_latexmk_project("close-stops");
+    let slow = latexmk.with_file_name("slow");
+    std::fs::write(&slow, "").unwrap();
+    let mut config = config();
+    config.build.latexmk = latexmk.clone();
+    let state = window(&dir, config);
+    open(&state, &dir.join("main.tex"));
+    let build = state.build.get().unwrap();
+    build.request(Reason::Manual);
+    // The iteration that started the build is over; its thread's messages wait for the next.
+    common::pump_until(TIMEOUT, || build.is_running());
+    let pids = latexmk.with_file_name("pids.txt");
+    let deadline = Instant::now() + TIMEOUT;
+    let pid = loop {
+        let text = std::fs::read_to_string(&pids).unwrap_or_default();
+        if let Some(pid) = text.lines().next() {
+            break pid.to_owned();
+        }
+        assert!(Instant::now() < deadline, "latexmk did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(process_runs(&pid));
+    activate(&state, "win.stop-build");
+    // Without the main loop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_runs(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = process_runs(&pid);
+    std::fs::remove_file(&slow).unwrap();
+    common::pump_until(TIMEOUT, || !build.is_running());
+    assert!(!survived, "latexmk runs on after the Stop");
+    assert_eq!(state.status.build.text(), "Build stopped");
+    state.window.destroy();
+}
+
+/// A build stopped by its timeout says the timeout it ran with, also when `[build] timeout_s`
+/// changed while it ran.
+fn a_timed_out_build_names_its_own_timeout() {
+    let (dir, latexmk) = fake_latexmk_project("timeout");
+    let slow = latexmk.with_file_name("slow");
+    std::fs::write(&slow, "").unwrap();
+    let mut config = config();
+    config.build.latexmk = latexmk.clone();
+    config.build.timeout_s = 1;
+    let state = window(&dir, config.clone());
+    open(&state, &dir.join("main.tex"));
+    let build = state.build.get().unwrap();
+    let outcomes = record_outcomes(&state);
+    build.request(Reason::Manual);
+    common::pump_until(TIMEOUT, || build.is_running());
+    let mut longer = config;
+    longer.build.timeout_s = 600;
+    state.set_config(Rc::new(longer));
+    common::pump_until(TIMEOUT, || outcomes.borrow().len() == 1);
+    std::fs::remove_file(&slow).unwrap();
+    assert_eq!(outcomes.borrow()[0].status, BuildStatus::TimedOut);
+    assert_eq!(state.status.build.text(), "Build timed out");
+    let toast = build.toast().expect("a timeout is toasted");
+    assert_eq!(
+        toast.title().as_deref(),
+        Some("Build timed out after 1 s and was stopped")
+    );
     state.window.destroy();
 }

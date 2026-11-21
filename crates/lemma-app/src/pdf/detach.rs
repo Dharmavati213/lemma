@@ -24,6 +24,7 @@
 //!
 //! [`PdfView::hold_anchor`]: super::pdf_view::PdfView::hold_anchor
 
+use super::pdf_view::ChangedId;
 use crate::window::WindowState;
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -65,6 +66,8 @@ struct Detach {
     attaching: Cell<bool>,
     /// The handler that keeps the pane hidden while detached.
     pane_handler: RefCell<Option<glib::SignalHandlerId>>,
+    /// The view's callback that keeps the window's title current while detached.
+    title_handler: Cell<Option<ChangedId>>,
 }
 
 thread_local! {
@@ -88,6 +91,7 @@ pub fn install(state: &Rc<WindowState>) {
         size: Cell::new(DEFAULT_SIZE),
         attaching: Cell::new(false),
         pane_handler: RefCell::new(None),
+        title_handler: Cell::new(None),
     });
     WINDOWS.with_borrow_mut(|w| w.push((Rc::downgrade(state), detach.clone())));
     // Closing the main window closes the PDF window too (the application would otherwise keep
@@ -243,11 +247,12 @@ fn detach_now(state: &Rc<WindowState>, detach: &Rc<Detach>) {
     window.connect_default_width_notify(move |w| remember_size(&weak, w));
     let weak = Rc::downgrade(detach);
     window.connect_default_height_notify(move |w| remember_size(&weak, w));
-    // A title for the PDF shown (it may change while detached).
+    // A title for the PDF shown (it may change while detached). Disconnected when the view goes
+    // back: it runs on every scroll, and holds the title of a window that is gone.
     if let Some(view) = &view {
         let weak = Rc::downgrade(state);
         let title = title.clone();
-        view.connect_changed(move |_| {
+        let handler = view.connect_changed(move |_| {
             if let Some(state) = weak.upgrade()
                 && let Some(pdf) = state.pdf.get().and_then(|p| p.pdf())
                 && let Some(name) = pdf.file_name()
@@ -258,6 +263,9 @@ fn detach_now(state: &Rc<WindowState>, detach: &Rc<Detach>) {
                 }
             }
         });
+        if let Some(old) = detach.title_handler.replace(Some(handler)) {
+            view.disconnect_changed(old);
+        }
     }
 
     // While detached, showing the pane brings the PDF window forward instead.
@@ -315,6 +323,9 @@ fn attach_now(state: &Rc<WindowState>, detach: &Rc<Detach>) {
         state.pdf_pane.disconnect(handler);
     }
     let view = state.pdf.get().map(|p| p.view().clone());
+    if let (Some(view), Some(handler)) = (&view, detach.title_handler.take()) {
+        view.disconnect_changed(handler);
+    }
     let anchor = view.as_ref().and_then(|v| v.anchor());
     let content = window
         .content()

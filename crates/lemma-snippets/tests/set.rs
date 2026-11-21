@@ -94,6 +94,30 @@ fn if_undefined_needs_a_single_control_word_body() {
     assert!(msg.starts_with("if_undefined: "), "{msg}");
 }
 
+/// Notepad saves `snippets.toml` with Windows line breaks, and TOML keeps them in multi-line
+/// strings. The editor gives each `\n` of a body the document's own line break, so a body must
+/// break its lines with `\n` alone (a `\r\n` became `\r\r\n` in a CRLF document).
+#[test]
+fn a_file_with_windows_line_breaks_gives_bodies_with_plain_line_breaks() {
+    let s = set("[[snippet]]\r\n\
+         trigger = 'dm'\r\n\
+         body = '''\\[\r\n  ${1:a\r\nb}\r\n\\]'''\r\n\
+         \r\n\
+         [[snippet]]\r\n\
+         trigger = 'NN'\r\n\
+         body = '\\N'\r\n\
+         if_undefined = '''\\mathbb{N}\r\n'''\r\n");
+    let dm = s.manual("dm", "dm", &text()).pop().expect("dm");
+    assert_eq!(dm.def.body, "\\[\n  ${1:a\nb}\n\\]");
+    assert_eq!(to_body(dm.chunks), "\\[\n  ${1:a\nb}\n\\]$0");
+    let nn = s.manual("NN", "NN", &text()).pop().expect("NN");
+    assert_eq!(nn.def.if_undefined.as_deref(), Some("\\mathbb{N}\n"));
+    assert_eq!(
+        nn.alt_chunks.map(to_body).as_deref(),
+        Some("\\mathbb{N}\n$0")
+    );
+}
+
 #[test]
 fn errors_display_their_cause() {
     let e = SnippetSet::from_toml(&one("trigger = ''\nbody = 'b'")).unwrap_err();

@@ -46,6 +46,10 @@ fn main() -> ExitCode {
             "undefined_references_wait_for_every_file_past_the_cap",
             undefined_past_the_cap,
         ),
+        (
+            "bibliographies_are_the_files_the_build_reads",
+            bibliographies_as_the_build_reads_them,
+        ),
         ("problems_page_references_section_and_fix", problems_page),
         (
             "problems_keep_the_lines_of_a_file_edited_before_its_tab",
@@ -64,6 +68,10 @@ fn main() -> ExitCode {
         (
             "equation_numbers_from_aux_and_following_edits",
             equation_numbers,
+        ),
+        (
+            "equation_numbers_go_on_the_lines_gtk_breaks",
+            equation_numbers_on_gtk_lines,
         ),
     ];
     if std::env::args().any(|a| a == "--ignored") {
@@ -323,6 +331,82 @@ fn undefined_follows_files_on_disk() {
     common::pump_until(TIMEOUT, || !labels::cites_checked(&f.state));
     block_on(bib.document().save()).unwrap();
     common::pump_until(TIMEOUT, || labels::cites_checked(&f.state));
+}
+
+/// biblatex's `\addbibresource` names its file in full: biber (its default backend) reads
+/// `\addbibresource{refs}` from a file named `refs`, and stops with "Cannot find 'refs'!" when
+/// there is only `refs.bib`; BibTeX's `\bibliography{refs}` reads `refs.bib`. Completion and the
+/// citation checks read the file the build reads: `refs.bib` is not taken for
+/// `\addbibresource{refs}` (which would hide the mistake: its keys completed, its citations
+/// found), and a file named `refs` is read (and followed when another program changes it).
+fn bibliographies_as_the_build_reads_them() {
+    let f = fixture("labels-bib-names");
+    let editor = f.open("main.tex");
+    f.wait_index();
+    assert!(labels::cites_checked(&f.state));
+    let replace = |old: &str, new: &str| {
+        let at = offset_of(&editor, old, 0);
+        editor
+            .document()
+            .apply_edits(
+                &[TextEdit {
+                    range: at..at + old.len(),
+                    text: new.to_owned(),
+                }],
+                Origin::User,
+            )
+            .unwrap();
+    };
+    let read = |file: &str| {
+        let path = f.path(file);
+        f.state.workspace.index.borrow().bibs.contains_key(&path)
+    };
+    let settled = || {
+        completion::refresh_project(&f.state);
+        f.wait_checks();
+    };
+    // biber reads `refs`, which does not exist: no citation is checked, none completes.
+    replace("\\addbibresource{refs.bib}", "\\addbibresource{refs}");
+    settled();
+    common::pump_until(TIMEOUT, || !read("refs.bib"));
+    labels::check_now(&f.state);
+    assert!(!labels::cites_checked(&f.state));
+    assert!(
+        labels::undefined(&f.state)
+            .iter()
+            .all(|finding| finding.kind == NameKind::Label)
+    );
+    assert!(!proposals_after(&f, &editor, "\\cite{").contains(&"knuth".to_owned()));
+    // A file named `refs`: read, and its changes followed.
+    std::fs::write(f.path("refs"), BIB).unwrap();
+    common::pump_until(TIMEOUT, || read("refs") && labels::cites_checked(&f.state));
+    assert!(proposals_after(&f, &editor, "\\cite{").contains(&"knuth".to_owned()));
+    assert!(
+        labels::undefined(&f.state)
+            .iter()
+            .any(|finding| finding.name == "missing")
+    );
+    std::fs::write(
+        f.path("refs"),
+        format!("{BIB}@misc{{missing, title = {{Found}}, year = {{2026}}}}\n"),
+    )
+    .unwrap();
+    common::pump_until(TIMEOUT, || {
+        !labels::undefined(&f.state)
+            .iter()
+            .any(|finding| finding.name == "missing")
+    });
+    // BibTeX adds `.bib`: `\bibliography{refs}` reads `refs.bib`.
+    replace("\\addbibresource{refs}", "\\bibliography{refs}");
+    settled();
+    common::pump_until(TIMEOUT, || read("refs.bib") && !read("refs"));
+    labels::check_now(&f.state);
+    assert!(labels::cites_checked(&f.state));
+    assert!(
+        labels::undefined(&f.state)
+            .iter()
+            .any(|finding| finding.name == "missing")
+    );
 }
 
 /// A check looks again only at what the project index replaced since the last one: after prose
@@ -1024,6 +1108,76 @@ fn equation_numbers() {
     f.state.set_config(Rc::new(config));
     assert_eq!(annotations::shown(&editor).len(), 4);
     assert_eq!(annotations::shown(&chapter).len(), 1);
+}
+
+/// GTK also ends a line after a lone `\r` and after U+2029, where the text's (`\n`) lines go on:
+/// a number is drawn on the GTK line where its line starts, and moves when such a break is
+/// typed or deleted above it.
+fn equation_numbers_on_gtk_lines() {
+    let f = fixture("labels-eqnumbers-gtk-lines");
+    f.state.pdf_pane.set_visible(false);
+    let editor = f.open("main.tex");
+    f.wait_index();
+    let lines = || {
+        annotations::shown(&editor)
+            .iter()
+            .map(|(l, _)| *l as i32)
+            .collect::<Vec<_>>()
+    };
+    let numbers = [8, 11, 14, 18];
+    assert_eq!(lines(), numbers);
+    assert_eq!(annotations::shown_gtk_lines(&editor), numbers);
+    let buffer = editor.buffer();
+    buffer.insert(&mut buffer.start_iter(), "%\r");
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(lines(), numbers, "the text's lines are the same");
+    assert_eq!(annotations::shown_gtk_lines(&editor), [9, 12, 15, 19]);
+    // Where GtkSourceView draws them: a number's pill at the right end of its GTK line.
+    let view = editor.view().clone();
+    let shot = f.dir.join("numbers.png");
+    block_on(lemma_app::testmode::snapshot_next_frame(&view, &shot)).unwrap();
+    let texture = gtk::gdk::Texture::from_filename(&shot).unwrap();
+    let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
+    downloader.set_format(gtk::gdk::MemoryFormat::R8g8b8a8);
+    let (bytes, stride) = downloader.download_bytes();
+    let width = view.width();
+    let pixel = |x: i32, y: i32| &bytes[y as usize * stride + x as usize * 4..][..3];
+    // The background, from the empty bottom margin.
+    let background = pixel(width - 1, texture.height() - 1);
+    let has_pill = |line: i32| {
+        let (y, height) = view.line_yrange(&buffer.iter_at_line(line).unwrap());
+        let (_, top) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, 0, y);
+        (top.max(0)..(top + height).min(texture.height())).any(|row| {
+            (width - 90..width).any(|x| {
+                let p = pixel(x, row);
+                (0..3).any(|c| p[c].abs_diff(background[c]) > 30)
+            })
+        })
+    };
+    assert_eq!(
+        [9, 12, 15, 19].map(has_pill),
+        [true; 4],
+        "the numbers' GTK lines"
+    );
+    assert_eq!(
+        [8, 14, 18].map(has_pill),
+        [false; 3],
+        "the lines above them"
+    );
+    // A break between the second and the third number, then none before the first.
+    insert_before(&editor, "Statement", "\u{2029}");
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(annotations::shown_gtk_lines(&editor), [9, 12, 16, 20]);
+    let start = buffer.start_iter();
+    let mut end = start;
+    end.forward_chars(2);
+    buffer.delete(&mut buffer.start_iter(), &mut end);
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(annotations::shown_gtk_lines(&editor), [8, 11, 15, 19]);
+    // A refresh reads the same.
+    labels::check_now(&f.state);
+    assert_eq!(lines(), numbers);
+    assert_eq!(annotations::shown_gtk_lines(&editor), [8, 11, 15, 19]);
 }
 
 /// `tests/fixtures/large.tex` with a label in each of its 2500 theorems besides the 2500 of its

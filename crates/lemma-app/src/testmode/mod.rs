@@ -107,6 +107,15 @@ async fn run_demo(state: &Rc<WindowState>, demo: Demo) -> Result<(), String> {
     }
 }
 
+/// A new private temporary directory (`fsutil::private_temp_dir`) for the document a demo
+/// writes, removed with what it holds when the app ends (`fsutil::remove_at_exit`).
+pub fn demo_dir(prefix: &str) -> Result<PathBuf, String> {
+    let dir = crate::fsutil::private_temp_dir(prefix)
+        .map_err(|e| format!("cannot create a temporary directory: {e}"))?;
+    crate::fsutil::remove_at_exit(&dir);
+    Ok(dir)
+}
+
 /// The environment variable naming the `lemma-fake-agent` binary (an absolute path).
 pub const FAKE_AGENT_ENV: &str = "LEMMA_FAKE_AGENT";
 
@@ -351,7 +360,7 @@ mod tests {
 
     #[test]
     fn sibling_binaries_next_to_the_executable_or_above_deps() {
-        let dir = std::env::temp_dir().join(format!("lemma-sibling-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-sibling-").unwrap();
         let deps = dir.join("deps");
         std::fs::create_dir_all(&deps).unwrap();
         let tool = dir.join("lemma-mcp");

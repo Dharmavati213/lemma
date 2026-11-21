@@ -24,19 +24,28 @@
 //!   edit: git never runs per keystroke. Meanwhile the marks move with inserted and deleted
 //!   lines.
 //! - **Refreshing:** on save, when the window becomes active, and when the repository's `HEAD`,
-//!   index, packed refs or branch refs change (`gio::FileMonitor`s on the git directory and
-//!   `refs/heads`, [`REFRESH_DELAY`] debounce), `HEAD` is resolved again (one `git rev-parse`);
+//!   index, packed refs, branch refs or `HEAD`'s log change (`gio::FileMonitor`s on the git
+//!   directory, `refs/heads` and `logs`, [`REFRESH_DELAY`] debounce), `HEAD` is resolved again
+//!   (one `git rev-parse`);
 //!   a new commit re-reads the bases, and the files without a `HEAD` text are checked again
 //!   against the index.
 //! - `[git] gutter = false` removes the renderers and stops all git work; turning it on brings
 //!   them back. A missing `git` binary turns the gutter off quietly. git runs with
-//!   `GIT_OPTIONAL_LOCKS=0`, no fsmonitor, literal pathspecs and no terminal prompt.
+//!   `GIT_OPTIONAL_LOCKS=0`, no fsmonitor, literal pathspecs, no terminal prompt and no fetch
+//!   of missing objects (a repository that came with the project could name a command as its
+//!   remote).
+//! - **A git that hangs** (a network file system, a file that blocks) is killed after
+//!   [`GIT_TIMEOUT`] (30 s), with every process it started (`output_within`), and what it was
+//!   asked gets no git information: a directory whose repository it was looking for counts as
+//!   outside any, a file whose text it was reading as untracked, and when it was resolving
+//!   `HEAD`, the files without a base yet get no marks and `HEAD` is resolved again at the next
+//!   refresh. The same holds for [`head_bytes`], which the watcher of the agent's writes uses.
 //!
 //! Hooks: [`install`] once per window; [`attach`] / [`detach`] per editor tab (the renderer is
 //! removed and every handler disconnected in `detach`; the view is held weakly).
 //!
 //! Tests: [`marks`], [`status`], [`has_renderer`], [`is_idle`], [`refresh`], [`git_runs`],
-//! [`last_diff_cost`], [`compute_marks`], [`diff_hashes`], [`line_hashes`].
+//! [`set_timeout`], [`last_diff_cost`], [`compute_marks`], [`diff_hashes`], [`line_hashes`].
 
 use crate::document::{Document, ObserverId};
 use crate::editor::review_overlay::Palette;
@@ -67,6 +76,9 @@ pub const DIFF_DELAY: Duration = Duration::from_millis(150);
 pub const REFRESH_DELAY: Duration = Duration::from_millis(250);
 /// The longest a diff may take; a slower one ends with a coarser (still correct) result.
 const DIFF_DEADLINE: Duration = Duration::from_millis(500);
+/// A change that adds more lines than this hashes the whole text again at the next diff instead
+/// of each new line on its own.
+const REHASH_LINES: u32 = 64;
 
 /// Width of the renderer, its bar and the deleted-lines wedge (pixels).
 const WIDTH: i32 = 6;
@@ -437,32 +449,156 @@ struct RepoInfo {
     common_dir: PathBuf,
 }
 
-/// Runs `git` with `args` (no prompt, no optional locks, no fsmonitor); `None` when it could not
-/// start, else whether it succeeded and its standard output.
-fn git(dir: &Path, args: &[&str]) -> Option<(bool, Vec<u8>)> {
+/// Why a git command gave no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoAnswer {
+    /// git could not start (it is not installed).
+    Missing,
+    /// It ran longer than [`GIT_TIMEOUT`] and was stopped.
+    TimedOut,
+}
+
+/// The longest a git command may run. A git that hangs (a network file system that does not
+/// answer, a file in the repository that blocks, as a named pipe does) is stopped after it,
+/// with everything it started, and the file it was asked about has no git information. The
+/// commands read the index and an object or two: a healthy repository answers in milliseconds,
+/// a huge one on a slow network disk in a few seconds.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`GIT_TIMEOUT`], or what a test set ([`set_timeout`]), in milliseconds.
+static TIMEOUT_MS: AtomicU64 = AtomicU64::new(GIT_TIMEOUT.as_millis() as u64);
+
+/// Changes how long a git command may run (`None`: [`GIT_TIMEOUT`]), for every window (tests).
+pub fn set_timeout(timeout: Option<Duration>) {
+    let ms = timeout.unwrap_or(GIT_TIMEOUT).as_millis();
+    TIMEOUT_MS.store(u64::try_from(ms).unwrap_or(u64::MAX), Ordering::SeqCst);
+}
+
+/// Runs `git` with `args` (no prompt, no optional locks, no fsmonitor, no network) for at most
+/// [`GIT_TIMEOUT`]: whether it succeeded and its standard output.
+///
+/// The repository may come with the project (an archive, a download) and is not trusted: a
+/// "partial clone" whose objects are missing makes git fetch them from the remote its
+/// configuration names, which can be a command (`ext::`) or any host. The gutter only reads
+/// what is there: no lazy fetch (git 2.45 and later), and no transport for older ones.
+fn git(dir: &Path, args: &[&str]) -> Result<(bool, Vec<u8>), NoAnswer> {
     GIT_RUNS.fetch_add(1, Ordering::SeqCst);
-    let out = lemma_core::process::command("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["--literal-pathspecs", "-c", "core.fsmonitor=false"])
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    match out {
-        Ok(out) => Some((out.status.success(), out.stdout)),
+    run_git(git_command(dir).args(args))
+}
+
+/// Runs a [`git_command`] within the timeout (see [`git`]).
+fn run_git(command: &mut std::process::Command) -> Result<(bool, Vec<u8>), NoAnswer> {
+    let timeout = Duration::from_millis(TIMEOUT_MS.load(Ordering::SeqCst));
+    match output_within(command, timeout) {
+        Ok(Some((status, out))) => Ok((status.success(), out)),
+        Ok(None) => {
+            tracing::warn!(
+                "git gutter: git ran longer than {} s and was stopped: {command:?}",
+                timeout.as_secs_f32()
+            );
+            Err(NoAnswer::TimedOut)
+        }
         Err(e) => {
             tracing::info!("git gutter: cannot run git: {e}");
-            None
+            Err(NoAnswer::Missing)
         }
     }
 }
 
-/// The repository containing `dir` (jobs thread). `Err` when git cannot run.
+/// Runs `command` and collects its standard output, for at most `timeout`: `None` when it ran
+/// longer (or its output stayed open longer, held by a process it started), in which case it is
+/// killed together with every process it started (its process group on Unix, its job on
+/// Windows). Blocking.
+fn output_within(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, Vec<u8>)>> {
+    use std::io::Read as _;
+    let deadline = Instant::now() + timeout;
+    command.stdout(Stdio::piped());
+    #[cfg(unix)]
+    let mut child = {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0).spawn()?
+    };
+    #[cfg(windows)]
+    let (mut child, job) = lemma_core::process::Job::spawn(command)?;
+    // Read on a thread of its own, so that a large output never fills the pipe while this one
+    // waits: the end of the output comes when every process that holds the pipe has ended.
+    let stdout = child.stdout.take();
+    let (sender, read) = std::sync::mpsc::channel();
+    let reader = std::thread::Builder::new()
+        .name("git-output".into())
+        .spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut stdout) = stdout {
+                let _ = stdout.read_to_end(&mut out);
+            }
+            let _ = sender.send(out);
+        });
+    // Without a reader (no thread to be had), nothing is read: the command is stopped below.
+    let out = reader.ok().and_then(|_| read.recv_timeout(timeout).ok());
+    let status = if out.is_some() {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                _ => break None,
+            }
+        }
+    } else {
+        None
+    };
+    if let (Some(status), Some(out)) = (status, out) {
+        return Ok(Some((status, out)));
+    }
+    #[cfg(unix)]
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: killpg only sends a signal; the group is the child's own (process_group(0)).
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    job.terminate(1);
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(None)
+}
+
+/// `git -C dir` with the precautions of [`git`], ready for its arguments.
+fn git_command(dir: &Path) -> std::process::Command {
+    let mut command = lemma_core::process::command("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(["--literal-pathspecs", "-c", "core.fsmonitor=false"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "none")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// The bytes of the file `rel` (relative to `root`, with `/`) in `HEAD`; `None` when `root` is
+/// in no repository, the file is not in `HEAD`, or git cannot run or does not answer within
+/// [`GIT_TIMEOUT`]. Blocking. For the watcher of the agent's writes, which reads a file's text
+/// from before the turn here.
+pub fn head_bytes(root: &Path, rel: &str) -> Option<Vec<u8>> {
+    let mut command = git_command(root);
+    command.arg("show").arg(format!("HEAD:./{}", git_path(rel)));
+    let (ok, out) = run_git(&mut command).ok()?;
+    ok.then_some(out)
+}
+
+/// The repository containing `dir` (jobs thread): `None` when there is none, or git did not
+/// answer (the directory then has no git information). `Err` when git cannot run.
 fn discover(dir: &Path) -> Result<Option<RepoInfo>, ()> {
-    let (ok, out) = git(
+    let found = git(
         dir,
         &[
             "rev-parse",
@@ -471,13 +607,18 @@ fn discover(dir: &Path) -> Result<Option<RepoInfo>, ()> {
             "--git-dir",
             "--git-common-dir",
         ],
-    )
-    .ok_or(())?;
+    );
+    let (ok, out) = match found {
+        Ok(found) => found,
+        Err(NoAnswer::TimedOut) => return Ok(None),
+        Err(NoAnswer::Missing) => return Err(()),
+    };
     if !ok {
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&out);
-    let mut lines = text.lines().map(|l| PathBuf::from(l.trim_end()));
+    // `lines` takes the line breaks off; a blank at the end belongs to the name.
+    let mut lines = text.lines().map(PathBuf::from);
     let (Some(top), Some(git_dir), Some(common_dir)) = (lines.next(), lines.next(), lines.next())
     else {
         return Ok(None);
@@ -494,9 +635,10 @@ fn discover(dir: &Path) -> Result<Option<RepoInfo>, ()> {
     }))
 }
 
-/// The commit `HEAD` names (`None` before the first commit); `Err` when git cannot run.
-fn resolve_head(top: &Path) -> Result<Option<String>, ()> {
-    let (ok, out) = git(top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).ok_or(())?;
+/// The commit `HEAD` names (`None` before the first commit); `Err` when git cannot run or did
+/// not answer.
+fn resolve_head(top: &Path) -> Result<Option<String>, NoAnswer> {
+    let (ok, out) = git(top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"])?;
     let oid = String::from_utf8_lossy(&out).trim().to_owned();
     Ok((ok && !oid.is_empty()).then_some(oid))
 }
@@ -513,17 +655,22 @@ pub(crate) fn git_path(rel: &str) -> String {
 }
 
 fn read_base(top: &Path, rel: &str, head: Option<&str>, charset: Option<&str>) -> Base {
-    if let Some(head) = head
-        && let Some((true, bytes)) = git(top, &["cat-file", "blob", &format!("{head}:./{rel}")])
-    {
-        return match crate::saver::decode(&bytes, charset) {
-            Ok(decoded) => Base::Text(Arc::from(line_hashes(&decoded.text))),
-            // A binary file: nothing to compare.
-            Err(_) => Base::Untracked,
-        };
+    if let Some(head) = head {
+        match git(top, &["cat-file", "blob", &format!("{head}:./{rel}")]) {
+            Ok((true, bytes)) => {
+                return match crate::saver::decode(&bytes, charset) {
+                    Ok(decoded) => Base::Text(Arc::from(line_hashes(&decoded.text))),
+                    // A binary file: nothing to compare.
+                    Err(_) => Base::Untracked,
+                };
+            }
+            // No git information: not another wait for the index.
+            Err(NoAnswer::TimedOut) => return Base::Untracked,
+            Ok((false, _)) | Err(NoAnswer::Missing) => {}
+        }
     }
     match git(top, &["ls-files", "--error-unmatch", "--", rel]) {
-        Some((true, _)) => Base::Added,
+        Ok((true, _)) => Base::Added,
         _ => Base::Untracked,
     }
 }
@@ -907,7 +1054,13 @@ impl Gutter {
             refreshing: Cell::new(false),
             again: Cell::new(false),
         });
-        let mut watched = vec![info.git_dir.clone(), info.common_dir.join("refs/heads")];
+        // `logs` for `logs/HEAD`: a branch in a folder of `refs/heads` (`feature/x`) is a file
+        // the monitors do not see, and a `reset --soft` moves it without touching the index.
+        let mut watched = vec![
+            info.git_dir.clone(),
+            info.common_dir.join("refs/heads"),
+            info.git_dir.join("logs"),
+        ];
         if info.common_dir != info.git_dir {
             watched.push(info.common_dir.clone());
         }
@@ -1004,13 +1157,33 @@ impl Gutter {
         glib::spawn_future_local(async move {
             let head = gio::spawn_blocking(move || resolve_head(&top))
                 .await
-                .unwrap_or(Err(()));
+                .unwrap_or(Err(NoAnswer::Missing));
             let (Some(g), Some(repo)) = (weak.upgrade(), repo_weak.upgrade()) else {
                 return;
             };
             repo.refreshing.set(false);
             match head {
-                Err(()) => g.no_git(),
+                Err(NoAnswer::Missing) => g.no_git(),
+                Err(NoAnswer::TimedOut) => {
+                    // No git information: the files that have no base yet get no marks (an
+                    // earlier base stays), and `HEAD` is resolved again at the next refresh.
+                    let unknown: Vec<Rc<Tracked>> = g
+                        .files
+                        .borrow()
+                        .iter()
+                        .filter(|t| {
+                            t.base.borrow().is_none()
+                                && t.repo
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|r| Rc::ptr_eq(r, &repo))
+                        })
+                        .cloned()
+                        .collect();
+                    for tracked in unknown {
+                        tracked.set_base(None, Base::Untracked, g.enabled());
+                    }
+                }
                 Ok(head) => {
                     let moved = repo.head.borrow().as_ref() != Some(&head);
                     repo.head.replace(Some(head));
@@ -1212,6 +1385,12 @@ impl Tracked {
             *hashes = None;
             return;
         }
+        // Many new lines (a paste, an undo, a reload) are hashed from one copy of the text at
+        // the next diff: each `line_text` reads the whole buffer while it holds a lone `\r`.
+        if added > REHASH_LINES {
+            *hashes = None;
+            return;
+        }
         let fresh: Vec<u64> = (first..first + added as usize)
             .map(|line| {
                 u32::try_from(line)
@@ -1295,11 +1474,12 @@ impl Tracked {
         let Some(doc) = self.doc.upgrade() else {
             return;
         };
+        // `Some(None)` for a file not in `HEAD`.
         let base = match self.base.borrow().as_ref() {
             None => return,
             Some((_, Base::Untracked)) => None,
-            Some((_, Base::Added)) => Some(Arc::<[u64]>::from(line_hashes(""))),
-            Some((_, Base::Text(lines))) => Some(lines.clone()),
+            Some((_, Base::Added)) => Some(None),
+            Some((_, Base::Text(lines))) => Some(Some(lines.clone())),
         };
         let Some(base) = base else {
             self.renderer.set_marks(Marks::default());
@@ -1311,6 +1491,17 @@ impl Tracked {
         }
         let started = Instant::now();
         let lines = self.current_hashes(&doc);
+        // A file not in `HEAD` is all added: compared with nothing, but for the empty line after
+        // a final line break, which is no line of its own (in `HEAD`'s texts neither). Against
+        // `line_hashes("")`, a last line without a line break was "changed".
+        let base = base.unwrap_or_else(|| {
+            let empty = line_hash("");
+            Arc::from(if lines.last() == Some(&empty) {
+                vec![empty]
+            } else {
+                Vec::new()
+            })
+        });
         let (version, generation) = (doc.version(), self.generation.get());
         let main_thread = started.elapsed();
         let weak = Rc::downgrade(self);
@@ -1430,6 +1621,51 @@ mod tests {
         // Nothing moves before the change.
         marks.shift(20, 1, 2);
         assert_eq!(marks.lines[0], (4..6, MarkKind::Changed));
+    }
+
+    /// A command that hangs is killed after the timeout, with the processes it started; one
+    /// that ends in time gives its whole output (more than a pipe holds) and its exit status.
+    #[cfg(unix)]
+    #[test]
+    fn hung_commands_are_killed_with_their_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let mut hung = std::process::Command::new("sh");
+        hung.arg("-c").arg(format!(
+            "sleep 600 & echo $! > '{}'; wait",
+            pid_file.display()
+        ));
+        let started = Instant::now();
+        let out = output_within(&mut hung, Duration::from_millis(300)).unwrap();
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let child: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The sleep is gone (a zombie of init's at worst, for a moment).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gone = || {
+            std::fs::read_to_string(format!("/proc/{child}/stat"))
+                .map_or(true, |stat| stat.contains(") Z "))
+        };
+        while !gone() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if cfg!(target_os = "linux") {
+            assert!(gone(), "the hung command's child still runs");
+        }
+
+        let mut big = std::process::Command::new("sh");
+        big.arg("-c").arg("head -c 1000000 /dev/zero; exit 3");
+        let (status, bytes) = output_within(&mut big, Duration::from_secs(20))
+            .unwrap()
+            .expect("in time");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(bytes.len(), 1_000_000);
+        let mut missing = std::process::Command::new("/nonexistent/git");
+        assert!(output_within(&mut missing, Duration::from_secs(1)).is_err());
     }
 
     #[test]

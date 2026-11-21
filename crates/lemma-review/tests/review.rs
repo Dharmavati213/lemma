@@ -458,6 +458,46 @@ fn ctrl_z_of_user_typing_outside_goes_to_the_baseline_too() {
     assert_eq!(s.pairs(), [("b\n".to_owned(), "B\n".to_owned())]);
 }
 
+/// `dd` on the last of the agent's new lines, or on the whole of its replacement, then `u`: the
+/// deletion was part of the proposal (inside the hunk), so its undo is too, although the line
+/// goes back at the end of the hunk, or at the pure deletion the hunk became, where the Inside
+/// rule alone puts it into the baseline. It used to: the agent's line became the user's text,
+/// and Reject left it in (beside the restored line, for a replacement). With and without the
+/// debounced recompute in between, and Ctrl+Shift+Z after it.
+#[test]
+fn ctrl_z_of_deleting_the_end_of_a_hunk_goes_back_into_the_proposal() {
+    let base = "a\nb\nc\n";
+    for (new, line) in [("b\nX\nY\n", "Y\n"), ("B\n", "B\n")] {
+        for recompute in [false, true] {
+            let mut s = Session::new(base);
+            s.agent_replace("b\n", new);
+            let proposed = s.text.clone();
+            let ids = s.ids();
+            let end = s.hunks()[0].cur_bytes.end;
+            let line = end - line.len()..end;
+            let removed = s.text[line.clone()].to_owned();
+            s.user(TextEdit::delete(line.clone()));
+            if recompute {
+                s.recompute();
+            }
+            s.edit(&TextEdit::insert(line.start, &removed), Origin::History);
+            s.recompute();
+            s.check();
+            assert_eq!(s.text, proposed);
+            assert_eq!(s.review.baseline(), base, "{new:?} {recompute}");
+            assert_eq!(s.ids(), ids, "{new:?} {recompute}");
+            // Ctrl+Shift+Z, Ctrl+Z.
+            s.edit(&TextEdit::delete(line.clone()), Origin::History);
+            s.recompute();
+            s.edit(&TextEdit::insert(line.start, &removed), Origin::History);
+            s.recompute();
+            assert_eq!(s.review.baseline(), base, "{new:?} {recompute}");
+            s.reject(ids[0]);
+            assert_eq!(s.text, base, "{new:?} {recompute}");
+        }
+    }
+}
+
 #[test]
 fn redo_of_an_agent_edit_brings_the_hunk_back() {
     let mut s = Session::new("a\nb\nc\n");
@@ -627,6 +667,192 @@ fn reject_of_a_touched_hunk_then_ctrl_z_keeps_it_touched() {
     s.recompute();
     assert_eq!(s.ids(), [id]);
     assert!(s.hunks()[0].user_touched);
+}
+
+/// The buffer's undo and redo of `edits`, an action of descending edits that replaced `replaced`,
+/// as an open buffer reports them (a deletion and an insertion each).
+fn ctrl_z(s: &mut Session, edits: &[TextEdit], replaced: &[&str]) {
+    s.review.begin_history_step(false);
+    for (e, r) in edits.iter().zip(replaced).rev() {
+        let start = e.range.start;
+        if !e.text.is_empty() {
+            s.edit(
+                &TextEdit::delete(start..start + e.text.len()),
+                Origin::History,
+            );
+        }
+        if !r.is_empty() {
+            s.edit(&TextEdit::insert(start, *r), Origin::History);
+        }
+    }
+    s.recompute();
+}
+
+fn ctrl_shift_z(s: &mut Session, edits: &[TextEdit]) {
+    s.review.begin_history_step(true);
+    for e in edits {
+        if !e.range.is_empty() {
+            s.edit(&TextEdit::delete(e.range.clone()), Origin::History);
+        }
+        if !e.text.is_empty() {
+            s.edit(&TextEdit::insert(e.range.start, &e.text), Origin::History);
+        }
+    }
+    s.recompute();
+}
+
+/// Reject, Ctrl+Z, Ctrl+Shift+Z: the redo takes the agent's text out again, which is also what
+/// undoing the agent's edit does. Told which way the buffer steps, the review takes it for the
+/// reject's redo, so that after another change Ctrl+Z still reopens the hunk. Taken for an undo
+/// of the agent's edit (the way the user went last), the records of both looked undone and the
+/// next change dropped them; the reject's undo then put the agent's text into the baseline.
+#[test]
+fn ctrl_shift_z_of_a_reject_is_its_redo() {
+    let base = "a\nb\n";
+    let mut s = Session::new(base);
+    s.agent_replace("a\n", "a\nnew\n");
+    let proposal = s.text.clone();
+    let id = s.ids()[0];
+    let (reject, replaced) = s.reject(id);
+    ctrl_z(&mut s, std::slice::from_ref(&reject), &[&replaced]);
+    assert_eq!(s.ids(), [id]);
+    ctrl_shift_z(&mut s, std::slice::from_ref(&reject));
+    assert_eq!(s.text, base);
+    assert!(s.hunks().is_empty());
+    // Another change, then Ctrl+Z of it and of the reject.
+    let other = s.agent_replace("b", "B");
+    ctrl_z(&mut s, &other, &["b"]);
+    ctrl_z(&mut s, std::slice::from_ref(&reject), &[&replaced]);
+    s.check();
+    assert_eq!(s.text, proposal);
+    assert_eq!(s.review.baseline(), base);
+    assert_eq!(s.ids(), [id]);
+}
+
+/// Alt+U of a reject is an action of the buffer's own: after another change, Ctrl+Z takes back
+/// that change, then Alt+U (rejecting again), then the reject. Alt+U's step was taken for the
+/// buffer's undo, so the other change dropped its record, and Ctrl+Z of Alt+U then put the
+/// rejected text into the baseline a second time. The agent's two edits make a hunk that
+/// neither explains alone, so that their own records do not stand in.
+#[test]
+fn ctrl_z_of_alt_u_after_another_change() {
+    let base = "x\ny";
+    let mut s = Session::new(base);
+    s.edits(&[TextEdit::delete(2..3)], Origin::Agent { call: 1 });
+    s.edits(&[TextEdit::delete(1..2)], Origin::Agent { call: 2 });
+    s.recompute();
+    let id = s.ids()[0];
+    let (reject, replaced) = s.reject(id);
+    assert_eq!(reject, TextEdit::insert(1, "\ny"));
+    let Some(UndoAction::Edits(alt_u)) = s.undo_review() else {
+        panic!()
+    };
+    assert_eq!(s.ids(), [id]);
+    s.user(TextEdit::insert(0, "z"));
+    s.recompute();
+    for begin in [false, true] {
+        let mut s = Session {
+            review: s.review.clone(),
+            text: s.text.clone(),
+        };
+        // Without being told which way the buffer steps, too.
+        let undo = |s: &mut Session, edits: &[TextEdit], replaced: &[&str]| {
+            if begin {
+                ctrl_z(s, edits, replaced);
+            } else {
+                for (e, r) in edits.iter().zip(replaced).rev() {
+                    s.undo_replace(e, r);
+                }
+                s.recompute();
+            }
+        };
+        undo(&mut s, &[TextEdit::insert(0, "z")], &[""]);
+        undo(&mut s, &alt_u, &["\ny"]);
+        s.check();
+        assert_eq!(s.text, base);
+        assert_eq!(s.review.baseline(), base);
+        assert!(s.hunks().is_empty());
+        undo(&mut s, std::slice::from_ref(&reject), &[&replaced]);
+        assert_eq!(s.text, "x");
+        assert_eq!(s.review.baseline(), base);
+        assert_eq!(s.ids(), [id]);
+    }
+}
+
+/// Select from inside the agent's text to the end of its hunk or past it, into the user's own
+/// text, type over it, then Ctrl+Z: the text, the baseline and the hunks are what they were
+/// before the typing, and Ctrl+Shift+Z gives the typing back. The deletion went into the
+/// proposal and the typing into the baseline, at the end of what was left of the hunk. Once the
+/// debounced recompute had widened the hunk over that line, the undo of the typing fell inside
+/// it, and the typed text stayed in the baseline (a phantom change); before it, the undo's
+/// insertion was taken for the undo of its own deletion, and the agent's text went into the
+/// baseline. With more keys typed after the first, which the buffer undoes with it or as a step
+/// of their own.
+#[test]
+fn ctrl_z_of_typing_over_the_end_of_a_hunk_gives_everything_back() {
+    let base = "a\nb\nc\n";
+    // The agent's "B\n" is at 2..4: from inside it to its end, all of it, or past it.
+    for selection in [3..4, 2..4, 3..5, 3..6] {
+        for recompute in [false, true] {
+            for (keys, merged) in [
+                (&["X"][..], true),
+                (&["X", "Y"], true),
+                (&["X", "Y"], false),
+            ] {
+                let case = format!("{selection:?} {recompute} {keys:?} {merged}");
+                let mut s = Session::new(base);
+                s.agent_replace("b\n", "B\n");
+                let (text, ids, pairs) = (s.text.clone(), s.ids(), s.pairs());
+                let removed = s.text[selection.clone()].to_owned();
+                s.user(TextEdit::delete(selection.clone()));
+                let mut at = selection.start;
+                for key in keys {
+                    s.user(TextEdit::insert(at, *key));
+                    at += key.len();
+                }
+                if recompute {
+                    s.recompute();
+                }
+                let (typed, typed_baseline) = (s.text.clone(), s.review.baseline().to_owned());
+                // The buffer's actions: the selection's deletion with the first key, then the
+                // other keys, merged with it or not.
+                let first = TextEdit {
+                    range: selection.clone(),
+                    text: keys[0].to_owned(),
+                };
+                let rest = TextEdit::insert(selection.start + 1, keys[1..].concat());
+                let all = TextEdit {
+                    range: selection.clone(),
+                    text: keys.concat(),
+                };
+                let undo = |s: &mut Session| {
+                    if merged {
+                        ctrl_z(s, std::slice::from_ref(&all), &[&removed]);
+                    } else {
+                        ctrl_z(s, std::slice::from_ref(&rest), &[""]);
+                        ctrl_z(s, std::slice::from_ref(&first), &[&removed]);
+                    }
+                };
+                undo(&mut s);
+                s.check();
+                assert_eq!(s.text, text, "{case}");
+                assert_eq!(s.review.baseline(), base, "{case}");
+                assert_eq!(s.ids(), ids, "{case}");
+                assert_eq!(s.pairs(), pairs, "{case}");
+                if merged {
+                    ctrl_shift_z(&mut s, std::slice::from_ref(&all));
+                } else {
+                    ctrl_shift_z(&mut s, std::slice::from_ref(&first));
+                    ctrl_shift_z(&mut s, std::slice::from_ref(&rest));
+                }
+                assert_eq!(s.text, typed, "{case}");
+                assert_eq!(s.review.baseline(), typed_baseline, "{case}");
+                undo(&mut s);
+                assert_eq!(s.review.baseline(), base, "{case}");
+                assert_eq!(s.pairs(), pairs, "{case}");
+            }
+        }
+    }
 }
 
 #[test]

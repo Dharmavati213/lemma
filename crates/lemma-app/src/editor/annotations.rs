@@ -22,8 +22,10 @@
 //! without reading anything, before the next frame (the moves of one main-loop iteration, as
 //! several changes of a paste, a replacement or Vim's `.` make, add the numbers again once, at
 //! `HIGH_IDLE`, which runs before GTK lays out and draws). Nothing is added again when nothing
-//! changed. Off with `[editor] equation_numbers = false` (read at use time; a configuration
-//! reload refreshes every view).
+//! changed. An annotation names a GTK line, and GTK also starts a line after a lone `\r` and
+//! after U+2029: while the text has such a break, the numbers below it go that many GTK lines
+//! further down, and every change moves them again. Off with `[editor] equation_numbers =
+//! false` (read at use time; a configuration reload refreshes every view).
 //!
 //! Hooks: [`attach`] / [`detach`] per editor tab (the view is held weakly; disconnect in
 //! `detach`).
@@ -50,6 +52,10 @@ struct Numbers {
     provider: sourceview5::AnnotationProvider,
     /// What is shown: (0-based line, text), by line.
     shown: RefCell<Vec<(u32, String)>>,
+    /// The GTK line of each of `shown`, where its annotation is (see [`gtk_lines`]).
+    shown_at: RefCell<Vec<i32>>,
+    /// GTK broke lines that are not `\n` lines when the numbers were last shown.
+    had_gtk_breaks: Cell<bool>,
     lines_changed: RefCell<Option<ObserverId>>,
     /// Line changes not followed yet ((first, removed, added), in order), and the idle that
     /// follows them before the next frame.
@@ -114,6 +120,8 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         editor: Rc::downgrade(editor),
         provider,
         shown: RefCell::new(Vec::new()),
+        shown_at: RefCell::new(Vec::new()),
+        had_gtk_breaks: Cell::new(false),
         lines_changed: RefCell::new(None),
         moves: RefCell::new(Vec::new()),
         moves_idle: RefCell::new(None),
@@ -161,7 +169,8 @@ pub fn detach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
 /// the numbers move at `HIGH_IDLE`, before the next frame, with the other changes made until
 /// then.
 fn follow_soon(numbers: &Rc<Numbers>, first: u32, removed: u32, added: u32) {
-    if removed == added {
+    // While GTK breaks lines that are not `\n` lines, the change may have added or removed one.
+    if removed == added && !numbers.had_gtk_breaks.get() && !gtk_breaks(numbers) {
         return;
     }
     let mut moves = numbers.moves.borrow_mut();
@@ -216,15 +225,16 @@ fn follow(numbers: &Numbers) {
 
 /// Replaces the annotations with `numbers` (nothing happens when they are already shown).
 fn show(numbers: &Numbers, wanted: Vec<(u32, String)>) {
-    if *numbers.shown.borrow() == wanted {
+    let at = gtk_lines(numbers, &wanted);
+    if *numbers.shown.borrow() == wanted && *numbers.shown_at.borrow() == at {
         return;
     }
     numbers.provider.remove_all();
     numbers.rebuilds.set(numbers.rebuilds.get() + 1);
-    for (line, text) in &wanted {
-        let Ok(line) = i32::try_from(*line) else {
+    for ((_, text), &line) in wanted.iter().zip(&at) {
+        if line < 0 {
             continue;
-        };
+        }
         numbers
             .provider
             .add_annotation(&sourceview5::Annotation::new(
@@ -235,6 +245,57 @@ fn show(numbers: &Numbers, wanted: Vec<(u32, String)>) {
             ));
     }
     numbers.shown.replace(wanted);
+    numbers.shown_at.replace(at);
+}
+
+/// True when GTK numbers the lines of `numbers`' buffer otherwise than `LineIndex`: GTK also
+/// ends a line after a lone `\r` and after U+2029.
+fn gtk_breaks(numbers: &Numbers) -> bool {
+    numbers.editor.upgrade().is_some_and(|editor| {
+        u32::try_from(editor.buffer().line_count()).ok()
+            != Some(editor.document().line_index().line_count())
+    })
+}
+
+/// The GTK lines of the (`\n`) lines of `wanted`, where their annotations go (-1 for a line
+/// GTK cannot number): each lone `\r` or U+2029 before a line moves it down a GTK line. They are
+/// found in one copy of the text while there are any ([`Numbers::had_gtk_breaks`]).
+fn gtk_lines(numbers: &Numbers, wanted: &[(u32, String)]) -> Vec<i32> {
+    let breaks = gtk_breaks(numbers);
+    numbers.had_gtk_breaks.set(breaks);
+    let editor = numbers
+        .editor
+        .upgrade()
+        .filter(|_| breaks && !wanted.is_empty());
+    let Some(editor) = editor else {
+        return wanted
+            .iter()
+            .map(|(line, _)| i32::try_from(*line).unwrap_or(-1))
+            .collect();
+    };
+    let text = crate::document::buffer_text(editor.buffer());
+    let bytes = text.as_bytes();
+    let at: Vec<usize> = text
+        .match_indices(['\r', '\u{2029}'])
+        .map(|(i, _)| i)
+        .filter(|&i| bytes[i] != b'\r' || bytes.get(i + 1) != Some(&b'\n'))
+        .collect();
+    let index = editor.document().line_index();
+    wanted
+        .iter()
+        .map(|(line, _)| {
+            let start = if *line < index.line_count() {
+                index.line_start(*line)
+            } else {
+                index.text_len()
+            };
+            let extra = at.partition_point(|&i| i < start);
+            usize::try_from(*line)
+                .ok()
+                .and_then(|line| i32::try_from(line + extra).ok())
+                .unwrap_or(-1)
+        })
+        .collect()
 }
 
 /// Recomputes `editor`'s numbers from its live text and the project index when either changed
@@ -373,6 +434,11 @@ pub fn numbers_for(
 /// The numbers `editor` shows: (0-based line, text) by line (tests).
 pub fn shown(editor: &Editor) -> Vec<(u32, String)> {
     lookup(editor).map_or_else(Vec::new, |n| n.shown.borrow().clone())
+}
+
+/// The GTK lines `editor`'s numbers are drawn on, in the order of [`shown`] (tests).
+pub fn shown_gtk_lines(editor: &Editor) -> Vec<i32> {
+    lookup(editor).map_or_else(Vec::new, |n| n.shown_at.borrow().clone())
 }
 
 /// How many times `editor`'s numbers were added again (tests).

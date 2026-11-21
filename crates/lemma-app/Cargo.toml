@@ -251,3 +251,7 @@ harness = false
 [[test]]
 name = "gtk_envtools"
 harness = false
+
+[[test]]
+name = "gtk_improve_editor"
+harness = false

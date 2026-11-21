@@ -28,8 +28,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     // Rejecting a file the agent created moves it to the trash: keep that out of the user's.
-    let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-review-data-{}", std::process::id()));
+    let data = common::target_tmpdir().join(format!("lemma-review-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
@@ -42,6 +41,14 @@ fn main() -> ExitCode {
             undo_after_reject,
         ),
         (
+            "ctrl_shift_z_after_reject_is_the_rejects_redo",
+            redo_after_reject_then_another_change,
+        ),
+        (
+            "ctrl_z_of_typing_over_the_end_of_a_hunk",
+            typing_over_the_end_of_a_hunk_then_ctrl_z,
+        ),
+        (
             "undo_and_redo_of_a_large_agent_edit_keep_it_under_review",
             undo_redo_large_agent_edit,
         ),
@@ -50,6 +57,10 @@ fn main() -> ExitCode {
             closed_documents_records,
         ),
         ("alt_u_reverts_accept_and_reject", review_undo),
+        (
+            "alt_u_after_rejecting_a_hunk_typed_back_reverts_nothing_older",
+            alt_u_after_rejecting_an_unchanged_hunk,
+        ),
         ("navigation_wraps_across_files", navigation),
         ("decisions_advance_to_the_next_hunk", auto_advance),
         ("bars_stay_pooled_and_off_the_text", bars_pool),
@@ -59,6 +70,7 @@ fn main() -> ExitCode {
             "replies_quote_the_change_and_feedback",
             replies_and_feedback,
         ),
+        ("feedback_outlives_the_tab", feedback_outlives_the_tab),
         ("user_typing_and_hunks", user_typing),
         (
             "decisions_after_a_pending_rename_settle_it_first",
@@ -86,6 +98,14 @@ fn main() -> ExitCode {
         ),
         ("tags_follow_random_edits", tags_follow_random_edits),
         ("emptied_file_draws_above_the_first_line", emptied_file),
+        (
+            "deleted_text_wraps_at_the_text_whatever_the_first_line",
+            phantom_wrap_whatever_the_first_line,
+        ),
+        (
+            "an_anchor_line_with_gtk_line_breaks_reserves_once",
+            anchor_line_with_gtk_breaks,
+        ),
         ("binary_apply_as_agent_and_demo", binary_runs),
     ];
     if std::env::args().any(|a| a == "--ignored") {
@@ -277,6 +297,10 @@ const GOLDEN_HEIGHT: i32 = 540;
 const GOLDEN_TOLERANCE: f64 = 2.0 / 255.0;
 
 fn golden_snapshots() {
+    if cfg!(windows) {
+        println!("  SKIP: the golden images are drawn with Linux's fonts");
+        return;
+    }
     let update = std::env::var_os("UPDATE_GOLDEN").is_some();
     let mut failures = Vec::new();
     for &(case, width, reading) in GOLDEN_CASES {
@@ -436,6 +460,149 @@ fn undo_after_reject() {
     assert_eq!(f.ids("main.tex"), vec![id]);
 }
 
+/// Reject, Ctrl+Z, Ctrl+Shift+Z, another change, then Ctrl+Z twice. The redo takes the agent's
+/// line out again, which is letter for letter what undoing the agent's edit does: the document
+/// tells the review that the buffer redoes (`FileReview::begin_history_step`), so it is the
+/// reject's redo. Taken for an undo (the way the user stepped last), the records of the edit and
+/// of the reject both looked undone, the other change dropped them, and the last Ctrl+Z put the
+/// agent's line into the baseline: it was in the document with nothing left to review.
+fn redo_after_reject_then_another_change() {
+    let original = "a\nb\n";
+    let f = fixture("redo-reject", &[("main.tex", original)]);
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "a\n", "a\nnew\n");
+    let proposal = f.doc("main.tex").text();
+    let id = f.ids("main.tex")[0];
+    f.action("review-next");
+    f.action("review-reject");
+    assert!(f.hunks("main.tex").is_empty());
+    let baseline = || {
+        f.doc("main.tex")
+            .review
+            .borrow()
+            .as_ref()
+            .map(|r| r.baseline().to_owned())
+    };
+
+    editor.buffer().undo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.ids("main.tex"), vec![id]);
+    editor.buffer().redo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.doc("main.tex").text(), original);
+    assert!(f.hunks("main.tex").is_empty());
+
+    // Another change, then Ctrl+Z of it and of the reject.
+    f.edit("main.tex", "b", "B");
+    common::pump_for(Duration::from_millis(80));
+    editor.buffer().undo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.doc("main.tex").text(), original);
+    editor.buffer().undo();
+    common::pump_for(Duration::from_millis(80));
+    assert_eq!(f.doc("main.tex").text(), proposal);
+    assert_eq!(
+        baseline().as_deref(),
+        Some(original),
+        "the agent's line went into the baseline"
+    );
+    assert_eq!(
+        f.ids("main.tex"),
+        vec![id],
+        "the hunk is under review again"
+    );
+}
+
+/// Select from inside the agent's text to the end of its hunk, or past it into the user's own
+/// text, type over it key by key as the text view does, then Ctrl+Z: the text, the baseline and
+/// the hunks are what they were before the typing, and Ctrl+Shift+Z gives the typing back. The
+/// deletion went into the proposal and the first key into the baseline, at the end of what was
+/// left of the hunk; the recompute after the typing widened the hunk over that line, so Ctrl+Z
+/// took the key out of the proposal only and left it in the baseline, a phantom change (and
+/// before that recompute, it put the agent's text into the baseline).
+fn typing_over_the_end_of_a_hunk_then_ctrl_z() {
+    let original = "first line\nsecond line\nthird line\n";
+    for (k, past) in [false, true].into_iter().enumerate() {
+        for wait in [false, true] {
+            let name = format!("type-over-hunk-end-{k}-{wait}");
+            let f = fixture(&name, &[("main.tex", original)]);
+            let editor = f.open("main.tex");
+            f.edit("main.tex", "second line\n", "second LINE\n");
+            let buffer = editor.buffer();
+            let baseline = || {
+                f.doc("main.tex")
+                    .review
+                    .borrow()
+                    .as_ref()
+                    .map(|r| r.baseline().to_owned())
+            };
+            let pairs = || -> Vec<(String, String)> {
+                let text = f.doc("main.tex").text();
+                f.hunks("main.tex")
+                    .iter()
+                    .map(|h| (h.old_text.clone(), text[h.cur_bytes.clone()].to_owned()))
+                    .collect()
+            };
+            let proposal = f.doc("main.tex").text();
+            let (ids, hunks) = (f.ids("main.tex"), pairs());
+            assert_eq!(
+                hunks,
+                [("second line\n".to_owned(), "second LINE\n".to_owned())]
+            );
+            // From inside "LINE" to the end of the hunk, or into "third".
+            let from = proposal.find("NE\n").unwrap();
+            let to = if past {
+                from + "NE\nthi".len()
+            } else {
+                from + "NE\n".len()
+            };
+            let iter = |at: usize| buffer.iter_at_offset(i32::try_from(at).unwrap());
+            buffer.select_range(&iter(from), &iter(to));
+            for key in ["X", "Y"] {
+                buffer.begin_user_action();
+                buffer.delete_selection(true, true);
+                buffer.insert_interactive_at_cursor(key, true);
+                buffer.end_user_action();
+            }
+            let typed = f.doc("main.tex").text();
+            assert_eq!(typed, format!("{}XY{}", &proposal[..from], &proposal[to..]));
+            if wait {
+                common::pump_for(Duration::from_millis(120));
+            }
+            let typed_baseline = baseline();
+            while f.doc("main.tex").text() != proposal {
+                assert!(
+                    buffer.can_undo(),
+                    "{name}: the undo stops short of the typing"
+                );
+                buffer.undo();
+                common::pump_for(Duration::from_millis(30));
+            }
+            assert_eq!(baseline().as_deref(), Some(original), "{name}");
+            assert_eq!(f.ids("main.tex"), ids, "{name}");
+            assert_eq!(pairs(), hunks, "{name}");
+            while f.doc("main.tex").text() != typed {
+                assert!(
+                    buffer.can_redo(),
+                    "{name}: the redo stops short of the typing"
+                );
+                buffer.redo();
+                common::pump_for(Duration::from_millis(30));
+            }
+            assert_eq!(baseline(), typed_baseline, "{name}");
+            while f.doc("main.tex").text() != proposal {
+                buffer.undo();
+                common::pump_for(Duration::from_millis(30));
+            }
+            assert_eq!(baseline().as_deref(), Some(original), "{name}");
+            assert_eq!(pairs(), hunks, "{name}");
+            f.action("review-next");
+            f.action("review-reject");
+            assert_eq!(f.doc("main.tex").text(), original, "{name}");
+        }
+    }
+}
+
 /// Ctrl+Z and Ctrl+Shift+Z of one agent edit with 300 replacements: an open buffer reports each
 /// as a deletion and an insertion, 600 changes, more than the review records of older turns
 /// (512). The undo leaves nothing to review, the redo brings every hunk back, and none of the
@@ -581,6 +748,48 @@ fn review_undo() {
     assert_eq!(f.ids("main.tex"), vec![id]);
 }
 
+/// Alt+N on a hunk the user has just typed back to what it was (its texts are equal until the
+/// recompute 50 ms after typing) rejects nothing, and records no decision. It used to record one
+/// with no entry in the review's journal: the next Alt+U, meant for the newest decision (a
+/// reject in another file), reverted this file's older reject instead.
+fn alt_u_after_rejecting_an_unchanged_hunk() {
+    let f = fixture(
+        "alt-u-unchanged",
+        &[("a.tex", &lines(30)), ("b.tex", &lines(10))],
+    );
+    let editor = f.open("a.tex");
+    f.open("b.tex");
+    f.edit("a.tex", "line 5\n", "line five\n");
+    f.edit("a.tex", "line 20\n", "line twenty\n");
+    f.edit("b.tex", "line 3\n", "line three\n");
+    let (a, b) = (f.doc("a.tex"), f.doc("b.tex"));
+    let ids = f.ids("a.tex");
+    assert_eq!(ids.len(), 2);
+    review_ui::decide(&f.state, &a, ids[0], Decision::Reject).unwrap();
+    review_ui::decide(&f.state, &b, f.ids("b.tex")[0], Decision::Reject).unwrap();
+    assert!(!b.text().contains("line three"));
+    // The user types a.tex's second change back, and presses Alt+N before the recompute.
+    let buffer = editor.buffer();
+    let mut start = buffer.iter_at_line(19).unwrap();
+    let mut end = start;
+    end.forward_to_line_end();
+    buffer.begin_user_action();
+    buffer.delete(&mut start, &mut end);
+    buffer.insert(&mut start, "line 20");
+    buffer.end_user_action();
+    let typed = a.text();
+    assert!(typed.contains("line 20\n"), "{typed}");
+    review_ui::decide(&f.state, &a, ids[1], Decision::Reject).unwrap();
+    assert_eq!(a.text(), typed, "nothing was rejected");
+    // Alt+U reverts the newest decision: b.tex's reject.
+    f.action("review-undo");
+    assert!(
+        b.text().contains("line three"),
+        "b.tex's reject was reverted"
+    );
+    assert_eq!(a.text(), typed, "a.tex's older reject stays");
+}
+
 /// Three hunks in a.tex (open), one in b.tex (never opened).
 fn two_file_fixture(name: &str) -> Fixture {
     let f = fixture(name, &[("a.tex", &lines(60)), ("b.tex", &lines(20))]);
@@ -642,7 +851,13 @@ fn auto_advance() {
     let view = editor.view();
     let visible = view.visible_rect();
     let (y, h) = view.line_yrange(&editor.buffer().iter_at_line(9).unwrap());
-    assert!(y >= visible.y() && y + h <= visible.y() + visible.height());
+    assert!(
+        y >= visible.y() && y + h <= visible.y() + visible.height(),
+        "line 10 is at {y} to {}, the view shows {} to {}",
+        y + h,
+        visible.y(),
+        visible.y() + visible.height()
+    );
 
     // No hunk at the cursor: nothing happens.
     f.put_cursor(&editor, 0);
@@ -924,8 +1139,41 @@ fn disk_before_reply() {
     assert_eq!(f.disk("open.tex"), f.doc("open.tex").text());
     let reply = f.write("chapters/new.tex", "\\section{New}\nText.\n");
     assert_eq!(f.disk("chapters/new.tex"), "\\section{New}\nText.\n");
+    // The reply names the file with `/` on every system.
     assert!(reply_text(&reply).starts_with("Created chapters/new.tex (2 lines)"));
     assert_eq!(f.hunks("chapters/new.tex").len(), 1);
+}
+
+/// The user rejects the agent's only change in a file and closes its tab: the review, with
+/// nothing left to decide, goes with the tab, and the reject still reaches the agent with the
+/// next reply (it went with the review, and the agent was free to make the change again).
+fn feedback_outlives_the_tab() {
+    let f = fixture(
+        "feedback-closed",
+        &[("main.tex", &lines(20)), ("other.tex", &lines(5))],
+    );
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "line 10\n", "line ten\n");
+    f.action("review-next");
+    f.action("review-reject");
+    f.wait_saved("main.tex");
+    f.state.close_editor(&editor, false);
+    drop(editor);
+    common::pump_until(TIMEOUT, || {
+        f.state.workspace.get(&f.path("main.tex")).is_none()
+    });
+    let reply = f.edit("other.tex", "line 2\n", "line two\n");
+    let text = reply_text(&reply);
+    assert!(
+        text.contains(
+            "<review_feedback>\nmain.tex: the user rejected line 10; your text \"line ten\\n\" \
+             was replaced by \"line 10\\n\"\n</review_feedback>"
+        ),
+        "{text}"
+    );
+    // Once.
+    let reply = f.edit("other.tex", "line 3\n", "line three\n");
+    assert!(!reply_text(&reply).contains("review_feedback"));
 }
 
 fn replies_and_feedback() {
@@ -1130,17 +1378,29 @@ fn bulk_decisions() {
 }
 
 fn new_file_trash() {
+    common::require_private_trash();
     let f = fixture("trash", &[("main.tex", "x\n")]);
     f.write("notes/new.tex", "fresh\ntext\n");
     let path = f.path("notes/new.tex");
     assert!(path.exists());
     let doc = f.doc("notes/new.tex");
+    // Where this directory has no trash (a container's volume), the file is deleted instead
+    // (`gtk_review_persist` has that case).
+    let probe = f.path("probe");
+    std::fs::write(&probe, "x").unwrap();
+    let has_trash = gio::File::for_path(&probe)
+        .trash(None::<&gio::Cancellable>)
+        .is_ok();
     review_ui::decide_document(&f.state, &doc, Decision::Reject);
     common::pump_until(TIMEOUT, || !path.exists());
     assert!(
         f.state.workspace.get(&path).is_none(),
         "dropped from the workspace"
     );
+    if !has_trash {
+        println!("    (no trash for the test directory: the file was deleted)");
+        return;
+    }
     let trash = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("Trash/files");
     let trashed = std::fs::read_dir(&trash)
         .unwrap()
@@ -1185,6 +1445,7 @@ fn ex_commands_and_chords() {
 
 /// Types `keys` into the active editor's Vim context, as a keyboard would.
 fn type_vim_keys(f: &Fixture, keys: &str) {
+    common::require_keymap();
     use gtk::gdk;
     let editor = f.state.active_editor().unwrap();
     let im = editor.vim().expect("Vim is on");
@@ -1309,6 +1570,12 @@ fn banner_and_panel() {
     assert!(panel.rows().is_empty());
     assert!(!controller.summary_button().is_visible());
     assert!(!f.state.banner.is_revealed());
+    // The plain diff of nothing is the page that says so (it was a blank page).
+    assert_eq!(panel.page().as_deref(), Some("empty"));
+    panel.diff_toggle().set_active(true);
+    controller.refresh();
+    assert_eq!(panel.page().as_deref(), Some("empty"));
+    panel.diff_toggle().set_active(false);
 }
 
 /// The Changes panel builds no rows while its page is hidden (the model a refresh leaves waits
@@ -2310,6 +2577,98 @@ fn pasted_anchor_line() {
     assert!(!buffer.iter_at_line(15).unwrap().has_tag(&added));
 }
 
+/// GTK also ends a line at a lone `\r` and at U+2029, where the review's (`\n`) lines go on: a
+/// band's space is reserved once, above the first of the GTK lines of its anchor line (below
+/// the last, for a deletion at the end), and the band is drawn there.
+fn anchor_line_with_gtk_breaks() {
+    let text = "line 1\nline 2\nline 3\nfour\rhalf\u{2029}more\nline 5\nsix\rseven\nline 8\n";
+    let f = fixture("gtk-breaks", &[("main.tex", text)]);
+    let editor = f.open("main.tex");
+    f.edit("main.tex", "line 3\n", "");
+    f.edit("main.tex", "line 8\n", "");
+    f.frames(2);
+    let view = editor.view().clone();
+    let review = view.review_state().unwrap();
+    let buffer = editor.buffer();
+    // GTK lines: 0 "line 1", 1 "line 2", 2 "four\r", 3 "half\u{2029}", 4 "more", 5 "line 5",
+    // 6 "six\r", 7 "seven", 8 "".
+    assert_eq!(buffer.line_count(), 9);
+    let blocks = review.blocks();
+    assert_eq!(
+        blocks.iter().map(|b| b.anchor).collect::<Vec<_>>(),
+        [Anchor::Above(2), Anchor::Below(4)]
+    );
+    let header = review.header_height();
+    let space = |b: &lemma_app::editor::review_overlay::Block| header + b.deleted;
+    let above = |line: i32| {
+        let iter = buffer.iter_at_line(line).unwrap();
+        view.iter_location(&iter).y() - view.line_yrange(&iter).0
+    };
+    let below = |line: i32| {
+        let iter = buffer.iter_at_line(line).unwrap();
+        let (y, height) = view.line_yrange(&iter);
+        let text = view.iter_location(&iter);
+        y + height - (text.y() + text.height())
+    };
+    let reserved: Vec<(i32, i32)> = (0..9).map(|l| (above(l), below(l))).collect();
+    let mut expected = vec![(0, 0); 9];
+    expected[2].0 = space(&blocks[0]);
+    expected[7].1 = space(&blocks[1]);
+    assert_eq!(reserved, expected, "the space each GTK line reserves");
+    let y_of = |line: i32| view.line_yrange(&buffer.iter_at_line(line).unwrap());
+    let (seven_y, seven_h) = y_of(7);
+    assert_eq!(
+        review.band_tops(),
+        [
+            (blocks[0].id, y_of(2).0),
+            (blocks[1].id, seven_y + seven_h - space(&blocks[1]))
+        ],
+        "the bands"
+    );
+    // The gutter marks the deleted lines (red) next to the bands only: none next to the other
+    // GTK lines of the anchor lines.
+    let shot = f.path("gutter.png");
+    block_on(testmode::snapshot_next_frame(
+        view.upcast_ref::<gtk::Widget>(),
+        &shot,
+    ))
+    .unwrap();
+    let (bytes, _, height, stride) = pixels(&shot).unwrap();
+    let gutter = sourceview5::prelude::ViewExt::gutter(&view, gtk::TextWindowType::Left).width();
+    let red_rows = |line: i32| {
+        let (y, h) = y_of(line);
+        let (_, top) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, 0, y);
+        (top.max(0)..(top + h).min(height as i32))
+            .filter(|&row| {
+                (0..gutter as usize).any(|x| {
+                    let p = &bytes[row as usize * stride + x * 4..][..3];
+                    let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+                    r > g + 25 && r > b + 25
+                })
+            })
+            .count()
+    };
+    assert!(
+        red_rows(2) > 0 && red_rows(7) > 0,
+        "the deleted lines are marked"
+    );
+    assert_eq!(
+        [3, 4, 6].map(red_rows),
+        [0; 3],
+        "no marks next to the other GTK lines"
+    );
+    // Typing in the anchor lines: until the recompute the bands are found from the text.
+    let tops = review.band_tops();
+    for line in [2, 3, 6, 7] {
+        buffer.insert(&mut buffer.iter_at_line_offset(line, 1).unwrap(), "x");
+    }
+    assert_eq!(review.band_tops(), tops, "the bands while the text changes");
+    common::pump_for(Duration::from_millis(150));
+    f.frames(1);
+    let reserved: Vec<(i32, i32)> = (0..9).map(|l| (above(l), below(l))).collect();
+    assert_eq!(reserved, expected, "after typing");
+}
+
 fn emptied_file() {
     let f = fixture("emptied", &[("main.tex", "first\nsecond\n")]);
     let editor = f.open("main.tex");
@@ -2343,6 +2702,67 @@ fn emptied_file() {
     f.action("review-reject");
     assert_eq!(f.doc("main.tex").text(), "first\nsecond\n");
     assert_eq!(view.top_margin(), base_margin, "the margin is restored");
+}
+
+/// The deleted lines in a band start where the text starts and wrap at the text's width,
+/// whatever the document's first line is: right-to-left text there (Hebrew, Arabic) is laid out
+/// from the right edge, and its first character is not where lines start. Also with CSS padding
+/// on the view, which GTK keeps outside the text area.
+fn phantom_wrap_whatever_the_first_line() {
+    let deleted = format!("{}\n", "Deleted words that wrap. ".repeat(12));
+    let padding = gtk::CssProvider::new();
+    padding.load_from_string("textview { padding-left: 25px; padding-right: 7px; }");
+    let display = gtk::gdk::Display::default().unwrap();
+    for padded in [false, true] {
+        if padded {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &padding,
+                gtk::STYLE_PROVIDER_PRIORITY_USER + 10,
+            );
+        }
+        let mut measured = Vec::new();
+        for (case, first) in [
+            ("ltr", "A first line."),
+            ("indented", "    An indented first line."),
+            ("hebrew", "שורה ראשונה בעברית"),
+            ("arabic", "السطر الأول بالعربية"),
+        ] {
+            let case = format!("{case}{}", if padded { "-padded" } else { "" });
+            let text = format!("{first}\nOne.\n{deleted}Two.\n");
+            let f = fixture(&format!("phantom-{case}"), &[("main.tex", &text)]);
+            let editor = f.open("main.tex");
+            f.frames(2);
+            f.edit("main.tex", &deleted, "");
+            let view = editor.view();
+            let review = view.review_state().unwrap();
+            f.frames(2);
+            let blocks = review.blocks();
+            assert_eq!(blocks.len(), 1, "{case}");
+            let layouts = review.phantom_layouts(blocks[0].id);
+            assert_eq!(layouts.len(), 1, "{case}");
+            let origin = review.phantom_origin().unwrap();
+            if measured.is_empty() {
+                // Where GTK starts a left-to-right line.
+                let start = view.iter_location(&editor.buffer().start_iter());
+                assert_eq!(origin, start.x(), "{case}");
+                assert!(
+                    layouts[0].width() > 0 && layouts[0].line_count() > 1,
+                    "{case}"
+                );
+            }
+            measured.push((case, layouts[0].width(), origin));
+        }
+        let (_, width, origin) = measured[0].clone();
+        for (case, w, o) in &measured[1..] {
+            assert_eq!(
+                (*w, *o),
+                (width, origin),
+                "{case}: as with a first line in English"
+            );
+        }
+    }
+    gtk::style_context_remove_provider_for_display(&display, &padding);
 }
 
 // ----- the binary -----

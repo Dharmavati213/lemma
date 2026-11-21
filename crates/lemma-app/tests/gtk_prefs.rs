@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         ("prefs_numbers_are_written_once_settled", debounce),
         ("prefs_refuse_what_they_cannot_write", refusals),
         ("prefs_open_config_file", open_file),
+        ("prefs_show_paths_as_text", paths_as_text),
         ("prefs_demo_resolves", demo),
     ])
 }
@@ -90,6 +91,7 @@ fn fixture(name: &str, text: &str, link: bool) -> Fixture {
     std::fs::create_dir_all(&config_dir).unwrap();
     let config = config_dir.join("config.toml");
     let target = if link {
+        common::require_symlinks();
         let dotfiles = dir.join("dotfiles");
         std::fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join("lemma.toml");
@@ -417,11 +419,15 @@ fn live() {
     assert!(!f.state.pdf_sidebar.split.shows_sidebar());
     assert!(prefs::set_bool(&f.state, "pdf", "thumbnails", true));
     assert!(f.state.pdf_sidebar.split.shows_sidebar());
-    // Spell checking starts and stops.
-    assert!(prefs::set_bool(&f.state, "spell", "enabled", true));
-    common::pump_until(TIMEOUT, || lemma_app::editor::spell::is_checking(&editor));
-    assert!(prefs::set_bool(&f.state, "spell", "enabled", false));
-    common::pump_until(TIMEOUT, || !lemma_app::editor::spell::is_checking(&editor));
+    // Spell checking starts and stops (with a dictionary to check against).
+    if common::english_dictionary() {
+        assert!(prefs::set_bool(&f.state, "spell", "enabled", true));
+        common::pump_until(TIMEOUT, || lemma_app::editor::spell::is_checking(&editor));
+        assert!(prefs::set_bool(&f.state, "spell", "enabled", false));
+        common::pump_until(TIMEOUT, || !lemma_app::editor::spell::is_checking(&editor));
+    } else {
+        println!("SKIP: no en_US spelling dictionary installed; spell checking is not switched");
+    }
     // The rest is read where it is used: the window's configuration has it.
     assert!(prefs::set_bool(&f.state, "typing", "autopair", false));
     assert!(!f.state.config.typing.autopair);
@@ -542,43 +548,100 @@ fn refusals() {
     f.close();
     drop(f);
 
-    // LEMMA_CONFIG=/dev/null: nothing can be written; the dialog says so.
-    let f = fixture("refuse-null", "", false);
-    f.state
-        .set_settings_files(Some(SettingsFiles::next_to("/dev/null".into())));
-    assert!(!prefs::is_writable(&f.state));
-    let dialog = f.show();
-    let widgets = descendants(dialog.upcast_ref());
-    let groups: Vec<&adw::PreferencesGroup> = widgets
-        .iter()
-        .filter_map(|w| w.downcast_ref::<adw::PreferencesGroup>())
-        .collect();
-    let titles: Vec<&str> = prefs::PAGES
-        .iter()
-        .flat_map(|p| p.groups.iter().map(|g| g.title))
-        .collect();
-    let controls: Vec<&&adw::PreferencesGroup> = groups
-        .iter()
-        .filter(|g| titles.contains(&g.title().as_str()))
-        .collect();
-    assert!(controls.len() >= titles.len() - 1, "{}", controls.len());
-    assert!(
-        controls.iter().all(|g| !g.is_sensitive()),
-        "the controls are insensitive"
-    );
-    assert!(groups.iter().any(|g| {
-        g.description()
-            .is_some_and(|d| d.contains("cannot be changed here"))
-    }));
-    // A change anyway is refused and reverted.
-    let before = f.state.config.get();
-    assert!(prefs::set_bool(&f.state, "editor", "wrap", false));
-    assert_eq!(prefs::bool_value(&f.state, "editor", "wrap"), Some(true));
-    assert_eq!(*f.state.config.get(), *before);
-    common::pump_until(TIMEOUT, || !toasts(&dialog).is_empty());
-    let shown = toasts(&dialog).join(" ");
-    assert!(shown.contains("not a file"), "{shown}");
-    f.close();
+    // LEMMA_CONFIG=/dev/null: nothing can be written; the dialog says so. (Windows has no such
+    // file.)
+    if !cfg!(windows) {
+        let f = fixture("refuse-null", "", false);
+        f.state
+            .set_settings_files(Some(SettingsFiles::next_to("/dev/null".into())));
+        assert!(!prefs::is_writable(&f.state));
+        let dialog = f.show();
+        let widgets = descendants(dialog.upcast_ref());
+        let groups: Vec<&adw::PreferencesGroup> = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<adw::PreferencesGroup>())
+            .collect();
+        let titles: Vec<&str> = prefs::PAGES
+            .iter()
+            .flat_map(|p| p.groups.iter().map(|g| g.title))
+            .collect();
+        let controls: Vec<&&adw::PreferencesGroup> = groups
+            .iter()
+            .filter(|g| titles.contains(&g.title().as_str()))
+            .collect();
+        assert!(controls.len() >= titles.len() - 1, "{}", controls.len());
+        assert!(
+            controls.iter().all(|g| !g.is_sensitive()),
+            "the controls are insensitive"
+        );
+        assert!(groups.iter().any(|g| {
+            g.description()
+                .is_some_and(|d| d.contains("cannot be changed here"))
+        }));
+        // A change anyway is refused and reverted.
+        let before = f.state.config.get();
+        assert!(prefs::set_bool(&f.state, "editor", "wrap", false));
+        assert_eq!(prefs::bool_value(&f.state, "editor", "wrap"), Some(true));
+        assert_eq!(*f.state.config.get(), *before);
+        common::pump_until(TIMEOUT, || !toasts(&dialog).is_empty());
+        let shown = toasts(&dialog).join(" ");
+        assert!(shown.contains("not a file"), "{shown}");
+        f.close();
+        drop(f);
+    }
+
+    // A configuration the user made read-only (or one in a read-only store, linked to) is not
+    // replaced: the controls are insensitive, and a change anyway is refused.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = fixture("refuse-read-only", COMMENTED, true);
+        let mode = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&f.target, mode(0o444)).unwrap();
+        assert!(!prefs::is_writable(&f.state));
+        let refused = f
+            .state
+            .edit_config_file(|text| Ok(format!("{text}# more\n")));
+        std::fs::set_permissions(&f.target, mode(0o644)).unwrap();
+        let error = refused.expect_err("a read-only file is refused");
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(f.text(), COMMENTED, "nothing written");
+        assert!(
+            std::fs::symlink_metadata(&f.config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Read-only for the user although some write bit is set (root's 0644 file in the user's
+        // folder is the usual case; here the owner's bits deny what the group's allow): the
+        // rename would have replaced it with the user's own file.
+        std::fs::set_permissions(&f.target, mode(0o464)).unwrap();
+        assert!(!prefs::is_writable(&f.state));
+        let refused = f
+            .state
+            .edit_config_file(|text| Ok(format!("{text}# more\n")));
+        std::fs::set_permissions(&f.target, mode(0o644)).unwrap();
+        let error = refused.expect_err("a file the user cannot write is refused");
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(f.text(), COMMENTED, "nothing written");
+        // A file the user can write, in a folder the user cannot: the rename would fail.
+        let folder = f.target.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, mode(0o555)).unwrap();
+        let writable = prefs::is_writable(&f.state);
+        let refused = f
+            .state
+            .edit_config_file(|text| Ok(format!("{text}# more\n")));
+        std::fs::set_permissions(&folder, mode(0o755)).unwrap();
+        assert!(
+            !writable,
+            "a file in a read-only folder is shown as writable"
+        );
+        let error = refused.expect_err("a file in a read-only folder is refused");
+        assert!(error.contains("cannot be written"), "{error}");
+        assert_eq!(f.text(), COMMENTED, "nothing written");
+        assert!(prefs::is_writable(&f.state));
+    }
 }
 
 fn open_file() {
@@ -601,6 +664,25 @@ fn open_file() {
     assert!(text.starts_with("# "), "{text}");
     assert_eq!(lemma_config::parse(&text).unwrap(), Config::default());
     prefs::set_open_hook(None);
+}
+
+/// The configuration file's path is shown as it is: an `&` or `<` in a folder name is no markup
+/// (the row's subtitle is markup, with the path escaped in it; else GTK warns and shows nothing).
+fn paths_as_text() {
+    common::require_any_file_name();
+    let f = fixture("smith & jones <draft>", COMMENTED, false);
+    let before = common::logged_problems();
+    let dialog = f.show();
+    let shown = descendants(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+        .any(|row| {
+            row.subtitle()
+                .is_some_and(|s| s.contains("smith &amp; jones &lt;draft&gt;"))
+        });
+    assert!(shown, "the path is shown");
+    common::assert_no_new_problems(before);
+    f.close();
 }
 
 /// Saves a snapshot of the window when `LEMMA_TEST_SNAPSHOTS` names a directory.

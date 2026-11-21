@@ -96,7 +96,8 @@ fn lifecycle_leaves_no_threads_processes_or_zombies() {
         assert_eq!(unsafe { libc::kill(agent, libc::SIGKILL) }, 0);
         let rest = drain(&handle, SLOW);
         assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
-        // The turn ends (no stop reason from a dead agent), then Exited with no code: a signal.
+        // The turn ends cut short (no stop reason from a dead agent), then Exited with no code:
+        // a signal.
         let tail: Vec<&AgentEvent> = rest
             .iter()
             .filter(|e| !matches!(e, AgentEvent::MessageChunk(_) | AgentEvent::ThoughtChunk(_)))
@@ -104,7 +105,7 @@ fn lifecycle_leaves_no_threads_processes_or_zombies() {
         assert_eq!(
             tail,
             [
-                &AgentEvent::TurnEnded(StopReason::EndTurn),
+                &AgentEvent::TurnEnded(StopReason::Cancelled),
                 &AgentEvent::Exited(None)
             ]
         );

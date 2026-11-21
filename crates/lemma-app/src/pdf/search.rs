@@ -2,8 +2,10 @@
 //!
 //! A search bar below the PDF toolbar (Ctrl+F while the PDF has the focus, `/` in the view, or
 //! the toolbar's search button): the query, the match count ("3 of 17"), previous and next,
-//! and a menu with Match Case and Whole Words. Matching is case-insensitive by default, ignores
-//! diacritics when the query has none, and spans line breaks (poppler's `find_text`).
+//! and a menu with Match Case and Whole Words. Matching is case-insensitive by default (`ß`
+//! matches `ss`, and ligatures their letters), ignores diacritics when the query has none, and
+//! spans line breaks; a word hyphenated across a page break is found on the page where it
+//! starts (`lemma_pdf`'s search).
 //!
 //! - The PDF thread searches page by page from the page shown on, wrapping around
 //!   (`PdfCmd::Search`), between page renders; each new query replaces the search in progress
@@ -219,15 +221,17 @@ impl Search {
             return;
         }
         let n = matches.len();
+        // On the page the search started on, the first match below the top of the view; none
+        // when every match there is above it: the first one below is on a later page, or
+        // (wrapping around) this page's first, which `search_done` selects.
         let first = {
             let (start, top) = self.origin.get();
             if page == start {
                 matches
                     .iter()
                     .position(|m| m.first().is_some_and(|r| r.1 + r.3 > top))
-                    .unwrap_or(0)
             } else {
-                0
+                Some(0)
             }
         };
         self.view.set_search_matches(page, matches);
@@ -235,7 +239,10 @@ impl Search {
         if self.view.current_match().is_some() {
             self.refresh_count();
         } else if !rerun {
-            self.select(page, first);
+            match first {
+                Some(first) => self.select(page, first),
+                None => self.refresh_count(),
+            }
         } else {
             // A re-run: the match that was current, in place, if this page still has it.
             if kept.is_some_and(|(p, index)| p == page && index < n) {
@@ -250,13 +257,22 @@ impl Search {
         let rerun = match self.query.borrow_mut().as_mut().filter(|q| q.id == id) {
             Some(q) => {
                 q.done = true;
-                q.rerun
+                Some(q.rerun)
             }
-            None => false,
+            None => None,
         };
-        // A re-run whose match is gone: the first from the view on, in place.
-        if rerun && self.view.current_match().is_none() {
-            self.view.set_current_match(self.first_from_view());
+        if self.view.current_match().is_none() {
+            match rerun {
+                // A re-run whose match is gone: the first from the view on, in place.
+                Some(true) => self.view.set_current_match(self.first_from_view()),
+                // The only matches are above the view on the page it started on.
+                Some(false) => {
+                    if let Some((page, index)) = self.first_from_view() {
+                        self.select(page, index);
+                    }
+                }
+                None => {}
+            }
         }
         self.refresh_count();
     }

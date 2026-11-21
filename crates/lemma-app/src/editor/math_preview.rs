@@ -37,8 +37,9 @@
 //! text again.
 //!
 //! The formats live in `Paths::preview_cache_dir()`; scripted runs (and windows without
-//! paths) use a temporary directory that goes with the window, and tests set their own
-//! ([`set_cache_dir`]).
+//! paths) use a temporary directory that goes with the window, or with the application when it
+//! quits first, and tests set their own ([`set_cache_dir`]). A quit also kills the TeX run going
+//! on (`lemma_preview::stop_all`).
 //!
 //! # Live preview
 //!
@@ -267,23 +268,27 @@ fn pipeline(state: &WindowState) -> Rc<Pipeline> {
         Some(dir) => (dir, false),
         None => match &state.paths {
             Some(paths) if !state.scripted => (paths.preview_cache_dir(), false),
+            // A new private directory: a fixed name in /tmp could be made first by another
+            // user, with formats TeX would then load. (In the user's own runtime directory
+            // when none can be made.)
             _ => (
-                std::env::temp_dir().join(format!("lemma-preview-{}", std::process::id())),
+                crate::fsutil::private_temp_dir("lemma-preview-").unwrap_or_else(|e| {
+                    tracing::warn!("math preview: no temporary directory: {e}");
+                    glib::user_runtime_dir().join(format!("lemma-preview-{}", std::process::id()))
+                }),
                 true,
             ),
         },
     };
     let temp_dir = temporary.then(|| dir.clone());
     if temporary {
-        // The temporary formats go with the window (and the pipeline that uses them).
+        // The temporary formats go with the window (and the pipeline that uses them), or with
+        // the application when it quits without destroying the window (see `on_quit`; and
+        // `fsutil::remove_at_exit`, should the directory outlive that too).
+        crate::fsutil::remove_at_exit(&dir);
         let dir = dir.clone();
         state.window.connect_destroy(move |_| {
-            let ours = PIPELINE.with_borrow(|p| {
-                p.as_ref()
-                    .is_some_and(|p| p.temp_dir.as_ref() == Some(&dir))
-            });
-            if ours {
-                PIPELINE.with_borrow_mut(|p| *p = None);
+            if drop_temporary_pipeline(&dir) {
                 let dir = dir.clone();
                 // Off the main thread; a render still running finishes in it first.
                 gio::spawn_blocking(move || {
@@ -292,6 +297,7 @@ fn pipeline(state: &WindowState) -> Rc<Pipeline> {
             }
         });
     }
+    on_quit(&state.app);
     tracing::debug!("math preview: formats in {}", dir.display());
     let p = Rc::new(Pipeline {
         previewer: Arc::new(Previewer::new(dir)),
@@ -307,6 +313,46 @@ fn pipeline(state: &WindowState) -> Rc<Pipeline> {
     });
     PIPELINE.with_borrow_mut(|slot| *slot = Some(p.clone()));
     p
+}
+
+/// What the application's end does (connected once): a quit ends the process without
+/// destroying the windows. The TeX run going on is killed, or one that never ends by itself (a
+/// macro that expands to itself) would go on without Lemma, using a whole processor; and the
+/// temporary formats of a scripted run go (they used to stay in the temporary folder).
+fn on_quit(app: &adw::Application) {
+    thread_local! {
+        static CONNECTED: Cell<bool> = const { Cell::new(false) };
+    }
+    if CONNECTED.replace(true) {
+        return;
+    }
+    app.connect_shutdown(|_| {
+        // A render the stop ends returns within milliseconds; nothing is written after it.
+        if !lemma_preview::stop_all(Duration::from_secs(2)) {
+            tracing::warn!("math preview: a render did not end at the quit");
+        }
+        let temporary = PIPELINE.with_borrow(|p| p.as_ref().and_then(|p| p.temp_dir.clone()));
+        if let Some(dir) = temporary
+            && drop_temporary_pipeline(&dir)
+        {
+            // Now: the process ends right after.
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+}
+
+/// Drops the pipeline when its formats are in the temporary directory `dir`; true if it did
+/// (the directory is then the caller's to remove).
+fn drop_temporary_pipeline(dir: &Path) -> bool {
+    PIPELINE.with_borrow_mut(|p| {
+        let ours = p
+            .as_ref()
+            .is_some_and(|p| p.temp_dir.as_deref() == Some(dir));
+        if ours {
+            *p = None;
+        }
+        ours
+    })
 }
 
 impl Pipeline {

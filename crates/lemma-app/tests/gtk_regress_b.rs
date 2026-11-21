@@ -6,6 +6,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_app::build_ui::Reason;
 use lemma_app::diagnostics_panel::{ERROR_CATEGORY, Problem};
@@ -96,7 +98,7 @@ fn copy_proj(name: &str) -> PathBuf {
     for file in ["main.tex", "refs.bib", "chapters/yoneda.tex"] {
         std::fs::copy(src.join(file), dir.join(file)).unwrap();
     }
-    dir.canonicalize().unwrap()
+    dir.canonical().unwrap()
 }
 
 /// Writes `files` (relative path, bytes) into a fresh test directory.
@@ -107,7 +109,7 @@ fn write_project(name: &str, files: &[(&str, &[u8])]) -> PathBuf {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
-    dir.canonicalize().unwrap()
+    dir.canonical().unwrap()
 }
 
 fn config(on_save: bool) -> Config {

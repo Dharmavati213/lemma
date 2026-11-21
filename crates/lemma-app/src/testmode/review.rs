@@ -154,13 +154,13 @@ It will be removed.
 ";
 
 /// `--demo review`: a document with a few reviewable hunks. It writes a small LaTeX file to a
-/// fresh temporary directory, opens it and applies agent edits to it (a replacement, an
-/// insertion, a deletion and a word-level change).
+/// fresh temporary directory (removed when the app ends, `super::demo_dir`), opens it and
+/// applies agent edits to it (a replacement, an insertion, a deletion and a word-level change).
 pub async fn run_demo(state: Rc<WindowState>) -> Result<(), String> {
     if !state.workspace.is_empty() {
         return Err("the review demo opens its own document; run it without FILE".into());
     }
-    let dir = glib::tmp_dir().join(format!("lemma-review-demo-{}", std::process::id()));
+    let dir = super::demo_dir("lemma-review-demo-")?;
     let path = dir.join("demo.tex");
     write_file(&path, DEMO_TEX).await?;
     state.open_file(&path).await?;

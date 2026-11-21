@@ -4,7 +4,8 @@
 //! - **Matching** ([`Query`], [`Matcher`]): plain text or a regular expression (the `regex`
 //!   crate), with case and whole-word options, **line by line** with `rg`'s semantics (see
 //!   [`query`]): the results equal `rg [-F] [-i] [-w]` on the same files (tested on the
-//!   fixtures).
+//!   fixtures), with `--crlf` for lines that end with `\r\n`, whose `\r` a match takes only
+//!   when the pattern names a line break (so a replace keeps the file's line breaks).
 //! - **Scope** ([`Scope`]): the project graph's files first (the caller's include order), then
 //!   the other `.tex`, `.bib`, `.sty`, `.cls` and `.md` files under the root ([`EXTENSIONS`]),
 //!   skipping hidden directories (`.git`, `.build`), symbolic links and the caller's

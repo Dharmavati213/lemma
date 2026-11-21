@@ -476,7 +476,10 @@ fn hover_closed_file() {
     assert!(text.contains("Chapter"), "{text}");
     assert!(text.contains("\\section{Chapter}\\label{sec:ch}"), "{text}");
     assert!(text.contains("Back to Theorem~\\ref{thm:main}"), "{text}");
-    assert!(text.contains("chapters/ch1.tex:1"), "{text}");
+    assert!(
+        text.contains(&common::shown("chapters/ch1.tex:1")),
+        "{text}"
+    );
 }
 
 fn hover_names() {
@@ -602,6 +605,43 @@ fn popover_goes_with_its_view() {
     assert!(popover.parent().is_none());
 }
 
+/// How many `destroy` handlers `object` (a widget) has.
+fn destroy_handlers(object: &glib::Object) -> u32 {
+    use glib::gobject_ffi::{
+        G_SIGNAL_MATCH_ID, g_signal_handlers_block_matched, g_signal_handlers_unblock_matched,
+    };
+    use glib::translate::{IntoGlib as _, ToGlibPtr as _};
+    let signal = glib::subclass::signal::SignalId::lookup("destroy", gtk::Widget::static_type())
+        .unwrap()
+        .into_glib();
+    use std::ptr::null_mut;
+    // SAFETY: a live object and its own signal; blocking and unblocking every handler of the
+    // signal counts them and leaves them as they were.
+    unsafe {
+        let instance = object.to_glib_none().0;
+        let mask = G_SIGNAL_MATCH_ID;
+        let n = g_signal_handlers_block_matched(
+            instance,
+            mask,
+            signal,
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        );
+        g_signal_handlers_unblock_matched(
+            instance,
+            mask,
+            signal,
+            0,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        );
+        n
+    }
+}
+
 /// The crop shown in a hover's widget, if any.
 fn crop_of(widget: &gtk::Widget) -> Option<gtk::Widget> {
     if widget.type_().name() == "LemmaCropView" {
@@ -664,6 +704,18 @@ fn hover_crop() {
     assert!(text.contains("Equation (1)"), "{text}");
     assert!(lemma_app::labels::crop_worker_running(&f.state));
     snapshots(&f, "j-hover-crop", show);
+    // A worker started again after a stop (IDLE_STOP without hovers) leaves no handler on the
+    // window behind: one while a worker runs, none once it stopped.
+    let window = f.state.window.upcast_ref::<glib::Object>();
+    let running = destroy_handlers(window);
+    for _ in 0..3 {
+        lemma_app::labels::stop_crop_worker(&f.state);
+        assert!(!lemma_app::labels::crop_worker_running(&f.state));
+        assert_eq!(destroy_handlers(window), running - 1);
+        show();
+        assert!(lemma_app::labels::crop_worker_running(&f.state));
+        assert_eq!(destroy_handlers(window), running);
+    }
     // A label the PDF does not have yet (written after the build): the source lines stay.
     let buffer = editor.buffer();
     let mut end = editor

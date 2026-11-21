@@ -399,6 +399,14 @@ impl Doc {
         }
     }
 
+    /// The size of the 0-based `page` as displayed and how it is turned, for the destinations of
+    /// links and bookmarks ([`links::PageTurn`]).
+    fn turn(&mut self, page: u32) -> ((f64, f64), Rotation) {
+        self.read(page);
+        let size = self.sizes.get(page as usize).copied().unwrap_or_default();
+        (size, self.rotation(page))
+    }
+
     /// A SyncTeX box (TeX's page space) on its page as displayed.
     fn box_to_display(&mut self, b: SyncBox) -> SyncBox {
         let page = b.page.saturating_sub(1);
@@ -637,11 +645,12 @@ impl<'a> Worker<'a> {
                 self.sync_query(SyncQuery::Inverse { page, x_bp, y_bp })
             }
             PdfCmd::Links { page } => {
-                let (generation, links) = self.doc.as_ref().map_or((0, Vec::new()), |doc| {
+                let (generation, links) = self.doc.as_mut().map_or((0, Vec::new()), |doc| {
+                    let pdf = doc.doc.clone();
                     // poppler logs a critical warning for out-of-range pages, so check first.
                     let links = doc
                         .page(page)
-                        .map(|p| links::page_links(&doc.doc, &p))
+                        .map(|p| links::page_links(&pdf, &p, &mut |i| doc.turn(i)))
                         .unwrap_or_default();
                     (doc.generation, links)
                 });
@@ -666,8 +675,9 @@ impl<'a> Worker<'a> {
                 ControlFlow::Continue(())
             }
             PdfCmd::Outline => {
-                let (generation, items) = self.doc.as_ref().map_or((0, Vec::new()), |d| {
-                    (d.generation, outline::outline(&d.doc))
+                let (generation, items) = self.doc.as_mut().map_or((0, Vec::new()), |d| {
+                    let pdf = d.doc.clone();
+                    (d.generation, outline::outline(&pdf, &mut |i| d.turn(i)))
                 });
                 self.emit(PdfEvent::Outline { generation, items })
             }
@@ -729,10 +739,11 @@ impl<'a> Worker<'a> {
             Vec::new()
         } else {
             let (query, options) = (job.query.clone(), job.options);
+            // The next page too, for a word hyphenated across the page break.
             self.doc
                 .as_ref()
-                .and_then(|d| d.page(page_index))
-                .map(|page| search::find(&page, &query, options))
+                .and_then(|d| Some((d.page(page_index)?, d.page(page_index + 1))))
+                .map(|(page, next)| search::find(&page, next.as_ref(), &query, options))
                 .unwrap_or_default()
         };
         if !matches.is_empty() {
@@ -1033,7 +1044,12 @@ impl<'a> Worker<'a> {
                 }
                 // The view lays out the pages read for the boxes before it draws them.
                 self.report_sizes()?;
-                self.emit(PdfEvent::Forward { generation, boxes })
+                self.emit(PdfEvent::Forward {
+                    generation,
+                    file,
+                    line,
+                    boxes,
+                })
             }
             SyncQuery::Inverse { page, x_bp, y_bp } => {
                 let (x_bp, y_bp) = match &mut self.doc {
@@ -1251,17 +1267,37 @@ mod tests {
         assert_eq!(Unit::order_after(Some(Unit::Sizes)), Unit::ALL);
     }
 
+    /// A directory of one test, removed when the test ends (passed or failed). Unit tests have
+    /// no `CARGO_TARGET_TMPDIR`, so it is in the system's temporary directory, where nothing
+    /// else would remove it.
+    struct TempDir(PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A fresh directory for one test.
-    fn temp_dir(name: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> TempDir {
         let dir =
             std::env::temp_dir().join(format!("lemma-pdf-worker-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        lemma_core::canonicalize(&dir).unwrap()
+        TempDir(lemma_core::canonicalize(&dir).unwrap())
     }
 
-    /// A copy of `tests/fixtures/proj` with its PDF and SyncTeX file; returns the PDF.
-    fn proj_copy(name: &str) -> PathBuf {
+    /// A copy of `tests/fixtures/proj` with its PDF and SyncTeX file; returns its directory and
+    /// the PDF.
+    fn proj_copy(name: &str) -> (TempDir, PathBuf) {
         let dir = temp_dir(name);
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
         for file in [
@@ -1272,7 +1308,8 @@ mod tests {
         ] {
             std::fs::copy(fixture(&format!("proj/{file}")), dir.join(file)).unwrap();
         }
-        dir.join("main.pdf")
+        let pdf = dir.join("main.pdf");
+        (dir, pdf)
     }
 
     /// Gives the SyncTeX file next to `pdf` another modification time, as a rebuild does.
@@ -1316,7 +1353,7 @@ mod tests {
 
     #[test]
     fn sync_queries_wait_for_the_parse_while_pages_render() {
-        let pdf = proj_copy("wait");
+        let (_dir, pdf) = proj_copy("wait");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1348,6 +1385,7 @@ mod tests {
                 PdfEvent::Forward {
                     generation: 1,
                     boxes,
+                    ..
                 },
                 PdfEvent::Inverse {
                     target: Some(target),
@@ -1366,7 +1404,7 @@ mod tests {
 
     #[test]
     fn a_rebuild_is_parsed_ahead_only_after_a_recent_sync() {
-        let pdf = proj_copy("ahead");
+        let (_dir, pdf) = proj_copy("ahead");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1411,7 +1449,7 @@ mod tests {
 
     #[test]
     fn a_parse_of_a_file_changed_meanwhile_is_dropped() {
-        let pdf = proj_copy("changed");
+        let (_dir, pdf) = proj_copy("changed");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1433,13 +1471,13 @@ mod tests {
         take_parse(&mut worker, &rx);
         assert!(matches!(
             drain(&received)[..],
-            [PdfEvent::Forward { generation: 1, ref boxes }] if !boxes.is_empty()
+            [PdfEvent::Forward { generation: 1, ref boxes, .. }] if !boxes.is_empty()
         ));
     }
 
     #[test]
     fn a_new_open_detaches_the_running_parse() {
-        let pdf = proj_copy("detach");
+        let (_dir, pdf) = proj_copy("detach");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1465,6 +1503,7 @@ mod tests {
                 PdfEvent::Forward {
                     generation: 2,
                     boxes,
+                    ..
                 },
             ] => assert!(!boxes.is_empty()),
             other => panic!("{other:?}"),
@@ -1473,7 +1512,7 @@ mod tests {
 
     #[test]
     fn trim_frees_the_scanner_and_forgets_the_recent_sync() {
-        let pdf = proj_copy("trim");
+        let (_dir, pdf) = proj_copy("trim");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1512,7 +1551,7 @@ mod tests {
 
     #[test]
     fn a_restart_answers_the_queries_that_waited() {
-        let pdf = proj_copy("restart");
+        let (_dir, pdf) = proj_copy("restart");
         let (events, received) = async_channel::unbounded();
         let (tx, rx) = mpsc::channel();
         let mut state = Persistent::default();
@@ -1534,6 +1573,7 @@ mod tests {
                 PdfEvent::Forward {
                     generation: 1,
                     boxes,
+                    ..
                 },
             ] => assert!(!boxes.is_empty()),
             other => panic!("{other:?}"),

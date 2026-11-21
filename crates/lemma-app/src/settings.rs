@@ -292,23 +292,47 @@ impl Targets {
 }
 
 /// A monitor of the file at `path` that calls `f` on each event that may change its contents.
+///
+/// On Windows it is a monitor of the file's directory that leaves out the events of the other
+/// files there. GIO's monitor of a single file (GLib 2.90) reports nothing when another file is
+/// renamed to the watched name: it takes the rename for reported already, with the old name,
+/// whose events it has left out. That is how most programs save a file (a temporary file, then
+/// a rename), so settings saved that way were not read again.
 fn monitor(path: &Path, f: impl Fn() + 'static) -> Option<gio::FileMonitor> {
-    let monitor = match gio::File::for_path(path)
-        .monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
-    {
+    let file = gio::File::for_path(path);
+    let directory = if cfg!(windows) { file.parent() } else { None };
+    let monitor = match &directory {
+        Some(directory) => {
+            directory.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        }
+        None => file.monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE),
+    };
+    let monitor = match monitor {
         Ok(monitor) => monitor,
         Err(e) => {
             tracing::warn!("cannot watch {}: {}", path.display(), e.message());
             return None;
         }
     };
-    monitor.connect_changed(move |_, _, _, event| {
-        if !matches!(
+    // Of a directory's events, those that name the file (Windows' names ignore case).
+    let name = directory
+        .and_then(|_| path.file_name())
+        .map(|name| name.to_string_lossy().to_lowercase());
+    monitor.connect_changed(move |_, changed, other, event| {
+        if matches!(
             event,
             gio::FileMonitorEvent::AttributeChanged
                 | gio::FileMonitorEvent::PreUnmount
                 | gio::FileMonitorEvent::Unmounted
         ) {
+            return;
+        }
+        let named = |file: &gio::File| {
+            let basename = file.basename();
+            let basename = basename.as_deref().and_then(Path::file_name);
+            basename.map(|b| b.to_string_lossy().to_lowercase()) == name
+        };
+        if name.is_none() || named(changed) || other.is_some_and(named) {
             f();
         }
     });
@@ -420,7 +444,7 @@ mod tests {
 
     #[test]
     fn load_reads_merges_and_reports() {
-        let dir = std::env::temp_dir().join(format!("lemma-settings-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-settings-").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let files = SettingsFiles::next_to(dir.join("config.toml"));
         std::fs::write(&files.config, "[editor]\nvim = true\n").unwrap();

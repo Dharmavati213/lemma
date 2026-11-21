@@ -25,7 +25,7 @@ use broadway_input::{Browser, CONTROL, SHIFT};
 use gtk::gdk;
 use lemma_agent::EditorRequest;
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, VimMode, completion, typing, vim};
+use lemma_app::editor::{Editor, VimMode, completion, typing};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
@@ -263,7 +263,7 @@ impl Typist for Emulated {
             let consumed = f
                 .editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, f.editor.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, f.editor.view(), keyval, state));
             let modified =
                 state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
             if !consumed && !modified {
@@ -629,7 +629,8 @@ fn switches() {
 
 /// `[typing] replacements` (off by default): `...` typed in text becomes `\dots`, in plain
 /// editing and in Vim insert mode; one undo (Ctrl+Z, or `u` after `<Esc>`) gives back the
-/// three dots, and typing on adds dots.
+/// three dots, and typing on adds dots. A space or a line break typed right after that `\dots`
+/// gets `\dots{}` before it, as an undo step of its own.
 fn replacements() {
     for vim in [false, true] {
         let label = if vim { "vim" } else { "plain" };
@@ -672,6 +673,89 @@ fn replacements() {
                 "{label}: {typed:?} keeps the session"
             );
         }
+        // A space or a line break typed right after the replacement's `\dots` stays in the
+        // output: `\dots{}` before it (TeX skips the blanks after a control word).
+        check(&mut typist, "Wait‸", "... and", "Wait\\dots{} and‸");
+        check(&mut typist, "Wait‸", "...\nand", "Wait\\dots{}\nand‸");
+        check(&mut typist, "  so‸", "...\nand", "  so\\dots{}\n  and‸");
+        check(&mut typist, "Wait‸ there", "... ", "Wait\\dots{} ‸ there");
+        // Shift+Enter breaks the line plainly, and the space it makes is kept too.
+        typist.start(&f, "Wait‸");
+        typist.text(&f, "...");
+        typist.key(&f, gdk::Key::Return, gdk::ModifierType::SHIFT_MASK);
+        assert_eq!(f.shown(), "Wait\\dots{}\n‸", "{label}: Shift+Enter");
+        // In `\text` inside math too (text); never in math, where there was no replacement.
+        check(
+            &mut typist,
+            "$\\text{a‸}$",
+            "... b",
+            "$\\text{a\\dots{} b‸}$",
+        );
+        check(&mut typist, "$x‸$", "... y", "$x... y‸$");
+        // A space or a line break that already follows the dots, with text after it, gets the
+        // braces at once (`three\dots and` printed "three…and"); at the end of a paragraph or of
+        // the document they do not matter.
+        check(&mut typist, "three‸ and", "...", "three\\dots{}‸ and");
+        check(&mut typist, "three‸\nand", "...", "three\\dots{}‸\nand");
+        check(
+            &mut typist,
+            "three‸ % a note\nand",
+            "...",
+            "three\\dots{}‸ % a note\nand",
+        );
+        check(
+            &mut typist,
+            "three‸\n\nNext.",
+            "...",
+            "three\\dots‸\n\nNext.",
+        );
+        check(&mut typist, "three‸ ", "...", "three\\dots‸ ");
+        check(
+            &mut typist,
+            "$\\text{a‸ b}$",
+            "...",
+            "$\\text{a\\dots{}‸ b}$",
+        );
+        if !vim {
+            // One undo gives back the dots, braces and all.
+            typist.start(&f, "three‸ and");
+            typist.text(&f, "...");
+            f.buffer().undo();
+            common::pump_for(Duration::from_millis(5));
+            assert_eq!(f.shown(), "three...‸ and", "undo gives back the dots");
+        }
+        // Not after any other character, and not after a `\dots` typed by hand.
+        check(&mut typist, "Wait‸", "..., and", "Wait\\dots, and‸");
+        check(&mut typist, "Wait‸", "...) and", "Wait\\dots) and‸");
+        check(&mut typist, "Wait‸", "\\dots and", "Wait\\dots and‸");
+        // Nor after one the cursor left and came back to.
+        typist.start(&f, "Wait‸");
+        typist.text(&f, "...");
+        let at = |n: i32| f.buffer().iter_at_offset(n);
+        f.buffer().place_cursor(&at(4));
+        common::pump_for(Duration::from_millis(5));
+        f.buffer().place_cursor(&at(9));
+        typist.text(&f, " and");
+        assert_eq!(f.shown(), "Wait\\dots and‸", "{label}: moved away and back");
+        // One undo takes the braces back and keeps what was typed.
+        typist.start(&f, "Wait‸");
+        typist.text(&f, "... ");
+        assert_eq!(f.shown(), "Wait\\dots{} ‸");
+        if vim {
+            typist.escape(&f);
+            typist.text(&f, "u");
+            f.wait("the undo", || !f.shown().contains('{'));
+        } else {
+            f.buffer().undo();
+            common::pump_for(Duration::from_millis(5));
+        }
+        assert_eq!(
+            f.buffer()
+                .text(&f.buffer().start_iter(), &f.buffer().end_iter(), true),
+            "Wait\\dots ",
+            "{label}: one undo takes the braces back"
+        );
+        typist.escape(&f);
         // One undo gives back the dots; a fourth dot then is a dot.
         typist.start(&f, "Wait‸");
         typist.text(&f, "...");
@@ -921,6 +1005,9 @@ const REAL_ROWS: &[Row] = &[
 /// in a snippet's stop, whose session goes on (Tab to the snippet's exit).
 const REAL_REPLACEMENT_ROWS: &[Row] = &[
     row("Wait‸", "...", "Wait\\dots‸"),
+    row("Wait‸", "... and", "Wait\\dots{} and‸"),
+    row("Wait‸", "...\nand", "Wait\\dots{}\nand‸"),
+    row("Wait‸", "..., and", "Wait\\dots, and‸"),
     row("$‸$", "x tta...\tb", "$x \\text{a\\dots}b‸$"),
     row("$‸$", "x tt...\tb", "$x \\text{\\dots}b‸$"),
     row("$x‸$", "...", "$x...‸$"),

@@ -16,7 +16,7 @@ use crate::{Magic, parse_magic};
 use args::{
     LineCounter, arg_count, at, brace, bracket, clean, control_sequence, defined_name, group,
     line_end, raw_group, skip_blanks, skip_optionals, skip_space, split_list, star,
-    strip_outer_braces, with_text_index,
+    strip_outer_braces, utf8_len, with_text_index,
 };
 use commands::{
     CiteForm, Cmd, RefForm, is_default_theorem, is_primitive_conditional, is_verbatim_env,
@@ -111,8 +111,13 @@ pub enum IncludeKind {
     Import,
     /// `\includegraphics`, `\includesvg`, `\includepdf`.
     Graphics,
-    /// One entry of `\bibliography{a,b}`, or `\addbibresource` and friends.
+    /// One entry of `\bibliography{a,b}`: a BibTeX database, whose name gets `.bib` unless it
+    /// ends in it.
     Bibliography,
+    /// `\addbibresource`, `\addglobalbib`, `\addsectionbib`: a biblatex data source, named in
+    /// full (biber, biblatex's default backend, reads `refs` for `\addbibresource{refs}`, never
+    /// `refs.bib`).
+    BibResource,
     /// One entry of `\usepackage{a,b}` or `\RequirePackage`.
     Package,
 }
@@ -331,7 +336,7 @@ impl<'a> Indexer<'a> {
             Cmd::Bibliography => self.list_include(start, after, after, IncludeKind::Bibliography),
             Cmd::BibResource => {
                 let j = skip_optionals(self.b, after, 1);
-                self.single_include(start, after, j, IncludeKind::Bibliography)
+                self.single_include(start, after, j, IncludeKind::BibResource)
             }
             Cmd::Package => {
                 let j = skip_optionals(self.b, after, 1);
@@ -354,11 +359,14 @@ impl<'a> Indexer<'a> {
             Cmd::NewIf => self.new_if(after),
             Cmd::Caption => self.caption(after),
             Cmd::InlineVerb => {
+                // Starred only with the star right after the name; then LaTeX skips spaces (not
+                // tabs) before the delimiter, so in `\verb *x*` the star is the delimiter.
                 let j = if at(self.b, after) == b'*' {
                     after + 1
                 } else {
                     after
                 };
+                let j = j + self.b[j..].iter().take_while(|&&c| c == b' ').count();
                 skip_delimited(self.b, j).unwrap_or(after)
             }
             Cmd::InlineCode { lang } => self.inline_code(after, lang),
@@ -1268,12 +1276,13 @@ fn xparse_args(spec: &str) -> XparseArgs {
     let mut optional = 0usize;
     let mut first_default = None;
     let mut i = 0;
-    // Skips one token (a character or a control sequence) or a braced group.
+    // Skips one token (a character or a control sequence) or a braced group. Never past the
+    // end, and a whole character, so the positions it gives can slice `spec`.
     let token = |i: usize| -> usize {
         match at(b, i) {
             b'\\' => control_sequence(b, i).map_or(i + 1, |(_, e)| e),
             b'{' => group(b, i, true).map_or(b.len(), |(_, e)| e),
-            _ => i + 1,
+            c => (i + utf8_len(c)).min(b.len()),
         }
     };
     let tokens_in_group = |i: usize| -> (usize, usize) {
@@ -1398,6 +1407,12 @@ mod tests {
         assert_eq!(args("m O{x}"), (2, 1, None));
         assert_eq!(args("D(){x} r[] m"), (3, 1, None));
         assert_eq!(args("e{^_}"), (2, 2, None));
+        // An `O` whose default is not written yet (the spec as it stands while it is typed), or
+        // is one character that is not ASCII.
+        assert_eq!(args("O"), (1, 1, Some(String::new())));
+        assert_eq!(args("O "), (1, 1, Some(String::new())));
+        assert_eq!(args("Oé m"), (2, 1, Some("é".into())));
+        assert_eq!(args("m tσ m"), (3, 1, None));
     }
 
     #[test]

@@ -2981,7 +2981,7 @@ mod tests {
 
     #[test]
     fn problems_are_grouped_sorted_and_moved_to_the_root() {
-        let dir = std::env::temp_dir().join(format!("lemma-diag-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-diag-").unwrap();
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
         let dir = lemma_core::canonicalize(&dir).unwrap();
         let root = dir.join("main.tex");
@@ -3033,7 +3033,7 @@ mod tests {
 
     #[test]
     fn output_directories_holding_the_sources_and_file_order() {
-        let dir = std::env::temp_dir().join(format!("lemma-diag-out-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-diag-out-").unwrap();
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
         let dir = lemma_core::canonicalize(&dir).unwrap();
         let root = dir.join("main.tex");

@@ -53,7 +53,7 @@ Name: "addtopath"; Description: "Add Lemma to PATH (the lemma command in a termi
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Lemma"; Filename: "{app}\bin\lemma.exe"; Comment: "LaTeX editor with review of AI agent edits"
+Name: "{autoprograms}\Lemma"; Filename: "{app}\bin\lemma.exe"; Comment: "Write LaTeX and review an AI agent's edits inline"
 Name: "{autodesktop}\Lemma"; Filename: "{app}\bin\lemma.exe"; Tasks: desktopicon
 
 [Registry]
@@ -65,7 +65,9 @@ Root: HKA; Subkey: "Software\Classes\Lemma.Document\DefaultIcon"; ValueType: str
 Root: HKA; Subkey: "Software\Classes\Lemma.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\bin\lemma.exe"" ""%1"""; Tasks: associate
 Root: HKA; Subkey: "Software\Classes\.tex\OpenWithProgids"; ValueType: string; ValueName: "Lemma.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: associate
 Root: HKA; Subkey: "Software\Classes\.bib\OpenWithProgids"; ValueType: string; ValueName: "Lemma.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: associate
-Root: HKA; Subkey: "Software\Classes\Applications\lemma.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\bin\lemma.exe"" ""%1"""; Flags: uninsdeletekey
+; The whole Applications\lemma.exe key goes on uninstall, SupportedTypes included.
+Root: HKA; Subkey: "Software\Classes\Applications\lemma.exe"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\lemma.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\bin\lemma.exe"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\Applications\lemma.exe\SupportedTypes"; ValueType: string; ValueName: ".tex"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\lemma.exe\SupportedTypes"; ValueType: string; ValueName: ".bib"; ValueData: ""
 

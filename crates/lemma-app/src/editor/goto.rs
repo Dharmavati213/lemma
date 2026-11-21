@@ -179,9 +179,15 @@ struct ViewGoto {
     view: glib::WeakRef<TexView>,
     resolvers: RefCell<Vec<(i32, ResolverId, Rc<Resolver>)>>,
     next_id: Cell<u64>,
-    /// The underlined link (document bytes) while Ctrl is held over one.
+    /// The underlined link (document bytes) while Ctrl is held over one, and the document
+    /// version it was found in.
     link: RefCell<Option<Range<usize>>>,
+    link_version: Cell<u64>,
+    /// True while [`set_link`] applies the underline (any other application is a copy).
+    applying: Cell<bool>,
     controllers: RefCell<Vec<gtk::EventController>>,
+    /// The buffer's `apply-tag` handler.
+    apply_tag: RefCell<Option<(sourceview5::Buffer, glib::SignalHandlerId)>>,
     key_handler: Cell<Option<keys::HandlerId>>,
 }
 
@@ -510,10 +516,12 @@ fn line_offset(editor: &Editor, line: u32, find: Option<&str>) -> usize {
     let line = line.min(doc.line_index().line_count().saturating_sub(1));
     let start = doc.line_index().line_start(line);
     let text = doc.line_text(line).unwrap_or_default();
+    // Not into a Windows line break: a blank line's first non-blank character is its `\r`.
+    let content = text.strip_suffix('\r').unwrap_or(&text);
     let column = find
         .filter(|f| !f.is_empty())
         .and_then(|f| text.find(f))
-        .unwrap_or_else(|| text.len() - text.trim_start().len());
+        .unwrap_or_else(|| content.len() - content.trim_start().len());
     start + column
 }
 
@@ -628,8 +636,9 @@ pub fn pointer_moved(editor: &Editor, x: f64, y: f64, ctrl: bool) {
         return;
     };
     let offset = ctrl.then(|| editor.offset_at_point(x, y)).flatten();
-    // Still on the underlined link: nothing to resolve again.
+    // Still on the underlined link, in the same text: nothing to resolve again.
     if let Some(offset) = offset
+        && vg.link_version.get() == editor.document().version()
         && vg
             .link
             .borrow()
@@ -656,20 +665,23 @@ pub fn link_range(view: &TexView) -> Option<Range<usize>> {
 }
 
 fn set_link(vg: &ViewGoto, editor: &Editor, link: Option<Range<usize>>) {
-    if *vg.link.borrow() == link {
+    let version = editor.document().version();
+    if *vg.link.borrow() == link && (link.is_none() || vg.link_version.get() == version) {
         return;
     }
     let buffer = editor.buffer();
     let tag = link_tag(buffer);
-    let old = vg.link.replace(link.clone());
-    if let Some(old) = old
-        && let (Some(a), Some(b)) = (editor.iter_near(old.start), editor.iter_near(old.end))
-    {
-        buffer.remove_tag(&tag, &a, &b);
+    vg.link_version.set(version);
+    // Wherever the underline is now: an edit since (Ctrl+V, Ctrl+Z while Ctrl is held) moved
+    // it away from the offsets it was put on, and a paste of underlined text copied it.
+    if vg.link.replace(link.clone()).is_some() {
+        super::remove_tag_everywhere(buffer, &tag);
     }
     match link.and_then(|r| Some((editor.iter_near(r.start)?, editor.iter_near(r.end)?))) {
         Some((a, b)) => {
+            vg.applying.set(true);
             buffer.apply_tag(&tag, &a, &b);
+            vg.applying.set(false);
             editor.view().set_cursor_from_name(Some("pointer"));
         }
         None => editor.view().set_cursor_from_name(Some("text")),
@@ -719,7 +731,10 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         resolvers: RefCell::new(Vec::new()),
         next_id: Cell::new(1),
         link: RefCell::new(None),
+        link_version: Cell::new(0),
+        applying: Cell::new(false),
         controllers: RefCell::new(Vec::new()),
+        apply_tag: RefCell::new(None),
         key_handler: Cell::new(None),
     });
     VIEWS.with_borrow_mut(|views| {
@@ -778,6 +793,18 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
     view.add_controller(motion.clone());
     vg.controllers
         .replace(vec![click.upcast(), motion.upcast()]);
+    // Text pasted from the same buffer comes with its tags: an underline copied while Ctrl was
+    // held (Ctrl+C) would stay for good, so the copy is refused.
+    let buffer = editor.buffer().clone();
+    let weak = Rc::downgrade(&vg);
+    let id = buffer.connect_apply_tag(move |buffer, tag, _, _| {
+        if weak.upgrade().is_some_and(|vg| !vg.applying.get())
+            && tag.name().as_deref() == Some(LINK_TAG)
+        {
+            buffer.stop_signal_emission_by_name("apply-tag");
+        }
+    });
+    vg.apply_tag.replace(Some((buffer, id)));
 
     let (st, ed) = (Rc::downgrade(state), Rc::downgrade(editor));
     let handler = keys::register(view, PRIORITY_BACK_KEY, move |event, mode| {
@@ -829,6 +856,9 @@ pub fn detach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
     vg.resolvers.borrow_mut().clear();
     for controller in vg.controllers.take() {
         view.remove_controller(&controller);
+    }
+    if let Some((buffer, id)) = vg.apply_tag.take() {
+        buffer.disconnect(id);
     }
     if let Some(id) = vg.key_handler.take() {
         keys::unregister(view, id);

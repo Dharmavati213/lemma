@@ -518,8 +518,10 @@ pub fn set_keeping_comments(
     }
     let mut lines: Vec<String> = new_lines.iter().map(|l| (*l).to_owned()).collect();
     lines[i] = format!("{indent}{}{comment}", new_lines[i]);
-    let mut kept = lines.join("\n");
-    kept.push('\n');
+    // With the file's own line breaks, as `set_value` wrote the others.
+    let newline = if new.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut kept = lines.join(newline);
+    kept.push_str(newline);
     // Only when it means the same.
     match (lemma_config::parse(&kept), lemma_config::parse(&new)) {
         (Ok(a), Ok(b)) if a == b => Ok(kept),
@@ -528,14 +530,12 @@ pub fn set_keeping_comments(
 }
 
 /// True when the configuration file can be written: there is one, and it is a regular file (or
-/// missing, or a link to one).
+/// missing, or a link to one) that the user may write, in a folder the user may write (what
+/// `WindowState::edit_config_file` checks before it writes).
 pub fn is_writable(state: &WindowState) -> bool {
     state
         .config_file()
-        .is_some_and(|path| match std::fs::metadata(&path) {
-            Ok(m) => m.is_file(),
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        })
+        .is_some_and(|path| crate::window::writable_config_target(&path).is_ok())
 }
 
 // ───────────── The dialog ─────────────
@@ -802,13 +802,14 @@ impl Prefs {
                  changed here",
             ));
         }
+        // The row's texts are markup: a path is escaped (`&` in a folder name).
+        let name = path
+            .as_deref()
+            .and_then(Path::file_name)
+            .map_or_else(|| "config.toml".into(), |n| n.to_string_lossy());
         let row = adw::ActionRow::builder()
-            .title(
-                path.as_deref()
-                    .and_then(Path::file_name)
-                    .map_or_else(|| "config.toml".into(), |n| n.to_string_lossy()),
-            )
-            .subtitle(&shown)
+            .title(glib::markup_escape_text(&name).as_str())
+            .subtitle(glib::markup_escape_text(&shown).as_str())
             .subtitle_selectable(true)
             .build();
         let button = gtk::Button::builder()
@@ -1237,6 +1238,17 @@ mod tests {
         assert_eq!(trailing_comment("a = \"q\\\" # \" #c"), Some(" #c"));
         assert_eq!(trailing_comment("a = [\"#\", 'b']"), None);
         assert_eq!(trailing_comment("a = 1"), None);
+    }
+
+    /// A `config.toml` with Windows line breaks keeps them, also on the line whose comment
+    /// and indentation are kept (it was put together again with `\n` alone).
+    #[test]
+    fn set_keeps_crlf_line_breaks() {
+        let src = "[editor]\r\n  vim = false  # modal\r\nwrap = true\r\n";
+        let out = set_keeping_comments(src, "editor", "vim", ConfigValue::Bool(true)).unwrap();
+        assert_eq!(out, "[editor]\r\n  vim = true  # modal\r\nwrap = true\r\n");
+        let out = set_keeping_comments(&out, "editor", "wrap", ConfigValue::Bool(false)).unwrap();
+        assert_eq!(out, "[editor]\r\n  vim = true  # modal\r\nwrap = false\r\n");
     }
 
     #[test]

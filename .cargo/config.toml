@@ -1,0 +1,8 @@
+# The debug information stays beside the object files (`.dwo`) instead of being copied into every
+# program that links them. Lemma has 46 GUI test programs that each link the whole app: with the
+# debug information inside, each was 580 MB (85% of it debug information), and a change to the
+# app rewrote 27 GB before a test ran. Debuggers and backtraces read the `.dwo` files from
+# `target/`. Linux only: the option is not available for the Windows targets, and macOS keeps
+# debug information out of its programs already.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "split-debuginfo=unpacked"]

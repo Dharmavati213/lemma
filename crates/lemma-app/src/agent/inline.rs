@@ -9,15 +9,17 @@
 //! light tint and shows a popover below it with a one-line entry. Enter ([`submit`]) sends a
 //! prompt with `PromptOrigin::Inline { path, range }` (UTF-8 byte offsets of the region at that
 //! moment) whose text is the user's instruction followed by a note that tells the agent to
-//! change **only** that region of that file, with `mcp__lemma__edit`; the region itself goes
+//! change **only** that region of that file, with `mcp__lemma__edit` (the edit tool of Lemma's
+//! MCP server, for the agents that name it otherwise); the region itself goes
 //! along as a resource (`file://…#L<a>-L<b>`). The popover then shows progress (the tool the
 //! agent is running, or that it waits for a permission answer in the panel) and closes when the
 //! turn ends; its hunks are ordinary hunks. An error the agent reports shows at once, and the
 //! popover stays open with it when the turn ends (an `Error` comes before the `TurnEnded` of a
 //! prompt the agent answered with an error), ready for another try; an error alone does not end
 //! the edit (it may be about something else: a refused model, another prompt), so Esc still
-//! cancels the turn. A start of the agent that fails (its state becomes `Failed`) or a stop
-//! ends it with the reason. Esc ([`cancel`]) cancels the turn, also while the prompt still waits
+//! cancels the turn. A start of the agent that fails (its state becomes `Failed`), a stop, and a
+//! turn that ends other than by itself (Stop in the pane, an agent that died, a token limit, a
+//! refusal) end it with the reason. Esc ([`cancel`]) cancels the turn, also while the prompt still waits
 //! for the agent to start, or just closes the popover before anything was sent. The popover
 //! follows the region when the view scrolls.
 
@@ -25,7 +27,7 @@ use super::{AgentController, AgentState, PromptBlock, PromptOrigin, panel};
 use crate::editor::Editor;
 use crate::window::WindowState;
 use adw::prelude::*;
-use lemma_agent::AgentEvent;
+use lemma_agent::{AgentEvent, StopReason};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -94,6 +96,29 @@ pub fn install(state: &Rc<WindowState>) {
     });
     state.window.add_action(&action);
     crate::app::set_default_accels(state, &[("win.agent-inline-edit", &["<Control>k"])]);
+}
+
+/// The tab of `editor` closes: its session goes, and so does every inline-edit popover still
+/// on its view. A session closed with Esc (or by a click elsewhere) unparents its popover from
+/// an idle callback; when the tab closed before that ran, with no session left to take the
+/// popover along, it stayed on the view, and a GtkTextView disposed with a popover still
+/// parented prints "GtkPopover is not a child of …" without end.
+pub fn detach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
+    if let Some(session) = current(state)
+        && session
+            .editor
+            .upgrade()
+            .is_some_and(|e| Rc::ptr_eq(&e, editor))
+    {
+        close(state, &session, Unparent::TabGoes);
+    }
+    let mut child = editor.view().first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.is::<gtk::Popover>() && widget.has_css_class(POPOVER_CSS_CLASS) {
+            widget.unparent();
+        }
+    }
 }
 
 /// The paragraph around `at`: from the line after the previous blank line to the end of the
@@ -373,11 +398,16 @@ pub fn submit(state: &Rc<WindowState>, instruction: &str) {
     let range = doc.byte_offset(&start)..doc.byte_offset(&end);
     let region = buffer.text(&start, &end, false).to_string();
     let (a, b) = line_span(&start, &end);
-    let file = crate::review_ui::relative_name(state, doc.path());
-    let text = inline_prompt(instruction, &file, a, b, region.is_empty());
+    // In the prompt, so named as the agent is shown every file: with `/` on every system.
+    let file = state.workspace.root().agent_name(doc.path());
+    // The other ACP agents name Lemma's MCP tools their own way (see `bridge::GENERIC_APPEND`).
+    // The agent that runs gets the prompt, also when `config.toml` names another one by now.
+    let generic =
+        super::bridge::acp_flavor(panel::backend(state)) == lemma_agent::AcpFlavor::Generic;
+    let text = inline_prompt(instruction, &file, a, b, region.is_empty(), generic);
     let uri = glib::filename_to_uri(doc.path(), None)
         .map(|u| u.to_string())
-        .unwrap_or_else(|_| format!("file://{}", doc.path().display()));
+        .unwrap_or_else(|_| format!("file://{}", lemma_core::agent_path(doc.path())));
     let blocks = vec![
         PromptBlock::Text(text),
         PromptBlock::Resource {
@@ -410,11 +440,19 @@ pub fn submit(state: &Rc<WindowState>, instruction: &str) {
 
 /// What messages call the window's agent ("Claude", "Pi", "Codex", …).
 fn who(state: &WindowState) -> String {
-    super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
+    super::bridge::agent_label(panel::backend(state), &state.config.agent)
 }
 
-/// The prompt text of an inline edit of lines `a`–`b` of `file`.
-pub fn inline_prompt(instruction: &str, file: &str, a: i32, b: i32, empty: bool) -> String {
+/// The prompt text of an inline edit of lines `a`–`b` of `file`. `generic`: the agent is not
+/// Claude Code (nor the API backend), whose name for Lemma's edit tool is `mcp__lemma__edit`.
+pub fn inline_prompt(
+    instruction: &str,
+    file: &str,
+    a: i32,
+    b: i32,
+    empty: bool,
+    generic: bool,
+) -> String {
     let lines = if a == b {
         format!("line {a}")
     } else {
@@ -425,10 +463,15 @@ pub fn inline_prompt(instruction: &str, file: &str, a: i32, b: i32, empty: bool)
     } else {
         format!("{lines} of {file}, the region attached below as it is now")
     };
+    let tool = if generic {
+        "the edit tool of Lemma's MCP server (\"lemma\")"
+    } else {
+        "mcp__lemma__edit"
+    };
     format!(
         "{instruction}\n\n(Inline edit of {region}. Change only this region: make the change \
-         with mcp__lemma__edit on {file}, taking old_string from the region, and do not edit \
-         anything outside it or any other file. Reply with one short sentence.)"
+         with {tool} on {file}, taking old_string from the region, and do not edit anything \
+         outside it or any other file. Reply with one short sentence.)"
     )
 }
 
@@ -462,8 +505,22 @@ fn follow_turn(state: &Rc<WindowState>, session: &Rc<Session>, controller: &Rc<A
                 session.status.set_text(&message);
                 session.error.replace(Some(message));
             }
-            AgentEvent::TurnEnded(_) => {
-                let error = session.error.take();
+            AgentEvent::TurnEnded(reason) => {
+                // A turn that did not end by itself (Stop in the pane, an agent that died, a
+                // token limit) is not a finished edit: the popover says so and stays.
+                let error = session.error.take().or_else(|| match reason {
+                    StopReason::EndTurn => None,
+                    StopReason::Cancelled => {
+                        Some(format!("{} stopped before finishing the edit", who(&state)))
+                    }
+                    StopReason::MaxTokens => {
+                        Some("Stopped: the answer reached the token limit".to_owned())
+                    }
+                    StopReason::MaxTurnRequests => {
+                        Some("Stopped: the turn reached its request limit".to_owned())
+                    }
+                    StopReason::Refusal => Some(format!("{} declined the edit", who(&state))),
+                });
                 finish(&state, &session, error.as_deref());
             }
             AgentEvent::Exited(_) => {
@@ -641,12 +698,19 @@ mod tests {
 
     #[test]
     fn prompt_text() {
-        let text = inline_prompt("Make it shorter", "main.tex", 12, 14, false);
+        let text = inline_prompt("Make it shorter", "main.tex", 12, 14, false, false);
         assert!(text.starts_with("Make it shorter\n\n(Inline edit of lines 12–14 of main.tex"));
         assert!(text.contains("mcp__lemma__edit"));
         assert!(text.contains("do not edit anything outside it"));
         assert!(text.contains("region"));
-        let text = inline_prompt("Add a remark", "a.tex", 3, 3, true);
+        let text = inline_prompt("Add a remark", "a.tex", 3, 3, true, false);
         assert!(text.contains("the empty region at line 3 of a.tex: insert"));
+        // The other ACP agents have no tool of that name.
+        let text = inline_prompt("Make it shorter", "main.tex", 12, 14, false, true);
+        assert!(!text.contains("mcp__lemma__"), "{text}");
+        assert!(
+            text.contains("with the edit tool of Lemma's MCP server (\"lemma\") on main.tex"),
+            "{text}"
+        );
     }
 }

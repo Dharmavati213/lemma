@@ -1,6 +1,6 @@
 //! Running a TeX process: in its own process group (on Windows: a job), with stdin from
 //! `/dev/null` and its output discarded (TeX writes a log), killed with the whole group when it
-//! outlives its timeout.
+//! outlives its timeout, or when the application ends ([`stop_all`]).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Why a run did not finish.
@@ -17,6 +18,39 @@ pub(crate) enum RunError {
     Spawn(io::Error),
     /// It ran longer than its timeout and was killed.
     Timeout,
+    /// [`stop_all`] killed it (or it was asked for afterwards).
+    Stopped,
+}
+
+/// Set by [`stop_all`]: no TeX runs any more.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// The process groups of the runs going on (their leaders' pids), for [`stop_all`]. A run takes
+/// its own out under the lock as it reaps its process, so a group is never signalled after its
+/// pid could be another process's.
+#[cfg(unix)]
+static RUNNING: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn running() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Kills every TeX run going on, with its process group, and refuses the runs asked for after
+/// (see the crate's `stop_all`).
+pub(crate) fn stop_all() {
+    STOPPED.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
+    for &pid in running().iter() {
+        kill_group(pid);
+    }
+}
+
+/// Whether [`stop_all`] ran.
+pub(crate) fn stopped() -> bool {
+    STOPPED.load(Ordering::SeqCst)
 }
 
 /// The separator of kpathsea's path lists: `;` on Windows, where `:` belongs to drive names.
@@ -44,36 +78,66 @@ pub(crate) fn run(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(unix)]
-    let mut child = command.process_group(0).spawn().map_err(RunError::Spawn)?;
-    #[cfg(windows)]
-    let (mut child, job) =
-        lemma_core::process::Job::spawn(&mut command).map_err(RunError::Spawn)?;
-    let kill_group = |child: &std::process::Child| {
-        #[cfg(unix)]
-        kill_group(child.id());
-        #[cfg(windows)]
-        {
-            let _ = child;
-            job.terminate(1);
+    let mut child = {
+        // Under the lock, so that `stop_all` either refuses the run or kills it.
+        let mut running = running();
+        if stopped() {
+            return Err(RunError::Stopped);
         }
+        let child = command.process_group(0).spawn().map_err(RunError::Spawn)?;
+        running.push(child.id());
+        child
+    };
+    #[cfg(windows)]
+    let (mut child, job) = {
+        if stopped() {
+            return Err(RunError::Stopped);
+        }
+        lemma_core::process::Job::spawn(&mut command).map_err(RunError::Spawn)?
+    };
+    // Kills the group and reaps the process (out of `RUNNING` first: it is not reaped yet, so
+    // `stop_all` cannot meet its pid reused meanwhile).
+    let end = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        {
+            kill_group(child.id());
+            running().retain(|&pid| pid != child.id());
+        }
+        #[cfg(windows)]
+        job.terminate(1);
+        let _ = child.wait();
     };
     let deadline = Instant::now() + timeout;
     // TeX runs take tens of milliseconds: poll finely at first, then less often.
     let mut nap = Duration::from_micros(500);
     loop {
-        match child.try_wait() {
+        #[cfg(unix)]
+        let polled = {
+            let mut running = running();
+            let polled = child.try_wait();
+            if !matches!(polled, Ok(None)) {
+                running.retain(|&pid| pid != child.id());
+            }
+            polled
+        };
+        #[cfg(windows)]
+        let polled = child.try_wait();
+        match polled {
+            Ok(Some(_)) if stopped() => return Err(RunError::Stopped),
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
             Err(e) => {
-                kill_group(&child);
-                let _ = child.wait();
+                end(&mut child);
                 return Err(RunError::Spawn(e));
             }
         }
+        if stopped() {
+            end(&mut child);
+            return Err(RunError::Stopped);
+        }
         let now = Instant::now();
         if now >= deadline {
-            kill_group(&child);
-            let _ = child.wait();
+            end(&mut child);
             return Err(RunError::Timeout);
         }
         std::thread::sleep(nap.min(deadline - now));

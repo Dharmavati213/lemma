@@ -1,10 +1,15 @@
 //! What to look for ([`Query`]) and how it matches text ([`Matcher`]).
 //!
-//! Matching is **line by line**, as `rg` does it: a match never spans a line break, `^` and `$`
-//! are the start and end of a line, and the line's own `\r` (a CRLF file) is part of the line, so
-//! `$` does not match before it (`rg` without `--crlf`). Whole words follow `rg -w`: the match must
+//! Matching is **line by line**, as `rg` does it: a match never spans a line break, and `^` and
+//! `$` are the start and end of a line. In a line that ends with `\r\n` (a CRLF file) the `\r`
+//! belongs to the line break, as with `rg --crlf`: `$` matches before it and no match takes it
+//! (`\s+$` finds the spaces, not the `\r`), so a replace never changes a file's line breaks.
+//! Only a pattern that names a line break ([`names_line_break`]: `\r`, `\n`, the character
+//! itself, but not in a class that excludes it, as `[^\n]` does) sees that `\r` as the line's
+//! last character. Whole words follow `rg -w`: the match must
 //! not be preceded or followed by a word character (`\b{start-half}…\b{end-half}`), so
-//! `\alpha` as a whole word is found in `a \alpha b` but not in `x\alpha` or `\alphax`.
+//! `\alpha` as a whole word is found in `a \alpha b` but not in `x\alpha` or `\alphax`. As with
+//! `rg`, a final line break ends the last line: no empty line follows it.
 
 use regex::{Regex, RegexBuilder};
 use std::fmt;
@@ -73,10 +78,16 @@ impl Query {
         } else {
             Some(build(true)?)
         };
+        let sees_crlf = if self.regex {
+            names_line_break(&self.pattern)
+        } else {
+            self.pattern.contains(['\r', '\n'])
+        };
         Ok(Matcher {
             query: self.clone(),
             line,
             text,
+            sees_crlf,
         })
     }
 }
@@ -119,23 +130,90 @@ fn error_message(e: &regex::Error) -> String {
     }
 }
 
-/// True when a regular expression may use `\A`, `\z` or turn multi-line mode off (`(?-m)`),
-/// where matching a whole text and matching each line differ.
+/// True when a regular expression may use `\A`, `\z`, turn multi-line mode off (`(?-m)`) or
+/// CRLF mode on (`(?R)`), where matching a whole text and matching each line differ. (In CRLF
+/// mode a whole text has no `$` between the `\r` and the `\n` of a CRLF line, where the line
+/// alone ends.)
 fn anchors_haystack(pattern: &str) -> bool {
     if pattern.contains(r"\A") || pattern.contains(r"\z") {
         return true;
     }
-    // A flag group `(?…)` that negates `m`: `(?-m)`, `(?s-m:…)`, `(?i-sm)`.
+    // A flag group `(?…)` that negates `m` (`(?-m)`, `(?s-m:…)`, `(?i-sm)`) or sets `R`.
     let mut rest = pattern;
     while let Some(i) = rest.find("(?") {
         let flags: &str = &rest[i + 2..];
         let end = flags.find([':', ')']).unwrap_or(flags.len());
-        if let Some(minus) = flags[..end].find('-')
-            && flags[minus..end].contains('m')
-        {
+        let (set, unset) = flags[..end].split_once('-').unwrap_or((&flags[..end], ""));
+        if unset.contains('m') || set.contains('R') {
             return true;
         }
         rest = &rest[i + 2..];
+    }
+    false
+}
+
+/// True when a regular expression names a carriage return or a line feed: as the character
+/// itself, as `\r` or `\n`, or as a hexadecimal escape (`\x0D`, `\x{a}`, `\u000D`, …). `\s`,
+/// `.` and classes such as `[^x]` match a `\r` without naming it, and a class that excludes it
+/// (`[^\r\n]`, "the rest of the line") does not name it either.
+fn names_line_break(pattern: &str) -> bool {
+    // The classes open at this point, innermost last: whether each is negated.
+    let mut classes: Vec<bool> = Vec::new();
+    let mut rest = pattern;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        let named = match c {
+            '\r' | '\n' => true,
+            '[' => {
+                let negated = rest.starts_with('^');
+                if negated {
+                    rest = &rest[1..];
+                }
+                // A `]` right after the opening bracket is a literal one.
+                rest = rest.strip_prefix(']').unwrap_or(rest);
+                classes.push(negated);
+                continue;
+            }
+            ']' => {
+                classes.pop();
+                continue;
+            }
+            '\\' => {
+                let Some(escaped) = rest.chars().next() else {
+                    break;
+                };
+                rest = &rest[escaped.len_utf8()..];
+                match escaped {
+                    'r' | 'n' => true,
+                    'x' | 'u' | 'U' => {
+                        let digits = match rest.strip_prefix('{') {
+                            Some(braced) => braced.split('}').next().unwrap_or_default(),
+                            None => {
+                                let len = match escaped {
+                                    'x' => 2,
+                                    'u' => 4,
+                                    _ => 8,
+                                };
+                                rest.get(..len).unwrap_or_default()
+                            }
+                        };
+                        matches!(u32::from_str_radix(digits.trim(), 16), Ok(0x0a | 0x0d))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        // Inside an odd number of negated classes the line break is excluded.
+        if named
+            && classes
+                .iter()
+                .filter(|&&negated| negated)
+                .count()
+                .is_multiple_of(2)
+        {
+            return true;
+        }
     }
     false
 }
@@ -145,7 +223,8 @@ fn anchors_haystack(pattern: &str) -> bool {
 pub struct LineHits {
     /// 0-based line number.
     pub line: u32,
-    /// Byte range of the line in the text, without its `\n` (with a CRLF line's `\r`).
+    /// Byte range of the line in the text, without its `\n`, and without a CRLF line's `\r`
+    /// unless the pattern names a line break (see the module docs).
     pub span: Range<usize>,
     /// The matches, as byte ranges **within the line**, in order, not overlapping.
     pub ranges: Vec<Range<usize>>,
@@ -160,6 +239,8 @@ pub struct Matcher {
     /// The same pattern in multi-line mode, for the whole-text pass; `None` when that pass could
     /// miss lines (see [`anchors_haystack`]).
     text: Option<Regex>,
+    /// The pattern names a line break: the `\r` of a CRLF line is part of the line.
+    sees_crlf: bool,
 }
 
 impl Matcher {
@@ -179,6 +260,10 @@ impl Matcher {
     }
 
     /// Calls `f` for every line of `text` that has matches, in order. `f` can stop the walk.
+    ///
+    /// As with `rg`, no line follows a final line break: the empty line an editor shows after
+    /// it is not searched, so `^` or `$` does not match there (and a replace adds nothing after
+    /// the last line break). An empty text is one empty line.
     pub fn for_each_line(
         &self,
         text: &str,
@@ -193,7 +278,14 @@ impl Matcher {
             counted_at = start;
             counted_line
         };
-        let mut hits = |start: usize, end: usize, line: u32| -> ControlFlow<()> {
+        let mut hits = |start: usize, mut end: usize, line: u32| -> ControlFlow<()> {
+            if !self.sees_crlf
+                && end > start
+                && bytes[end - 1] == b'\r'
+                && bytes.get(end) == Some(&b'\n')
+            {
+                end -= 1;
+            }
             let ranges = self.line_ranges(&text[start..end]);
             if ranges.is_empty() {
                 return ControlFlow::Continue(());
@@ -204,7 +296,13 @@ impl Matcher {
                 ranges,
             })
         };
-        match &self.text {
+        // The whole-text regex has no `$` before the `\r` of a CRLF line, where a line without it
+        // ends: such a text is matched line by line.
+        let text_pass = self
+            .text
+            .as_ref()
+            .filter(|_| self.sees_crlf || memchr::memmem::find(bytes, b"\r\n").is_none());
+        match text_pass {
             Some(regex) => {
                 // Every line match is also a match of the whole text at the same place, so the
                 // leftmost match from `at` is never after the next line with matches.
@@ -214,6 +312,10 @@ impl Matcher {
                         break;
                     };
                     let start = memchr::memrchr(b'\n', &bytes[..m.start()]).map_or(0, |i| i + 1);
+                    if start == text.len() && start > 0 {
+                        // The empty "line" after a final line break.
+                        break;
+                    }
                     let end = memchr::memchr(b'\n', &bytes[m.start()..])
                         .map_or(text.len(), |i| m.start() + i);
                     let line = line_of(start);
@@ -228,7 +330,8 @@ impl Matcher {
                     let end =
                         memchr::memchr(b'\n', &bytes[start..]).map_or(text.len(), |i| start + i);
                     hits(start, end, line)?;
-                    if end >= text.len() {
+                    // Nothing after the last line break.
+                    if end + 1 >= text.len() {
                         break;
                     }
                     start = end + 1;
@@ -328,9 +431,10 @@ mod tests {
         // `\s` never matches the line break.
         assert!(lines(&Query::regex(r"b\s*c"), text).is_empty());
         assert_eq!(lines(&Query::regex("^c"), text), [(1, vec!["c"])]);
-        // `$` is the end of the line: in a CRLF line `\r` comes first (as with rg).
+        // `$` is the end of the line: in a CRLF line before the `\r` (as with `rg --crlf`), after
+        // it for a pattern that names it.
         assert_eq!(lines(&Query::regex("b$"), text), [(0, vec!["b"])]);
-        assert!(lines(&Query::regex("d$"), text).is_empty());
+        assert_eq!(lines(&Query::regex("d$"), text), [(1, vec!["d"])]);
         assert_eq!(lines(&Query::regex(r"d\r$"), text), [(1, vec!["d\r"])]);
         assert_eq!(lines(&Query::regex("f$"), text), [(2, vec!["f"])]);
     }
@@ -353,6 +457,19 @@ mod tests {
         assert!(anchors_haystack(r"(?s-m:x)"));
         assert!(!anchors_haystack(r"(?i)x-m"));
         assert!(!anchors_haystack(r"(?im)x"));
+        // In CRLF mode a whole text has no `$` between the `\r` and the `\n` of a CRLF line,
+        // where the line alone ends.
+        assert_eq!(
+            lines(&Query::regex(r"(?R)\r$"), "a\r\nb\r\nc"),
+            [(0, vec!["\r"]), (1, vec!["\r"])]
+        );
+        assert_eq!(
+            lines(&Query::regex(r"(?sR:.)$"), "a\r\nb"),
+            [(0, vec!["a"]), (1, vec!["b"])]
+        );
+        assert!(anchors_haystack(r"(?R)x"));
+        assert!(anchors_haystack(r"(?iR:x)"));
+        assert!(!anchors_haystack(r"(?i-R)x"));
     }
 
     #[test]
@@ -366,6 +483,110 @@ mod tests {
         assert_eq!(lines(&Query::plain("y"), text), [(2, vec!["y"])]);
         assert!(lines(&Query::plain("z"), "").is_empty());
         assert_eq!(lines(&Query::regex("^$"), ""), [(0, vec![""])]);
+        // As with rg, no line follows a final line break, in the whole-text pass and in the
+        // line-by-line one.
+        assert_eq!(lines(&Query::regex("^"), "x\n"), [(0, vec![""])]);
+        assert_eq!(lines(&Query::regex("^$"), "x\n\n"), [(1, vec![""])]);
+        assert_eq!(lines(&Query::regex(r"\s*$"), "x\r\n"), [(0, vec![""])]);
+        assert_eq!(lines(&Query::regex(r"(?-m)$"), "x\n"), [(0, vec![""])]);
+        assert_eq!(
+            lines(&Query::regex(r"\A"), "x\n\n"),
+            [(0, vec![""]), (1, vec![""])]
+        );
+    }
+
+    /// The `\r` of a CRLF line is the line break's, unless the pattern names a line break; a
+    /// `\r` that is not before a `\n` is the line's.
+    #[test]
+    fn crlf_line_breaks_are_not_part_of_the_line() {
+        let text = "a  \r\nb\t\r\n\r\nc\r";
+        for (pattern, expect) in [
+            (
+                r"\s+$",
+                vec![(0, vec!["  "]), (1, vec!["\t"]), (3, vec!["\r"])],
+            ),
+            (
+                r".$",
+                vec![(0, vec![" "]), (1, vec!["\t"]), (3, vec!["\r"])],
+            ),
+            (
+                r"[^a]+$",
+                vec![(0, vec!["  "]), (1, vec!["b\t"]), (3, vec!["c\r"])],
+            ),
+            (r"\s+\r$", vec![(0, vec!["  \r"]), (1, vec!["\t\r"])]),
+            // A class that excludes the line break does not name it (as with `rg --crlf`).
+            (
+                r"[^\n]+$",
+                vec![(0, vec!["a  "]), (1, vec!["b\t"]), (3, vec!["c\r"])],
+            ),
+            (r"[^\r\n]+$", vec![(0, vec!["a  "]), (1, vec!["b\t"])]),
+            (
+                r"\x0D",
+                vec![
+                    (0, vec!["\r"]),
+                    (1, vec!["\r"]),
+                    (2, vec!["\r"]),
+                    (3, vec!["\r"]),
+                ],
+            ),
+        ] {
+            assert_eq!(lines(&Query::regex(pattern), text), expect, "{pattern}");
+        }
+        // Without a CRLF line, the whole-text pass finds the same.
+        assert_eq!(
+            lines(&Query::regex(r"\s+$"), "a  \nb\r"),
+            [(0, vec!["  "]), (1, vec!["\r"])]
+        );
+        // A plain pattern with the character itself.
+        assert_eq!(lines(&Query::plain("b\t\r"), text), [(1, vec!["b\t\r"])]);
+    }
+
+    #[test]
+    fn line_breaks_named_in_a_pattern() {
+        for named in [
+            r"\r",
+            r"a\n",
+            "\r",
+            r"[\r]",
+            r"\x0d",
+            r"\x0A",
+            r"\x{D}",
+            r"\x{000a}",
+            r"\u000D",
+            r"\U0000000a",
+            r"\u{a}",
+            r"[^\n]\r",
+            r"[]\n]",
+            r"[\[\n]",
+            r"[^[^\n]]",
+            r"[^a]\n",
+        ] {
+            assert!(names_line_break(named), "{named}");
+        }
+        for unnamed in [
+            r"\s+$",
+            r".",
+            r"\\r",
+            r"\\n",
+            r"\x0b",
+            r"\x{dd}",
+            r"\u00d0",
+            r"[^a]",
+            r"\pC",
+            r"x\",
+            r"\x",
+            r"\x{",
+            r"[^\n]",
+            r"%[^\r\n]*$",
+            r"[^\x0d]",
+            r"[^]\n]",
+            r"[^\]\n]",
+            r"[^a[\n]]",
+            r"[a[^\n]]",
+            r"[[:^space:]\pL&&[^\r]]",
+        ] {
+            assert!(!names_line_break(unnamed), "{unnamed}");
+        }
     }
 
     #[test]

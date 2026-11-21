@@ -2,7 +2,8 @@ use crate::TextEdit;
 use std::fmt;
 use std::ops::Range;
 
-/// Byte offsets of line starts. Line count = number of '\n' + 1 (same as GtkTextBuffer).
+/// Byte offsets of line starts. Line count = number of '\n' + 1 (same as GtkTextBuffer, except
+/// that GTK also ends a line at a lone '\r' and at U+2029).
 ///
 /// The index also tracks the text length, so it can be kept exact by mirroring every buffer
 /// change through [`LineIndex::apply`] and compared against a fresh [`LineIndex::new`].

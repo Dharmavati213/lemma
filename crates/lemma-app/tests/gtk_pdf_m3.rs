@@ -15,6 +15,8 @@
 mod broadway_input;
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use gtk::{gdk, graphene};
 use lemma_app::editor::goto;
@@ -41,6 +43,10 @@ fn main() -> ExitCode {
         ("web_links_ask_before_opening", web_links),
         ("search_counts_match_pdftotext_and_navigate", search_counts),
         (
+            "search_goes_to_the_first_match_below_the_top_of_the_view",
+            search_from_below_a_match,
+        ),
+        (
             "search_options_cancel_latest_wins_and_rebuild",
             search_behaviour,
         ),
@@ -65,6 +71,10 @@ fn main() -> ExitCode {
             "perf_bookmarks_after_rebuilds",
             perf_bookmarks_after_rebuilds,
         ));
+        tests.push((
+            "perf_bookmark_followed_per_scroll_step",
+            perf_bookmark_follow,
+        ));
     }
     common::run(&tests)
 }
@@ -73,14 +83,14 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const MIB: usize = 1 << 20;
 
 fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    common::manifest_dir().join("../..")
 }
 
 /// `target/fixtures/pdf50.pdf`, if `scripts/build-fixtures.sh` has run.
 fn pdf50() -> Option<PathBuf> {
     let pdf = repo().join("target/fixtures/pdf50.pdf");
     if pdf.is_file() {
-        Some(pdf.canonicalize().expect("canonical fixture path"))
+        Some(pdf.canonical().expect("canonical fixture path"))
     } else {
         println!(
             "  SKIP: {} is missing; run scripts/build-fixtures.sh",
@@ -104,7 +114,7 @@ fn copy_proj(name: &str) -> PathBuf {
     ] {
         std::fs::copy(src.join(file), dir.join(file)).unwrap();
     }
-    dir.canonicalize().unwrap()
+    dir.canonical().unwrap()
 }
 
 /// A window (not scripted: dialogs are shown) on `dir`.
@@ -352,6 +362,28 @@ fn links_and_back() {
     // With nothing left, Back is the editor's (here: nowhere to go).
     assert!(!links::back(&state));
 
+    // The history is the PDF's: a rebuild keeps it, another PDF (the root document of another
+    // tab) starts a new one, so Back never goes to a page of the old one's numbering.
+    assert!(links::click(&state, x, y));
+    assert_eq!(links::history_len(&state), 1);
+    let controller = state.pdf.get().unwrap();
+    let pdf = dir.join("main.pdf");
+    let generation = controller.generation().unwrap();
+    std::fs::write(&pdf, std::fs::read(&pdf).unwrap()).unwrap();
+    controller.open(&pdf);
+    common::pump_until(TIMEOUT, || controller.generation() > Some(generation));
+    assert_eq!(links::history_len(&state), 1, "rebuilt");
+    let other = dir.join("other.pdf");
+    std::fs::copy(&pdf, &other).unwrap();
+    controller.open(&other);
+    common::pump_until(TIMEOUT, || controller.pdf() == Some(other.clone()));
+    assert_eq!(links::history_len(&state), 0, "another PDF");
+    assert!(!links::back(&state));
+    controller.open(&pdf);
+    common::pump_until(TIMEOUT, || controller.pdf() == Some(pdf.clone()));
+    wait_for_pages(&state);
+    let (x, y) = centre(&view, 0, cite.area);
+
     // The cursor is plain over a page without links under the pointer, and leaving resets it.
     links::pointer_moved(&state, x, y);
     links::pointer_left(&state);
@@ -526,6 +558,40 @@ fn search_counts() {
         page + 1
     );
     assert!(status.current.unwrap() > 1);
+    state.window.destroy();
+}
+
+/// A search goes to the first match at or below the top of the view: when the page shown has
+/// its only match above the top of the view, that is the next page's, and the view does not go
+/// back up.
+fn search_from_below_a_match() {
+    let Some(pdf50) = pdf50() else {
+        return;
+    };
+    let dir = common::temp_dir("search-below");
+    let pdf = dir.join("pdf50.pdf");
+    std::fs::copy(&pdf50, &pdf).unwrap();
+    let state = window(&dir);
+    let view = show_pdf(&state, &pdf);
+    // "Compare" is on every page once, about halfway down.
+    assert_eq!(search_all(&state, "Compare").total, 50);
+    let (_, y, _, h) = view.search_matches(20)[0][0];
+    search::close(&state);
+    // Page 21 taller than the view, the top of the view a little below its match.
+    view.set_zoom(3.0, None);
+    let page_height = view.page_size(20).unwrap().1;
+    view.set_anchor(lemma_pdf::Anchor {
+        page: 20,
+        frac: (y + h + 10.0) / page_height,
+        x: 0.0,
+    });
+    wait_for_pages(&state);
+    assert_eq!(view.current_page(), 20, "the toolbar shows page 21");
+    let before = view.scroll_position().1;
+    let status = search_all(&state, "Compare");
+    assert_eq!(view.current_match(), Some((21, 0)), "{status:?}");
+    assert_eq!(status.current, Some(22));
+    assert!(view.scroll_position().1 >= before, "the view went back up");
     state.window.destroy();
 }
 
@@ -1103,7 +1169,7 @@ fn bookmarks() {
     controller.open(
         &common::fixtures()
             .join("pdf/stress.pdf")
-            .canonicalize()
+            .canonical()
             .unwrap(),
     );
     common::pump_until(TIMEOUT, || {
@@ -1224,6 +1290,9 @@ fn detach_reattach() {
     wait_for_pages(&state);
     let anchor = view.anchor().unwrap();
     println!("  anchor before: {anchor:?}");
+    // What follows the view while it is in the main window; the PDF window adds its own while
+    // it is open and takes it away again (each runs on every scroll).
+    let callbacks = view.changed_callbacks();
 
     let close = |a: lemma_pdf::Anchor, b: lemma_pdf::Anchor| {
         a.page == b.page && (a.frac - b.frac).abs() < 0.01
@@ -1300,7 +1369,7 @@ fn detach_reattach() {
         .unwrap() as u32
         + 2;
     // The SyncTeX file records the fixture's own source path.
-    controller.forward_search(&tex.canonicalize().unwrap(), line);
+    controller.forward_search(&tex.canonical().unwrap(), line);
     common::pump_until(TIMEOUT, || view.highlight().is_some());
     assert_eq!(view.highlight().unwrap().0, 11);
     wait_for_pages(&state);
@@ -1349,17 +1418,24 @@ fn detach_reattach() {
         close(before_attach, attached),
         "{before_attach:?} vs {attached:?}"
     );
+    assert_eq!(view.changed_callbacks(), callbacks, "after Attach");
 
     // Closing the PDF window re-attaches the view.
     println!("  closing the PDF window");
     activate(&state, "win.pdf-detach");
     let window = detach::window(&state).unwrap();
     common::pump_until(TIMEOUT, || window.is_mapped());
+    assert_eq!(view.changed_callbacks(), callbacks + 1, "while detached");
     window.close();
     common::pump_until(TIMEOUT, || !detach::is_detached(&state));
     assert_eq!(action_state(&state), Some(false));
     assert!(state.pdf_pane.is_visible());
     assert!(view.is_ancestor(&state.pdf_pane));
+    assert_eq!(
+        view.changed_callbacks(),
+        callbacks,
+        "after closing the window"
+    );
     wait_for_pages(&state);
 
     // Closing the main window closes the PDF window too.
@@ -1600,6 +1676,70 @@ fn flat_outline(count: u32, title: &str, y: f64) -> Vec<common::OutlineEntry> {
     (0..count)
         .map(|k| (0, format!("{title} {k}"), k, y))
         .collect()
+}
+
+/// What following the view costs the strip per scroll step with a large outline: each step's
+/// change runs `follow_view`, which looks through the bookmark rows for the section the view is
+/// in. A scroll step (`set_scroll_position`, with every handler of the view's change) is timed
+/// with the Bookmarks page shown and with the strip hidden, on 5000 bookmarks (five a page on
+/// 1000 pages, top level) and on 500: the difference ≤ 0.25 ms in a release build (measured
+/// 5.3 and 5.7 µs; 86 µs and 0.94 ms, up to 8 ms, while every step read every row from the
+/// tree).
+fn perf_bookmark_follow() {
+    for (pages, per_page) in [(100u32, 5u32), (1000, 5)] {
+        let dir = common::temp_dir(&format!("perf-bookmark-follow-{pages}"));
+        let pdf = dir.join("main.pdf");
+        let sizes = vec![(595.0, 842.0); pages as usize];
+        let outline: Vec<common::OutlineEntry> = (0..pages)
+            .flat_map(|page| {
+                (0..per_page).map(move |k| {
+                    (
+                        0,
+                        format!("Section {page}.{k}"),
+                        page,
+                        100.0 + 140.0 * f64::from(k),
+                    )
+                })
+            })
+            .collect();
+        common::write_pdf(&pdf, &sizes, &outline);
+        let state = window(&dir);
+        let view = show_pdf(&state, &pdf);
+        state.pdf_sidebar.split.set_show_sidebar(true);
+        sidebar::show_page(&state, sidebar::Page::Bookmarks);
+        common::pump_until(TIMEOUT, || sidebar::bookmarks_loaded(&state));
+        let rows = sidebar::bookmark_rows(&state).0.len();
+        assert_eq!(rows, outline.len());
+        let steps = |label: &str| {
+            view.goto_page(pages / 2);
+            common::pump_for(Duration::from_millis(100));
+            let (x, y0) = view.scroll_position();
+            let mut times = Vec::new();
+            for i in 0..300 {
+                let started = std::time::Instant::now();
+                view.set_scroll_position(x, y0 + 40.0 * f64::from(i));
+                times.push(started.elapsed());
+                common::pump_for(Duration::from_millis(1));
+            }
+            let (median, max) = median_max(&mut times);
+            println!(
+                "  {rows} bookmarks, {label}: a scroll step {median:.1?} median, {max:.1?} max"
+            );
+            median
+        };
+        let shown = steps("Bookmarks shown");
+        // The current section is selected (the follow ran).
+        assert!(sidebar::bookmark_rows(&state).1.is_some());
+        state.pdf_sidebar.split.set_show_sidebar(false);
+        common::pump_for(Duration::from_millis(100));
+        let hidden = steps("strip hidden");
+        let follow = shown.saturating_sub(hidden);
+        println!("  {rows} bookmarks: following the view costs {follow:.1?} a scroll step");
+        state.window.destroy();
+        if !cfg!(debug_assertions) {
+            assert!(follow <= Duration::from_micros(250), "{rows}: {follow:?}");
+        }
+    }
 }
 
 /// The median and the largest of `times`.

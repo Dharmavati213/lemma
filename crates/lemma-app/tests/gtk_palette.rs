@@ -47,6 +47,11 @@ fn main() -> ExitCode {
         ("palette_rows_show_keycaps_and_matches", rows_widgets),
         ("quick_open_orders_tabs_index_then_walk", quick_open_order),
         ("quick_open_ranks_and_opens", quick_open_ranks),
+        #[cfg(unix)]
+        (
+            "quick_open_opens_names_that_are_not_utf8",
+            quick_open_latin1_names,
+        ),
         ("quick_open_goes_to_lines", quick_open_lines),
         ("pickers_replace_each_other", pickers_replace),
         ("shortcuts_window_lists_every_group", shortcuts_groups),
@@ -740,12 +745,13 @@ fn quick_open_order() {
         .iter()
         .map(|c| (c.display.as_str(), c.source))
         .collect();
+    let yoneda = common::shown("chapters/yoneda.tex");
     assert_eq!(
         shown,
         [
             ("appendix.tex", Source::Tab),
             ("main.tex", Source::Tab),
-            ("chapters/yoneda.tex", Source::Index),
+            (yoneda.as_str(), Source::Index),
             ("refs.bib", Source::Index),
         ],
         "tabs first (the active one last), then the index"
@@ -755,6 +761,7 @@ fn quick_open_order() {
     let walked: Vec<String> = quick_open::walk_files(&f.dir, &skip)
         .iter()
         .map(|p| p.strip_prefix(&f.dir).unwrap().display().to_string())
+        .map(|p| p.replace(std::path::MAIN_SEPARATOR, "/"))
         .collect();
     assert_eq!(
         walked,
@@ -777,6 +784,7 @@ fn quick_open_order() {
             .strip_prefix(&f.dir)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| key.clone())
+            .replace(std::path::MAIN_SEPARATOR, "/")
     };
     let visible: Vec<String> = palette::visible(&f.state).iter().map(rel).collect();
     assert_eq!(
@@ -876,6 +884,32 @@ fn quick_open_ranks() {
     assert!(palette::activate_selected(&f.state));
     common::pump_until(TIMEOUT, || f.active_path() == Some(f.path("main.tex")));
     assert_eq!(f.state.editors().len(), 2);
+}
+
+/// A file whose name is not UTF-8 (Latin-1 `café.tex`) is listed with replacement characters,
+/// and choosing it opens that very file (also at a line), not a new empty one of the shown name.
+#[cfg(unix)]
+fn quick_open_latin1_names() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let f = fixture("quick-latin1", PROJECT);
+    let _main = f.open("main.tex");
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.tex");
+    std::fs::write(f.dir.join(name), "caf\n").unwrap();
+    let path = lemma_app::workspace::normalize(&f.dir.join(name));
+    for query in ["caf", "caf:1"] {
+        quick_open::show(&f.state);
+        common::pump_until(TIMEOUT, || {
+            palette::set_query(&f.state, query);
+            palette::visible(&f.state).len() == 1
+        });
+        assert!(palette::activate_selected(&f.state));
+        common::pump_until(TIMEOUT, || f.active_path() == Some(path.clone()));
+        let editor = f.state.active_editor().unwrap();
+        assert_eq!(editor.document().text(), "caf\n", "{query}");
+        assert!(!editor.document().is_dirty());
+        f.state.close_editor(&editor, true);
+        common::pump_until(TIMEOUT, || f.active_path() != Some(path.clone()));
+    }
 }
 
 /// Go to Line: `:N` and `:N:C` in the active document, `file:N` in the files that match.

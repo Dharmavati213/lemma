@@ -3,27 +3,9 @@
 //! Callbacks run on a snapshot of the list, so a callback may connect or disconnect others
 //! (including itself) while it runs. Ids are unique per thread, so one `disconnect(id)` can serve
 //! several lists.
-//!
-//! [`not_available`] is what the M3 stubs (WP3.0) do until their work package fills them.
 
-use crate::window::WindowState;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-
-/// What an action whose module is still a stub does: a toast saying `feature` (a sentence-case
-/// noun phrase, "The command palette") is not available yet, and a log line naming the work
-/// package that fills it.
-pub fn not_available(state: &WindowState, feature: &str, work_package: &str) {
-    tracing::info!("{feature}: a stub until {work_package}");
-    state.toast(&format!("{feature} is not available yet"));
-}
-
-/// What a scripted demo whose module is still a stub returns.
-pub fn demo_not_available(demo: &str, work_package: &str) -> Result<(), String> {
-    Err(format!(
-        "--demo {demo} is not available yet ({work_package} fills it)"
-    ))
-}
 
 /// Identifies a connected callback; pass it to the matching `disconnect`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

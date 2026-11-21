@@ -4,7 +4,10 @@
 //! 1, so sending never blocks; a send error means the MCP thread timed out and is ignored), with
 //! `Origin::Agent { call: call.call }` on every edit, and only after the change is on disk.
 //! Every path goes through `ProjectRoot::resolve`; a refused one gets `"path outside project
-//! root"`. The bridge spawns it with `glib::spawn_future_local(tools::handle(state, call))`.
+//! root"`. Every path in a reply is written with `/` on every system (`chapters/intro.tex`,
+//! `C:/Users/u/paper`: [`lemma_core::agent_path`]), so that the agent can copy it into
+//! `\input{…}`; from the agent, Windows' `\` is taken as well. The bridge spawns it with
+//! `glib::spawn_future_local(tools::handle(state, call))`.
 //! Every reply also carries the review feedback queued since the last one
 //! (`<review_feedback>…</review_feedback>`, see [`review_ui::drain_feedback`]).
 //!
@@ -28,11 +31,10 @@ use crate::review_ui;
 use crate::saver;
 use crate::window::WindowState;
 use crate::workspace::{self, normalize};
-use gio::prelude::*;
 use gtk::prelude::*;
 use lemma_agent::{EditorRequest, PromptBlock, ToolCall, ToolContent, ToolReply};
 use lemma_build::{BuildOutcome, BuildStatus};
-use lemma_core::{PathError, ProjectRoot, Severity};
+use lemma_core::{PathError, ProjectRoot, Severity, agent_path, agent_text};
 use lemma_review::{DiffLimit, review_diff};
 use lemma_syntax::{FileIndex, IncludeKind, ProjectIndex, index_file, parse_magic};
 use std::collections::{HashMap, HashSet};
@@ -375,8 +377,11 @@ fn resolve_path(state: &WindowState, path: &Path) -> Result<PathBuf, String> {
     })
 }
 
+/// The name of `path` in a reply: relative to the project root when below it, with `/` between
+/// its names on every system ([`ProjectRoot::agent_name`]). What the user is shown is
+/// [`review_ui::relative_name`], in the system's spelling.
 fn relative(state: &WindowState, path: &Path) -> String {
-    review_ui::relative_name(state, path)
+    state.workspace.root().agent_name(path)
 }
 
 /// Where the agent's runtime files go (the MCP socket, `render_page` copies):
@@ -442,24 +447,24 @@ fn lexical(path: &Path) -> PathBuf {
 }
 
 /// The text of `path`: the live text when the workspace has it, else the file's (decoded as the
-/// editor would open it).
+/// editor would open it). A named pipe, a socket or a device is refused, as the file tools
+/// refuse it.
 async fn live_text(state: &WindowState, path: &Path) -> Result<String, String> {
     if let Some(doc) = state.workspace.get(path) {
         return Ok(doc.text());
     }
     let rel = relative(state, path);
-    let (bytes, _etag) = gio::File::for_path(path)
-        .load_contents_future()
-        .await
-        .map_err(|e| {
-            if e.matches(gio::IOErrorEnum::NotFound) {
-                format!("file does not exist: {rel}")
-            } else if e.matches(gio::IOErrorEnum::IsDirectory) {
-                format!("{rel} is a directory, not a file")
-            } else {
-                format!("cannot read {rel}: {}", e.message())
-            }
-        })?;
+    let (bytes, _etag) = workspace::load_file(path).await.map_err(|e| {
+        if e.matches(gio::IOErrorEnum::NotFound) {
+            format!("file does not exist: {rel}")
+        } else if e.matches(gio::IOErrorEnum::IsDirectory) {
+            format!("{rel} is a directory, not a file")
+        } else if e.matches(gio::IOErrorEnum::NotRegularFile) {
+            format!("{rel} is not a regular file (a named pipe, a socket or a device)")
+        } else {
+            format!("cannot read {rel}: {}", agent_text(e.message(), path))
+        }
+    })?;
     saver::decode(&bytes, None)
         .map(|d| d.text)
         .map_err(|e| format!("cannot read {rel}: {e}"))
@@ -582,13 +587,13 @@ fn build_graph(
     let mut bibs = Vec::new();
     for (_, idx) in &files {
         for inc in idx.iter().flat_map(|i| &i.includes) {
-            if inc.kind != IncludeKind::Bibliography {
-                continue;
-            }
-            let name = if Path::new(&inc.target).extension().is_some() {
-                inc.target.clone()
-            } else {
-                format!("{}.bib", inc.target)
+            let name = match inc.kind {
+                // BibTeX adds `.bib`; biber reads a data source as written.
+                IncludeKind::Bibliography if Path::new(&inc.target).extension().is_none() => {
+                    format!("{}.bib", inc.target)
+                }
+                IncludeKind::Bibliography | IncludeKind::BibResource => inc.target.clone(),
+                _ => continue,
             };
             let path = lexical(&root_dir.join(name));
             if path.is_file() && !bibs.contains(&path) {
@@ -661,10 +666,10 @@ fn list_reply(
     keys: Vec<PathBuf>,
     walk: workspace::ProjectWalk,
 ) -> String {
-    // As `review_ui::relative_name` names them, against the root that was walked.
-    let relative = |path: &Path| root.relative(path).unwrap_or(path).display().to_string();
+    // As [`relative`] names them, against the root that was walked.
+    let relative = |path: &Path| root.agent_name(path);
     let mut listed: HashSet<PathBuf> = HashSet::new();
-    let mut out = format!("Project root: {}\n", root.path().display());
+    let mut out = format!("Project root: {}\n", agent_path(root.path()));
     let mut count = 0usize;
     let mut omitted = 0usize;
     if !documented.is_empty() {
@@ -753,7 +758,7 @@ async fn outline(state: &Rc<WindowState>, path: Option<&Path>) -> Result<String,
                         let _ = writeln!(
                             out,
                             "{} (outside the project root; not shown)",
-                            path.display()
+                            agent_path(path)
                         );
                     }
                     Some(index) => format_outline(&relative(state, path), index, &mut out),
@@ -946,10 +951,9 @@ fn build_report(state: &WindowState, build: &BuildController, outcome: &BuildOut
     };
     match &outcome.report.output {
         Some((pdf, pages)) => {
-            let name = pdf.file_name().map_or_else(
-                || pdf.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
+            let name = pdf
+                .file_name()
+                .map_or_else(|| agent_path(pdf), |n| n.to_string_lossy().into_owned());
             let _ = write!(
                 out,
                 " {name} has {}.",
@@ -1245,7 +1249,7 @@ async fn render_page(state: &Rc<WindowState>, page: u32) -> Result<Vec<ToolConte
         rendered.pages,
         rendered.width,
         rendered.height,
-        rendered.copy.display()
+        agent_path(&rendered.copy)
     );
     if still_building {
         note.push_str(
@@ -1438,10 +1442,11 @@ fn render_job(
             image
         }
     };
-    create_private_dir(dir)?;
+    // The messages go to the agent: they name the files as it is shown them.
+    create_private_dir(dir).map_err(|e| agent_text(&e, dir))?;
     let copy = dir.join(format!("page-{page}.png"));
     std::fs::write(&copy, &image.png)
-        .map_err(|e| format!("cannot write {}: {e}", copy.display()))?;
+        .map_err(|e| format!("cannot write {}: {e}", agent_path(&copy)))?;
     let stamp = std::fs::metadata(&copy)
         .ok()
         .and_then(|m| Some((m.len(), m.modified().ok()?)));
@@ -1682,8 +1687,7 @@ mod tests {
 
     #[test]
     fn the_include_graph_follows_live_texts_and_magic_roots() {
-        let dir = std::env::temp_dir().join(format!("lemma-graph-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-graph-").unwrap();
         std::fs::create_dir_all(dir.join("chapters")).unwrap();
         let dir = lemma_core::canonicalize(&dir).unwrap();
         std::fs::write(

@@ -101,13 +101,19 @@ pub async fn from_file(file: &gio::File, embed_only: bool) -> Result<Attachment,
     if info.file_type() == gio::FileType::Directory {
         return Err(format!("{name} is a folder; only files can be attached"));
     }
+    // A FIFO or a socket would keep the attachments waiting until another program writes to it,
+    // and a device such as `/dev/zero` never ends.
+    if info.file_type() == gio::FileType::Special {
+        return Err(format!("{name} is not a regular file; it was not attached"));
+    }
     let size = usize::try_from(info.size()).unwrap_or(usize::MAX);
     let head = read_head(file)
         .await
         .map_err(|e| format!("Could not attach {name}: {e}"))?;
     let uri = file.uri().to_string();
     let mime = guess_mime(&name, &head);
-    let format_size = |n: usize| glib::format_size(n as u64);
+    // In the units of the limits (64 MiB is "67.1 MB" in GLib's default ones).
+    let format_size = |n: usize| glib::format_size_full(n as u64, glib::FormatSizeFlags::IEC_UNITS);
     if mime.starts_with("image/") && mime != "image/svg+xml" {
         if size > MAX_IMAGE_FILE_BYTES {
             return Err(format!(
@@ -129,7 +135,7 @@ pub async fn from_file(file: &gio::File, embed_only: bool) -> Result<Attachment,
     if mime == "application/pdf" {
         if size <= MAX_EMBEDDED_DOCUMENT_BYTES {
             let data = load(file, &name).await?;
-            let detail = format!("PDF document · {}", format_size(data.len()));
+            let detail = format!("PDF document · {}", glib::format_size(data.len() as u64));
             return Ok(Attachment {
                 name,
                 detail,
@@ -151,7 +157,7 @@ pub async fn from_file(file: &gio::File, embed_only: bool) -> Result<Attachment,
         let data = load(file, &name).await?;
         return match text_of(data) {
             Some(text) => {
-                let detail = format!("Text · {}", format_size(text.len()));
+                let detail = format!("Text · {}", glib::format_size(text.len() as u64));
                 Ok(Attachment {
                     block: PromptBlock::Resource {
                         uri,
@@ -270,12 +276,39 @@ pub async fn thumbnail(data: Vec<u8>) -> Option<gdk::Texture> {
 }
 
 /// The MIME type of a file named `name` with contents `data`.
+///
+/// On Windows GIO knows a file's type from its extension alone, as the registry describes it:
+/// `.png` is `image/png` where a program registered that, and `application/x-ext-png` where
+/// none did (an image or a PDF was then refused as "not a text file, an image or a PDF"). The
+/// formats that are attached in a way of their own are told by their first bytes there.
 pub fn guess_mime(name: &str, data: &[u8]) -> String {
+    if cfg!(windows)
+        && let Some(mime) = sniffed_mime(data)
+    {
+        return mime.to_owned();
+    }
     let head = &data[..data.len().min(4096)];
     let (content_type, _) = gio::content_type_guess(Some(Path::new(name)), head);
     gio::content_type_get_mime_type(&content_type)
         .map(|m| m.to_string())
         .unwrap_or_else(|| content_type.to_string())
+}
+
+/// The type of an image or a PDF that starts with `data`, from the bytes every file of the
+/// format begins with: PNG, JPEG, GIF, WebP and PDF.
+fn sniffed_mime(data: &[u8]) -> Option<&'static str> {
+    const STARTS: &[(&[u8], &str)] = &[
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"%PDF-", "application/pdf"),
+    ];
+    if let Some((_, mime)) = STARTS.iter().find(|(start, _)| data.starts_with(start)) {
+        return Some(mime);
+    }
+    // RIFF, the size of the file, then the form's name.
+    (data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP").then_some("image/webp")
 }
 
 /// `data` as text: valid UTF-8 without NUL bytes.
@@ -531,6 +564,34 @@ mod tests {
         );
         assert_eq!(text_of(vec![0xff, 0xfe]), None);
         assert_eq!(text_of(b"a\0b".to_vec()), None);
+    }
+
+    #[test]
+    fn images_and_pdfs_are_told_by_their_first_bytes() {
+        assert_eq!(
+            sniffed_mime(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniffed_mime(b"\xff\xd8\xff\xe0\0\x10JFIF"),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniffed_mime(b"GIF89a\x01\0\x01\0"), Some("image/gif"));
+        assert_eq!(sniffed_mime(b"GIF87a"), Some("image/gif"));
+        assert_eq!(sniffed_mime(b"RIFF\x24\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniffed_mime(b"%PDF-1.7\n"), Some("application/pdf"));
+        // Not a WebP: another RIFF form, and a file too short to say.
+        assert_eq!(sniffed_mime(b"RIFF\x24\0\0\0WAVEfmt "), None);
+        assert_eq!(sniffed_mime(b"RIFF"), None);
+        assert_eq!(sniffed_mime(b"\\documentclass{article}"), None);
+        assert_eq!(sniffed_mime(b""), None);
+        // Windows asks the registry about the extension, which may say nothing: the bytes
+        // decide there. Elsewhere GIO looks at them itself.
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        if cfg!(windows) {
+            assert_eq!(guess_mime("figure.dat", png), "image/png");
+            assert_eq!(guess_mime("paper", b"%PDF-1.4\n"), "application/pdf");
+        }
     }
 
     #[test]

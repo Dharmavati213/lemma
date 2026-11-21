@@ -6,7 +6,9 @@
 //! `@preamble` and `@comment` are skipped, and text outside entries is ignored. A malformed entry is
 //! dropped and scanning resumes at the next `@` after the point where it went wrong. An `@comment`
 //! whose delimiter is never closed hides nothing: scanning resumes right after its opening
-//! delimiter, as in BibTeX.
+//! delimiter, as in BibTeX. A `%` comments out the rest of its line, between entries as between
+//! fields, as for biber (and Lemma's highlighting and Toggle Comment): an entry whose lines start
+//! with `%` is no entry. (BibTeX has no comments and would still read it.)
 
 use crate::structure::args::{LineCounter, strip_outer_braces};
 use std::collections::HashMap;
@@ -42,6 +44,12 @@ pub fn scan_bib(text: &str) -> Vec<BibEntry> {
     let mut i = 0;
     while let Some(off) = memchr::memchr(b'@', &parser.b[i..]) {
         let at = i + off;
+        // Outside an entry, a `%` before the `@` on its line comments it out.
+        let line_start = memchr::memrchr(b'\n', &parser.b[i..at]).map_or(i, |o| i + o + 1);
+        if memchr::memchr(b'%', &parser.b[line_start..at]).is_some() {
+            i = memchr::memchr(b'\n', &parser.b[at..]).map_or(parser.b.len(), |o| at + o + 1);
+            continue;
+        }
         match parser.item(at) {
             Ok((Some(fields), end)) => {
                 out.push(fields.into_entry(lines.line_at(at)));

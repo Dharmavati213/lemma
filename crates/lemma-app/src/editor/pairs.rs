@@ -1189,6 +1189,8 @@ struct ViewPairs {
     typed: RefCell<String>,
     /// GtkSourceView's bracket matching before attach (restored on detach).
     brackets_were_on: Cell<bool>,
+    /// True while [`update`] applies the highlight (any other application is a copy).
+    applying: Cell<bool>,
 }
 
 thread_local! {
@@ -1391,7 +1393,9 @@ fn update(vp: &Rc<ViewPairs>) {
         let [Some(a), Some(b)] = pair else {
             continue;
         };
+        vp.applying.set(true);
         buffer.apply_tag(&tag, a, b);
+        vp.applying.set(false);
         marks.push((
             buffer.create_mark(None, a, true),
             buffer.create_mark(None, b, false),
@@ -1648,6 +1652,7 @@ pub fn attach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
         key_handler: Cell::new(None),
         typed: RefCell::default(),
         brackets_were_on: Cell::new(buffer.is_highlight_matching_brackets()),
+        applying: Cell::new(false),
     });
     VIEWS.with_borrow_mut(|views| {
         views.retain(|v| v.view.upgrade().is_some());
@@ -1692,6 +1697,19 @@ pub fn attach(_state: &Rc<WindowState>, editor: &Rc<Editor>) {
     signals.push((
         buffer.clone().upcast(),
         buffer.connect_style_scheme_notify(restyle),
+    ));
+    // Text pasted from the same buffer comes with its tags: a highlighted delimiter would keep
+    // the highlight for good (only the ranges shown are ever cleared), so the copy is refused.
+    let weak = Rc::downgrade(&vp);
+    signals.push((
+        buffer.clone().upcast(),
+        buffer.connect_apply_tag(move |buffer, tag, _, _| {
+            if weak.upgrade().is_some_and(|vp| !vp.applying.get())
+                && matches!(tag.name().as_deref(), Some(MATCH_TAG | UNMATCHED_TAG))
+            {
+                buffer.stop_signal_emission_by_name("apply-tag");
+            }
+        }),
     ));
     let style = adw::StyleManager::default();
     let weak_buffer = buffer.downgrade();
@@ -1777,8 +1795,8 @@ pub async fn run_demo(state: Rc<WindowState>) -> Result<(), String> {
     let editor = match state.active_editor() {
         Some(editor) => editor,
         None => {
-            let dir = std::env::temp_dir().join(format!("lemma-pairs-demo-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let dir = crate::fsutil::private_temp_dir("lemma-pairs-demo-")
+                .map_err(|e| format!("cannot create a temporary directory: {e}"))?;
             let path = dir.join("pairs.tex");
             std::fs::write(&path, DEMO_TEX).map_err(|e| format!("{}: {e}", path.display()))?;
             state.open_file(&path).await?

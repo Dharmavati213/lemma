@@ -9,15 +9,18 @@
 //!
 //! The process environment is isolated before GTK starts (as in `gtk_agent_panel`): `HOME`, the
 //! `XDG_*` directories and `LEMMA_CONFIG` point into a temporary directory, `PATH` is a temporary
-//! `bin` (which always holds a fake `secret-tool`, so the real keyring is never asked) plus
-//! `/usr/bin` and `/bin`, and `ANTHROPIC_API_KEY` is unset. Nothing here runs the real node, npm,
-//! pi or claude, or calls any API.
+//! `bin` (which always holds a fake `secret-tool`, so the real keyring is never asked) plus links
+//! to the programs of `/usr/bin` and `/bin` other than node, npm, pi, claude and the other agents'
+//! tools (`common::system_programs_without`), and `ANTHROPIC_API_KEY` is unset. Nothing here
+//! finds or runs the real node, npm, pi or claude, or calls any API.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_agent_backends`.
 //! `LEMMA_TEST_SNAPSHOTS=dir` saves `r-api-key-row.png`, `r-backend-picker.png` (its list open),
 //! `r-api-key-dialog.png` and `r-api-key-stored.png` there.
 
 mod common;
+
+use common::Canonical as _;
 
 use adw::prelude::*;
 use lemma_agent::{AgentEvent, PromptBlock, StopReason, Usd};
@@ -102,8 +105,7 @@ esac
 exit 2"#;
 
 fn isolate_environment() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-backends-env-{}", std::process::id()));
+    let root = common::target_tmpdir().join(format!("lemma-backends-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
     let bin = root.join("bin");
@@ -111,6 +113,7 @@ fn isolate_environment() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let config = home.join(".config/lemma/config.toml");
+    let path = common::path_without(&bin, &root, common::AGENT_PROGRAMS);
     // SAFETY: single-threaded: GTK is not initialised yet and no thread was spawned.
     unsafe {
         std::env::set_var("HOME", &home);
@@ -118,7 +121,7 @@ fn isolate_environment() {
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", path);
         std::env::set_var("LEMMA_CONFIG", &config);
         std::env::remove_var("MISE_DATA_DIR");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -129,6 +132,7 @@ fn isolate_environment() {
 
 /// Writes an executable shell script into the temporary `bin`.
 fn fake_program(name: &str, body: &str) -> PathBuf {
+    common::require_shell_scripts();
     let path = env().bin.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     #[cfg(unix)]
@@ -198,6 +202,7 @@ fn fixture(
     config.editor.vim = false;
     configure(&mut config);
     let ws = Workspace::new(ProjectRoot::new(&dir).unwrap());
+    common::restore_home(&env().home);
     let paths = Paths::from_env();
     assert!(
         paths.as_ref().is_some_and(|p| p.home == env().home),
@@ -225,7 +230,7 @@ fn fixture(
     common::pump_for(Duration::from_millis(20));
     Fixture {
         state,
-        dir: dir.canonicalize().unwrap(),
+        dir: dir.canonical().unwrap(),
         commands,
     }
 }
@@ -688,6 +693,7 @@ fn pi_login_hint() {
 // ----- the API backend -----
 
 fn api_key_row() {
+    common::require_stand_in_keyring();
     let _ = std::fs::remove_file(env().home.join("stored-key"));
     let _ = std::fs::remove_file(env().home.join("secret-tool-args.txt"));
     let f = fixture("api-key", &[("main.tex", MAIN)], true, |c| {
@@ -772,6 +778,7 @@ fn api_key_row() {
 }
 
 fn api_cost_label() {
+    common::require_stand_in_keyring();
     let f = fixture("api-cost", &[("main.tex", MAIN)], true, |c| {
         c.agent.backend = AgentBackend::Api;
     });
@@ -861,6 +868,7 @@ fn regress5_config_reload() {
 /// With `backend = "api"`, building the window looks nothing up in the keyring (it may ask to
 /// be unlocked); the key row does when the pane is first shown.
 fn regress5_lazy_key_lookup() {
+    common::require_stand_in_keyring();
     let args = env().home.join("secret-tool-args.txt");
     let _ = std::fs::remove_file(&args);
     let f = fixture("r5-lazy-key", &[("main.tex", MAIN)], true, |c| {

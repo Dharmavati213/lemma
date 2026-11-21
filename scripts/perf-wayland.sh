@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Timing gate on a real Wayland session, run by hand. scripts/ci.sh never runs it, because it opens windows on the desktop (each
-# a short scripted run that quits by itself).
+# Timing gate on a real Wayland session, run by hand. scripts/ci.sh never runs it, because it
+# opens windows on the desktop (each a short scripted run that quits by itself).
 #
 #   scripts/perf-wayland.sh [startup] [typing] [pdf]     default: all three
 #
@@ -9,7 +9,8 @@
 #            the first frame with the document (medians);
 #   typing   keystroke to frame on doc1k.tex and tests/fixtures/large.tex, outline sidebar shown;
 #   pdf      PDF scroll frames on target/fixtures/pdf50.tex, three pages high and fit width;
-# prints every `[perf]` line and checks the [perf] budgets of scripts/budgets.toml.
+# prints every `[perf]` line and checks the [perf] budgets of scripts/budgets.toml. A run that
+# fails, or ends without printing the lines of its scenario, fails the script.
 #
 # Env: LEMMA_BIN        use this binary instead of building lemma-app
 #      LEMMA_CONFIG     settings file (default: every optional feature on, see below)
@@ -84,18 +85,44 @@ echo "perf-wayland.sh: $bin; renderer ${GSK_RENDERER:-from the settings}; config
 out="$tmp/perf.out"
 : >"$out"
 
-# run SCENARIOS ARGS...: one scripted run; its [perf] lines go to $out and the terminal.
+# missing_lines SCENARIO LOG: prints the starts of the [perf] lines a run of SCENARIO prints that
+# LOG lacks, one per line, and fails when there is one. Without its lines the budgets of that
+# measurement would not be checked at all: a run that ends without measuring (a binary that does
+# not know LEMMA_PERF, a window that never drew a frame) must not pass.
+missing_lines() {
+  local start missing=0 starts=()
+  case "$1" in
+    startup) starts=('startup first_frame_ms=' 'startup ready_ms=') ;;
+    pdf-scroll) starts=('pdf-scroll zoom=pages3 ' 'pdf-scroll zoom=fit-width ') ;;
+    *) starts=("$1 ") ;;
+  esac
+  for start in "${starts[@]}"; do
+    if ! grep -q -- "^\[perf\] $start" "$2"; then
+      echo "[perf] $start"
+      missing=1
+    fi
+  done
+  return "$missing"
+}
+
+# run SCENARIO ARGS...: one scripted run; its [perf] lines go to $out and the terminal.
 run() {
-  local scenarios="$1"
+  local scenario="$1"
   shift
-  local log="$tmp/run.log" status=0
+  local log="$tmp/run.log" status=0 missing
   local runner=("$bin")
   [ "$broadway" = 1 ] && runner=(scripts/broadway.sh "$bin")
-  LEMMA_PERF="$scenarios" LEMMA_PERF_T0="$(date +%s%N)" \
+  LEMMA_PERF="$scenario" LEMMA_PERF_T0="$(date +%s%N)" \
     "${runner[@]}" "$@" --quit-after-ms 1 </dev/null >"$log" 2>&1 || status=$?
   grep '^\[perf\]' "$log" | tee -a "$out" || true
   if [ "$status" != 0 ]; then
     echo "perf-wayland.sh: lemma $* failed (status $status):" >&2
+    tail -n 30 "$log" >&2
+    return 1
+  fi
+  if ! missing="$(missing_lines "$scenario" "$log")"; then
+    echo "perf-wayland.sh: lemma $* ended without printing these lines:" >&2
+    echo "$missing" >&2
     tail -n 30 "$log" >&2
     return 1
   fi

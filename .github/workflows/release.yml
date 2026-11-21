@@ -22,8 +22,9 @@ on:
     tags: ["*"]
   workflow_dispatch:
 
+# Only the publish job writes (the release); the build jobs run third-party code and get read.
 permissions:
-  contents: write # the release
+  contents: read
 
 env:
   LABEL: ${{ github.ref_type == 'tag' && github.ref_name || 'snapshot' }}
@@ -52,6 +53,9 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A tag's run restores main's cache; one it saved would serve no other run.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build (bundled SyncTeX)
         run: LEMMA_SYNCTEX_BUNDLED=1 cargo build --release --locked -p lemma-app -p lemma-mcp
       - name: .deb and tarball
@@ -80,6 +84,9 @@ jobs:
           gtk4-devel libadwaita-devel gtksourceview5-devel libspelling-devel poppler-glib-devel
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A tag's run restores main's cache; one it saved would serve no other run.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build (bundled SyncTeX)
         run: LEMMA_SYNCTEX_BUNDLED=1 cargo build --release --locked -p lemma-app -p lemma-mcp
       - name: .rpm
@@ -190,7 +197,8 @@ jobs:
       - name: install.sh names the missing libraries
         run: |
           tar -C /tmp -xzf dist/lemma-*-linux-x86_64.tar.gz
-          if /tmp/lemma-*-linux-x86_64/install.sh 2>missing.txt; then
+          dir="$(echo /tmp/lemma-*-linux-x86_64)"
+          if "$dir/install.sh" 2>missing.txt; then
             echo "install.sh installed without the libraries"; exit 1
           fi
           cat missing.txt
@@ -200,9 +208,10 @@ jobs:
           apt-get update
           apt-get install -y libgtk-4-1 libadwaita-1-0 libgtksourceview-5-0 libspelling-1-2 \
             libpoppler-glib8t64 libgtk-4-bin fonts-dejavu-core
-          /tmp/lemma-*-linux-x86_64/install.sh --system
+          dir="$(echo /tmp/lemma-*-linux-x86_64)"
+          "$dir/install.sh" --system
           packaging/linux/smoke-test.sh /usr/local/bin/lemma shots tarball-debian-sid
-          /tmp/lemma-*-linux-x86_64/install.sh --system --uninstall
+          "$dir/install.sh" --system --uninstall
           test ! -e /usr/local/bin/lemma
       - uses: actions/upload-artifact@v7
         if: always()
@@ -215,6 +224,8 @@ jobs:
     needs: [macos, test-deb, test-rpm, test-arch, test-tarball]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8

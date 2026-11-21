@@ -91,6 +91,7 @@ use super::snippets::{self, Driver};
 use super::{Editor, TexView, VimMode, keys, spell};
 use crate::document::{DocRef, Document, ObserverId};
 use crate::hooks::HookId;
+use crate::labels::scan::{self, bibliographies};
 use crate::settings::ConfigFile;
 use crate::window::WindowState;
 use gtk::gdk;
@@ -102,7 +103,7 @@ use lemma_complete::{
 };
 use lemma_snippets::Chunk;
 use lemma_syntax::{
-    ArgKind, AuxInfo, BibEntry, Context, FileIndex, IncludeKind, ProjectIndex, aux_inputs,
+    ArgKind, AuxInfo, BibEntry, Context, FileIndex, ProjectIndex, aux_inputs,
     index_file_with_theorems, parse_aux, scan_bib,
 };
 use sourceview5::prelude::*;
@@ -130,6 +131,9 @@ const MAX_NEARBY_PER_DIR: usize = 64;
 /// Caps of the walk that lists the project's files for file arguments.
 const WALK_MAX_FILES: usize = 4000;
 const WALK_MAX_DIRS: usize = 400;
+/// The names of the listed files are kept for at most this many directories besides the listed
+/// one (`Feed::named`).
+const MAX_NAMED_DIRS: usize = 8;
 /// Longest detail shown next to a proposal (the full text is in the comment row).
 const DETAIL_CHARS: usize = 48;
 
@@ -675,6 +679,8 @@ pub struct Attached {
     selecting: Cell<bool>,
     /// The popup was created ([`Attached::prime`]).
     primed: Cell<bool>,
+    /// How many times [`Attached::compute`] ran (tests).
+    computations: Cell<u64>,
 }
 
 /// A `show-completion` request whose proposals GtkSourceView has not asked for yet: the
@@ -735,6 +741,7 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         request: Cell::new(None),
         selecting: Cell::new(true),
         primed: Cell::new(false),
+        computations: Cell::new(0),
     });
     let completion = view.completion();
     completion.set_page_size(10);
@@ -1018,7 +1025,14 @@ impl Attached {
         let Some(trigger) = trigger else {
             return;
         };
-        let Some(stash) = self.compute() else {
+        // An open popup was refiltered as the character arrived: those proposals are the
+        // cursor's (computing them costs as much as the rest of the keystroke).
+        let current = if self.stash_is_current() {
+            self.stash.take()
+        } else {
+            None
+        };
+        let Some(stash) = current.or_else(|| self.compute()) else {
             self.hide();
             return;
         };
@@ -1174,6 +1188,7 @@ impl Attached {
     /// The proposals at the cursor, best first (at most `completion.max_items`); `None` when
     /// nothing can be completed there (a selection, a closed document, no window).
     fn compute(&self) -> Option<Stash> {
+        self.computations.set(self.computations.get() + 1);
         let (view, doc, shared) = (self.view.upgrade()?, self.doc.upgrade()?, self.shared()?);
         let state = shared.state()?;
         let buffer = view.buffer();
@@ -1183,6 +1198,7 @@ impl Attached {
         let position = Position::at_cursor(&doc, &buffer)?;
         let req = CompletionRequest::new(&position.ctx, &position.line_before);
         let mut items = Vec::new();
+        shared.name_files_for(&state, &doc);
         {
             let words = shared.words.borrow().clone();
             let index = state.workspace.index.borrow();
@@ -1250,20 +1266,21 @@ impl Attached {
         }
     }
 
-    /// Fills `store` with the proposals at the cursor (from the stash when it is current).
+    /// Fills `store` with the proposals at the cursor (from the stash when it is current; else
+    /// they are computed and become the stash, for the popup's policy after the key that
+    /// changed them).
     fn fill(&self, store: &gio::ListStore) {
         // The stash stays: a retried `show` asks again.
-        let (items, needle) = if self.stash_is_current() {
-            let stash = self.stash.borrow();
-            stash
-                .as_ref()
-                .map(|s| (s.items.clone(), s.needle.clone()))
-                .unwrap_or_default()
-        } else {
-            self.compute()
-                .map(|s| (s.items, s.needle))
-                .unwrap_or_default()
-        };
+        if !self.stash_is_current() {
+            let stash = self.compute();
+            self.stash.replace(stash);
+        }
+        let (items, needle) = self
+            .stash
+            .borrow()
+            .as_ref()
+            .map(|s| (s.items.clone(), s.needle.clone()))
+            .unwrap_or_default();
         let objects: Vec<glib::Object> = items
             .into_iter()
             .map(|item| Proposal::new(item, &needle).upcast())
@@ -1682,6 +1699,11 @@ pub fn items_at_cursor(state: &WindowState, editor: &Editor) -> Vec<Item> {
         .unwrap_or_default()
 }
 
+/// How many times the proposals at the cursor of `editor` were computed so far (tests).
+pub fn proposal_computations(state: &WindowState, editor: &Editor) -> u64 {
+    attached_of(state, editor).map_or(0, |a| a.computations.get())
+}
+
 /// Accepts `item` at the cursor of `editor`, as activating its proposal does.
 pub fn accept(state: &WindowState, editor: &Editor, item: &Item) {
     if let Some(attached) = attached_of(state, editor) {
@@ -1733,6 +1755,16 @@ pub fn type_and_replace(
     };
     attached.hide();
     attached.driver.type_and_replace(c, typed, with)
+}
+
+/// Runs `f` (which makes its own user action) as an undo step of its own, through the snippet
+/// driver of `editor` (`snippets::Driver::as_undo_step`: Vim's open insert is closed around it);
+/// as it is when `editor` has no driver.
+pub fn as_undo_step<R>(state: &WindowState, editor: &Editor, f: impl FnOnce() -> R) -> R {
+    match attached_of(state, editor) {
+        Some(attached) => attached.driver.as_undo_step(f),
+        None => f(),
+    }
 }
 
 /// Whether the project defines the macro `name`, as the `if_undefined` snippet bodies see it.
@@ -1892,6 +1924,24 @@ struct Feed {
     /// many times they were listed (only the newest listing is kept).
     walked_dir: RefCell<Option<PathBuf>>,
     walks: Cell<u64>,
+    /// The files of the last listing, relative to `walked_dir`; that directory as the workspace
+    /// names it (`workspace::normalize`, resolved on the jobs thread with the listing); and the
+    /// directory the completer's names of the files are relative to now (see
+    /// `Shared::name_files_for`).
+    walked_files: RefCell<Vec<String>>,
+    walked_real: RefCell<Option<PathBuf>>,
+    files_base: RefCell<Option<PathBuf>>,
+    /// The directory each document (by path) writes file names from, with the build's root it
+    /// was worked out with ([`Shared::name_files_for`]). Worked out again only when what it
+    /// depends on changes: the listing, the build's root, or what the function [`bases_hash`]
+    /// covers of the index (the files, their includes, roots and subfiles parents), whose last
+    /// value is kept in `bases_hash`.
+    bases: RefCell<HashMap<PathBuf, (Option<PathBuf>, PathBuf)>>,
+    bases_hash: Cell<u64>,
+    /// The names of the listed files from directories other than the listed one, by directory,
+    /// until the next listing: a switch between documents that write them differently does not
+    /// work them out again.
+    named: RefCell<HashMap<PathBuf, Vec<String>>>,
     /// Paths whose re-index job runs; a path in `index_again` is indexed once more when its job
     /// ends (one job per path at a time, so an older text never lands after a newer one).
     indexing: RefCell<HashSet<PathBuf>>,
@@ -2186,6 +2236,12 @@ impl Shared {
             return;
         };
         let disk = self.promote_candidates(&state) | self.prune(&state) || disk;
+        // The directories documents write file names from follow only what they depend on: a
+        // `\label` or a section typed leaves them.
+        let hash = bases_hash(&state.workspace.index.borrow());
+        if self.feed.bases_hash.replace(hash) != hash {
+            self.feed.bases.borrow_mut().clear();
+        }
         let mut packages = state.workspace.index.borrow().packages();
         if let Some(class) = self
             .project_root(&state)
@@ -2440,11 +2496,12 @@ impl Shared {
             .iter()
             .skip(wanted.budget)
             .any(|p| included.contains(p));
-        // Bibliographies.
+        // Bibliographies (those in BibTeX's format).
         let mut bib_seen = HashSet::new();
         for (path, file) in &index.files {
             for bib in bibliographies(path, file) {
-                if (!index.bibs.contains_key(&bib) || stale.contains(&bib))
+                if scan::is_bibtex_file(&bib)
+                    && (!index.bibs.contains_key(&bib) || stale.contains(&bib))
                     && !unreadable.contains(&bib)
                     && bib_seen.insert(bib.clone())
                 {
@@ -2852,18 +2909,18 @@ impl Shared {
         };
         let skip = dir.join(&state.config.build.outdir);
         let differs = {
-            let completer = self.completer.borrow();
-            let listed: HashSet<&str> = completer.files().iter().map(String::as_str).collect();
+            let walked = self.feed.walked_files.borrow();
+            let listed: HashSet<&str> = walked.iter().map(String::as_str).collect();
             moved.iter().any(|(path, exists)| {
+                // A name the listing leaves out is never there, nor anything under it.
                 let Some(rel) = path
                     .strip_prefix(&dir)
                     .ok()
                     .filter(|_| !path.starts_with(&skip))
-                    .and_then(Path::to_str)
+                    .and_then(listed_name)
                 else {
                     return false;
                 };
-                let rel = rel.replace('\\', "/");
                 // A directory that went takes its files along (moved out of the project, they
                 // get no events of their own).
                 listed.contains(rel.as_str()) != *exists
@@ -2877,6 +2934,76 @@ impl Shared {
         if differs {
             self.walk_files();
         }
+    }
+
+    /// A new listing: the documents' directories (one without a known root writes names from the
+    /// listed directory) and the names from other directories are worked out again.
+    fn listing_changed(&self) {
+        self.feed.bases.borrow_mut().clear();
+        self.feed.named.borrow_mut().clear();
+    }
+
+    /// Gives the completer the project's files as `doc` has to write them: relative to the
+    /// directory LaTeX resolves `doc`'s paths against (`paste::known_path_base`). That is the
+    /// directory they were listed from (the root's) for most documents; a subfiles document, or
+    /// one below an `\import`, writes them from its own or its import directory
+    /// (`../img/plot.png` there, not `img/plot.png`). Every completion asks, so the directory is
+    /// worked out once per document until something it depends on changes (see `Feed::bases`):
+    /// working it out resolves paths on the file system and looks through the project's
+    /// includes. The names from a directory are kept until the next listing.
+    fn name_files_for(&self, state: &WindowState, doc: &DocRef) {
+        if self.feed.walked_real.borrow().is_none() {
+            // Nothing listed yet: the listing names the files when it comes.
+            return;
+        }
+        let build_root = state.build.get().and_then(|b| b.root());
+        let known = self
+            .feed
+            .bases
+            .borrow()
+            .get(doc.path())
+            .filter(|(root, _)| *root == build_root)
+            .map(|(_, base)| base.clone());
+        if known.is_some() && *self.feed.files_base.borrow() == known {
+            return;
+        }
+        let Some(walked) = self.feed.walked_real.borrow().clone() else {
+            return;
+        };
+        let base = known.unwrap_or_else(|| {
+            let base = crate::paste::known_path_base(state, doc).unwrap_or_else(|| walked.clone());
+            self.feed
+                .bases
+                .borrow_mut()
+                .insert(doc.path().to_path_buf(), (build_root, base.clone()));
+            base
+        });
+        if self.feed.files_base.borrow().as_ref() == Some(&base) {
+            return;
+        }
+        let files: Vec<String> = if base == walked {
+            self.feed.walked_files.borrow().clone()
+        } else {
+            let mut named = self.feed.named.borrow_mut();
+            if named.len() >= MAX_NAMED_DIRS && !named.contains_key(&base) {
+                named.clear();
+            }
+            named
+                .entry(base.clone())
+                .or_insert_with(|| {
+                    self.feed
+                        .walked_files
+                        .borrow()
+                        .iter()
+                        .filter_map(|file| {
+                            listed_name(&crate::paste::relative_path(&base, &walked.join(file)))
+                        })
+                        .collect()
+                })
+                .clone()
+        };
+        self.completer.borrow_mut().set_files(files);
+        self.feed.files_base.replace(Some(base));
     }
 
     /// Lists the project's files (for file arguments) on the jobs thread.
@@ -2898,12 +3025,14 @@ impl Shared {
             let files = gio::spawn_blocking(move || {
                 let walk =
                     crate::workspace::walk_project(&root_dir, &skip, WALK_MAX_FILES, WALK_MAX_DIRS);
-                walk.files
+                let files = walk
+                    .files
                     .iter()
                     .filter_map(|f| f.strip_prefix(&root_dir).ok())
-                    .filter_map(Path::to_str)
-                    .map(|s| s.replace('\\', "/"))
-                    .collect::<Vec<String>>()
+                    .filter_map(listed_name)
+                    .collect::<Vec<String>>();
+                // Resolved here: the main thread does not touch the file system for it.
+                (files, crate::workspace::normalize(&root_dir))
             })
             .await;
             let Some(shared) = weak.upgrade() else {
@@ -2911,10 +3040,14 @@ impl Shared {
             };
             shared.feed.jobs.set(shared.feed.jobs.get() - 1);
             // An older listing that ends after a newer one is dropped.
-            if let Ok(files) = files
+            if let Ok((files, real_dir)) = files
                 && shared.feed.walks.get() == walk
             {
-                shared.completer.borrow_mut().set_files(files);
+                shared.completer.borrow_mut().set_files(files.clone());
+                shared.feed.walked_files.replace(files);
+                shared.feed.files_base.replace(Some(real_dir.clone()));
+                shared.feed.walked_real.replace(Some(real_dir));
+                shared.listing_changed();
             }
         });
     }
@@ -3081,6 +3214,19 @@ impl Shared {
     }
 }
 
+/// The name file arguments propose for the file at the relative path `rel`: directories
+/// separated by `/`, on Windows too. `None` when it is not UTF-8, or when LaTeX would misread
+/// it (`paste::unsafe_in_latex`: a `%` starts a comment, and so on); outside Windows a backslash
+/// is part of a file's name, not a separator, and is one of those.
+fn listed_name(rel: &Path) -> Option<String> {
+    let name = rel.to_str()?;
+    #[cfg(windows)]
+    let name = name.replace('\\', "/");
+    #[cfg(not(windows))]
+    let name = name.to_owned();
+    (!crate::paste::unsafe_in_latex(&name)).then_some(name)
+}
+
 /// `dir` joined with `rel`, `.` and `..` folded without touching the file system (as
 /// `ProjectIndex::project_files` does).
 fn lexical_join(dir: &Path, rel: impl AsRef<Path>) -> PathBuf {
@@ -3144,6 +3290,27 @@ fn open_latex_documents(state: &WindowState) -> HashSet<PathBuf> {
         .collect()
 }
 
+/// A hash of what the directories documents write file names from depend on in `index`
+/// (`paste::known_path_base`): which files are indexed, their includes, their `% !TEX root` and
+/// subfiles parent, and which are whole documents. Labels, sections, citations, and the lines
+/// the includes are on, are left out.
+fn bases_hash(index: &ProjectIndex) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for (path, file) in &index.files {
+        path.hash(&mut hasher);
+        file.magic.root.hash(&mut hasher);
+        file.magic.subfiles_parent.hash(&mut hasher);
+        (file.has_documentclass, file.has_begin_document).hash(&mut hasher);
+        file.includes.len().hash(&mut hasher);
+        for include in &file.includes {
+            std::mem::discriminant(&include.kind).hash(&mut hasher);
+            include.target.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 /// The directories of the indexed files that have a `\documentclass` (the roots): TeX runs
 /// there, so it finds a package there first.
 fn root_dirs(index: &ProjectIndex) -> Vec<PathBuf> {
@@ -3193,28 +3360,6 @@ fn magic_root(path: &Path, file: &FileIndex) -> Option<PathBuf> {
         root.set_extension("tex");
     }
     Some(root)
-}
-
-/// The `.bib` files `file` (at `path`) names in `\bibliography`/`\addbibresource`.
-fn bibliographies(path: &Path, file: &FileIndex) -> Vec<PathBuf> {
-    let dir = path.parent().unwrap_or(Path::new("/"));
-    file.includes
-        .iter()
-        .filter(|i| i.kind == IncludeKind::Bibliography)
-        .map(|i| i.target.trim())
-        .filter(|target| !target.is_empty())
-        .map(|target| {
-            let bib = lexical_join(dir, target);
-            if bib
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("bib"))
-            {
-                bib
-            } else {
-                PathBuf::from(format!("{}.bib", bib.display()))
-            }
-        })
-        .collect()
 }
 
 /// The text of the regular file at `path` (lossy UTF-8), when it is at most `cap` bytes.
@@ -3498,7 +3643,7 @@ mod tests {
     /// deleted, and a key linked to it under another name.
     #[test]
     fn keys_naming_a_changed_path() {
-        let dir = std::env::temp_dir().join(format!("lemma-keys-naming-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-keys-naming-").unwrap();
         std::fs::create_dir_all(dir.join("real")).unwrap();
         std::fs::write(dir.join("real/ch1.tex"), "").unwrap();
         let dir = crate::workspace::normalize(&dir);
@@ -3508,8 +3653,8 @@ mod tests {
             dir.join("other/ch1.tex"),
         ];
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        if cfg!(unix) {
             keys.push(dir.join("link/ch1.tex"));
         }
         let none = HashMap::new();

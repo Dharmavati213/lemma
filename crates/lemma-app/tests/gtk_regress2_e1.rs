@@ -10,7 +10,7 @@ use adw::prelude::*;
 use gtk::gdk;
 use lemma_app::editor::highlight::{self, Highlighter, NO_SPELL_TAG};
 use lemma_app::editor::keys;
-use lemma_app::editor::{Editor, VimMode, completion, spell, typing, vim};
+use lemma_app::editor::{Editor, VimMode, completion, spell, typing};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
@@ -197,7 +197,7 @@ impl Fixture {
             let consumed = self
                 .editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, self.editor.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, self.editor.view(), keyval, state));
             if !consumed {
                 let buffer = self.buffer();
                 match keyval {
@@ -706,6 +706,10 @@ fn lone_cr_margin_progress() {
 // ───────────── E1-9: changed word lists are not read again on a reload ─────────────
 
 fn word_list_reread_on_reload() {
+    if !common::english_dictionary() {
+        println!("SKIP: no en_US spelling dictionary installed");
+        return;
+    }
     let (state, dir) = window(
         "e1-9",
         &[("main.tex", "Qqwalpha and Qqwbeta here.\n")],

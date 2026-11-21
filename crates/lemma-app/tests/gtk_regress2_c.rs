@@ -12,6 +12,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use gtk::gdk::{Key, ModifierType};
 use lemma_agent::StopReason;
@@ -125,8 +127,7 @@ fn env() -> &'static TestEnv {
 }
 
 fn isolate_environment() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-regress2-c-env-{}", std::process::id()));
+    let root = common::target_tmpdir().join(format!("lemma-regress2-c-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
     let bin = root.join("bin");
@@ -134,6 +135,8 @@ fn isolate_environment() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let config = home.join(".config/lemma/config.toml");
+    // The system's programs, but not the host's node, npm, claude or keyring tool.
+    let path = common::path_without(&bin, &root, common::AGENT_PROGRAMS);
     // SAFETY: single-threaded: GTK is not initialised yet and no thread was spawned.
     unsafe {
         std::env::set_var("HOME", &home);
@@ -141,7 +144,7 @@ fn isolate_environment() {
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", path);
         std::env::set_var("LEMMA_CONFIG", &config);
         std::env::remove_var("MISE_DATA_DIR");
     }
@@ -194,10 +197,12 @@ fn fixture_with(
     config.editor.vim = false;
     configure(&mut config);
     let ws = Workspace::new(ProjectRoot::new(&dir).unwrap());
+    common::restore_home(&env().home);
     let paths = Paths::from_env();
     assert!(
         paths.as_ref().is_some_and(|p| p.home == env().home),
-        "the test home is used"
+        "the test home {} is used: {paths:?}",
+        env().home.display()
     );
     let state = WindowState::new(&common::application(), Rc::new(config), paths, ws, true);
     let commands: Rc<RefCell<Vec<PanelCommand>>> = Rc::default();
@@ -770,7 +775,7 @@ fn fix_diagnostic_context_is_bounded() {
     let text =
         format!("\\begin{{document}}\n\\addplot coordinates {{{huge}}};\n\\end{{document}}\n");
     let f = fixture("fix-huge", &[("main.tex", &text)], Hook::Swallow);
-    let path = f.dir.join("main.tex").canonicalize().unwrap();
+    let path = f.dir.join("main.tex").canonical().unwrap();
     let problem = Problem {
         path,
         line: Some(2),

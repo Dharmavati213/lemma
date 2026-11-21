@@ -8,7 +8,8 @@ use std::ffi::CStr;
 use glib::translate::{FromGlibPtrFull, ToGlibPtr, ToGlibPtrMut};
 use poppler::ffi;
 
-use crate::{LinkDest, OutlineItem, links};
+use crate::links::{self, PageTurn};
+use crate::{LinkDest, OutlineItem};
 
 /// Deeper levels are cut off (a malformed outline must not exhaust the stack).
 const MAX_DEPTH: usize = 32;
@@ -16,14 +17,14 @@ const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 20_000;
 
 /// The outline of `doc` (empty when it has none).
-pub(crate) fn outline(doc: &poppler::Document) -> Vec<OutlineItem> {
+pub(crate) fn outline(doc: &poppler::Document, turn: &mut PageTurn) -> Vec<OutlineItem> {
     // SAFETY: `doc` is a live document; poppler returns a new iterator or NULL when the
     // document has no outline, which `from_glib_full` maps to `None`.
     let root: Option<poppler::IndexIter> = unsafe {
         FromGlibPtrFull::from_glib_full(ffi::poppler_index_iter_new(doc.to_glib_none().0))
     };
     let mut budget = MAX_ITEMS;
-    root.map(|iter| level(doc, iter, 0, &mut budget))
+    root.map(|iter| level(doc, iter, 0, &mut budget, turn))
         .unwrap_or_default()
 }
 
@@ -33,6 +34,7 @@ fn level(
     mut iter: poppler::IndexIter,
     depth: usize,
     budget: &mut usize,
+    turn: &mut PageTurn,
 ) -> Vec<OutlineItem> {
     let mut items = Vec::new();
     loop {
@@ -40,10 +42,10 @@ fn level(
             break;
         }
         *budget -= 1;
-        let (title, dest) = entry(doc, &mut iter);
+        let (title, dest) = entry(doc, &mut iter, turn);
         let children = if depth + 1 < MAX_DEPTH {
             iter.child()
-                .map(|child| level(doc, child, depth + 1, budget))
+                .map(|child| level(doc, child, depth + 1, budget, turn))
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -62,7 +64,11 @@ fn level(
 }
 
 /// The title and destination of the entry `iter` points at.
-fn entry(doc: &poppler::Document, iter: &mut poppler::IndexIter) -> (String, LinkDest) {
+fn entry(
+    doc: &poppler::Document,
+    iter: &mut poppler::IndexIter,
+    turn: &mut PageTurn,
+) -> (String, LinkDest) {
     // SAFETY: `iter` is valid; poppler returns a new action (or NULL), which we free.
     unsafe {
         let action = ffi::poppler_index_iter_get_action(iter.to_glib_none_mut().0);
@@ -76,7 +82,7 @@ fn entry(doc: &poppler::Document, iter: &mut poppler::IndexIter) -> (String, Lin
         } else {
             clean_title(&CStr::from_ptr(title).to_string_lossy())
         };
-        let dest = links::action_dest(doc, action);
+        let dest = links::action_dest(doc, action, turn);
         ffi::poppler_action_free(action);
         (title, dest)
     }

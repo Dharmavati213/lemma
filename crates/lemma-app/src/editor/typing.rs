@@ -21,7 +21,8 @@
 //! | Enter after `\begin{x}…` | `auto_end` | an indented body line (the `document` body is not indented), and `\end{x}` below it when the environment is unclosed |
 //! | Enter in itemize, enumerate, description | `item_on_enter` | a new line with `\item ` (at the indentation of the item above); right after `\begin{itemize}` too |
 //! | Enter on an empty `\item` line | `item_on_enter` | removes the line and leaves the list: the cursor goes to a new line after `\end{itemize}` when only blank lines are left in the list, else the item line is just emptied |
-//! | `.` completing `...` | `replacements` (off by default) | in text, the three dots become `\dots`; not in math or arguments, not after a backslash (`\.` is the dot accent), not after a fourth dot |
+//! | `.` completing `...` | `replacements` (off by default) | in text, the three dots become `\dots`; not in math or arguments, not after a backslash (`\.` is the dot accent), not after a fourth dot; `\dots{}` when a space or a line break follows already and the paragraph goes on (see below) |
+//! | Space or Enter right after that `\dots` | `replacements` | `\dots{}` before the space or line break, so that it prints (see below) |
 //!
 //! Shift+Enter always inserts a plain line break. While the completion popup is open, Enter
 //! belongs to it (it may accept a proposal): the helper lets the key through and, if the view
@@ -41,6 +42,18 @@
 //! snippet driver): the typed `.` goes in first, then the replacement as an undo step of its
 //! own, so one undo gives back `...` (in Vim, `u` after `<Esc>`), and an active snippet keeps
 //! its session.
+//!
+//! **A space after `\dots`.** TeX skips the spaces and the line break after a control word, so
+//! `three\dots and` prints "three…and". When a space or a line break (Enter, also Shift+Enter)
+//! is typed while the cursor is still right after the `\dots` a replacement has just inserted
+//! (not moved away and back, nothing typed in between), the key does what it always does, and
+//! then `{}` goes between the `\dots` and it, as an undo step of its own: one undo gives back
+//! `\dots` and the space, as one undo after a replacement gives back the dots. The replacement
+//! never happens in math, where spaces do not matter (and amsmath's `\dots` looks at the next
+//! token), and a `\dots` typed by hand or moved to is left alone. Like the other edits that are
+//! not typing at the cursor, it ends an active snippet session first. When the blank is there
+//! already (`...` typed in `three‸ and`, or at the end of a line the paragraph goes on after),
+//! the replacement itself is `\dots{}` ([`dots_need_braces`]), and one undo gives back `...`.
 //!
 //! **Counting brackets.** A group or a formula can span lines but not paragraphs (`\par` ends
 //! inline math and the arguments of ordinary commands), so whether a closer is new, or an opener
@@ -81,6 +94,11 @@ pub const MAX_PARAGRAPH_LINES: u32 = 100;
 /// Closers this helper remembers per editor (typed over and deleted with their opener; the
 /// interval rule).
 const MAX_TRACKED_CLOSERS: usize = 16;
+/// What the `...` replacement inserts, and its length in chars.
+const DOTS: &str = "\\dots";
+const DOTS_CHARS: i32 = 5;
+/// What it inserts when a space or a line break follows already (see [`dots_need_braces`]).
+const DOTS_BRACED: &str = "\\dots{}";
 /// Lines of unknown content (see [`EnvIndex`]) above which the next scan classifies every line
 /// from one copy of the text instead of line by line.
 const ENV_FILL_AT: usize = 256;
@@ -319,7 +337,23 @@ pub fn replacement(
     if head.ends_with('.') || ends_with_unescaped_backslash(head) {
         return None;
     }
-    Some(("...", "\\dots"))
+    Some(("...", DOTS))
+}
+
+/// Whether `\dots` typed before `after` (the rest of its line) needs `{}` for the blank that
+/// follows to print: TeX skips the spaces and the line break after a control word. True when a
+/// space, a tab or the end of the line comes next and the paragraph goes on: text follows on
+/// the line, or (after the end of the line, or a comment, which ends it as well) `next()`, the
+/// next line, is not blank. At the end of a paragraph a lost space does not matter.
+pub fn dots_need_braces<'a>(after: &str, next: impl FnOnce() -> Option<Cow<'a, str>>) -> bool {
+    if !(after.is_empty() || after.starts_with([' ', '\t'])) {
+        return false;
+    }
+    let rest = after.trim_start_matches([' ', '\t']);
+    if !rest.is_empty() && !rest.starts_with('%') {
+        return true;
+    }
+    next().is_some_and(|line| !line.trim().is_empty())
 }
 
 /// `{`, `[`, `(` and `|` (only after `\left`).
@@ -1362,6 +1396,11 @@ struct Attached {
     /// keeps the mark next to it).
     closers: RefCell<Vec<gtk::TextMark>>,
     pending_enter: RefCell<Option<PendingEnter>>,
+    /// The `\dots` the last replacement inserted, while the cursor stays right after it: the
+    /// document's version then and the cursor's (char) offset. See [`Attached::space_after_dots`].
+    dots: Cell<Option<(u64, i32)>>,
+    /// The buffer's `notify::cursor-position` handler, which forgets `dots`.
+    cursor_handler: Cell<Option<glib::SignalHandlerId>>,
     /// Which lines may hold environment commands.
     envs: Rc<EnvIndex>,
     /// The document observer that keeps `envs` up to date.
@@ -1399,9 +1438,21 @@ pub fn attach(state: &Rc<WindowState>, editor: &Rc<Editor>) {
         view_handlers: RefCell::default(),
         closers: RefCell::default(),
         pending_enter: RefCell::new(None),
+        dots: Cell::new(None),
+        cursor_handler: Cell::new(None),
         envs: Rc::new(EnvIndex::new(editor.document().line_index().line_count())),
         observer: Cell::new(None),
     });
+    let moved = Rc::downgrade(&attached);
+    attached
+        .cursor_handler
+        .set(Some(attached.buffer.connect_cursor_position_notify(
+            move |_| {
+                if let Some(attached) = moved.upgrade() {
+                    attached.cursor_moved();
+                }
+            },
+        )));
     let envs = attached.envs.clone();
     let doc = Rc::downgrade(editor.document());
     attached
@@ -1459,6 +1510,10 @@ impl Attached {
             }
         }
         self.pending_enter.replace(None);
+        self.dots.set(None);
+        if let Some(id) = self.cursor_handler.take() {
+            self.buffer.disconnect(id);
+        }
         if let (Some(id), Some(doc)) = (self.observer.take(), self.doc.upgrade()) {
             doc.disconnect(id);
         }
@@ -1466,7 +1521,21 @@ impl Attached {
 
     /// The key-layer handler (priority [`keys::PRIORITY_TYPING`]).
     fn on_key(self: &Rc<Self>, event: &keys::KeyEvent, mode: VimMode) -> glib::Propagation {
-        let handled = mode == VimMode::Insert && self.handle(event);
+        if mode != VimMode::Insert {
+            return glib::Propagation::Proceed;
+        }
+        let dots = self.space_after_dots(event);
+        let handled = self.handle(event);
+        if let Some((version, at)) = dots {
+            // After the key's own work (and after a pending Enter's, queued by `handle`).
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_full(glib::Priority::HIGH, move || {
+                if let Some(attached) = weak.upgrade() {
+                    attached.keep_space_after_dots(version, at);
+                }
+                glib::ControlFlow::Break
+            });
+        }
         if handled {
             glib::Propagation::Stop
         } else {
@@ -1567,7 +1636,18 @@ impl Attached {
             paragraph: &paragraph,
         };
         if let Some((trigger, with)) = replacement(c, &typed, cfg) {
-            return completion::type_and_replace(state, editor, c, trigger, with);
+            // A blank that follows already gets the braces at once (see the module docs).
+            let with = if with == DOTS && dots_need_braces(typed.after, || lines.line(at.line + 1))
+            {
+                DOTS_BRACED
+            } else {
+                with
+            };
+            let done = completion::type_and_replace(state, editor, c, trigger, with);
+            if done {
+                self.remember_dots(doc, with);
+            }
+            return done;
         }
         let nl = if at.crlf { "\r\n" } else { "\n" };
         let mut unclosed = |name: &str, from: usize| {
@@ -1770,6 +1850,82 @@ impl Attached {
             view.scroll_mark_onscreen(&buffer.get_insert());
         }
         true
+    }
+
+    /// Remembers `with`, the text a replacement just put before the cursor, when it is the
+    /// `\dots` that a space typed next would end (see the module docs).
+    fn remember_dots(&self, doc: &Document, with: &str) {
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let mut start = cursor;
+        start.backward_chars(DOTS_CHARS);
+        let dots = with == DOTS && self.buffer.slice(&start, &cursor, true) == DOTS;
+        self.dots
+            .set(dots.then(|| (doc.version(), cursor.offset())));
+    }
+
+    /// Forgets the replacement's `\dots` once the cursor is anywhere else.
+    fn cursor_moved(&self) {
+        if let Some((_, at)) = self.dots.get()
+            && self.buffer.iter_at_mark(&self.buffer.get_insert()).offset() != at
+        {
+            self.dots.set(None);
+        }
+    }
+
+    /// When `event` types a space or a line break right after the `\dots` the last replacement
+    /// inserted (the cursor still there, the text unchanged since): that `\dots`, as
+    /// [`Attached::keep_space_after_dots`] takes it once the key has done its work.
+    fn space_after_dots(&self, event: &keys::KeyEvent) -> Option<(u64, i32)> {
+        let (version, at) = self.dots.get()?;
+        let line_break = matches!(
+            event.keyval,
+            gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter
+        ) && !event.state.intersects(COMMAND_MODIFIERS);
+        if !line_break && snippets::typed_char(event.keyval, event.state) != Some(' ') {
+            return None;
+        }
+        let (view, doc) = (self.view.upgrade()?, self.doc.upgrade()?);
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let unchanged = doc.version() == version && cursor.offset() == at;
+        let typing = view.is_editable()
+            && !view.overwrites()
+            && !self.preedit.get()
+            && !self.buffer.has_selection();
+        (unchanged && typing).then_some((version, at))
+    }
+
+    /// After a key [`Attached::space_after_dots`] took: when the `\dots` that ends at char
+    /// offset `at` is now followed by the space or line break the key typed, puts `{}` between
+    /// them as an undo step of its own (see the module docs).
+    fn keep_space_after_dots(&self, version: u64, at: i32) {
+        let (Some(state), Some(editor), Some(doc)) = (
+            self.state.upgrade(),
+            self.editor.upgrade(),
+            self.doc.upgrade(),
+        ) else {
+            return;
+        };
+        let buffer = &self.buffer;
+        let mut end = buffer.iter_at_offset(at);
+        let mut start = end;
+        start.backward_chars(DOTS_CHARS);
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let followed = matches!(end.char(), ' ' | '\n' | '\r');
+        if doc.version() == version
+            || end.offset() != at
+            || cursor.offset() <= at
+            || !followed
+            || buffer.slice(&start, &end, true) != DOTS
+        {
+            return;
+        }
+        // Not typing at the cursor (see `apply`).
+        self.end_snippet_sessions();
+        completion::as_undo_step(&state, &editor, || {
+            buffer.begin_user_action();
+            buffer.insert(&mut end, "{}");
+            buffer.end_user_action();
+        });
     }
 
     /// Ends the view's snippet sessions while one is active.
@@ -2617,6 +2773,28 @@ mod tests {
         );
         assert_eq!(replaced("\\..|", '.', &on), None);
         assert_eq!(replaced("Wait...|", '.', &on), None);
+    }
+
+    /// `\dots` before a blank the paragraph goes on after needs `{}` for the blank to print.
+    #[test]
+    fn dots_before_a_blank() {
+        let braces = |after: &str, next: Option<&str>| {
+            dots_need_braces(after, || next.map(|n| Cow::Owned(n.to_owned())))
+        };
+        assert!(braces(" and", None));
+        assert!(braces("\tand", None));
+        assert!(braces("", Some("and")));
+        assert!(braces("  ", Some("  and")));
+        assert!(braces(" % a note", Some("and")));
+        // At the end of a paragraph or of the text it does not matter.
+        assert!(!braces("", Some("")));
+        assert!(!braces("", Some("  \r")));
+        assert!(!braces(" ", None));
+        assert!(!braces(" % a note", None));
+        // Not before anything else.
+        assert!(!braces(", and", Some("and")));
+        assert!(!braces("}", Some("and")));
+        assert!(!braces("% a note", Some("and")));
     }
 
     #[test]

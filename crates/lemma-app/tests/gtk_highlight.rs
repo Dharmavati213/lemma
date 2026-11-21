@@ -172,7 +172,7 @@ fn fixture_text(rel: &str) -> String {
 }
 
 fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/highlight")
+    common::manifest_dir().join("tests/golden/highlight")
 }
 
 // ----- tag spans: from the buffer, and expected from a fresh scan -----
@@ -893,6 +893,11 @@ fn large_paste() {
     );
     // Once GTK has measured the lines and scrolled, the screen and its window are exact.
     common::pump_for(Duration::from_millis(300));
+    // (Under Wine GTK takes a second or two to measure them.)
+    common::pump_until(TIMEOUT, || {
+        let (first, last) = visible_lines(&ed);
+        last - first < 150
+    });
     h.flush();
     let (first, last) = visible_lines(&ed);
     assert!(

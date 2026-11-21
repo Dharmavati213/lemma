@@ -384,11 +384,11 @@ pub fn save(state: &Rc<WindowState>) {
         last.window = s.window_geometry(state);
         s.remember_last(paths.last_session_file(), &last);
     }
-    let unchanged = s
-        .last
-        .borrow()
-        .as_ref()
-        .is_some_and(|(r, last)| *r == root && *last == snapshot);
+    let unchanged = !s.retry.get()
+        && s.last
+            .borrow()
+            .as_ref()
+            .is_some_and(|(r, last)| *r == root && *last == snapshot);
     if unchanged {
         return;
     }
@@ -399,6 +399,7 @@ pub fn save(state: &Rc<WindowState>) {
             return;
         }
     };
+    s.retry.set(false);
     s.last.replace(Some((root, snapshot)));
     s.write(file, bytes);
 }
@@ -580,10 +581,14 @@ struct Session {
     pending_pdf: RefCell<Option<(Option<PathBuf>, PdfPlace)>>,
     pdf_attempt_queued: Cell<bool>,
     pdf_map_handler: RefCell<Option<glib::SignalHandlerId>>,
+    /// The view's change callback that waits with `pdf_map_handler`.
+    pdf_changed_handler: Cell<Option<crate::pdf::pdf_view::ChangedId>>,
     writer: Arc<Writer>,
     seq: Cell<u64>,
     /// The last snapshot handed to a writer.
     queued: RefCell<Option<Queued>>,
+    /// A write failed: the next save writes even a snapshot equal to `last`.
+    retry: Cell<bool>,
     /// A write failure was reported (once per window).
     reported: Cell<bool>,
     /// Writes `last.json` (see [`LastSession`]).
@@ -630,9 +635,11 @@ fn session_for(state: &Rc<WindowState>) -> Rc<Session> {
         pending_pdf: RefCell::new(None),
         pdf_attempt_queued: Cell::new(false),
         pdf_map_handler: RefCell::new(None),
+        pdf_changed_handler: Cell::new(None),
         writer: Arc::new(Writer::default()),
         seq: Cell::new(0),
         queued: RefCell::new(None),
+        retry: Cell::new(false),
         reported: Cell::new(false),
         last_writer: Arc::new(Writer::default()),
         last_queued: RefCell::new(None),
@@ -921,10 +928,11 @@ impl Session {
         });
     }
 
-    /// A write failed: the next save tries again; the user is told once.
+    /// A write failed: the next save tries again, also when nothing changed meanwhile (`last`
+    /// stays: it carries what the window cannot see over to that save); the user is told once.
     fn failed(&self, error: &str) {
         tracing::warn!("cannot save the session: {error}");
-        self.last.replace(None);
+        self.retry.set(true);
         if !self.reported.replace(true)
             && let Some(state) = self.state.upgrade()
             && self.phase.get() != Phase::Closed
@@ -951,11 +959,7 @@ impl Session {
         self.write_last_now();
         self.phase.set(Phase::Closed);
         self.pending_pdf.replace(None);
-        if let (Some(handler), Some(state)) = (self.pdf_map_handler.take(), self.state.upgrade())
-            && let Some(pdf) = state.pdf.get()
-        {
-            pdf.view().disconnect(handler);
-        }
+        self.disconnect_pdf_handlers();
         SESSIONS.with(|list| {
             list.borrow_mut()
                 .retain(|s| !std::ptr::eq(Rc::as_ptr(s), self))
@@ -1216,13 +1220,16 @@ impl Session {
         };
         self.pending_pdf.replace(Some((pdf, place)));
         let view = controller.view();
-        // The view has no way to disconnect this: it does nothing once the place is applied.
+        // Both wait until the place is applied (`pdf_place_done`).
         let weak = Rc::downgrade(self);
-        view.connect_changed(move |_| {
+        let changed = view.connect_changed(move |_| {
             if let Some(s) = weak.upgrade() {
                 s.try_pdf_place_soon();
             }
         });
+        if let Some(old) = self.pdf_changed_handler.replace(Some(changed)) {
+            view.disconnect_changed(old);
+        }
         let weak = Rc::downgrade(self);
         let handler = view.connect_map(move |_| {
             if let Some(s) = weak.upgrade() {
@@ -1323,10 +1330,23 @@ impl Session {
     }
 
     fn pdf_place_done(&self) {
-        if let (Some(handler), Some(state)) = (self.pdf_map_handler.take(), self.state.upgrade())
-            && let Some(pdf) = state.pdf.get()
-        {
+        self.disconnect_pdf_handlers();
+    }
+
+    /// Stops waiting for the PDF's place: the view's handlers of `want_pdf_place` go.
+    fn disconnect_pdf_handlers(&self) {
+        let (map, changed) = (self.pdf_map_handler.take(), self.pdf_changed_handler.take());
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Some(pdf) = state.pdf.get() else {
+            return;
+        };
+        if let Some(handler) = map {
             pdf.view().disconnect(handler);
+        }
+        if let Some(handler) = changed {
+            pdf.view().disconnect_changed(handler);
         }
     }
 }
@@ -1639,8 +1659,7 @@ mod tests {
     #[test]
     fn writes_are_atomic_private_and_ordered() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("lemma-session-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-session-").unwrap();
         let file = dir.join("sessions").join("x.json");
         let writer = Writer::default();
         writer.write(&file, b"two", 2).unwrap();
@@ -1708,8 +1727,7 @@ mod tests {
 
     #[test]
     fn reopen_reads_what_is_still_there() {
-        let base = std::env::temp_dir().join(format!("lemma-reopen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::fsutil::private_temp_dir("lemma-reopen-").unwrap();
         let paths = Paths::from_vars(|name| match name {
             "HOME" => Some(base.join("home").into()),
             "XDG_STATE_HOME" => Some(base.join("state").into()),
@@ -1803,8 +1821,7 @@ mod tests {
 
     #[test]
     fn pruning_removes_stale_sessions_only() {
-        let base = std::env::temp_dir().join(format!("lemma-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::fsutil::private_temp_dir("lemma-prune-").unwrap();
         let dir = base.join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let project = |name: &str| {

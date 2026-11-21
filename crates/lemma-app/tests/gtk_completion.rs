@@ -23,7 +23,7 @@ use broadway_input::{Browser, CONTROL, SHIFT};
 use gtk::gdk;
 use lemma_app::editor::completion::{self, Trigger};
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, VimMode, spell, vim};
+use lemma_app::editor::{Editor, VimMode, spell};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_complete::{Insert, Item, ItemKind};
@@ -71,10 +71,22 @@ fn main() -> ExitCode {
             "the_project_feed_reads_a_linked_chapter_whose_tab_closed",
             project_feed_linked_chapter_closed,
         ),
+        (
+            "file_names_latex_misreads_are_not_proposed",
+            unsafe_file_names,
+        ),
+        (
+            "file_names_are_named_once_per_document_until_its_includes_change",
+            file_names_named_once,
+        ),
         ("triggers_on_the_scanners_contexts", triggers),
         ("accepting_each_kind_of_proposal", accepting),
         ("accepted_proposals_rank_higher", recency),
         ("tab_precedence_through_the_key_layer", tab_precedence),
+        (
+            "tab_is_the_input_methods_while_it_composes",
+            tab_while_composing,
+        ),
         (
             "word_popups_select_only_unfinished_words",
             word_popups_select_unfinished_words,
@@ -97,6 +109,7 @@ fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_completion_keystroke", perf_keystroke));
         tests.push(("perf_completion_end_large_tex", perf_end_large));
+        tests.push(("perf_completion_file_names", perf_file_names));
     }
     common::run(&tests)
 }
@@ -319,7 +332,7 @@ impl Fixture {
             let consumed = self
                 .editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, self.editor.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, self.editor.view(), keyval, state));
             if !consumed && let Some(c) = keyval.to_unicode().filter(|c| !c.is_control()) {
                 self.buffer()
                     .insert_interactive_at_cursor(&c.to_string(), true);
@@ -572,6 +585,134 @@ fn project_feed() {
         !completion::project_busy(&f.state)
             && f.labels("A pseudomon")
                 .contains(&"pseudomonotone".to_owned())
+    });
+}
+
+/// File arguments propose only names LaTeX reads as file names: not one with `%` (a comment),
+/// `#`, a brace or (outside Windows, where it is no separator) a backslash, which would break the
+/// document or name another file. Such a file appearing does not list the project's files again.
+fn unsafe_file_names() {
+    let dir = project("unsafe-file-names");
+    let mut odd = vec!["50%.png", "a#b.png", "{x}.png"];
+    if cfg!(unix) {
+        odd.push("back\\slash.png");
+    }
+    for name in &odd {
+        std::fs::write(dir.join("figures").join(name), b"").unwrap();
+    }
+    let f = fixture_at(&dir, "main.tex", false);
+    let files = f.labels("\\includegraphics{");
+    assert!(files.contains(&"figures/plot.pdf".to_owned()), "{files:?}");
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.contains(['%', '#', '{', '}']) || f.contains("slash")),
+        "{files:?}"
+    );
+    // A file LaTeX cannot name, created by another program: the list stays as it is.
+    let idle =
+        || lemma_app::agent::watcher::is_idle(&f.state) && !completion::project_busy(&f.state);
+    common::pump_for(Duration::from_millis(300));
+    common::pump_until(TIMEOUT, idle);
+    let walks = completion::file_walks(&f.state);
+    std::fs::write(dir.join("figures/c%d.png"), b"").unwrap();
+    common::pump_for(Duration::from_millis(500));
+    common::pump_until(TIMEOUT, idle);
+    assert_eq!(completion::file_walks(&f.state), walks);
+    // One it can: listed.
+    std::fs::write(dir.join("figures/drawn.png"), b"").unwrap();
+    f.wait("the new image", || {
+        f.labels("\\includegraphics{")
+            .contains(&"figures/drawn.png".to_owned())
+    });
+}
+
+/// Every completion gives the completer the file names its document writes (from the root's
+/// directory, or from an import directory: `../img/plot.png` below `\subimport{parts/}`). The
+/// directory is worked out once per document: completing again, in another tab, or after a
+/// `\label` was typed and the document indexed again, resolves no path on the file system
+/// (`workspace::normalizations`). A change to what reaches the document (the `\subimport` made
+/// an `\input`) is followed.
+fn file_names_named_once() {
+    let dir = common::temp_dir("file-names-once");
+    std::fs::create_dir_all(dir.join("chapters")).unwrap();
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::create_dir_all(dir.join("img")).unwrap();
+    std::fs::write(
+        dir.join("main.tex"),
+        "\\documentclass{book}\n\\usepackage{graphicx,import}\n\\begin{document}\n\
+         \\input{chapters/intro}\n\\subimport{parts/}{p}\n\\end{document}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("chapters/intro.tex"), "Intro.\n").unwrap();
+    std::fs::write(dir.join("parts/p.tex"), "Part.\n").unwrap();
+    std::fs::write(dir.join("img/plot.png"), b"").unwrap();
+    let f = fixture_at(&dir, "main.tex", false);
+    let intro = block_on(f.state.open_file(&dir.join("chapters/intro.tex"))).unwrap();
+    let part = block_on(f.state.open_file(&dir.join("parts/p.tex"))).unwrap();
+    // A file argument at the end of each document.
+    for editor in [&f.editor, &intro, &part] {
+        let buffer = editor.buffer();
+        buffer.insert(&mut buffer.end_iter(), "\\includegraphics{");
+        buffer.place_cursor(&buffer.end_iter());
+    }
+    f.settle();
+    // The names it proposes, and how many paths that resolved on the file system.
+    let names = |editor: &Editor| -> (Vec<String>, u64) {
+        let before = lemma_app::workspace::normalizations();
+        let names = completion::items_at_cursor(&f.state, editor)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        (names, lemma_app::workspace::normalizations() - before)
+    };
+    let has = |editor: &Editor, name: &str| {
+        let (names, _) = names(editor);
+        names.iter().any(|n| n == name)
+    };
+    f.wait("the names", || {
+        has(&part, "../img/plot.png") && has(&intro, "img/plot.png")
+    });
+    assert!(has(&f.editor, "img/plot.png"));
+    for editor in [&part, &intro, &part, &f.editor, &part] {
+        let (_, resolved) = names(editor);
+        assert_eq!(resolved, 0, "paths resolved by a completion");
+    }
+    // A label typed in the chapter: indexed again, the names stay.
+    let buffer = intro.buffer();
+    buffer.insert(&mut buffer.start_iter(), "\\label{sec:intro}\n");
+    common::pump_for(Duration::from_millis(50));
+    f.settle();
+    assert!(
+        f.state
+            .workspace
+            .index
+            .borrow()
+            .find_label("sec:intro")
+            .is_some()
+    );
+    for editor in [&intro, &part] {
+        let (_, resolved) = names(editor);
+        assert_eq!(resolved, 0, "paths resolved after a re-index");
+    }
+    assert!(has(&part, "../img/plot.png"));
+    // The part read through `\input`: from the root's directory.
+    let text = f.editor.document().text();
+    let at = text.find("\\subimport{parts/}{p}").unwrap();
+    f.editor
+        .document()
+        .apply_edits(
+            &[TextEdit {
+                range: at..at + "\\subimport{parts/}{p}".len(),
+                text: "\\input{parts/p}".into(),
+            }],
+            Origin::User,
+        )
+        .unwrap();
+    f.wait("the part's names from the root's directory", || {
+        !completion::project_busy(&f.state)
+            && has(&part, "img/plot.png")
+            && !has(&part, "../img/plot.png")
     });
 }
 
@@ -839,6 +980,7 @@ fn project_feed_reads_local_packages() {
 /// are on disk) for the index only while the index has files there (at most 32 of them), not
 /// the folder's own.
 fn project_feed_outside_the_folder() {
+    common::require_symlinks();
     let base = common::temp_dir("feed-outside");
     let dir = base.join("thesis");
     for sub in ["thesis", "central", "shared", "library", "drafts"] {
@@ -985,6 +1127,7 @@ fn project_feed_outside_the_folder() {
 /// tabs) is indexed from its tab, not read through the link. When its tab closes, it is read
 /// from disk through the link: its labels stay in the index without a build.
 fn project_feed_linked_chapter_closed() {
+    common::require_symlinks();
     let dir = common::temp_dir("feed-linked");
     std::fs::create_dir_all(dir.join("real")).unwrap();
     #[cfg(unix)]
@@ -1291,6 +1434,27 @@ fn tab_precedence() {
         assert_eq!(f.cursor_offset(), "$\\frac{a}{b}".len() as i32);
         assert_eq!(tab(&f), glib::Propagation::Stop);
         assert_eq!(f.cursor_offset(), "$\\frac{a}{b}$".len() as i32);
+        // Only after some text: with nothing but white space before the cursor, Tab indents
+        // (the key goes on), whatever closes later on the line.
+        for before in ["", "  ", "\t"] {
+            f.probe(before, "\\textbf{x} (y)");
+            assert_eq!(tab(&f), glib::Propagation::Proceed, "{before:?}");
+            assert_eq!(f.cursor_offset(), before.len() as i32, "{before:?}");
+        }
+        // A snippet's stop there still takes Tab first: `dm` leaves the cursor in its first
+        // stop, an indented line of its own.
+        f.probe("", "");
+        f.type_text("dm");
+        assert!(
+            completion::snippet_active(&f.state, &f.editor),
+            "{}",
+            f.text()
+        );
+        assert!(f.text().contains("\\[\n  \n\\]"), "{}", f.text());
+        assert_eq!(tab(&f), glib::Propagation::Proceed);
+        assert!(completion::snippet_active(&f.state, &f.editor));
+        f.reset();
+        f.probe("$\\frac{a}{b}$", "");
         // 4. Nothing applies: the key goes on (the view indents).
         assert_eq!(tab(&f), glib::Propagation::Proceed);
         f.probe("word", "");
@@ -1313,6 +1477,26 @@ fn tab_precedence() {
             assert!(f.probe_text().ends_with("thm"));
         }
     }
+}
+
+/// While the input method composes (preedit text shows), Tab does not step out of a group: the
+/// key goes on to the input method, and the cursor stays in the text being composed. No input
+/// method runs here, so the test emits the view's `preedit-changed` as one would.
+fn tab_while_composing() {
+    let f = fixture("tab-preedit", false);
+    let view = f.editor.view().clone();
+    let preedit = |text: &str| view.emit_by_name::<()>("preedit-changed", &[&text]);
+    let tab = |f: &Fixture| f.press(gdk::Key::Tab, gdk::ModifierType::empty());
+    f.probe("$\\frac{a", "}{b}$");
+    preedit("か");
+    let before = f.cursor_offset();
+    assert_eq!(tab(&f), glib::Propagation::Proceed);
+    assert_eq!(f.cursor_offset(), before);
+    assert_eq!(f.probe_text(), "$\\frac{a}{b}$");
+    // Composed: Tab steps out again.
+    preedit("");
+    assert_eq!(tab(&f), glib::Propagation::Stop);
+    assert_eq!(f.cursor_offset(), "$\\frac{a}".len() as i32);
 }
 
 /// `detach` removes the provider, the key handler and the document observers.
@@ -1437,6 +1621,20 @@ fn real_popup(f: &Fixture, real: &mut Real, vim: bool) {
     real.start(f, "$x = ", "$");
     real.text(f, "\\fr");
     real.wait_popup(f, "\\frac");
+    // A key the open popup refilters on computes the proposals once: GtkSourceView's refilter
+    // and the popup's policy after the key share them.
+    let before = completion::proposal_computations(&f.state, &f.editor);
+    real.text(f, "a");
+    f.wait("the refilter", || {
+        completion::proposal_computations(&f.state, &f.editor) > before
+    });
+    common::pump_for(Duration::from_millis(30));
+    real.wait_popup(f, "\\frac");
+    assert_eq!(
+        completion::proposal_computations(&f.state, &f.editor) - before,
+        1,
+        "proposals computed for one key"
+    );
     real.text(f, "\n");
     f.wait("\\frac", || f.probe_text() == "$x = \\frac{}{}$");
     assert!(!completion::popup_visible(&f.editor));
@@ -1518,6 +1716,12 @@ fn real_tab(f: &Fixture, real: &mut Real) {
     real.text(f, "\t");
     f.wait("the indentation", || f.probe_text() != "word");
     assert!(f.probe_text().starts_with("word") && f.probe_text().trim_end() == "word");
+    // Only white space before the cursor: the view indents, even before a group.
+    real.start(f, "", "\\emph{x}");
+    real.text(f, "\t");
+    f.wait("the indentation", || f.probe_text() != "\\emph{x}");
+    assert_eq!(f.probe_text().trim_start(), "\\emph{x}");
+    assert_eq!(f.cursor_offset(), f.probe_text().find('\\').unwrap() as i32);
     real.key(f, gdk::Key::Escape, 0);
 }
 
@@ -1707,6 +1911,91 @@ fn perf_end_large() {
     }
 }
 
+/// The names of the project's files as each document writes them (`name_files_for`), on a
+/// generated book (300 chapters, 3000 images) with a part read through `\subimport`, whose names
+/// differ from the root's: what a completion costs right after its chapter was indexed again for
+/// a new `\label` (the first completion after it, and the next), and after a switch between the
+/// root and the part; and how many paths the main thread resolved on the file system for them.
+fn perf_file_names() {
+    let dir = common::temp_dir("perf-file-names");
+    common::big_project::write(&dir, 300, 66, 100, 1);
+    std::fs::create_dir_all(dir.join("img")).unwrap();
+    for i in 0..3000 {
+        std::fs::write(dir.join(format!("img/f{i:04}.png")), b"").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    std::fs::write(dir.join("parts/p.tex"), "Part.\n").unwrap();
+    let main = std::fs::read_to_string(dir.join("main.tex"))
+        .unwrap()
+        .replace(
+            "\\begin{document}",
+            "\\usepackage{import}\n\\begin{document}",
+        )
+        .replace("\\end{document}", "\\subimport{parts/}{p}\n\\end{document}");
+    std::fs::write(dir.join("main.tex"), main).unwrap();
+    let f = fixture_at(&dir, "main.tex", false);
+    let chapter = block_on(f.state.open_file(&dir.join("c/c0150.tex"))).unwrap();
+    let part = block_on(f.state.open_file(&dir.join("parts/p.tex"))).unwrap();
+    let idle =
+        || !completion::project_busy(&f.state) && lemma_app::agent::watcher::is_idle(&f.state);
+    completion::refresh_project(&f.state);
+    common::pump_until(Duration::from_secs(120), idle);
+    // The cursor in a file argument at the end of each document.
+    for editor in [&f.editor, &chapter, &part] {
+        let buffer = editor.buffer();
+        buffer.insert(&mut buffer.end_iter(), "\n\\includegraphics{");
+        buffer.place_cursor(&buffer.end_iter());
+    }
+    common::pump_until(Duration::from_secs(120), idle);
+    let labels = |editor: &Editor| -> Vec<String> {
+        completion::items_at_cursor(&f.state, editor)
+            .into_iter()
+            .map(|i| i.label)
+            .collect()
+    };
+    assert!(labels(&f.editor).contains(&"img/f0000.png".to_owned()));
+    assert!(labels(&part).contains(&"../img/f0000.png".to_owned()));
+    let timed = |editor: &Editor| {
+        let started = Instant::now();
+        let _ = completion::items_at_cursor(&f.state, editor);
+        started.elapsed()
+    };
+    let ms = |times: &mut Vec<Duration>| {
+        times.sort();
+        times[times.len() / 2].as_secs_f64() * 1e3
+    };
+    let (mut first, mut next, mut normalized) = (Vec::new(), Vec::new(), 0);
+    for i in 0..15 {
+        let buffer = chapter.buffer();
+        buffer.insert(&mut buffer.start_iter(), &format!("\\label{{tmp:{i}}}\n"));
+        common::pump_for(Duration::from_millis(50));
+        common::pump_until(TIMEOUT, || !completion::index_busy(&f.state));
+        common::pump_until(TIMEOUT, idle);
+        let before = lemma_app::workspace::normalizations();
+        first.push(timed(&chapter));
+        normalized += lemma_app::workspace::normalizations() - before;
+        next.push(timed(&chapter));
+    }
+    let (mut switched, mut same) = (Vec::new(), Vec::new());
+    let before = lemma_app::workspace::normalizations();
+    for _ in 0..15 {
+        switched.push(timed(&f.editor));
+        switched.push(timed(&part));
+        same.push(timed(&part));
+    }
+    let switch_normalized = lemma_app::workspace::normalizations() - before;
+    println!(
+        "    completion in a chapter after a re-index: first {:.2} ms, next {:.2} ms (medians), \
+         {normalized} paths resolved in 15; after a switch between the root and a part {:.2} ms, \
+         in the same {:.2} ms, {switch_normalized} paths resolved in 30 switches (load {})",
+        ms(&mut first),
+        ms(&mut next),
+        ms(&mut switched),
+        ms(&mut same),
+        common::big_project::load()
+    );
+}
+
 /// True when the cursor is in the argument of `\end{`.
 fn argument_typed(buffer: &sourceview5::Buffer) -> bool {
     let cursor = buffer.iter_at_mark(&buffer.get_insert());
@@ -1762,6 +2051,11 @@ fn end_offers_the_open_environment() {
 /// (Enter takes `Lorem` after `Lor`), but not after a word the dictionary has (`the`, with
 /// `theorem` proposed, or `Lore`): Enter then breaks the line.
 fn word_popups_select_unfinished_words() {
+    // Whole English words are told by the spell checker.
+    if !common::english_dictionary() {
+        println!("SKIP: no en_US spelling dictionary installed");
+        return;
+    }
     let f = fixture_with(&project("word-select"), "main.tex", |config| {
         config.spell.enabled = true;
     });

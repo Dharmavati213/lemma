@@ -191,6 +191,16 @@ fn comment_lines_between_fields() {
     );
 }
 
+/// Between entries too, as biber reads them: an entry commented out line by line (as Toggle
+/// Comment does) is no entry, and neither is one whose `@` line alone is commented out.
+#[test]
+fn comment_lines_between_entries() {
+    let text = "@misc{a, title = {A}}\n% @article{dead,\n%   title = {Dead},\n% }\n  %@book{gone, title = {G}}\n@misc{b, note = {50%}} % @misc{c}\n@misc{d}\n";
+    let keys: Vec<String> = scan_bib(text).into_iter().map(|e| e.key).collect();
+    assert_eq!(keys, ["a", "b", "d"]);
+    assert_eq!(scan_bib(text)[2].line, 6);
+}
+
 #[test]
 fn empty_and_garbage() {
     assert!(scan_bib("").is_empty());

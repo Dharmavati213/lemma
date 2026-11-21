@@ -180,7 +180,9 @@ pub fn delete_edits(text: &str, span: &EnvSpan) -> Vec<TextEdit> {
         edits.push(TextEdit::delete(whole_line(text, end_line.clone())));
     } else if after_end.trim().is_empty() {
         let from = end_line.start + before_end.trim_end().len();
-        edits.push(TextEdit::delete(from..end_line.end));
+        // A CRLF line keeps its `\r`.
+        let to = end_line.end - usize::from(after_end.ends_with('\r'));
+        edits.push(TextEdit::delete(from..to));
     } else {
         edits.push(TextEdit::delete(span.end.clone()));
     }
@@ -248,12 +250,14 @@ pub fn delete_edits(text: &str, span: &EnvSpan) -> Vec<TextEdit> {
     out
 }
 
-/// A line's range with its `\n` (or, for the last line, the `\n` before it).
+/// A line's range with its `\n` (or, for the last line, the line break before it: `\r\n` in a
+/// CRLF text, so no `\r` is left at the end).
 fn whole_line(text: &str, line: Range<usize>) -> Range<usize> {
     if line.end < text.len() {
         line.start..line.end + 1
     } else if line.start > 0 {
-        line.start - 1..line.end
+        let crlf = text[..line.start - 1].ends_with('\r');
+        line.start - 1 - usize::from(crlf)..line.end
     } else {
         line
     }
@@ -902,6 +906,30 @@ mod tests {
             ("\\begin{x}\nA\n\\end{x}", "x", "A"),
             // Tabs.
             ("\\begin{x}\n\tA\n\t\tB\n\\end{x}\n", "x", "A\n\tB\n"),
+        ];
+        for &(text, name, want) in cases {
+            let edits = delete_edits(text, &span(text, name, 0));
+            assert_eq!(apply_all(text, &edits), want, "{text:?}");
+        }
+    }
+
+    /// CRLF texts keep a `\r\n` on every line: none becomes `\n`, and no `\r` is left over.
+    #[test]
+    fn delete_keeps_crlf_line_breaks() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a\r\n\\begin{center}\r\n  Text\r\n\\end{center}\r\nb\r\n",
+                "center",
+                "a\r\nText\r\nb\r\n",
+            ),
+            // `\end` after text: its line keeps its `\r\n`.
+            (
+                "\\begin{equation}\r\n  x = 1 \\end{equation}\r\nb\r\n",
+                "equation",
+                "  x = 1\r\nb\r\n",
+            ),
+            // The last line: the `\r\n` before it goes, not just its `\n`.
+            ("\\begin{x}\r\nA\r\n\\end{x}", "x", "A"),
         ];
         for &(text, name, want) in cases {
             let edits = delete_edits(text, &span(text, name, 0));

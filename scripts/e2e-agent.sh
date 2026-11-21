@@ -25,22 +25,6 @@ PROFILE="${LEMMA_PROFILE:-dev}"
 OUT="${LEMMA_E2E_DIR:-$ROOT/target/e2e-agent}"
 case "$OUT" in /*) ;; *) OUT="$ROOT/$OUT" ;; esac
 
-if [ -n "${LEMMA_BIN:-}" ]; then
-  bin="$LEMMA_BIN"
-else
-  target="${CARGO_TARGET_DIR:-$ROOT/target}"
-  case "$target" in /*) ;; *) target="$ROOT/$target" ;; esac
-  if [ "$PROFILE" = dev ] || [ "$PROFILE" = debug ]; then
-    cargo build --quiet -p lemma-app -p lemma-fake-agent -p lemma-mcp
-    bin="$target/debug/lemma"
-  else
-    cargo build --quiet --profile "$PROFILE" -p lemma-app -p lemma-fake-agent -p lemma-mcp
-    bin="$target/$PROFILE/lemma"
-  fi
-fi
-[ -x "$bin" ] || die "lemma binary not found at $bin"
-mkdir -p "$OUT"
-
 failures=0
 report=""
 
@@ -159,8 +143,28 @@ case_long() {
 all=(basic inline permission permission-y permission-Y permission-n bypass errors cancel cancel-permission long)
 cases=("$@")
 [ ${#cases[@]} -gt 0 ] || cases=("${all[@]}")
+# A misspelt case fails here, before the build.
 for c in "${cases[@]}"; do
   declare -F "case_$c" >/dev/null || die "unknown case $c (known: ${all[*]})"
+done
+
+if [ -n "${LEMMA_BIN:-}" ]; then
+  bin="$LEMMA_BIN"
+else
+  target="${CARGO_TARGET_DIR:-$ROOT/target}"
+  case "$target" in /*) ;; *) target="$ROOT/$target" ;; esac
+  if [ "$PROFILE" = dev ] || [ "$PROFILE" = debug ]; then
+    cargo build --quiet -p lemma-app -p lemma-fake-agent -p lemma-mcp
+    bin="$target/debug/lemma"
+  else
+    cargo build --quiet --profile "$PROFILE" -p lemma-app -p lemma-fake-agent -p lemma-mcp
+    bin="$target/$PROFILE/lemma"
+  fi
+fi
+[ -x "$bin" ] || die "lemma binary not found at $bin"
+mkdir -p "$OUT"
+
+for c in "${cases[@]}"; do
   "case_$c"
 done
 

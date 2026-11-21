@@ -45,9 +45,37 @@ fn main() -> ExitCode {
         ("templates_build_every_file", templates_files),
         ("project_instructions_are_inferred_and_kept", instructions),
         ("citations_are_appended_as_hunks", citations),
+        (
+            "citations_keep_the_encoding_of_their_file",
+            citations_latin1,
+        ),
+        (
+            "citations_that_fail_leave_no_new_file",
+            citations_fail_cleanly,
+        ),
         ("citation_dialog_reports_errors", citation_dialog),
+        (
+            "citation_dialog_closed_while_fetching_adds_nothing",
+            citation_dialog_closed,
+        ),
+        (
+            "citation_window_closed_while_fetching_adds_nothing",
+            citation_window_closed,
+        ),
+        (
+            "citation_after_a_discarded_bib_tab_reads_the_file",
+            citation_bib_tab_discarded,
+        ),
         ("autosave_idle_waits_for_agent_turns", autosave_idle),
         ("autosave_focus_and_off", autosave_focus),
+        (
+            "autosave_never_writes_discarded_changes",
+            autosave_after_discard,
+        ),
+        (
+            "autosave_waits_for_the_discard_of_a_reviewed_document",
+            autosave_during_discard,
+        ),
         (
             "autosave_of_several_documents_builds_once",
             autosave_builds_once,
@@ -64,6 +92,12 @@ fn main() -> ExitCode {
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 const CROSSREF: &str = " @article{Grothendieck_1957, title={Sur quelques points d’algèbre homologique, I}, volume={9}, DOI={10.2748/tmj/1178244839}, journal={Tohoku Mathematical Journal}, author={Grothendieck, Alexander}, year={1957}, month=jan, pages={119–221} }\n";
+
+const SLOW: &str =
+    "@article{Slow_2020, title={Slow}, DOI={10.5555/slow}, author={Slow, Sam}, year={2020}}\n";
+
+const SLOWER: &str = "@article{Slower_2021, title={Slower}, DOI={10.5555/slower}, author={Slower, \
+                      Sue}, year={2021}}\n";
 
 const ATOM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -103,6 +137,16 @@ fn fake_server() -> String {
             let path = request.split_whitespace().nth(1).unwrap_or("").to_owned();
             let (status, extra, body) = match path.as_str() {
                 "/10.2748/tmj/1178244839" => (302, format!("Location: {redirect}\r\n"), ""),
+                // A slow answer, which the user stops waiting for.
+                "/10.5555/slow" => {
+                    std::thread::sleep(Duration::from_millis(800));
+                    (200, String::new(), SLOW)
+                }
+                // Slow enough for a window to be closed meanwhile.
+                "/10.5555/slower" => {
+                    std::thread::sleep(Duration::from_millis(2500));
+                    (200, String::new(), SLOWER)
+                }
                 "/crossref/tmj" if accept.contains("x-bibtex") => (200, String::new(), CROSSREF),
                 p if p.starts_with("/api/query?id_list=2301.01234") => (200, String::new(), ATOM),
                 _ => (404, String::new(), "not found"),
@@ -293,8 +337,14 @@ fn drops() {
         &[root.join("notes.txt")],
         0
     ));
-    // With biblatex in an open document, a .bib file becomes \addbibresource.
+    // With biblatex in an open document, a .bib file becomes \addbibresource. Opening
+    // main.tex makes it the window's main document (the one its PDF is looked for), whose
+    // directory the paths of the files below it are then relative to.
     let main = open(&state, &root.join("main.tex"));
+    common::pump_until(TIMEOUT, || {
+        state.build.get().and_then(|b| b.root())
+            == lemma_core::canonicalize(root.join("main.tex")).ok()
+    });
     main.buffer().set_text("\\usepackage{biblatex}\n");
     assert!(paste::drop_files(
         &state,
@@ -302,7 +352,7 @@ fn drops() {
         &[root.join("refs.bib")],
         0
     ));
-    assert_eq!(text_of(&editor), "\\addbibresource{../refs.bib}\nA\n");
+    assert_eq!(text_of(&editor), "\\addbibresource{refs.bib}\nA\n");
     close(&state);
 }
 
@@ -514,6 +564,9 @@ fn citations() {
         .get(&normalize(&bib))
         .expect("the .bib document");
     assert_eq!(review_ui::hunk_count(&doc), 1, "one reviewable hunk");
+    // The banner names the change: it said "Claude changed …".
+    state.review.get().unwrap().refresh();
+    assert_eq!(state.banner.title(), "Add Citation · 1 file · 1 hunk");
 
     // Already there: nothing is fetched or appended, the key is reused.
     let requests = REQUESTS.load(Ordering::SeqCst);
@@ -563,6 +616,89 @@ fn citations() {
     );
     let doc = state.workspace.get(&normalize(&fresh)).unwrap();
     assert_eq!(review_ui::hunk_count(&doc), 1);
+    close(&state);
+}
+
+/// A `.bib` file in Latin-1 (read as ISO-8859-15) stays in it: an entry it can hold is appended
+/// in that encoding; one with characters it cannot hold (Crossref's ’ and –) is refused before
+/// anything changes, with the reason.
+fn citations_latin1() {
+    let root = common::temp_dir("citations-latin1");
+    write(&root, &[("main.tex", "See .\n")]);
+    let bib = root.join("refs.bib");
+    let latin1 = b"@book{old, title = {Caf\xe9}}\n".to_vec();
+    std::fs::write(&bib, &latin1).unwrap();
+    let state = window(&root);
+    let added = block_on(bibimport::add_citation(&state, "2301.01234", &bib, None)).unwrap();
+    assert!(added.appended);
+    let bytes = std::fs::read(&bib).unwrap();
+    assert!(bytes.starts_with(&latin1), "{bytes:?}");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("@misc{lovelace2023stacks,"),
+        "{bytes:?}"
+    );
+    let doc = state.workspace.get(&normalize(&bib)).unwrap();
+    assert_eq!(doc.charset().as_deref(), Some(saver::FALLBACK_CHARSET));
+    let text = doc.text();
+    let requests = REQUESTS.load(Ordering::SeqCst);
+    let refused = block_on(bibimport::add_citation(
+        &state,
+        "10.2748/tmj/1178244839",
+        &bib,
+        None,
+    ))
+    .unwrap_err();
+    assert!(REQUESTS.load(Ordering::SeqCst) > requests, "fetched");
+    assert_eq!(
+        refused,
+        "Nothing was added: refs.bib is in the ISO-8859-15 encoding, which cannot hold “’” and \
+         “–” of the new entry"
+    );
+    assert_eq!(doc.text(), text);
+    assert!(!doc.is_dirty());
+    assert_eq!(review_ui::hunk_count(&doc), 1, "the first entry's");
+    assert_eq!(std::fs::read(&bib).unwrap(), bytes);
+    close(&state);
+}
+
+/// An import into a new `references.bib` that fails (the entry is not found, the file cannot be
+/// made) leaves no document of it behind, and no file.
+fn citations_fail_cleanly() {
+    let root = common::temp_dir("citations-fail");
+    write(&root, &[("main.tex", "")]);
+    let state = window(&root);
+    let bib = root.join("references.bib");
+    let error = block_on(bibimport::add_citation(
+        &state,
+        "10.1000/missing",
+        &bib,
+        None,
+    ))
+    .unwrap_err();
+    assert!(error.contains("No record found"), "{error}");
+    assert!(state.workspace.get(&normalize(&bib)).is_none());
+    assert!(!bib.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let bib = locked.join("references.bib");
+        let error =
+            block_on(bibimport::add_citation(&state, "2301.01234", &bib, None)).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            error.starts_with("Could not create references.bib: "),
+            "{error}"
+        );
+        assert!(state.workspace.get(&normalize(&bib)).is_none());
+        assert!(!bib.exists());
+    }
+    // The next import makes it.
+    let added = block_on(bibimport::add_citation(&state, "2301.01234", &bib, None)).unwrap();
+    assert!(added.appended);
+    assert!(bib.exists());
     close(&state);
 }
 
@@ -629,6 +765,155 @@ fn citation_dialog() {
     assert!(!d.cite_row.is_sensitive(), "no document to cite in");
     d.dialog.close();
     close(&state);
+}
+
+/// Closing the dialog while the entry is fetched gives up on it: when the answer comes, nothing
+/// is appended to the `.bib` and no `\cite` lands where the cursor happens to be by then.
+fn citation_dialog_closed() {
+    let root = common::temp_dir("citation-closed");
+    write(&root, &[("main.tex", "\\bibliography{b}\n"), ("b.bib", "")]);
+    let state = window(&root);
+    let editor = open(&state, &root.join("main.tex"));
+    editor.place_cursor_at(0);
+    bibimport::show(&state);
+    common::pump_until(TIMEOUT, || bibimport::citation_dialog(&state).is_some());
+    let d = bibimport::citation_dialog(&state).unwrap();
+    assert!(d.cite_row.is_active());
+    d.entry.set_text("10.5555/slow");
+    d.add();
+    assert!(d.is_busy());
+    d.dialog.close();
+    common::pump_until(TIMEOUT, || bibimport::citation_dialog(&state).is_none());
+    // The user goes on typing elsewhere meanwhile.
+    editor.place_cursor_at(text_of(&editor).len());
+    common::pump_until(TIMEOUT, || !d.is_busy());
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(std::fs::read_to_string(root.join("b.bib")).unwrap(), "");
+    assert_eq!(text_of(&editor), "\\bibliography{b}\n");
+    close(&state);
+}
+
+/// A window that asks before it discards unsaved changes, as the user's windows do.
+fn asking_window(root: &Path) -> Rc<WindowState> {
+    let mut config = Config::default();
+    config.build.on_save = false;
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    let ws = Workspace::new(ProjectRoot::new(root).unwrap());
+    let state = WindowState::new(&common::application(), Rc::new(config), None, ws, false);
+    state.window.set_default_size(1000, 700);
+    state.window.present();
+    common::pump_until(TIMEOUT, || state.window.is_mapped());
+    state
+}
+
+/// Answers the "Save changes?" alert shown over `state`'s window.
+fn answer_save_changes(state: &WindowState, response: &str) {
+    common::pump_until(TIMEOUT, || {
+        state
+            .window
+            .visible_dialog()
+            .is_some_and(|d| d.is::<adw::AlertDialog>())
+    });
+    let alert = state
+        .window
+        .visible_dialog()
+        .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        .expect("Save changes?");
+    alert.emit_by_name::<()>("response", &[&response]);
+    alert.force_close();
+}
+
+/// Closing the window while the entry is fetched gives it up too, and the unsaved changes of the
+/// `.bib` thrown away in "Save changes?" are not saved with it: the window's close first closes
+/// the dialog (as its Escape would), and only the next one asks about the changes. (Destroying
+/// the window without closing it would not tell the dialog; nothing in Lemma does that.)
+fn citation_window_closed() {
+    let root = common::temp_dir("citation-window-closed");
+    write(&root, &[("main.tex", "\\bibliography{b}\n"), ("b.bib", "")]);
+    let state = asking_window(&root);
+    let bib = open(&state, &root.join("b.bib"));
+    bib.place_cursor_at(0);
+    type_text(&bib, "% thrown away\n");
+    let editor = open(&state, &root.join("main.tex"));
+    editor.place_cursor_at(0);
+    drop((bib, editor));
+    bibimport::show(&state);
+    common::pump_until(TIMEOUT, || bibimport::citation_dialog(&state).is_some());
+    let d = bibimport::citation_dialog(&state).unwrap();
+    d.entry.set_text("10.5555/slower");
+    d.add();
+    assert!(d.is_busy());
+    // Closing the window closes the dialog first (libadwaita), which gives the entry up; the
+    // window stays.
+    state.window.close();
+    common::pump_until(TIMEOUT, || bibimport::citation_dialog(&state).is_none());
+    common::pump_for(Duration::from_millis(100));
+    assert!(state.window.is_visible());
+    assert!(state.window.visible_dialog().is_none(), "no Save Changes?");
+    // Closed again: "Save changes?", and Discard.
+    state.window.close();
+    answer_save_changes(&state, "discard");
+    common::pump_until(TIMEOUT, || !state.window.is_visible());
+    common::pump_until(TIMEOUT, || !d.is_busy());
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.bib")).unwrap(),
+        "",
+        "the discarded changes (or the entry) were saved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.tex")).unwrap(),
+        "\\bibliography{b}\n"
+    );
+    state.window.destroy();
+}
+
+/// The `.bib`'s tab closes while the entry is fetched, its unsaved changes discarded: the entry
+/// is added to the file as it is on disk. The document the import had loaded, with the discarded
+/// changes in it, was saved with the entry.
+fn citation_bib_tab_discarded() {
+    let root = common::temp_dir("citation-tab-discarded");
+    let old = "@misc{old, title={Old}}\n";
+    write(
+        &root,
+        &[("main.tex", "\\bibliography{b}\n"), ("b.bib", old)],
+    );
+    let state = asking_window(&root);
+    let bib = open(&state, &root.join("b.bib"));
+    bib.place_cursor_at(0);
+    type_text(&bib, "% thrown away\n");
+    let editor = open(&state, &root.join("main.tex"));
+    editor.place_cursor_at(0);
+    bibimport::show(&state);
+    common::pump_until(TIMEOUT, || bibimport::citation_dialog(&state).is_some());
+    let d = bibimport::citation_dialog(&state).unwrap();
+    d.entry.set_text("10.5555/slower");
+    d.add();
+    assert!(d.is_busy());
+    let page = state.tab_view.page(bib.widget());
+    drop(bib);
+    state.tab_view.close_page(&page);
+    answer_save_changes(&state, "discard");
+    common::pump_until(TIMEOUT, || state.tab_view.n_pages() == 1);
+    common::pump_until(TIMEOUT, || !d.is_busy());
+    common::pump_for(Duration::from_millis(300));
+    let saved = std::fs::read_to_string(root.join("b.bib")).unwrap();
+    assert!(!saved.contains("thrown away"), "{saved}");
+    assert!(
+        saved.starts_with(old) && saved.contains("{10.5555/slower}"),
+        "{saved}"
+    );
+    assert!(
+        text_of(&editor).starts_with("\\cite{slower2021"),
+        "{}",
+        text_of(&editor)
+    );
+    drop(editor);
+    for editor in state.editors() {
+        state.close_editor(&editor, true);
+    }
+    state.window.destroy();
 }
 
 // ----- auto-save -----
@@ -712,6 +997,159 @@ fn autosave_focus() {
     close(&state);
 }
 
+/// Discard in "Save changes?" (and Vim's `:qa!`) throws the changes away: the window losing the
+/// focus as it closes must not auto-save them after all.
+fn autosave_after_discard() {
+    let root = common::temp_dir("autosave-discard");
+    write(&root, &[("main.tex", "a\n")]);
+    let mut config = Config::default();
+    config.build.on_save = false;
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    config.editor.autosave = Autosave::Focus;
+    let ws = Workspace::new(ProjectRoot::new(&root).unwrap());
+    // A window that asks before it discards changes, as the user's windows do.
+    let state = WindowState::new(&common::application(), Rc::new(config), None, ws, false);
+    state.window.present();
+    common::pump_until(TIMEOUT, || state.window.is_mapped());
+    let path = root.join("main.tex");
+    let editor = open(&state, &path);
+    editor.place_cursor_at(0);
+    type_text(&editor, "thrown away ");
+    drop(editor);
+    state.window.close();
+    common::pump_until(TIMEOUT, || state.window.visible_dialog().is_some());
+    let alert = state
+        .window
+        .visible_dialog()
+        .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        .expect("Save changes?");
+    alert.emit_by_name::<()>("response", &[&"discard"]);
+    alert.force_close();
+    common::pump_until(TIMEOUT, || !state.window.is_visible());
+    common::pump_for(Duration::from_millis(500));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "a\n",
+        "the discarded changes were saved"
+    );
+    state.window.destroy();
+
+    // While "Save changes?" waits for an answer, nothing is saved by itself: Discard leaves the
+    // file alone, and after Cancel the save comes.
+    let root = common::temp_dir("autosave-asking");
+    write(&root, &[("main.tex", "a\n"), ("other.tex", "o\n")]);
+    let mut config = Config::default();
+    config.build.on_save = false;
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    config.editor.autosave = Autosave::Idle;
+    let ws = Workspace::new(ProjectRoot::new(&root).unwrap());
+    let state = WindowState::new(&common::application(), Rc::new(config), None, ws, false);
+    autosave::set_idle_delay(&state, Duration::from_millis(100));
+    state.window.present();
+    common::pump_until(TIMEOUT, || state.window.is_mapped());
+    let answer = |response: &str| {
+        common::pump_until(TIMEOUT, || state.window.visible_dialog().is_some());
+        let alert = state
+            .window
+            .visible_dialog()
+            .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+            .expect("Save changes?");
+        alert.emit_by_name::<()>("response", &[&response]);
+        alert.force_close();
+    };
+    let _other = open(&state, &root.join("other.tex"));
+    let editor = open(&state, &root.join("main.tex"));
+    editor.place_cursor_at(0);
+    type_text(&editor, "x");
+    let page = state.tab_view.page(editor.widget());
+    state.tab_view.close_page(&page);
+    common::pump_until(TIMEOUT, || state.window.visible_dialog().is_some());
+    common::pump_for(Duration::from_millis(400));
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.tex")).unwrap(),
+        "a\n",
+        "saved while the dialog asked"
+    );
+    answer("cancel");
+    common::pump_until(TIMEOUT, || {
+        std::fs::read_to_string(root.join("main.tex")).unwrap() == "xa\n"
+    });
+    type_text(&editor, "y");
+    state.tab_view.close_page(&page);
+    common::pump_until(TIMEOUT, || state.window.visible_dialog().is_some());
+    common::pump_for(Duration::from_millis(400));
+    answer("discard");
+    common::pump_until(TIMEOUT, || state.tab_view.n_pages() == 1);
+    common::pump_for(Duration::from_millis(400));
+    assert_eq!(
+        std::fs::read_to_string(root.join("main.tex")).unwrap(),
+        "xa\n",
+        "the discarded “y” was saved"
+    );
+    drop(editor);
+    state.window.destroy();
+}
+
+/// Discard in "Save changes?" for a document under review reloads it from its file before its
+/// tab closes, and auto-save waits for that too. It was let go as the dialog closed: an idle save
+/// that came due during the reload wrote the discarded typing (which the reload then read back).
+fn autosave_during_discard() {
+    let root = common::temp_dir("autosave-discard-review");
+    write(&root, &[("main.tex", "one\ntwo\n")]);
+    let mut config = Config::default();
+    config.build.on_save = false;
+    config.spell.enabled = false;
+    config.history.enabled = false;
+    config.editor.autosave = Autosave::Idle;
+    let ws = Workspace::new(ProjectRoot::new(&root).unwrap());
+    let state = WindowState::new(&common::application(), Rc::new(config), None, ws, false);
+    // The test runs the idle save itself, at every turn of the main loop.
+    autosave::set_idle_delay(&state, Duration::from_secs(3600));
+    state.window.present();
+    common::pump_until(TIMEOUT, || state.window.is_mapped());
+    let path = root.join("main.tex");
+    let editor = open(&state, &path);
+    let reply = block_on(lemma_app::agent_edits::apply(
+        &state.workspace,
+        1,
+        lemma_agent::EditorRequest::Edit {
+            path: "main.tex".into(),
+            old_string: "two".into(),
+            new_string: "TWO".into(),
+            replace_all: false,
+        },
+    ));
+    assert!(!reply.is_error, "{reply:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\nTWO\n");
+    editor.place_cursor_at(0);
+    type_text(&editor, "thrown away ");
+    let page = state.tab_view.page(editor.widget());
+    drop(editor);
+    state.tab_view.close_page(&page);
+    answer_save_changes(&state, "discard");
+    // What the idle timer does whenever it runs out, at every turn of the main loop: no save of
+    // the document starts until its tab is gone (whether such a save wrote the discarded typing
+    // depends on which of it and the reload reads the text first).
+    common::pump_until(TIMEOUT, || {
+        let saves = autosave::save_now(&state);
+        let closed = state.tab_view.n_pages() == 0;
+        assert!(
+            closed || saves == 0,
+            "an auto-save started while the discarded changes were thrown away"
+        );
+        closed
+    });
+    common::pump_for(Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "one\nTWO\n",
+        "the discarded typing was saved"
+    );
+    state.window.destroy();
+}
+
 /// Auto-saving several documents builds once, when all of them are written, and writes each of
 /// them once. (A build per document ran latexmk a second time for nothing, and the second
 /// build's save wrote the documents still being saved again.)
@@ -731,6 +1169,7 @@ fn autosave_builds_once() {
     // A fake latexmk that only counts its runs, copied into place by `cp`: had this process
     // written it, a child forked meanwhile could still hold it open for writing ("Text file
     // busy").
+    common::require_shell_scripts();
     let bin = common::temp_dir("autosave-build-bin");
     let source = bin.join("latexmk.src");
     std::fs::write(

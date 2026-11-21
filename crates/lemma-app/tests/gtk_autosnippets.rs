@@ -20,7 +20,7 @@ use broadway_input::{Browser, CONTROL};
 use gtk::gdk;
 use lemma_agent::EditorRequest;
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, VimMode, completion, vim};
+use lemma_app::editor::{Editor, VimMode, completion};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
@@ -333,7 +333,7 @@ impl Typist for Emulated {
             let consumed = f
                 .editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, f.editor.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, f.editor.view(), keyval, state));
             let modified =
                 state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
             if !consumed && !modified {

@@ -16,7 +16,8 @@
 //!   with [`set_uri_hook`]). Ctrl+click stays inverse search.
 //! - **Back:** Alt+Left (`win.goto-back`, through `editor::goto::add_back_handler`) returns from
 //!   link jumps while the PDF has the focus, also in a detached PDF window; so do Backspace in
-//!   the view and the mouse's back button (forward: the mouse's forward button).
+//!   the view and the mouse's back button (forward: the mouse's forward button). The history is
+//!   the PDF's: a rebuild keeps it, another PDF starts a new one.
 //!
 //! Hooks: [`install`] once per window (after `pdf_controller::install`).
 
@@ -112,9 +113,15 @@ impl Links {
         }
     }
 
-    /// A new generation (or another PDF): its links are fetched anew.
-    pub(super) fn document_changed(&self, generation: u64) {
+    /// A new generation (or another PDF, unless `rebuilt`): its links are fetched anew. Another
+    /// PDF (the root document of another tab) also starts a new history: Back would go to a
+    /// page of the old one's numbering.
+    pub(super) fn document_changed(&self, generation: u64, rebuilt: bool) {
         self.generation.set(generation);
+        if !rebuilt {
+            self.back.borrow_mut().clear();
+            self.forward.borrow_mut().clear();
+        }
         self.links.borrow_mut().clear();
         self.requested.borrow_mut().clear();
         self.hovered.replace(None);

@@ -5,7 +5,9 @@
 //! write starts (typing during the write is not part of it; the document stays dirty), encoded
 //! with the charset the file was read with, **byte for byte**: the text keeps the file's line
 //! terminators (`\n`, `\r\n`, `\r`, mixed) and any byte-order mark, so nothing is rewritten that
-//! the user did not change. The write is an atomic replace (`g_file_replace_contents`).
+//! the user did not change. The write is an atomic replace (`g_file_replace_contents`, on a
+//! worker thread): a file that cannot be replaced fails the save, on Windows after a second of
+//! trying again (see [`replace_file`]).
 //!
 //! **External changes.** The saver remembers what the file held when it was last read or written
 //! (GIO's entity tag, the size, and the `fnv1a64` hash of the bytes). Before writing it compares
@@ -37,6 +39,8 @@ use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 type SavedFn = dyn Fn(&Path, &str);
 
@@ -92,8 +96,9 @@ fn notify_saving(doc: &Document) {
     }
 }
 
-/// The charset of a file that is not valid UTF-8 (GtkSourceView's fallback candidate, a superset
-/// of Latin-1 for text).
+/// The charset of a file that is not valid UTF-8 (GtkSourceView's fallback candidate): Latin-1
+/// with `€`, `Š`, `š`, `Ž`, `ž`, `Œ`, `œ` and `Ÿ` in place of `¤ ¦ ¨ ´ ¸ ¼ ½ ¾`. Every byte
+/// decodes, so a file's bytes come back unchanged when it is written.
 pub const FALLBACK_CHARSET: &str = "ISO-8859-15";
 
 /// The file attributes compared before a save.
@@ -198,6 +203,29 @@ fn convert(bytes: &[u8], to: &str, from: &str) -> Result<String, String> {
     String::from_utf8(converted.to_vec()).map_err(|_| format!("it cannot be read as {from}"))
 }
 
+/// The characters of `text` that `charset` (a file's encoding, as the saver writes it) cannot
+/// hold, each once, in the order they come. Every charset a file is read in holds ASCII, so only
+/// the other characters are tried, each once: a whole document costs one conversion per distinct
+/// character, not one per character.
+pub fn unwritable(text: &str, charset: &str) -> Vec<char> {
+    let mut tried = std::collections::HashSet::new();
+    text.chars()
+        .filter(|c| !c.is_ascii() && tried.insert(*c))
+        .filter(|c| glib::convert(c.encode_utf8(&mut [0; 4]).as_bytes(), charset, "UTF-8").is_err())
+        .collect()
+}
+
+/// `chars` for a message: “’”, “–” and “ő” (the first five, then "and more").
+pub fn quoted_chars(chars: &[char]) -> String {
+    let shown: Vec<String> = chars.iter().take(5).map(|c| format!("“{c}”")).collect();
+    match (shown.as_slice(), chars.len()) {
+        (_, n) if n > 5 => format!("{} and more", shown.join(", ")),
+        ([one], _) => one.clone(),
+        ([rest @ .., last], _) => format!("{} and {last}", rest.join(", ")),
+        ([], _) => String::new(),
+    }
+}
+
 type Waiter = async_channel::Sender<Result<(), SaveError>>;
 
 #[derive(Default)]
@@ -281,6 +309,12 @@ impl Saver {
         self.charset.borrow().clone()
     }
 
+    /// From now on the file is written as UTF-8 (the user's choice, when its charset cannot hold
+    /// the text).
+    pub(crate) fn write_as_utf8(&self) {
+        self.charset.replace(None);
+    }
+
     /// The `fnv1a64` hash of the bytes the file held when the document last read or wrote it,
     /// if known (the file monitor checks a merge base against it).
     pub(crate) fn disk_hash(&self) -> Option<u64> {
@@ -319,16 +353,23 @@ impl Saver {
         self.own_writes.set(writes);
     }
 
-    /// `text` in the file's charset.
+    /// `text` in the file's charset. Text the charset cannot hold is refused with the characters
+    /// named (GLib only says "Invalid byte sequence in conversion input").
     fn encode(&self, text: &str) -> Result<Vec<u8>, SaveError> {
         match self.charset.borrow().as_deref() {
             None => Ok(text.as_bytes().to_vec()),
             Some(charset) => glib::convert(text.as_bytes(), charset, "UTF-8")
                 .map(|(bytes, _)| bytes.to_vec())
                 .map_err(|e| {
-                    SaveError::Io(format!(
-                        "the text cannot be written in the file's encoding, {charset}: {e}"
-                    ))
+                    SaveError::Io(match unwritable(text, charset).as_slice() {
+                        [] => format!(
+                            "the text cannot be written in the file's encoding, {charset}: {e}"
+                        ),
+                        chars => format!(
+                            "the file's encoding, {charset}, cannot hold {}",
+                            quoted_chars(chars)
+                        ),
+                    })
                 }),
         }
     }
@@ -364,10 +405,13 @@ impl Saver {
         let Some(hash) = hash else {
             return Err(SaveError::ExternallyModified);
         };
-        let (bytes, etag) = file
-            .load_contents_future()
-            .await
-            .map_err(|e| SaveError::Io(e.message().to_owned()))?;
+        // Through the workspace's read, which refuses a named pipe that took the file's place
+        // (reading one would wait for a writer, and the save with it).
+        let loaded = match file.path() {
+            Some(path) => crate::workspace::load_file(&path).await,
+            None => file.load_contents_future().await,
+        };
+        let (bytes, etag) = loaded.map_err(|e| SaveError::Io(e.message().to_owned()))?;
         if fnv1a64(&[&bytes]) == hash {
             Ok(etag.map(String::from))
         } else {
@@ -431,11 +475,9 @@ async fn write(doc: &Document, overwrite: bool) -> Result<(), SaveError> {
     let hash = fnv1a64(&[&bytes]);
     let size = bytes.len() as u64;
     saver.write_started(hash);
-    let written = file
-        .replace_contents_future(bytes, etag.as_deref(), false, gio::FileCreateFlags::NONE)
-        .await;
+    let written = replace_file(doc.path(), bytes, etag).await;
     saver.write_ended(written.is_ok());
-    let (_, etag) = written.map_err(|(_, e)| SaveError::from(e))?;
+    let etag = written?;
     saver.disk.replace(DiskState::Present {
         etag: etag.map(String::from),
         size,
@@ -446,4 +488,92 @@ async fn write(doc: &Document, overwrite: bool) -> Result<(), SaveError> {
         notify_saved(doc.path(), &text);
     }
     Ok(())
+}
+
+/// How long a write is tried again on Windows while the file cannot be replaced (see
+/// [`replace_file`]), and the pause between two tries.
+const REPLACE_PATIENCE: Duration = Duration::from_secs(1);
+const REPLACE_PAUSE: Duration = Duration::from_millis(40);
+
+/// Replaces the file at `path` with `bytes` (`g_file_replace_contents`: written to a temporary
+/// file beside it, which is then renamed over it) on a worker thread, checking `etag` when
+/// given, and returns the file's new entity tag.
+///
+/// GIO's blocking call, not `replace_contents_future`: the asynchronous one ignores the error of
+/// closing the stream (GLib 2.90), and the rename happens there. A file that could not be
+/// replaced was reported as written, so the document was marked saved while its file held the
+/// old text.
+///
+/// That happens on Windows, where a file cannot be replaced while a program holds it open
+/// without sharing deletes, as the C library's `open` does: a viewer, a virus scanner, TeX
+/// reading the file, or Lemma's own file monitor reading it after the last save. Such a hold
+/// mostly lasts milliseconds, so there the write is tried again for [`REPLACE_PATIENCE`] before
+/// the save fails with GIO's message.
+async fn replace_file(
+    path: &Path,
+    bytes: Vec<u8>,
+    etag: Option<String>,
+) -> Result<Option<glib::GString>, SaveError> {
+    let bytes = Arc::new(bytes);
+    let started = Instant::now();
+    loop {
+        let (path, bytes, etag) = (path.to_path_buf(), bytes.clone(), etag.clone());
+        let written = gio::spawn_blocking(move || {
+            gio::File::for_path(path).replace_contents(
+                &bytes,
+                etag.as_deref(),
+                false,
+                gio::FileCreateFlags::NONE,
+                gio::Cancellable::NONE,
+            )
+        })
+        .await
+        .map_err(|_| SaveError::Io("the write did not finish".into()))?;
+        match written {
+            Ok(etag) => return Ok(etag),
+            Err(e)
+                if cfg!(windows)
+                    && e.matches(gio::IOErrorEnum::PermissionDenied)
+                    && started.elapsed() < REPLACE_PATIENCE =>
+            {
+                glib::timeout_future(REPLACE_PAUSE).await;
+            }
+            Err(e) => return Err(SaveError::from(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A save that the file's charset cannot hold names the characters, so that the user knows
+    /// what to change (GLib only says "Invalid byte sequence in conversion input").
+    #[test]
+    fn characters_the_charset_cannot_hold_are_named() {
+        let saver = Saver::new();
+        saver.set_loaded(Some(FALLBACK_CHARSET.to_owned()), DiskState::Unknown);
+        assert_eq!(saver.encode("café, 50 €\n").unwrap(), b"caf\xe9, 50 \xa4\n");
+        assert_eq!(
+            saver.encode("a → b, d’Erdős → c\n"),
+            Err(SaveError::Io(
+                "the file's encoding, ISO-8859-15, cannot hold “→”, “’” and “ő”".into()
+            ))
+        );
+        let many = "αβγδεζη";
+        assert_eq!(
+            saver.encode(many),
+            Err(SaveError::Io(
+                "the file's encoding, ISO-8859-15, cannot hold “α”, “β”, “γ”, “δ”, “ε” and more"
+                    .into()
+            ))
+        );
+        assert_eq!(unwritable("Gödel, Ångström, 50 €", FALLBACK_CHARSET), []);
+        assert_eq!(unwritable("x ’ y ’ z –", FALLBACK_CHARSET), ['’', '–']);
+        assert_eq!(unwritable("anything → ő", "UTF-8"), []);
+        assert_eq!(quoted_chars(&['’']), "“’”");
+        // UTF-8 files take any text.
+        let utf8 = Saver::new();
+        assert_eq!(utf8.encode("→\n").unwrap(), "→\n".as_bytes());
+    }
 }

@@ -4,20 +4,28 @@
 //!   `paste-clipboard` signal, also the context menu's Paste) asks for a name (default
 //!   `fig-<n>`, the first free number), saves the image as `figures/<name>.png` next to the
 //!   current file (the directory is created when missing; an existing file is never replaced)
-//!   and inserts `\includegraphics[width=0.8\textwidth]{figures/<name>}` where the cursor was.
+//!   and inserts `\includegraphics[width=0.8\textwidth]{…/figures/<name>}` where the cursor was.
 //!   A clipboard that also holds text pastes the text, as before (an office program copies
 //!   both).
 //! - **Drops:** files dropped on the text insert one line each, at the drop point when it
 //!   starts a line, else from the start of the next line,
 //!   `\includegraphics[width=0.8\textwidth]{…}` for images, `\input{…}` for `.tex` files and
 //!   `\addbibresource{….bib}` (when the project uses biblatex) or `\bibliography{…}` for `.bib`
-//!   files, with paths relative to the current file. Other files, and names with `%`, `#`,
-//!   braces or backslashes (LaTeX would misread them), are skipped with a toast.
+//!   files. Other files, and names with `%`, `#`, braces or backslashes (LaTeX would misread
+//!   them), are skipped with a toast.
+//!
+//! The inserted paths are relative to the directory LaTeX resolves them against
+//! ([`path_base`]): the root document's when the current file belongs to a project with a known
+//! root (a chapter in `chapters/` gets `img/plot.png`, not `../img/plot.png`), the import
+//! directory below a `\subfile` or an `\import`, and the current file's own directory without
+//! a known root. Completion offers file names relative to the root's directory too, and the
+//! quick fix for a missing file looks for one from the last build's root directory.
 //!
 //! Hooks: [`attach`] per editor tab (the view's signal handler and drop target die with the
 //! view). Tests: [`paste_image`] (what the signal handler runs), [`name_prompt`] (the open
 //! dialog), [`drop_files`] (what a drop runs: GTK cannot inject a drop) and the pure helpers.
 
+use crate::document::DocRef;
 use crate::editor::Editor;
 use crate::window::WindowState;
 use adw::prelude::*;
@@ -190,16 +198,20 @@ async fn paste_image_at(
         .map(Path::to_path_buf)
         .ok_or("The document has no directory")?;
     let figures = dir.join(FIGURES_DIR);
+    // The folder as LaTeX finds it (from the root document's directory), before anything is
+    // saved: a path it would misread is refused.
+    let folder = latex_path(&relative_path(
+        &path_base(state, editor.document()),
+        &resolved_dir(&figures),
+    ))
+    .filter(|f| !unsafe_in_latex(f))
+    .ok_or("The figures folder's path holds characters LaTeX misreads (% # { } or \\)")?;
     let Some(name) = ask_name(state, &figures).await else {
         return Ok(None);
     };
     let path = figures.join(format!("{name}.png"));
     save_png(texture, path.clone()).await?;
-    insert_at_mark(
-        editor,
-        mark,
-        &include_graphics(&format!("{FIGURES_DIR}/{name}")),
-    )?;
+    insert_at_mark(editor, mark, &include_graphics(&format!("{folder}/{name}")))?;
     Ok(Some(path))
 }
 
@@ -366,18 +378,86 @@ pub fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
     out
 }
 
-/// The command a file dropped into `current` (a file path) inserts; `None` for other files and
-/// for paths that are not UTF-8.
-pub fn drop_command(current: &Path, file: &Path, biblatex: bool) -> Option<String> {
+/// `path` as LaTeX takes it: directories separated by `/`, on Windows too. `None` when it is
+/// not UTF-8.
+fn latex_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    #[cfg(windows)]
+    return Some(path.replace('\\', "/"));
+    #[cfg(not(windows))]
+    Some(path.to_owned())
+}
+
+/// The directory LaTeX resolves the paths written in `doc` against (`\includegraphics`,
+/// `\input`, `\include`, `\bibliography`): where TeX runs, the root document's directory, when
+/// `doc` belongs to a project with a known root (`math_preview::root_for`: its `% !TEX root`,
+/// a root of the project index that includes it, or the last build's root above it). Below a
+/// `\subfile` or an `\import` it is the import directory the project index finds for `doc`, and
+/// a subfiles document's own directory (the subfiles package loads it with `\subimport`, so its
+/// paths are its own, compiled alone or from its parent). Without a known root, `doc`'s own
+/// directory.
+pub fn path_base(state: &WindowState, doc: &DocRef) -> PathBuf {
+    known_path_base(state, doc).unwrap_or_else(|| own_dir(&crate::workspace::normalize(doc.path())))
+}
+
+/// [`path_base`] when `doc` belongs to a project with a known root (or is a subfiles document, or
+/// a root itself); `None` without one, where `path_base` takes `doc`'s own directory. Completion
+/// of file names, which lists the files from the project's directory then, asks this.
+pub fn known_path_base(state: &WindowState, doc: &DocRef) -> Option<PathBuf> {
+    let path = crate::workspace::normalize(doc.path());
+    let own = own_dir(&path);
+    let subfile = {
+        let index = state.workspace.index.borrow();
+        match index.files.get(&path) {
+            Some(file) => file.magic.subfiles_parent.is_some(),
+            None => doc
+                .with_text(lemma_syntax::parse_magic)
+                .subfiles_parent
+                .is_some(),
+        }
+    };
+    if subfile {
+        return Some(own);
+    }
+    let root = crate::editor::math_preview::root_for(state, doc)?;
+    if root == path {
+        return Some(own);
+    }
+    let index = state.workspace.index.borrow();
+    Some(
+        index
+            .project_files_with_dirs(&root)
+            .into_iter()
+            .find(|(file, _)| *file == path)
+            .map(|(_, dir)| dir)
+            .or_else(|| root.parent().map(Path::to_path_buf))
+            .unwrap_or(own),
+    )
+}
+
+/// The directory of the file at `path`.
+fn own_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+}
+
+/// `file` in its directory resolved as the workspace's paths are (symlinks and `..`, as in the
+/// directory of [`path_base`]), under its own name (a link stays the link).
+fn resolved_dir(file: &Path) -> PathBuf {
+    match (file.parent(), file.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
+            crate::workspace::normalize(dir).join(name)
+        }
+        _ => file.to_path_buf(),
+    }
+}
+
+/// The command a file dropped into a document whose paths are relative to `dir` (see
+/// [`path_base`]) inserts; `None` for other files and for paths that are not UTF-8.
+pub fn drop_command(dir: &Path, file: &Path, biblatex: bool) -> Option<String> {
     let kind = drop_kind(file)?;
-    let dir = current.parent().unwrap_or(Path::new("/"));
-    let rel = relative_path(dir, file);
-    let rel = rel.to_str()?;
-    // LaTeX separates directories with `/`, on Windows too.
-    #[cfg(windows)]
-    let slashed = rel.replace('\\', "/");
-    #[cfg(windows)]
-    let rel = slashed.as_str();
+    let rel = latex_path(&relative_path(dir, file))?;
+    let rel = rel.as_str();
     if unsafe_in_latex(rel) {
         return None;
     }
@@ -445,6 +525,7 @@ pub fn drop_files(
         .documents()
         .iter()
         .any(|d| d.with_text(uses_biblatex));
+    let base = path_base(state, doc);
     let mut lines = Vec::new();
     let mut skipped = Vec::new();
     let mut refused = Vec::new();
@@ -453,7 +534,7 @@ pub fn drop_files(
             || file.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        match drop_command(doc.path(), file, biblatex) {
+        match drop_command(&base, &resolved_dir(file), biblatex) {
             Some(line) => lines.push(line),
             None if drop_kind(file).is_some() => refused.push(name),
             None => skipped.push(name),
@@ -477,19 +558,21 @@ pub fn drop_files(
     let Some(mut at) = editor.iter_near(offset) else {
         return false;
     };
+    let buffer = editor.buffer();
+    // The document's line breaks (`\r\n` in a CRLF file).
+    let nl = crate::editor::snippets::line_break_at(buffer.upcast_ref(), &at);
     // On lines of their own: inside a line, from the start of the next one.
-    let mut text = lines.join("\n");
+    let mut text = lines.join(nl);
     if !at.starts_line() {
         at.forward_line();
         if !at.starts_line() {
             // The last line, without a line break.
-            text.insert(0, '\n');
+            text.insert_str(0, nl);
         }
     }
     if !at.is_end() {
-        text.push('\n');
+        text.push_str(nl);
     }
-    let buffer = editor.buffer();
     buffer.begin_user_action();
     buffer.insert(&mut at, &text);
     buffer.end_user_action();
@@ -534,7 +617,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_drop_commands_use_slashes() {
-        let cur = Path::new(r"C:\Users\u\thesis\chapters\intro.tex");
+        let cur = Path::new(r"C:\Users\u\thesis\chapters");
         assert_eq!(
             drop_command(cur, Path::new(r"C:\Users\u\thesis\figures\plot.png"), false).as_deref(),
             Some("\\includegraphics[width=0.8\\textwidth]{../figures/plot.png}")
@@ -547,7 +630,8 @@ mod tests {
 
     #[test]
     fn drop_commands() {
-        let cur = Path::new("/p/chapters/intro.tex");
+        // Relative to the document's directory (no known root) ...
+        let cur = Path::new("/p/chapters");
         assert_eq!(
             drop_command(cur, Path::new("/p/chapters/img/plot.PNG"), false).unwrap(),
             "\\includegraphics[width=0.8\\textwidth]{img/plot.PNG}"
@@ -570,6 +654,20 @@ mod tests {
         );
         assert_eq!(drop_command(cur, Path::new("/p/notes.txt"), false), None);
         assert_eq!(drop_command(cur, Path::new("/p/Makefile"), false), None);
+        // ... or to the root document's.
+        let root = Path::new("/p");
+        assert_eq!(
+            drop_command(root, Path::new("/p/fig.pdf"), false).unwrap(),
+            "\\includegraphics[width=0.8\\textwidth]{fig.pdf}"
+        );
+        assert_eq!(
+            drop_command(root, Path::new("/p/chapters/proofs.tex"), false).unwrap(),
+            "\\input{chapters/proofs}"
+        );
+        assert_eq!(
+            drop_command(root, Path::new("/p/refs.bib"), false).unwrap(),
+            "\\bibliography{refs}"
+        );
     }
 
     #[test]

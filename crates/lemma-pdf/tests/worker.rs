@@ -468,8 +468,15 @@ fn forward_and_inverse_go_through_synctex() {
         line: 66,
     });
     match next(&rx) {
-        PdfEvent::Forward { generation, boxes } => {
+        PdfEvent::Forward {
+            generation,
+            file,
+            line,
+            boxes,
+        } => {
             assert_eq!(generation, 7);
+            // The answer says which query it answers.
+            assert_eq!((file, line), (fixture("proj/main.tex"), 66));
             let b = boxes.first().expect("line 66 has a box");
             assert_eq!(b.page, 2);
             assert!(
@@ -512,7 +519,9 @@ fn sync_without_synctex_data_answers_empty() {
         file: fixture("pdf/test.tex"),
         line: 1,
     });
-    assert!(matches!(next(&rx), PdfEvent::Forward { generation: 2, boxes } if boxes.is_empty()));
+    assert!(
+        matches!(next(&rx), PdfEvent::Forward { generation: 2, boxes, .. } if boxes.is_empty())
+    );
     pdf.send(PdfCmd::Inverse {
         page: 0,
         x_bp: 10.0,
@@ -719,6 +728,7 @@ fn a_reload_maps_synctex_on_a_page_that_turned() {
         PdfEvent::Forward {
             generation: 2,
             boxes,
+            ..
         } => {
             let b = boxes.first().expect("line 5 has a box");
             let near = |a: f32, b: f32| (a - b).abs() < 0.5;
@@ -764,7 +774,9 @@ fn queries_without_a_document_are_answered() {
         file: fixture("proj/main.tex"),
         line: 66,
     });
-    assert!(matches!(next(&rx), PdfEvent::Forward { generation: 0, boxes } if boxes.is_empty()));
+    assert!(
+        matches!(next(&rx), PdfEvent::Forward { generation: 0, boxes, .. } if boxes.is_empty())
+    );
     pdf.send(PdfCmd::Links { page: 0 });
     assert!(matches!(next(&rx), PdfEvent::Links { generation: 0, links, .. } if links.is_empty()));
     assert!(pdf.shutdown_and_join(TIMEOUT), "the pdf thread stops");

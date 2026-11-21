@@ -514,7 +514,11 @@ fn unicode_engine_documents_compile_the_whole_preamble() {
 \\newcommand{\\cF}{\\mathcal{F}}\n\\begin{document}\nSo $\\cF \\otimes \\cF$.\n\\end{document}\n",
     )
     .unwrap();
-    let previewer = Previewer::new(dir.join("cache"));
+    let mut previewer = Previewer::new(dir.join("cache"));
+    // The route and the engine are under test, not the time: LuaTeX with fontspec takes a few
+    // seconds alone (more on its first run, which builds the font cache) and can pass
+    // `FULL_TIMEOUT` (10 s) while the machine is busy compiling.
+    previewer.full_timeout = Duration::from_secs(120);
     let o = previewer.render(&job(&root, &root, "\\cF \\otimes"));
     println!("lualatex preview: {:?}", o.total_time);
     assert_eq!(o.engine, Engine::LuaLatex);

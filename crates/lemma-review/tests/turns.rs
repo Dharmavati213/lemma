@@ -172,6 +172,59 @@ fn ctrl_z_of_a_rejected_turn_brings_its_turn_back() {
     assert_eq!(turns(&s), [vec![1], vec![2], vec![1, 2]]);
 }
 
+/// Reject Turn takes back two edits of the turn that the user's deletion between them put side
+/// by side, each with its own record, in one action; then Ctrl+Z. The insertion that completes
+/// the first reject lands at the end of the second's text, with that one's text: the second's
+/// record took it, the two records ended up holding each other's text, and Ctrl+Z left the hunk
+/// without its turn (Keep Turn, Reject Turn and Undo Last Turn skipped it). As an open buffer
+/// reports them, a deletion and an insertion an edit.
+#[test]
+fn ctrl_z_of_a_rejected_turn_whose_edits_are_side_by_side() {
+    let mut s = Session::new("x-y-z\n");
+    let open_buffer = |edits: &[TextEdit]| -> Vec<TextEdit> {
+        edits
+            .iter()
+            .flat_map(|e| {
+                [
+                    TextEdit::delete(e.range.clone()),
+                    TextEdit::insert(e.range.start, &e.text),
+                ]
+            })
+            .collect()
+    };
+    for (range, text) in [(3..4, "+"), (1..2, "++")] {
+        s.edits(
+            &open_buffer(&[TextEdit {
+                range,
+                text: text.into(),
+            }]),
+            Origin::Agent { call: 1 },
+        );
+        s.recompute();
+    }
+    s.user(TextEdit::delete(3..4));
+    s.recompute();
+    assert_eq!(s.text, "x+++z\n");
+    let (ids, before) = (s.ids(), turns(&s));
+    assert_eq!(before, [vec![0]]);
+    let edits = s.review.reject_turn(0, &s.text);
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    let replaced: Vec<String> = edits
+        .iter()
+        .map(|e| s.text[e.range.clone()].to_owned())
+        .collect();
+    s.edits(&open_buffer(&edits), Origin::Review);
+    s.recompute();
+    assert_eq!(s.text, "x--z\n");
+    s.review.begin_history_step(false);
+    s.undo_action(&edits, &replaced);
+    s.recompute();
+    s.check();
+    assert_eq!(s.text, "x+++z\n");
+    assert_eq!(s.ids(), ids);
+    assert_eq!(turns(&s), before);
+}
+
 #[test]
 fn accept_turn_keeps_the_text_and_reports_mixed_hunks() {
     let mut s = two_turns();

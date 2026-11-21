@@ -22,7 +22,6 @@ use std::ops::Range;
 pub(super) const MAX_SLIDE: usize = 256;
 
 /// Whether the closed intervals `x` and `y` share a position.
-#[cfg(test)]
 pub(super) fn touch(x: &Range<usize>, y: &Range<usize>) -> bool {
     x.start <= y.end && y.start <= x.end
 }
@@ -128,6 +127,15 @@ impl Attribution {
             .filter(|(_, list)| touches_any(list, r))
             .map(|(t, _)| *t)
             .collect()
+    }
+
+    /// Whether some turn wrote text inside `[a, b)` (`a < b`): an interval shares more than a
+    /// boundary with it.
+    pub fn wrote_inside(&self, a: usize, b: usize) -> bool {
+        self.turns.iter().any(|(_, list)| {
+            let i = list.partition_point(|x| x.end <= a);
+            list.get(i).is_some_and(|x| x.start < b)
+        })
     }
 
     /// Takes the closed interval `r` out of the intervals of `turn` (of every turn with `None`):

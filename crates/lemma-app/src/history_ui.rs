@@ -16,7 +16,10 @@
 //!   coloured like the review: red lines are current text a restore removes, green lines are
 //!   what it brings back. The header says when and why the snapshot was taken and how many
 //!   lines a restore adds and removes (`+12 −3`). Diffs are computed on the jobs thread; the newest
-//!   selection wins. Very long diffs are cut after [`MAX_PREVIEW_LINES`].
+//!   selection wins. Very long diffs are cut after [`MAX_PREVIEW_LINES`]. A snapshot whose text
+//!   differs from now only in its line breaks has the same text: the page says how the line
+//!   breaks differ (a diff would mark every line, none of them visibly changed, and a restore
+//!   make a hunk of each), and there is nothing to restore.
 //! - **Restore as Hunks** opens the file and applies the snapshot as reviewable hunks
 //!   ([`history::restore`]): every change can be accepted or rejected, and rejecting them all
 //!   gives the current text back. A deleted file comes back as a new file under review
@@ -37,7 +40,7 @@ use lemma_core::fnv1a64;
 use serde::Deserialize;
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -102,6 +105,15 @@ pub fn timeline(state: &WindowState) -> Option<Rc<Timeline>> {
 
 thread_local! {
     static TIMELINES: RefCell<Vec<Rc<Timeline>>> = const { RefCell::new(Vec::new()) };
+    /// How long a preview loads before the spinner shows (see [`set_spinner_delay`]).
+    static SPINNER_DELAY: Cell<std::time::Duration> =
+        const { Cell::new(std::time::Duration::from_millis(150)) };
+}
+
+/// Shows the spinner of a loading preview after `delay` instead of 150 ms (tests: a slow load,
+/// with `Duration::ZERO`).
+pub fn set_spinner_delay(delay: std::time::Duration) {
+    SPINNER_DELAY.with(|d| d.set(delay));
 }
 
 /// What the preview shows for the selected snapshot.
@@ -560,36 +572,40 @@ impl Timeline {
         self.generation.set(generation);
         self.restore_button.set_sensitive(false);
         self.selected.replace(None);
-        // A short load keeps the old preview on screen instead of flashing the spinner.
-        let spinner = {
-            let weak = Rc::downgrade(self);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+        // A short load keeps the old preview on screen instead of flashing the spinner. Once
+        // the timer has run its id is no source any more, and removing it again would be an
+        // error (glib-rs panics): it takes its id out itself.
+        let spinner: Rc<Cell<Option<glib::SourceId>>> = Rc::default();
+        {
+            let (weak, fired) = (Rc::downgrade(self), spinner.clone());
+            let id = glib::timeout_add_local_once(SPINNER_DELAY.with(Cell::get), move || {
+                fired.take();
                 if let Some(timeline) = weak.upgrade()
                     && timeline.generation.get() == generation
                 {
                     timeline.stack.set_visible_child_name("loading");
                 }
-            })
-        };
+            });
+            spinner.set(Some(id));
+        }
         let loaded = history::load(&state, &entry).await;
         let rel = self.display_name(&entry.path);
         let diff = match loaded {
             Ok(snapshot) => {
                 let current = current.clone();
-                gio::spawn_blocking(move || {
-                    let diff = lemma_review::unified_diff(&rel, &current, &snapshot);
-                    preview_of(&diff)
-                })
-                .await
-                .map_err(|_| "computing the differences failed".to_owned())
+                gio::spawn_blocking(move || compare(&rel, &current, &snapshot))
+                    .await
+                    .map_err(|_| "computing the differences failed".to_owned())
             }
             Err(e) => Err(e),
         };
+        if let Some(id) = spinner.take() {
+            id.remove();
+        }
         if self.generation.get() != generation {
             return;
         }
-        spinner.remove();
-        let reason = reason_label(entry.reason);
+        let reason = entry.reason.label();
         let when = time_label(entry.unix);
         match diff {
             Err(e) => {
@@ -602,10 +618,18 @@ impl Timeline {
             Ok(preview) => {
                 let same = preview.lines == 0;
                 if same {
-                    self.same.set_description(Some(
-                        "This snapshot has the same text as the file now; there is nothing to \
-                         restore.",
-                    ));
+                    let description = match &preview.line_breaks {
+                        // Restoring would make a hunk of every line, each with no visible change.
+                        Some((then, now)) => format!(
+                            "This snapshot differs from the file now only in its line breaks: \
+                             {then} in the snapshot, {now} now. Its text is the same, so there \
+                             is nothing to restore."
+                        ),
+                        None => "This snapshot has the same text as the file now; there is \
+                                 nothing to restore."
+                            .to_owned(),
+                    };
+                    self.same.set_description(Some(&description));
                     self.title.set_title(&when);
                     self.title.set_subtitle(&reason);
                     self.stack.set_visible_child_name("same");
@@ -768,6 +792,14 @@ impl Timeline {
         self.selected.borrow().as_ref().map(|s| s.entry.clone())
     }
 
+    /// What the page of a snapshot with the text of now says.
+    pub fn same_text(&self) -> String {
+        self.same
+            .description()
+            .map(|d| d.to_string())
+            .unwrap_or_default()
+    }
+
     /// The text of the preview.
     pub fn preview_text(&self) -> String {
         let (start, end) = self.buffer.bounds();
@@ -812,7 +844,6 @@ impl Timeline {
 #[derive(Deserialize)]
 struct IndexLine {
     path: PathBuf,
-    unix: u64,
 }
 
 /// The files of `state`'s project that have snapshots, plus `wanted` (see the module docs).
@@ -829,22 +860,19 @@ async fn history_files(state: &Rc<WindowState>, wanted: Option<&Path>) -> Vec<Hi
         .map(|p| history::project_dir(&p.history_dir(), state.workspace.root().path()));
     let wanted = wanted.map(Path::to_path_buf);
     gio::spawn_blocking(move || {
-        let mut newest: HashMap<PathBuf, u64> = HashMap::new();
+        let mut paths: HashSet<PathBuf> = HashSet::new();
         if let Some(dir) = dir
             && let Ok(text) = std::fs::read_to_string(dir.join("index.jsonl"))
         {
             for line in text.lines() {
                 if let Ok(line) = serde_json::from_str::<IndexLine>(line) {
-                    let unix = newest.entry(line.path).or_default();
-                    *unix = (*unix).max(line.unix);
+                    paths.insert(line.path);
                 }
             }
         }
-        if let Some(wanted) = wanted {
-            newest.entry(wanted).or_default();
-        }
-        let mut files: Vec<(u8, PathBuf, bool)> = newest
-            .into_keys()
+        paths.extend(wanted);
+        let mut files: Vec<(u8, PathBuf, bool)> = paths
+            .into_iter()
             .map(|path| {
                 let exists = path.is_file();
                 let rank = match open.iter().position(|p| *p == path) {
@@ -932,6 +960,43 @@ struct Preview {
     lines: usize,
     added: usize,
     removed: usize,
+    /// The texts are equal but for their line breaks: those of the snapshot and of now
+    /// ([`line_breaks`]).
+    line_breaks: Option<(&'static str, &'static str)>,
+}
+
+/// The preview of `snapshot` against `current` (of the file `rel`). Texts that differ only in
+/// their line breaks have no diff to show (each line would be a change with no visible
+/// difference): they count as equal, and the preview says how their line breaks differ.
+fn compare(rel: &str, current: &str, snapshot: &str) -> Preview {
+    let unified = |text: &str| text.replace("\r\n", "\n").replace('\r', "\n");
+    let breaks_only = current != snapshot
+        && (current.contains('\r') || snapshot.contains('\r'))
+        && unified(current) == unified(snapshot);
+    if breaks_only {
+        return Preview {
+            rows: Vec::new(),
+            lines: 0,
+            added: 0,
+            removed: 0,
+            line_breaks: Some((line_breaks(snapshot), line_breaks(current))),
+        };
+    }
+    preview_of(&lemma_review::unified_diff(rel, current, snapshot))
+}
+
+/// How the lines of `text` end, for the preview: "Windows (CRLF)", "Unix (LF)", "old Mac (CR)"
+/// or "mixed".
+fn line_breaks(text: &str) -> &'static str {
+    let crlf = text.matches("\r\n").count();
+    let cr = text.matches('\r').count() - crlf;
+    let lf = text.matches('\n').count() - crlf;
+    match (crlf > 0, lf > 0, cr > 0) {
+        (true, false, false) => "Windows (CRLF)",
+        (false, _, false) => "Unix (LF)",
+        (false, false, true) => "old Mac (CR)",
+        _ => "mixed",
+    }
 }
 
 /// The rows of `diff` (a unified diff; its `---`/`+++` header is left out), cut after
@@ -972,6 +1037,7 @@ fn preview_of(diff: &str) -> Preview {
         lines,
         added,
         removed,
+        line_breaks: None,
     }
 }
 
@@ -988,9 +1054,9 @@ fn entry_row(entry: &HistoryEntry, same: bool) -> gtk::ListBoxRow {
         .css_classes(["numeric"])
         .build();
     let caption = if same {
-        format!("{} · same as now", reason_label(entry.reason))
+        format!("{} · same as now", entry.reason.label())
     } else {
-        reason_label(entry.reason)
+        entry.reason.label()
     };
     let reason = gtk::Label::builder()
         .label(&caption)
@@ -1020,14 +1086,6 @@ fn entry_row(entry: &HistoryEntry, same: bool) -> gtk::ListBoxRow {
         time_label(entry.unix)
     ))]);
     row
-}
-
-fn reason_label(reason: HistoryReason) -> String {
-    match reason {
-        HistoryReason::Save => "Saved".to_owned(),
-        HistoryReason::Turn(n) => format!("Before agent turn {n}"),
-        HistoryReason::Reject => "Before a reject".to_owned(),
-    }
 }
 
 fn local(unix: u64) -> Option<glib::DateTime> {
@@ -1096,6 +1154,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn texts_that_differ_only_in_line_breaks_are_the_same() {
+        let crlf = "one\r\ntwo\r\n";
+        let lf = "one\ntwo\n";
+        let preview = compare("a.tex", lf, crlf);
+        assert_eq!((preview.lines, preview.added, preview.removed), (0, 0, 0));
+        assert_eq!(preview.line_breaks, Some(("Windows (CRLF)", "Unix (LF)")));
+        assert_eq!(
+            compare("a.tex", "one\rtwo\r\n", lf).line_breaks,
+            Some(("Unix (LF)", "mixed"))
+        );
+        assert_eq!(line_breaks("one\rtwo\r"), "old Mac (CR)");
+        assert_eq!(line_breaks("no break"), "Unix (LF)");
+        // Equal texts, and texts with other changes too, are compared as they are.
+        assert_eq!(compare("a.tex", crlf, crlf).line_breaks, None);
+        let changed = compare("a.tex", lf, "one\r\nTWO\r\n");
+        assert_eq!(changed.line_breaks, None);
+        assert_eq!((changed.added, changed.removed), (2, 2));
+    }
+
+    #[test]
     fn previews_count_and_cut_lines() {
         let diff =
             lemma_review::unified_diff("a.tex", "one\ntwo\nthree\n", "one\n2\nthree\nfour\n");
@@ -1123,7 +1201,7 @@ mod tests {
 
     #[test]
     fn reasons_and_days_read_well() {
-        assert_eq!(reason_label(HistoryReason::Turn(3)), "Before agent turn 3");
+        assert_eq!(HistoryReason::Turn(3).label(), "Before agent turn 3");
         let now = glib::DateTime::now_local().unwrap().to_unix() as u64;
         assert_eq!(day_label(now), "Today");
         assert_eq!(day_label(now - 86_400), "Yesterday");

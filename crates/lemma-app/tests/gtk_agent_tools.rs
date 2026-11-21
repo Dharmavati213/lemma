@@ -9,6 +9,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_agent::{
     AgentCmd, AgentEvent, ConfigOpt, EditorRequest, PromptBlock, StopReason, ToolCall, ToolContent,
@@ -46,6 +48,28 @@ const IGNORED: &[(&str, &str)] = &[(
 fn main() -> ExitCode {
     let tests: &[common::Test] = &[
         ("file_tools_reply_after_disk", file_tools),
+        (
+            "read_file_of_a_large_file_reads_only_its_lines",
+            read_file_of_a_large_file,
+        ),
+        (
+            "a_huge_file_that_is_not_open_is_not_read_whole",
+            huge_file_not_read_whole,
+        ),
+        #[cfg(unix)]
+        (
+            "file_tools_refuse_named_pipes",
+            file_tools_refuse_named_pipes,
+        ),
+        #[cfg(unix)]
+        (
+            "held_documents_whose_file_became_a_pipe",
+            held_documents_whose_file_became_a_pipe,
+        ),
+        (
+            "paths_for_the_agent_have_forward_slashes_and_come_back_either_way",
+            agent_paths,
+        ),
         ("list_files_document_first_and_capped", list_files),
         ("outline_of_a_file_and_of_the_document", outline),
         ("compile_reports_errors_and_success", compile),
@@ -84,11 +108,19 @@ fn main() -> ExitCode {
             watcher_outside_turn_reviews,
         ),
         (
+            "watcher_reload_keeps_the_rejects_for_undo",
+            watcher_reload_keeps_rejects_for_undo,
+        ),
+        (
             "watcher_git_baseline_for_files_not_snapshotted",
             watcher_git_baseline,
         ),
         ("history_on_save_and_turn_start", history_entries),
         ("history_restore_produces_hunks", history_restore),
+        (
+            "history_close_waits_once_for_a_held_index",
+            history_close_is_bounded,
+        ),
         ("demo_agent_needs_a_scenario", demo_needs_scenario),
         ("e2e_basic_scenario_edits_two_files_and_builds", e2e_basic),
         ("e2e_bypass_scenario_becomes_hunks", e2e_bypass),
@@ -122,6 +154,24 @@ fn main() -> ExitCode {
         })
         .collect();
     common::run(&selected)
+}
+
+/// The peak resident memory of this process since the last [`reset_peak_memory`], in KiB
+/// (`VmHWM`; Linux only).
+fn peak_memory_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Makes the peak resident memory the current one (Linux 4.0 and later).
+fn reset_peak_memory() -> bool {
+    std::fs::write("/proc/self/clear_refs", "5").is_ok()
 }
 
 // ----- fixtures -----
@@ -219,7 +269,7 @@ fn window_on(dir: PathBuf, configure: impl FnOnce(&mut Config)) -> Fixture {
     common::pump_until(TIMEOUT, || state.window.is_mapped());
     let f = Fixture {
         state,
-        dir: dir.canonicalize().unwrap(),
+        dir: dir.canonical().unwrap(),
         runtime,
     };
     // The file monitor watches the root before the test writes anything.
@@ -414,6 +464,274 @@ fn drain(rx: &async_channel::Receiver<AgentCmd>) -> Vec<AgentCmd> {
 
 // ----- tools -----
 
+/// The live text of a file that is not in the workspace is the file on disk, read whole: one
+/// larger than `LIVE_TEXT_MAX` is refused (an ACP `fs/read_text_file` of a multi-gigabyte log
+/// would otherwise take that much memory, twice), and the answer says how to read it.
+fn huge_file_not_read_whole() {
+    let f = fixture("read-huge", &[("main.tex", "x\n")]);
+    let path = f.dir.join("huge.log");
+    // A sparse file: its size without its bytes on disk.
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(lemma_app::agent_edits::LIVE_TEXT_MAX + 1)
+        .unwrap();
+    drop(file);
+    for (line, limit) in [(None, None), (Some(5), Some(2))] {
+        let error = f.call_error(EditorRequest::ReadText {
+            path: path.clone(),
+            line,
+            limit,
+        });
+        assert!(
+            error.contains("huge.log") && error.contains("64 MiB"),
+            "{error}"
+        );
+    }
+    assert!(f.state.workspace.get(&path).is_none());
+    // A file of an ordinary size is read.
+    std::fs::write(&path, "small\n").unwrap();
+    let text = f.call_text(EditorRequest::ReadText {
+        path: path.clone(),
+        line: None,
+        limit: None,
+    });
+    assert_eq!(text, "small\n");
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// `read_file` of a large file that is not open answers with its lines without reading it into
+/// memory: the file was read whole and copied once more as text (twice its size in memory)
+/// before the range applied.
+fn read_file_of_a_large_file() {
+    let f = fixture("read-large", &[("main.tex", "x\n")]);
+    let path = f.dir.join("data.txt");
+    {
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for i in 1..=640_000 {
+            writeln!(out, "{i:>9} {}", "y".repeat(90)).unwrap();
+        }
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size > 60 << 20);
+    let measured = reset_peak_memory();
+    let before = peak_memory_kib();
+    let text = f.call_text(EditorRequest::ReadFile {
+        path: "data.txt".into(),
+        offset: Some(320_000),
+        limit: Some(2),
+    });
+    let after = peak_memory_kib();
+    let line = |i: u32| format!("{i:>6}\t{i:>9} {}\n", "y".repeat(90));
+    // Read up to the lines asked for and not to the end (32 MiB more here): how many lines
+    // follow is said only when the end comes soon after them.
+    assert_eq!(
+        text,
+        format!(
+            "{}{}… more lines follow (read on with offset 320002)\n",
+            line(320_000),
+            line(320_001)
+        )
+    );
+    let text = f.call_text(EditorRequest::ReadFile {
+        path: "data.txt".into(),
+        offset: Some(630_000),
+        limit: Some(2),
+    });
+    assert_eq!(
+        text,
+        format!(
+            "{}{}… 9999 more lines (read on with offset 630002)\n",
+            line(630_000),
+            line(630_001)
+        )
+    );
+    // An answer of more lines than its cap takes stops there and says so.
+    let text = f.call_text(EditorRequest::ReadFile {
+        path: "data.txt".into(),
+        offset: None,
+        limit: Some(5000),
+    });
+    assert!(text.len() < 260 << 10, "{}", text.len());
+    let end = &text[text.len() - 120..];
+    assert!(
+        end.contains("not shown: the answer stops at 256 KiB"),
+        "{end}"
+    );
+    std::fs::remove_file(&path).unwrap();
+    if let (true, Some(before), Some(after)) = (measured, before, after) {
+        let grown = after.saturating_sub(before);
+        println!(
+            "    peak memory {before} → {after} KiB reading a {} MiB file",
+            size >> 20
+        );
+        assert!(
+            grown < 24 << 10,
+            "reading two lines of a {} MiB file took {grown} KiB",
+            size >> 20
+        );
+    } else {
+        println!("    SKIP the memory check: no VmHWM to reset");
+    }
+}
+
+/// The file tools refuse a named pipe in the project (a socket or a device alike), as opening it
+/// in the editor does: it reports a size of 0, so it was read whole, which waits for another
+/// program to write to it, and the agent never got its answer.
+#[cfg(unix)]
+fn file_tools_refuse_named_pipes() {
+    let f = fixture("tools-fifo", &[("main.tex", "x\n")]);
+    let fifo = f.dir.join("pipe.tex");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success(), "mkfifo");
+    let path = PathBuf::from("pipe.tex");
+    let requests = [
+        EditorRequest::ReadFile {
+            path: path.clone(),
+            offset: None,
+            limit: None,
+        },
+        EditorRequest::ReadText {
+            path: path.clone(),
+            line: None,
+            limit: None,
+        },
+        EditorRequest::Edit {
+            path: path.clone(),
+            old_string: "a".into(),
+            new_string: "b".into(),
+            replace_all: false,
+        },
+        EditorRequest::Write {
+            path: path.clone(),
+            content: "text\n".into(),
+        },
+        EditorRequest::Outline {
+            path: Some(path.clone()),
+        },
+    ];
+    for (call, req) in (900..).zip(requests) {
+        let shown = format!("{req:?}");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        glib::spawn_future_local(tools::handle(
+            f.state.clone(),
+            ToolCall {
+                call,
+                req,
+                reply: tx,
+            },
+        ));
+        let mut reply = None;
+        common::pump_until(Duration::from_secs(10), || {
+            reply = reply.take().or_else(|| rx.try_recv().ok());
+            reply.is_some()
+        });
+        let reply = reply.unwrap();
+        let text = tools::reply_text(&reply);
+        assert!(reply.is_error, "{shown}: {text}");
+        assert!(text.contains("not a regular file"), "{shown}: {text}");
+    }
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+/// Documents the window holds whose file another program replaced by a named pipe
+/// (`rm main.tex; mkfifo main.tex`): every read of the file refuses the pipe instead of
+/// waiting for a writer. Each of these waited forever: the file monitor's look at the change
+/// (and with it every later change in the window), the agent's tool on a closed document, a
+/// reload, and opening a closed document in a tab.
+#[cfg(unix)]
+fn held_documents_whose_file_became_a_pipe() {
+    let f = fixture(
+        "held-fifo",
+        &[("open.tex", "open\n"), ("closed.tex", "closed\n")],
+    );
+    let opened = f.open("open.tex");
+    let closed = block_on(f.state.workspace.get_or_load(&f.path("closed.tex"))).unwrap();
+    assert!(!closed.is_open());
+    for file in ["open.tex", "closed.tex"] {
+        std::fs::remove_file(f.path(file)).unwrap();
+        let made = Command::new("mkfifo").arg(f.path(file)).status().unwrap();
+        assert!(made.success(), "mkfifo");
+    }
+    // Each step is checked on its own: the ones still waiting are listed at the end.
+    let mut waiting = Vec::new();
+    let mut answered = |what: &'static str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() >= deadline {
+                waiting.push(what);
+                return false;
+            }
+            common::pump_for(Duration::from_millis(20));
+        }
+        true
+    };
+    // The agent's tool on the closed document.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    glib::spawn_future_local(tools::handle(
+        f.state.clone(),
+        ToolCall {
+            call: 950,
+            req: EditorRequest::ReadFile {
+                path: "closed.tex".into(),
+                offset: None,
+                limit: None,
+            },
+            reply: tx,
+        },
+    ));
+    let reply: RefCell<Option<ToolReply>> = RefCell::default();
+    let take = || {
+        if reply.borrow().is_none() {
+            reply.replace(rx.try_recv().ok());
+        }
+        reply.borrow().is_some()
+    };
+    if answered("read_file", &take) {
+        let reply = reply.take().unwrap();
+        let text = tools::reply_text(&reply);
+        assert!(reply.is_error, "{text}");
+        assert!(text.contains("not a regular file"), "{text}");
+    }
+    // A reload of the open document.
+    let reloaded: Rc<RefCell<Option<Result<(), String>>>> = Rc::default();
+    let (doc, out) = (opened.document().clone(), reloaded.clone());
+    glib::spawn_future_local(async move {
+        out.replace(Some(doc.reload().await));
+    });
+    if answered("the reload", &|| reloaded.borrow().is_some()) {
+        let error = reloaded.take().unwrap().unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(opened.document().text(), "open\n");
+    }
+    // Opening the closed document in a tab shows the text it holds.
+    let shown: Rc<RefCell<Option<Result<String, String>>>> = Rc::default();
+    let (state, path, out) = (f.state.clone(), f.path("closed.tex"), shown.clone());
+    glib::spawn_future_local(async move {
+        let opened = state.open_file(&path).await;
+        out.replace(Some(opened.map(|editor| editor.document().text())));
+    });
+    if answered("the tab", &|| shown.borrow().is_some()) {
+        let text = shown.take().unwrap().expect("the held text is shown");
+        assert_eq!(text, "closed\n");
+    }
+    // The file monitor's look at both changes ends, and it goes on following other files.
+    answered("the file monitor", &|| watcher::is_idle(&f.state));
+    f.external_write("other.tex", "other\n");
+    let other = f.open("other.tex");
+    f.external_write("other.tex", "changed\n");
+    answered("a later change", &|| other.document().text() == "changed\n");
+    assert!(
+        waiting.is_empty(),
+        "still waiting for the pipe: {waiting:?}"
+    );
+}
+
 /// read_file, edit and write: replies after the change is on disk; the exact error texts.
 fn file_tools() {
     let f = fixture(
@@ -468,6 +786,7 @@ fn file_tools() {
         path: "sub/new.tex".into(),
         content: "\\section{New}\n".into(),
     });
+    // The agent is shown paths with `/` on every system.
     assert!(
         created.starts_with("Created sub/new.tex (1 line)"),
         "{created}"
@@ -493,6 +812,201 @@ fn file_tools() {
         limit: None,
     });
     assert_eq!(outside, "path outside project root");
+}
+
+/// Every path in what the agent is told is written with `/`, on Windows too (the system writes
+/// `\` there, which LaTeX reads as the start of a command when the agent copies a path into
+/// `\input{…}`): the tools' replies and errors, the review feedback and the prompt's note of
+/// where the user is. And the agent may write a path either way, relative or absolute.
+fn agent_paths() {
+    let f = fixture(
+        "agent-paths",
+        &[
+            (
+                "main.tex",
+                "\\documentclass{article}\n\\begin{document}\n\\input{chapters/intro}\n\
+                 \\end{document}\n",
+            ),
+            ("chapters/intro.tex", "\\section{Intro}\nalpha\nstep 0\n"),
+        ],
+    );
+    // The main file first: the project is its directory.
+    f.open("main.tex");
+    let editor = f.open("chapters/intro.tex");
+    let doc = editor.document().clone();
+    // The file as the system writes it, and as the agent is shown it.
+    let native = f.dir.join("chapters").join("intro.tex");
+    let slashed = lemma_core::agent_path(&native);
+    let mut written = vec![
+        "chapters/intro.tex".to_owned(),
+        "./chapters/../chapters/intro.tex".to_owned(),
+        native.display().to_string(),
+        slashed.clone(),
+    ];
+    if cfg!(windows) {
+        assert!(native.display().to_string().contains('\\'));
+        assert!(!slashed.contains('\\'), "{slashed}");
+        assert_eq!(slashed.as_bytes()[1], b':', "a drive first: {slashed}");
+        written.push("chapters\\intro.tex".to_owned());
+        written.push(".\\chapters\\..\\chapters/intro.tex".to_owned());
+    } else {
+        assert_eq!(slashed, native.display().to_string());
+    }
+    // What the agent was told, to look through at the end.
+    let mut told: Vec<String> = Vec::new();
+    for (i, path) in written.iter().enumerate() {
+        let read = f.call_text(EditorRequest::ReadFile {
+            path: path.into(),
+            offset: None,
+            limit: None,
+        });
+        assert!(
+            read.contains(&format!("     3\tstep {i}\n")),
+            "{path}: {read}"
+        );
+        let edited = f.call_text(edit(path, &format!("step {i}"), &format!("step {}", i + 1)));
+        assert!(
+            edited.starts_with("Edited chapters/intro.tex: line 3\n"),
+            "{path}: {edited}"
+        );
+        let outline = f.call_text(EditorRequest::Outline {
+            path: Some(path.into()),
+        });
+        assert!(
+            outline.contains("\nchapters/intro.tex\n     1  \\section{Intro}\n"),
+            "{path}: {outline}"
+        );
+        // Named for the scope, whether or not a build has run.
+        let reply = f.call(EditorRequest::Diagnostics {
+            path: Some(path.into()),
+        });
+        assert!(!reply.is_error, "{path}: {}", tools::reply_text(&reply));
+        told.extend([read, edited, outline, tools::reply_text(&reply)]);
+    }
+    assert_eq!(
+        doc.text(),
+        format!("\\section{{Intro}}\nalpha\nstep {}\n", written.len())
+    );
+
+    // A new file in new directories, and the errors that name a file.
+    let new = if cfg!(windows) {
+        "new\\dir\\file.tex"
+    } else {
+        "new/dir/file.tex"
+    };
+    let created = f.call_text(EditorRequest::Write {
+        path: new.into(),
+        content: "x\n".into(),
+    });
+    assert!(
+        created.starts_with("Created new/dir/file.tex (1 line)"),
+        "{created}"
+    );
+    assert_eq!(f.disk("new/dir/file.tex"), "x\n");
+    let missing = f.call_error(EditorRequest::ReadFile {
+        path: Path::new("chapters").join("none.tex"),
+        offset: None,
+        limit: None,
+    });
+    assert_eq!(missing, "file does not exist: chapters/none.tex");
+    let directory = f.call_error(EditorRequest::ReadFile {
+        path: Path::new("new").join("dir"),
+        offset: None,
+        limit: None,
+    });
+    assert_eq!(directory, "new/dir is a directory, not a file");
+    let protected = f.call_error(EditorRequest::Write {
+        path: Path::new(".git").join("config"),
+        content: "x\n".into(),
+    });
+    assert!(
+        protected.starts_with(".git/config may not be written with Lemma's tools"),
+        "{protected}"
+    );
+    told.extend([created, missing, directory, protected]);
+
+    // list_files: the root, and every file below it.
+    let list = f.call_text(EditorRequest::ListFiles);
+    let lines: Vec<&str> = list.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("Project root: {}", lemma_core::agent_path(&f.dir))
+    );
+    for file in ["chapters/intro.tex", "new/dir/file.tex", "main.tex"] {
+        assert!(
+            lines.iter().any(|l| l.split(" (").next() == Some(file)),
+            "{file} not in\n{list}"
+        );
+    }
+    // The root named there leads back to the project, and so does a file below it.
+    let root = lines[0].strip_prefix("Project root: ").unwrap();
+    assert_eq!(Path::new(root).canonical().unwrap(), f.dir);
+    let read = f.call_text(EditorRequest::ReadFile {
+        path: format!("{root}/chapters/intro.tex").into(),
+        offset: None,
+        limit: None,
+    });
+    assert!(read.contains("\talpha\n"), "{read}");
+    told.extend([list.clone(), read]);
+
+    // Where the user is: get_selection, and the resource that goes with a prompt.
+    let selection = f.call_text(EditorRequest::Selection);
+    assert!(
+        selection.starts_with("File: chapters/intro.tex\nCursor: line "),
+        "{selection}"
+    );
+    told.push(selection);
+    // The pending changes, and what the user decided about them.
+    let state = f.call_text(EditorRequest::ReviewState);
+    assert!(
+        state.contains("--- a/chapters/intro.tex\n+++ b/chapters/intro.tex\n"),
+        "{state}"
+    );
+    told.push(state);
+    let id = doc.review.borrow().as_ref().unwrap().hunks()[0].id;
+    review_ui::decide(&f.state, &doc, id, Decision::Reject).unwrap();
+    let (_, blocks) = f.start_turn("go on");
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            PromptBlock::Text(text) | PromptBlock::Resource { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts[0].starts_with(
+            "<review_feedback>\nchapters/intro.tex: the user rejected line 3; your text "
+        ),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .last()
+            .unwrap()
+            .starts_with("The user's editor shows chapters/intro.tex (3 lines); the cursor is "),
+        "{texts:?}"
+    );
+    let Some(PromptBlock::Resource { uri, .. }) = blocks.last() else {
+        panic!("the editor's resource last: {blocks:?}");
+    };
+    assert!(
+        uri.starts_with("file:///") && uri.ends_with("/chapters/intro.tex"),
+        "{uri}"
+    );
+    told.extend(texts.iter().map(|t| (*t).to_owned()));
+    told.push(uri.clone());
+    f.end_turn(StopReason::EndTurn);
+
+    // Nothing the agent was told names a file the way Windows writes it. (The texts quote the
+    // files' own `\section`, so only a `\` after a name of a directory or a drive counts.)
+    for text in &told {
+        for native in ["chapters\\", "new\\", "dir\\", ".git\\", ":\\"] {
+            assert!(
+                !text.contains(native),
+                "{native:?} in what the agent was told:\n{text}"
+            );
+        }
+    }
 }
 
 fn list_files() {
@@ -524,10 +1038,17 @@ fn list_files() {
             .position(|l| *l == s)
             .unwrap_or_else(|| panic!("{s:?} not in\n{text}"))
     };
-    assert!(at("main.tex (root document)") < at("chapters/a.tex"));
-    assert!(at("chapters/a.tex") < at("refs.bib"));
+    // Paths are listed with `/` on every system, the project root too.
+    let chapter = "chapters/a.tex";
+    assert!(at("main.tex (root document)") < at(chapter));
+    assert!(at(chapter) < at("refs.bib"));
     assert!(at("refs.bib") < at("Other files:"));
     assert!(at("Other files:") < at("figures/plot.png"));
+    assert_eq!(
+        lines[0],
+        format!("Project root: {}", lemma_core::agent_path(&f.dir))
+    );
+    assert!(!text.contains('\\'), "{text}");
     at("notes.md");
     for hidden in ["main.aux", "synctex", ".git", ".build", ".hidden"] {
         assert!(!text.contains(hidden), "{hidden} listed:\n{text}");
@@ -737,8 +1258,16 @@ fn render_page() {
         text.starts_with("Page 2 of 5 of main.pdf, rendered at 918×1188 pixels."),
         "{text}"
     );
-    let copy = f.runtime.join("lemma/page-2.png");
-    assert!(text.contains(&copy.display().to_string()), "{text}");
+    // The copy is named as the agent is shown every path: with `/` on every system.
+    let copy = f.runtime.join("lemma").join("page-2.png");
+    assert!(
+        text.ends_with(&format!(
+            "A copy of the image is at {}.",
+            lemma_core::agent_path(&copy)
+        )),
+        "{text}"
+    );
+    assert!(!text.contains('\\'), "{text}");
     assert_eq!(
         &std::fs::read(&copy).unwrap(),
         png,
@@ -1028,8 +1557,8 @@ fn tool_records() {
     agent.bridge().disconnect_tool_done(id);
     f.call_text(EditorRequest::ListFiles);
     assert_eq!(seen.borrow().len(), 2);
-    // A record keeps the start of a long reply (here a 2000-line read of a 300 KB file) and
-    // its length.
+    // A record keeps the start of a long reply (here a 2000-line read of a 300 KB file, which
+    // the answer's cap cuts at 256 KiB) and its length.
     let line = format!("{}\n", "x".repeat(149));
     f.external_write("big.tex", &line.repeat(2000));
     let read = f.call_text(EditorRequest::ReadFile {
@@ -1037,7 +1566,7 @@ fn tool_records() {
         offset: None,
         limit: None,
     });
-    assert!(read.len() > 300_000, "{}", read.len());
+    assert!(read.len() > 250_000, "{}", read.len());
     let records = agent.bridge().tool_records();
     let last = records.last().unwrap();
     assert_eq!(last.tool, "read_file");
@@ -1608,8 +2137,9 @@ fn watcher_outside_turn() {
     assert!(f.state.workspace.get(&f.path("other.tex")).is_none());
 }
 
-/// Outside a turn, another program's change never becomes agent hunks of a decided review;
-/// with hunks pending, the review shows it against the accepted text.
+/// Outside a turn, another program's change never becomes agent hunks of a decided review (an
+/// open document keeps the review, for undo, and takes the change as the user's own; a closed
+/// one drops it); with hunks pending, the review shows it against the accepted text.
 fn watcher_outside_turn_reviews() {
     let f = fixture(
         "watch-reviews",
@@ -1639,7 +2169,12 @@ fn watcher_outside_turn_reviews() {
         f.state.workspace.get(&f.path("closed.tex")).is_none()
     });
     f.wait_watcher();
-    assert!(open.review.borrow().is_none(), "the decided review went");
+    assert_eq!(hunks(&f, "open.tex"), 0, "no hunks of the decided review");
+    assert_eq!(
+        baseline(&f, "open.tex").as_deref(),
+        Some("O1\no2 changed\n"),
+        "the change is the user's own"
+    );
     assert!(!open.is_dirty());
     assert_eq!(
         review_ui::hunk_count(&pending),
@@ -1654,6 +2189,46 @@ fn watcher_outside_turn_reviews() {
         limit: None,
     });
     assert!(read.contains("c2 changed"), "{read}");
+}
+
+/// A reload of an open document whose review has nothing left to decide keeps the review: the
+/// buffer's undo back past the reload, and past a later agent edit, reaches a reject made before
+/// it, which reopens its hunk. The review used to be dropped at the reload, and the next agent
+/// edit's new review took the rejected text, which the reject's undo brought back, for the
+/// user's own.
+fn watcher_reload_keeps_rejects_for_undo() {
+    let f = fixture("watch-reload-undo", &[("main.tex", "a\nb\n")]);
+    let editor = f.open("main.tex");
+    let doc = editor.document().clone();
+    f.call_text(edit("main.tex", "b\n", "B\n"));
+    review_ui::decide_document(&f.state, &doc, Decision::Reject);
+    assert_eq!(doc.text(), "a\nb\n");
+    f.wait_watcher();
+
+    f.external_write("main.tex", "z\na\nb\n");
+    common::pump_until(TIMEOUT, || doc.text() == "z\na\nb\n");
+    f.wait_watcher();
+    assert_eq!(
+        hunks(&f, "main.tex"),
+        0,
+        "another program's change is no hunk"
+    );
+    f.call_text(edit("main.tex", "a\n", "A\n"));
+    assert_eq!(hunks(&f, "main.tex"), 1);
+
+    // Ctrl+Z three times: the agent's last edit, the reload, the reject.
+    for _ in 0..3 {
+        editor.buffer().undo();
+        common::pump_for(Duration::from_millis(20));
+    }
+    review_ui::recompute(&doc);
+    assert_eq!(doc.text(), "a\nB\n");
+    assert_eq!(
+        baseline(&f, "main.tex").as_deref(),
+        Some("a\nb\n"),
+        "the rejected text is a change to review again, not the user's"
+    );
+    assert_eq!(hunks(&f, "main.tex"), 1);
 }
 
 fn watcher_own_writes() {
@@ -1872,6 +2447,41 @@ fn history_restore() {
     dialog.close();
 }
 
+/// The window closes while another Lemma holds the project's history (its collection runs, or it
+/// hangs): the close waits for it once, briefly, and then gives up what is still queued. It
+/// waited 5 seconds for the write running and then 5 more for each queued one, on the main
+/// thread, with the window frozen.
+fn history_close_is_bounded() {
+    let f = fixture("history-close", &[("main.tex", "v1\n")]);
+    // Opened (its collection is over).
+    block_on(history::flush(&f.state));
+    let dir = history_dir(&f);
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("index.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    for i in 0..4 {
+        history::record(
+            &f.state,
+            &f.path("main.tex"),
+            &format!("close {i}\n"),
+            HistoryReason::Save,
+        );
+    }
+    // The first waits for the lock on the jobs thread, the others are queued.
+    common::pump_for(Duration::from_millis(100));
+    let started = Instant::now();
+    history::close(&f.state);
+    let took = started.elapsed();
+    drop(held);
+    println!("    the close took {took:?}");
+    assert!(took < Duration::from_secs(4), "the close took {took:?}");
+}
+
 // ----- the demo -----
 
 fn demo_needs_scenario() {
@@ -1896,7 +2506,7 @@ fn demo_needs_scenario() {
 fn scenario(name: &str) -> PathBuf {
     let path = common::fixtures().join("agent").join(name);
     assert!(path.is_file(), "missing scenario {}", path.display());
-    path.canonicalize().unwrap()
+    path.canonical().unwrap()
 }
 
 /// Builds `lemma-fake-agent` and `lemma-mcp` next to this test (see
@@ -1943,7 +2553,10 @@ fn e2e_basic() {
         .iter()
         .map(|d| review_ui::relative_name(&f.state, d.path()))
         .collect();
-    assert_eq!(names, ["chapters/yoneda.tex", "main.tex"]);
+    assert_eq!(
+        names,
+        [common::shown("chapters/yoneda.tex").as_str(), "main.tex"]
+    );
     for doc in &reviewed {
         assert_eq!(
             std::fs::read_to_string(doc.path()).unwrap(),

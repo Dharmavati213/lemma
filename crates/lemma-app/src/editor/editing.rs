@@ -4,8 +4,13 @@
 //!   selection, or the cursor's line, with `% ` after the indentation they share; when every
 //!   one of them that is not blank is a comment already, it takes one `%` (and one space after
 //!   it) from each instead. Blank lines are left alone, and `\%` (a percent sign) is not a
-//!   comment. A selection that ends at the start of a line does not take that line. LaTeX and
-//!   BibTeX documents only.
+//!   comment. A selection that ends at the start of a line does not take that line. LaTeX
+//!   documents, and `.bib` files when biber reads them ([`biber_reads_bibliographies`]): only
+//!   biber skips a `%` line in a `.bib` file. BibTeX has no comments there: it still reads an
+//!   entry whose lines start with `%` (it looks for the next `@` anywhere outside an entry),
+//!   and a `%` line inside an entry is a syntax error that loses the fields after it. So in a
+//!   project that BibTeX reads, or one whose bibliography program is unknown, Toggle Comment
+//!   leaves a `.bib` file alone and says why.
 //! - **Bold**, **Italic** and **Emphasize** (`win.bold` Ctrl+B, `win.italic` Ctrl+I,
 //!   `win.emphasize` from the palette): wrap the selection in `\textbf{…}`, `\textit{…}` or
 //!   `\emph{…}` (in math, Bold in `\mathbf{…}` and the other two in `\mathit{…}`), and the
@@ -14,7 +19,8 @@
 //!   argument of one (an empty one around the cursor too), they remove the command instead, so
 //!   a second press undoes the first. A selection with unmatched braces is refused, and so is
 //!   one that ends in a comment or starts in one and leaves it (the `}` would be commented out,
-//!   or the command would be). LaTeX documents only.
+//!   or the command would be), and one that starts right after a backslash or ends with one
+//!   (the command or its `}` would be escaped). LaTeX documents only.
 //!
 //! Ctrl+B and Ctrl+I are Vim keys (page up, jump forward), so Bold and Italic are disabled while
 //! Vim is on (they follow `win.toggle-vim`) and the keys reach Vim, as Ctrl+F does outside the
@@ -40,7 +46,7 @@ use crate::window::WindowState;
 use adw::prelude::*;
 use lemma_core::{Origin, TextEdit};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// The actions (without `win.`), their labels and default accelerators.
@@ -57,9 +63,14 @@ const VIM_KEY_ACTIONS: &[&str] = &["bold", "italic"];
 /// Why they are disabled then, for the palette.
 const VIM_ON: &str = "Turn off Vim mode first";
 
+/// Why Toggle Comment leaves a `.bib` file alone (see the module docs).
+const BIB_WITHOUT_BIBER: &str = "BibTeX reads lines starting with % in a .bib file: \
+    Toggle Comment works there when biber reads it (biblatex)";
+
 const UNMATCHED: &str = "The selection has unmatched braces";
 const ENDS_IN_COMMENT: &str = "The selection ends in a comment";
 const STARTS_IN_COMMENT: &str = "The selection starts in a comment";
+const SPLITS_COMMAND: &str = "The selection starts or ends inside a command";
 
 // ───────────── Pure text functions ─────────────
 
@@ -214,6 +225,11 @@ pub fn style_edits(
             return Ok((edits, start - open..end - open));
         }
     }
+    // A backslash right before the selection (`\|textbf|`) would make the command's backslash
+    // a line break `\\`, and one ending it (`|50\|%`) would escape the `}`.
+    if ends_with_unescaped_backslash(before) || ends_with_unescaped_backslash(selected) {
+        return Err(SPLITS_COMMAND);
+    }
     // The command goes on the selection's first line and the `}` on its last: either both are
     // in a comment or neither is.
     let last_line = match selected.rfind('\n') {
@@ -339,7 +355,7 @@ fn run(state: &Rc<WindowState>, action: &str) {
         return;
     };
     let result = match action {
-        "toggle-comment" => toggle_comment_in(&editor),
+        "toggle-comment" => toggle_comment_in(state, &editor),
         "bold" => style_in(&editor, Style::Bold),
         "italic" => style_in(&editor, Style::Italic),
         "emphasize" => style_in(&editor, Style::Emphasis),
@@ -353,6 +369,75 @@ fn run(state: &Rc<WindowState>, action: &str) {
 /// Whether `path` is a document whose comments start with `%` (LaTeX and BibTeX).
 fn has_percent_comments(path: &Path) -> bool {
     crate::document::language_for(path).is_some_and(|l| l.id() == "latex" || l.id() == "bibtex")
+}
+
+/// How much of a file that loads biblatex and is not open [`biber_reads_bibliographies`] reads
+/// for its `backend` option: the preamble is at its start.
+const PREAMBLE_BYTES: u64 = 256 << 10;
+
+/// Whether biber reads the bibliographies of `state`'s project: biblatex is loaded (by an open
+/// document or a file of the project index) and no document that loads it chooses one of its
+/// BibTeX backends (`backend=bibtex`, `bibtex8`, `bibtexu`). A file of the index that is not
+/// open is read from disk for that (the start of it, once per Toggle Comment): the index knows
+/// that it loads biblatex, not with which options. A project with `\bibliography` and no
+/// biblatex is read by BibTeX.
+pub fn biber_reads_bibliographies(state: &WindowState) -> bool {
+    let loaders: Vec<PathBuf> = state
+        .workspace
+        .index
+        .borrow()
+        .files
+        .iter()
+        .filter(|(_, file)| file.packages.iter().any(|p| p == "biblatex"))
+        .map(|(path, _)| path.clone())
+        .collect();
+    let mut biblatex = !loaders.is_empty();
+    for doc in state.workspace.documents() {
+        if !completion::is_latex(doc.path()) {
+            continue;
+        }
+        let (uses, bibtex) = doc.with_text(|t| (crate::paste::uses_biblatex(t), bibtex_backend(t)));
+        if bibtex {
+            return false;
+        }
+        biblatex |= uses;
+    }
+    let on_disk = loaders
+        .iter()
+        .filter(|path| state.workspace.get(path).is_none());
+    for path in on_disk {
+        if read_start(path, PREAMBLE_BYTES).is_some_and(|text| bibtex_backend(&text)) {
+            return false;
+        }
+    }
+    biblatex
+}
+
+/// The first `cap` bytes of the regular file at `path` as text (invalid UTF-8 replaced).
+fn read_start(path: &Path, cap: u64) -> Option<String> {
+    use std::io::Read as _;
+    // Not blocking: opening a named pipe for reading would wait for a writer.
+    let file = crate::fsutil::open_nonblocking(path).ok()?;
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether `text` sets biblatex's `backend` option to one of BibTeX's programs (outside
+/// comments).
+fn bibtex_backend(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = crate::paste::strip_comment(line);
+        line.match_indices("backend").any(|(at, _)| {
+            line[at + "backend".len()..]
+                .trim_start()
+                .strip_prefix('=')
+                .is_some_and(|value| value.trim_start().starts_with("bibtex"))
+        })
+    })
 }
 
 /// The selection of `editor` (the cursor twice without one), and whether the cursor is at its
@@ -384,11 +469,14 @@ fn apply(editor: &Editor, edits: &[TextEdit]) -> Result<(), String> {
         .map_err(|e| format!("Could not change the text: {e}"))
 }
 
-/// `win.toggle-comment` in `editor`.
-pub fn toggle_comment_in(editor: &Editor) -> Result<(), String> {
+/// `win.toggle-comment` in `editor`, one of `state`'s.
+pub fn toggle_comment_in(state: &WindowState, editor: &Editor) -> Result<(), String> {
     let doc = editor.document();
     if !has_percent_comments(doc.path()) {
         return Err("Toggle Comment works in LaTeX and BibTeX documents".into());
+    }
+    if !completion::is_latex(doc.path()) && !biber_reads_bibliographies(state) {
+        return Err(BIB_WITHOUT_BIBER.into());
     }
     let (a, b, _) = selection(editor);
     let (start, end) = (doc.byte_offset(&a), doc.byte_offset(&b));
@@ -651,5 +739,33 @@ mod tests {
             styled(Style::Bold, "|50\\%|").as_deref(),
             Ok("\\textbf{|50\\%|}")
         );
+        // Cutting a command: `\textbf{50\}%` would escape the `}`, `\\textbf{textbf}` would
+        // be a line break.
+        assert_eq!(styled(Style::Bold, "|50\\|%"), Err(SPLITS_COMMAND));
+        assert_eq!(styled(Style::Bold, "\\|textbf|"), Err(SPLITS_COMMAND));
+        assert_eq!(styled(Style::Italic, "x \\|"), Err(SPLITS_COMMAND));
+        // A line break `\\` is no cut.
+        assert_eq!(
+            styled(Style::Bold, "|a\\\\|").as_deref(),
+            Ok("\\textbf{|a\\\\|}")
+        );
+        assert_eq!(
+            styled(Style::Bold, "a\\\\|b|").as_deref(),
+            Ok("a\\\\\\textbf{|b|}")
+        );
+    }
+
+    #[test]
+    fn bibtex_backends() {
+        assert!(bibtex_backend("\\usepackage[backend=bibtex]{biblatex}\n"));
+        assert!(bibtex_backend(
+            "\\usepackage[style=alphabetic, backend = bibtex8]{biblatex}"
+        ));
+        assert!(bibtex_backend(
+            "\\ExecuteBibliographyOptions{backend=bibtexu}"
+        ));
+        assert!(!bibtex_backend("\\usepackage[backend=biber]{biblatex}"));
+        assert!(!bibtex_backend("\\usepackage{biblatex}"));
+        assert!(!bibtex_backend("% \\usepackage[backend=bibtex]{biblatex}"));
     }
 }

@@ -22,8 +22,15 @@ pub type Test = (&'static str, fn());
 
 /// Initialises GTK (printing `SKIP: no display` and succeeding when there is no display), runs
 /// the tests that match the command-line filters, and reports like libtest.
+///
+/// With `LEMMA_TESTS_NEED_DISPLAY` set (`scripts/ci.sh` sets it: it gives the tests a display),
+/// no display is a failure: a whole test program skipped would pass for a run of its tests.
 pub fn run(tests: &[Test]) -> ExitCode {
     if gtk::init().is_err() {
+        if std::env::var_os("LEMMA_TESTS_NEED_DISPLAY").is_some() {
+            eprintln!("no display, and LEMMA_TESTS_NEED_DISPLAY is set: the GTK tests did not run");
+            return ExitCode::FAILURE;
+        }
         println!("SKIP: no display");
         return ExitCode::SUCCESS;
     }
@@ -43,7 +50,18 @@ pub fn run(tests: &[Test]) -> ExitCode {
         let started = Instant::now();
         let logged_before = logged_problems();
         EXPECTED.store(0, Ordering::SeqCst);
+        IN_TEST.set(true);
         let result = catch_unwind(AssertUnwindSafe(test));
+        IN_TEST.set(false);
+        // A test that found out part-way that it cannot run here (see [`skip`]) passes, like
+        // the tests that print `SKIP` and return; what its unwinding logged is not counted.
+        if let Err(payload) = &result
+            && let Some(Skip(reason)) = payload.downcast_ref()
+        {
+            println!("  SKIP: {reason}");
+            println!("test {name} ... ok ({:.2?})", started.elapsed());
+            continue;
+        }
         let unexpected =
             (logged_problems() - logged_before).saturating_sub(EXPECTED.load(Ordering::SeqCst));
         let ok = result.is_ok() && unexpected == 0;
@@ -72,11 +90,102 @@ pub fn run(tests: &[Test]) -> ExitCode {
     }
 }
 
+thread_local! {
+    /// Whether [`run`] is running a test (a helper that skips a test is also used by a
+    /// program's own set-up, before any test).
+    static IN_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// What [`skip`] unwinds with.
+struct Skip(String);
+
+/// Ends the running test as skipped: [`run`] prints `SKIP: reason` and counts it as passed.
+/// For a test that learns deep inside a helper that it cannot run on this system; a test that
+/// knows at its start prints `SKIP` and returns. (It unwinds without a panic message.)
+pub fn skip(reason: impl Into<String>) -> ! {
+    std::panic::resume_unwind(Box::new(Skip(reason.into())))
+}
+
+/// Whether the display can make key events: its keymap has a key for a letter. Under Wine
+/// (`packaging/windows/build.sh --test`) GDK finds no keyboard layout, so no keyval has a
+/// keycode and a key event made from one (`gtk_im_context_filter_key`) reaches nobody.
+pub fn has_keymap() -> bool {
+    use gtk::prelude::*;
+    gdk::Display::default().is_some_and(|d| d.map_keyval(gdk::Key::a).is_some())
+}
+
+/// For a test that synthesizes key events, before it does: on Windows without a keymap (Wine)
+/// the test is skipped. Everywhere else it goes on, and a missing keycode fails it.
+pub fn require_keymap() {
+    if cfg!(windows) && !has_keymap() {
+        skip("the display has no keymap (Wine has no keyboard layout for GDK): no key events");
+    }
+}
+
+/// For a test that makes Lemma send a file to the trash, before it does: skipped on Windows.
+/// The tests keep the trash in a temporary `XDG_DATA_HOME`, which Windows' Recycle Bin does not
+/// follow (the files would go to the user's own), and Wine asks in a dialog before it takes a
+/// file, which nobody answers.
+pub fn require_private_trash() {
+    if cfg!(windows) {
+        skip("on Windows the trash is the user's Recycle Bin (and Wine asks before each file)");
+    }
+}
+
+/// For a test whose stand-in for a program (latexmk, npm, node, latexindent, …) is a shell
+/// script made executable, before it writes one: skipped on Windows, which runs neither a `#!`
+/// script nor `cp` and `chmod`. Outside a test (a program's set-up before its tests) it does
+/// nothing.
+pub fn require_shell_scripts() {
+    if cfg!(windows) && IN_TEST.get() {
+        skip("the stand-in program is a shell script, which Windows does not run");
+    }
+}
+
+/// For a test that makes symbolic links, before it does: skipped on Windows, where making one
+/// needs a privilege most users do not have (the tests make them with Unix's call).
+pub fn require_symlinks() {
+    if cfg!(windows) {
+        skip("the test makes symbolic links, which need a privilege on Windows");
+    }
+}
+
+/// For a test whose files have a name Windows does not allow (with `<`, `>`, `:`, `"`, `|`, `?`
+/// or `*`), before it makes one: skipped there.
+pub fn require_any_file_name() {
+    if cfg!(windows) {
+        skip("Windows does not allow the file name the test uses");
+    }
+}
+
+/// For a test that shows or stores the API key, before it does: skipped on Windows. The tests'
+/// keyring is a stand-in `secret-tool` on their `PATH`; on Windows Lemma keeps the key in the
+/// user's Credential Manager, where a test must neither look nor write (one that stores its
+/// test key there would replace the user's own).
+pub fn require_stand_in_keyring() {
+    if cfg!(windows) {
+        skip("on Windows the API key is in the user's Credential Manager, not for tests");
+    }
+}
+
+/// `vim::feed_key` (a key press and release for Vim, made from the display's keymap) after
+/// [`require_keymap`].
+pub fn feed_vim_key(
+    im: &sourceview5::VimIMContext,
+    view: &lemma_app::editor::TexView,
+    keyval: gdk::Key,
+    state: gdk::ModifierType,
+) -> bool {
+    require_keymap();
+    lemma_app::editor::vim::feed_key(im, view, keyval, state)
+}
+
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 static EXPECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// Counts GLib/GTK warnings and criticals while still printing them. GLib accepts one writer
-/// per process; [`run`] installs it.
+/// per process; [`run`] installs it. With `LEMMA_TEST_BACKTRACE` set, a backtrace is printed
+/// before each one that counts.
 fn count_logged_problems() {
     glib::log_set_writer_func(|level, fields| {
         if matches!(
@@ -85,6 +194,10 @@ fn count_logged_problems() {
         ) && !is_environment_noise(fields)
         {
             LOGGED.fetch_add(1, Ordering::SeqCst);
+            // Who made GLib log it: the Rust frames below the C library's.
+            if std::env::var_os("LEMMA_TEST_BACKTRACE").is_some() {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
         }
         glib::log_writer_default(level, fields)
     });
@@ -97,7 +210,12 @@ fn count_logged_problems() {
 /// - GTK 4.24's Broadway backend warns about its own frame clock now and then (`Duplicate call
 ///   to gdk_frame_timings_submitted() with different values`, `… called on submitted frame`),
 ///   about once a second while frames are drawn. The function is internal to GDK, so nothing
-///   Lemma does can cause it.
+///   Lemma does can cause it;
+/// - on Windows under Wine (`packaging/windows/build.sh --test`), GDK's Win32 backend and GTK's
+///   input method warn about what Wine lacks: no presentation time for a frame, no blur behind
+///   a window, no properties of the input devices, no keyboard layout DLL, no list of the
+///   clipboard's formats; GIO finds no settings schemas beside a test program, and enchant's
+///   Windows spelling provider does not load.
 pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
     let field = |key: &str| {
         fields
@@ -106,9 +224,30 @@ pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
             .and_then(glib::LogField::value_str)
     };
     let message = field("MESSAGE");
-    match field("GLIB_DOMAIN") {
-        Some("libenchant") => message.is_some_and(|m| m.contains("Error loading plugin")),
-        Some("Gdk") => message.is_some_and(|m| m.contains("gdk_frame_timings_submitted()")),
+    let has = |parts: &[&str]| message.is_some_and(|m| parts.iter().any(|p| m.contains(p)));
+    let domain = field("GLIB_DOMAIN");
+    if cfg!(windows) {
+        let wine: &[&str] = match domain {
+            Some("Gdk") => &[
+                "gdk_frame_clock_presented: assertion 'presentation_time != 0'",
+                "DwmEnableBlurBehindWindow",
+                "Failed to get device node property",
+                "Failed to load keyboard layout DLL",
+                "Could not open registry key 'Keyboard Layout",
+                "GetUpdatedClipboardFormats() failed",
+            ],
+            Some("Gtk") => &["gtk_im_context_ime_message_filter: assertion"],
+            Some("GLib-GIO") => &["g_settings_schema_source_lookup: assertion 'source != NULL'"],
+            Some("libenchant") => &["EnchantProvider cannot be NULL"],
+            _ => &[],
+        };
+        if has(wine) {
+            return true;
+        }
+    }
+    match domain {
+        Some("libenchant") => has(&["Error loading plugin"]),
+        Some("Gdk") => has(&["gdk_frame_timings_submitted()"]),
         _ => false,
     }
 }
@@ -179,18 +318,147 @@ fn run_queue_wait() -> Option<Duration> {
     Some(Duration::from_nanos(nanos))
 }
 
+/// A path compiled into the test program, as a path of the system the program runs on. A
+/// Windows program built on Linux (`packaging/windows/build.sh --test`, run under Wine) has
+/// Linux's paths in it: `/home/…`, which Windows reads as relative to the current drive, so it
+/// is not absolute and is spelled unlike every path Lemma gets from the system. There it is made
+/// absolute, `Z:\home\…` (with `..` resolved and `\` between the names); elsewhere it is
+/// returned as it is.
+pub fn native(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if cfg!(windows) {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Cargo's directory for the temporary files of this package's tests
+/// (`CARGO_TARGET_TMPDIR`), see [`native`].
+pub fn target_tmpdir() -> PathBuf {
+    native(env!("CARGO_TARGET_TMPDIR"))
+}
+
+/// The directory of this package's `Cargo.toml` (`CARGO_MANIFEST_DIR`), see [`native`].
+pub fn manifest_dir() -> PathBuf {
+    native(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// `Path::canonicalize` as Lemma spells canonical paths (`lemma_core::canonicalize`): on Windows
+/// without the `\\?\` prefix that `std` adds, which no path of Lemma's has. The same elsewhere.
+pub trait Canonical {
+    fn canonical(&self) -> std::io::Result<PathBuf>;
+}
+
+impl<P: AsRef<Path> + ?Sized> Canonical for P {
+    fn canonical(&self) -> std::io::Result<PathBuf> {
+        lemma_core::canonicalize(self)
+    }
+}
+
+/// `rel` (a path with `/` between its names, as the tests write them) with the system's
+/// separator, as Lemma shows a path below the project root to the user: `chapters\a.tex` on
+/// Windows. Not for what the agent is told (tool replies, review feedback, prompts, the names
+/// `@` proposes): that has `/` on every system (`lemma_core::agent_path`), so a test compares
+/// it with `rel` as it is.
+pub fn shown(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// A fresh, empty directory for one test under cargo's per-test temp dir.
 pub fn temp_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-app-{}-{name}", std::process::id()));
+    let dir = target_tmpdir().join(format!("lemma-app-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the test directory");
     dir
 }
 
+/// The programs Lemma looks for on `PATH` to run an agent (and the keyring tool the API key
+/// backend asks), which a test's `PATH` must never find on the host: see
+/// [`system_programs_without`].
+pub const AGENT_PROGRAMS: &[&str] = &[
+    "node",
+    "nodejs",
+    "npm",
+    "npx",
+    "claude",
+    "pi",
+    "codex",
+    "grok",
+    "gemini",
+    "opencode",
+    "copilot",
+    "secret-tool",
+];
+
+/// A stand-in for the system's program directories (`/usr/bin`, `/bin`) on a test's `PATH`: a
+/// directory under `root` with a link to each of their programs except `hidden`. A fake
+/// program's script still finds `cat` or `sleep` there, but Lemma never finds the host's own
+/// node, npm or claude: with the real directories on `PATH`, a test that expects them missing
+/// passed or failed with what the machine had installed. (Empty outside Unix.)
+pub fn system_programs_without(root: &Path, hidden: &[&str]) -> PathBuf {
+    let dir = root.join("system-bin");
+    std::fs::create_dir_all(&dir).expect("create the system programs' stand-in");
+    #[cfg(unix)]
+    for system in ["/usr/bin", "/bin"] {
+        let Ok(entries) = std::fs::read_dir(system) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|n| hidden.contains(&n)) {
+                continue;
+            }
+            // As on `PATH`, the first directory's program wins (`/bin` is often `/usr/bin`).
+            let _ = std::os::unix::fs::symlink(entry.path(), dir.join(&name));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = hidden;
+    dir
+}
+
+/// The `PATH` of a test program that must not find the host's agent programs: `first` (the
+/// test's own directory of stand-ins), then [`system_programs_without`]`(root, hidden)`. On
+/// Windows, where that stand-in is empty, the directories of the `PATH` the program was started
+/// with follow, without those that hold one of `hidden`: Windows finds a program's libraries
+/// through `PATH` (the test program's own plugins, and the libraries of the programs it starts).
+pub fn path_without(first: &Path, root: &Path, hidden: &[&str]) -> std::ffi::OsString {
+    let mut dirs = vec![first.to_path_buf(), system_programs_without(root, hidden)];
+    if cfg!(windows) {
+        let holds_hidden = |dir: &Path| {
+            hidden.iter().any(|name| {
+                ["", ".exe", ".cmd", ".bat", ".com", ".ps1"]
+                    .iter()
+                    .any(|suffix| dir.join(format!("{name}{suffix}")).exists())
+            })
+        };
+        let started_with = std::env::var_os("PATH").unwrap_or_default();
+        dirs.extend(std::env::split_paths(&started_with).filter(|dir| !holds_hidden(dir)));
+    }
+    std::env::join_paths(dirs).expect("directories that PATH can hold")
+}
+
+/// Puts `home` back into `HOME`, for a test program that set it and reads it again later
+/// (`Paths::from_env`). On Windows the spell checker's library (enchant) replaces `HOME` with
+/// the user's profile directory when its providers load. Nothing happens elsewhere.
+pub fn restore_home(home: &Path) {
+    if cfg!(windows) {
+        // SAFETY: Windows' own call to set a variable is safe with other threads running.
+        unsafe { std::env::set_var("HOME", home) };
+    }
+}
+
+/// Whether enchant has an `en_US` spelling dictionary (hunspell's, aspell's, …). The tests that
+/// wait for spell checking need one: without it nothing is checked, so they print `SKIP` and
+/// pass, as the tests for programs that are not installed do. Call it after `gtk::init`.
+pub fn english_dictionary() -> bool {
+    libspelling::Provider::default().supports_language("en_US")
+}
+
 /// The repository's `tests/fixtures` directory.
 pub fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+    native(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"))
 }
 
 /// One registered application per test binary (without an id, so nothing is exported on
@@ -345,6 +613,21 @@ pub fn require_agent_binaries() {
         static BUILT: Cell<bool> = const { Cell::new(false) };
     }
     if BUILT.with(Cell::get) {
+        return;
+    }
+    // Whoever runs the tests built them already and says where they are (as for lemma-agent's
+    // tests): `packaging/windows/build.sh --test`, whose Windows test programs under Wine
+    // cannot run Linux's cargo (given this program's `Z:\…` path as the target directory, it
+    // made a directory of that name here).
+    if std::env::var_os(lemma_app::testmode::FAKE_AGENT_ENV).is_some()
+        && std::env::var_os("LEMMA_MCP_BRIDGE").is_some()
+    {
+        assert!(
+            lemma_app::testmode::sibling_binary("lemma-mcp").is_some()
+                && lemma_app::testmode::fake_agent_binary().is_some(),
+            "LEMMA_FAKE_AGENT is not a program, or lemma-mcp is not next to the test's directory"
+        );
+        BUILT.with(|b| b.set(true));
         return;
     }
     let exe = std::env::current_exe().unwrap();

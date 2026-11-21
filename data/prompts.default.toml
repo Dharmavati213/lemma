@@ -5,8 +5,9 @@
 # Put your own in ~/.config/lemma/prompts.toml: a template with the same name replaces one of
 # these, one with `prompt = ""` removes it.
 #
-# Placeholders: {selection}, {file} (relative to the project root), {line} (1-based) and
-# {diagnostic}. Any other {…} (such as \begin{align}) is kept as written.
+# Placeholders: {selection}, {file} (relative to the project root, with / between its names
+# on every system), {line} (1-based) and {diagnostic}. Any other {…} (such as \begin{align}) is
+# kept as written.
 # Fields: name, prompt, context ("selection" | "diagnostic" | "file"), needs_selection, key
 # (an optional GTK accelerator such as "<Control><Alt>p").
 

@@ -66,7 +66,8 @@ pub struct Link {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkDest {
     /// A page of the same document: 0-based `page`, and the target's y in bp from the top of that page
-    /// when the destination names one (`None` = the top of the page).
+    /// as displayed (also on a page turned by `/Rotate`) when the destination names one (`None` =
+    /// the top of the page).
     Page { page: u32, y_bp: Option<f64> },
     /// An external URI.
     Uri(String),
@@ -86,8 +87,10 @@ pub struct OutlineItem {
     pub children: Vec<OutlineItem>,
 }
 
-/// How [`PdfCmd::Search`] matches. The default is case-insensitive, ignores diacritics when the
-/// query has none (poppler's rule), and matches inside words and across line breaks.
+/// How [`PdfCmd::Search`] matches. The default is case-insensitive (`ß` is `ss`), ignores
+/// diacritics when the query has none (poppler's rule), reads ligatures as their letters, and
+/// matches inside words, across line breaks and across a page break inside a hyphenated word
+/// (reported on the page where the match starts).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SearchOptions {
     pub case_sensitive: bool,
@@ -192,9 +195,13 @@ pub enum PdfEvent {
     /// there is no document, no SyncTeX data or no match). Note that [`SyncBox::page`] is 1-based.
     /// Boxes are in the space of the page as displayed (the `page_sizes` of [`PdfEvent::Opened`]), also on
     /// pages turned by `/Rotate`.
-    /// `generation` is that of the current document, or 0 when none is open.
+    /// `generation` is that of the current document, or 0 when none is open. `file` and `line` are
+    /// the query's, as it was sent: they tell which of several queries this answers (a query a
+    /// restart of the thread lost gets no answer).
     Forward {
         generation: u64,
+        file: PathBuf,
+        line: u32,
         boxes: Vec<SyncBox>,
     },
     /// Answer to [`PdfCmd::Inverse`].

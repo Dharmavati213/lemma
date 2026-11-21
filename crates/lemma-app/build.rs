@@ -56,6 +56,12 @@ fn main() {
          (tried {})",
         candidates.join(", ")
     );
+    // A file that is never there makes cargo run this script again on every build, so a windres
+    // installed later is found (else only a change of the files above would).
+    println!(
+        "cargo:rerun-if-changed={}",
+        out.join("windres-not-found").display()
+    );
 }
 
 /// The resource script: the icon, the manifest (`RT_MANIFEST`, id 1) and the version.

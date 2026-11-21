@@ -17,9 +17,11 @@ makedepends=('cargo')
 optdepends=(
   'texlive-binextra: latexmk (builds) and chktex (lint)'
   'texlive-latexextra: the usual LaTeX packages'
+  'texlive-bibtexextra: biblatex'
+  'biber: bibliographies with biblatex'
   'hunspell-en_us: English spell checking'
-  'nodejs: the Claude Code agent (its ACP adapter)'
-  'npm: installing the agent adapter from the agent pane'
+  'nodejs: the Claude Code, Codex and Pi agents (their ACP adapters)'
+  'npm: installing an agent adapter from the agent pane'
   'git: the git gutter'
 )
 # No source array: build() uses the checkout around this directory as it is.
@@ -37,6 +39,8 @@ build() {
   # The build stays in makepkg's $srcdir; the repository's own target/ is not touched.
   export CARGO_TARGET_DIR="$srcdir/target"
   cargo build --release --locked -p lemma-app -p lemma-mcp
+  # The licences of the Rust crates compiled into the two programs.
+  cargo run -q --locked -p xtask -- licenses > "$srcdir/LICENSE.crates"
 }
 
 check() {
@@ -53,6 +57,8 @@ package() {
     "$pkgdir/usr/share/applications/io.github.lemma_editor.Lemma.desktop"
   install -Dm644 packaging/io.github.lemma_editor.Lemma.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg"
+  install -Dm644 packaging/io.github.lemma_editor.Lemma.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.lemma_editor.Lemma.metainfo.xml"
 
   # The defaults built into lemma, as examples for ~/.config/lemma/.
   install -Dm644 -t "$pkgdir/usr/share/lemma" data/snippets.default.toml data/prompts.default.toml
@@ -62,4 +68,5 @@ package() {
   fi
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/LICENSE.crates" "$pkgdir/usr/share/licenses/$pkgname/LICENSE.crates"
 }

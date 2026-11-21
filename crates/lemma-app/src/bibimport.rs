@@ -15,7 +15,11 @@
 //! and is **appended to the `.bib` file as a reviewable hunk** (applied like a restore from
 //! History: `Origin::Agent { call: 0 }` outside any agent turn, then saved), so it can be
 //! rejected like an agent's change. An entry whose DOI or arXiv ID is already in the file is not
-//! added again; its key is used.
+//! added again; its key is used. A file in another encoding than UTF-8 (Latin-1, read as
+//! ISO-8859-15) keeps it, and an entry with characters it cannot hold is refused, saying which,
+//! before anything changes ([`unwritable`]). A new file gets its document only once the entry
+//! has arrived, and goes again when it cannot be made: an import that fails leaves nothing
+//! behind.
 //!
 //! **Tests** never reach the real network: `LEMMA_DOI_URL` and `LEMMA_ARXIV_URL` replace the two
 //! endpoints ([`Endpoints::from_env`]), and the tests serve them from a local fake server.
@@ -70,7 +74,13 @@ impl Identifier {
 
 /// Recognises an arXiv ID or a DOI, with or without a prefix or link.
 pub fn parse_identifier(input: &str) -> Result<Identifier, String> {
-    let s = input.trim();
+    // Invisible characters a copy from a web page can bring along (zero-width spaces and
+    // joiners, a byte-order mark) are no part of an ID; sent along, nothing would be found.
+    let visible: String = input
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .collect();
+    let s = visible.trim();
     let lower = s.to_ascii_lowercase();
     let strip = |prefixes: &[&str]| {
         prefixes
@@ -83,7 +93,10 @@ pub fn parse_identifier(input: &str) -> Result<Identifier, String> {
         "http://doi.org/",
         "https://dx.doi.org/",
         "http://dx.doi.org/",
+        "https://www.doi.org/",
+        "http://www.doi.org/",
         "doi.org/",
+        "www.doi.org/",
         "doi:",
     ];
     let arxiv_prefixes = [
@@ -91,7 +104,10 @@ pub fn parse_identifier(input: &str) -> Result<Identifier, String> {
         "http://arxiv.org/abs/",
         "https://arxiv.org/pdf/",
         "http://arxiv.org/pdf/",
+        "https://export.arxiv.org/abs/",
+        "http://export.arxiv.org/abs/",
         "arxiv.org/abs/",
+        "arxiv.org/pdf/",
         "arxiv:",
     ];
     if let Some(doi) = strip(&doi_prefixes) {
@@ -100,6 +116,7 @@ pub fn parse_identifier(input: &str) -> Result<Identifier, String> {
             .ok_or_else(|| format!("“{doi}” is not a DOI"));
     }
     if let Some(id) = strip(&arxiv_prefixes) {
+        let id = id.trim_end_matches('/');
         let id = id.strip_suffix(".pdf").unwrap_or(id);
         return valid_arxiv(id)
             .then(|| Identifier::Arxiv(id.to_owned()))
@@ -230,6 +247,10 @@ pub fn fetch(endpoints: &Endpoints, id: &Identifier) -> Result<BibEntry, String>
     };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
+        // Once on HTTPS, a redirect (doi.org sends the request on to the publisher) may not
+        // leave it: an entry fetched over plain HTTP could be anybody's. (The tests' local
+        // servers speak plain HTTP from the start.)
+        .https_only(url.starts_with("https://"))
         .http_status_as_error(false)
         .user_agent(concat!(
             "Lemma/",
@@ -453,6 +474,8 @@ pub fn find_duplicate(bib: &str, id: &Identifier) -> Option<String> {
     // lower-casing does not: `İ` gets longer, the Kelvin sign shorter).
     let lower = bib.to_ascii_lowercase();
     let mut from = 0;
+    // Found once a match needs them.
+    let mut starts: Option<Vec<usize>> = None;
     while let Some(found) = lower[from..].find(&needle) {
         let at = from + found;
         from = at + needle.len();
@@ -466,7 +489,8 @@ pub fn find_duplicate(bib: &str, id: &Identifier) -> Option<String> {
             continue;
         }
         // An ID before the first entry (in a comment) is not an entry's.
-        let Some(entry_start) = bib[..at].rfind('@') else {
+        let starts = starts.get_or_insert_with(|| entry_starts(bib));
+        let Some(&entry_start) = starts.iter().rev().find(|&&s| s < at) else {
             continue;
         };
         return parse_bibtex(&bib[entry_start..])
@@ -477,16 +501,53 @@ pub fn find_duplicate(bib: &str, id: &Identifier) -> Option<String> {
     None
 }
 
-/// The edit appending `entry` to the text `bib`, after a blank line.
+/// The offsets of the `@` of the entries of `bib`, in order: an `@` followed by a name and `{`
+/// or `(`, outside braces or at the start of a line (where a brace left open by a broken entry
+/// is forgotten). An `@` inside a field's braces (a URL, an e-mail address) starts none.
+fn entry_starts(bib: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut depth = 0usize;
+    for (i, b) in bib.bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'@' => {
+                let before = bib[..i].trim_end_matches([' ', '\t']);
+                let line_start = before.is_empty() || before.ends_with('\n');
+                let rest = &bib[i + 1..];
+                let name = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                if (depth == 0 || line_start)
+                    && name > 0
+                    && rest[name..].trim_start().starts_with(['{', '('])
+                {
+                    depth = 0;
+                    starts.push(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    starts
+}
+
+/// The edit appending `entry` to the text `bib`, after a blank line, with the line breaks of
+/// `bib` (CRLF when it has them).
 pub fn append_edit(bib: &str, entry: &str) -> TextEdit {
-    let sep = if bib.trim().is_empty() || bib.ends_with("\n\n") {
+    let sep = if bib.trim().is_empty() || bib.ends_with("\n\n") || bib.ends_with("\n\r\n") {
         ""
     } else if bib.ends_with('\n') {
         "\n"
     } else {
         "\n\n"
     };
-    TextEdit::insert(bib.len(), format!("{sep}{entry}"))
+    let text = format!("{sep}{entry}");
+    if bib.contains("\r\n") {
+        TextEdit::insert(bib.len(), text.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        TextEdit::insert(bib.len(), text)
+    }
 }
 
 /// A key `lastname2020word` from the first author's last name, the year and the first word of
@@ -598,11 +659,15 @@ pub fn arxiv_to_bibtex(atom: &str, id: &str) -> Result<BibEntry, String> {
         .chars()
         .take(4)
         .collect();
-    // The record's ID (with its version) names the article, not what the user typed.
+    // The record's ID (with its version) names the article, not what the user typed; it goes
+    // into the key and the URL as it is, so it must be an arXiv ID (else what the user typed
+    // is used).
     let eprint = entry_id
         .rsplit_once("/abs/")
-        .map_or_else(|| id.to_owned(), |(_, id)| id.to_owned());
-    let eprint = strip_version(&eprint).to_owned();
+        .map(|(_, record)| record)
+        .filter(|record| valid_arxiv(record))
+        .unwrap_or(id);
+    let eprint = strip_version(eprint).to_owned();
     let class = attribute(entry, "arxiv:primary_category", "term");
     let doi = element(entry, "arxiv:doi").map(xml_text);
     let journal = element(entry, "arxiv:journal_ref").map(xml_text);
@@ -667,7 +732,8 @@ fn attribute(xml: &str, name: &str, attr: &str) -> Option<String> {
     let tag = &xml[at..at + xml[at..].find('>')?];
     let key = format!("{attr}=");
     let v = &tag[tag.find(&key)? + key.len()..];
-    let quote = v.chars().next()?;
+    // A quote (one byte) or nothing: what the server sent is not trusted.
+    let quote = v.chars().next().filter(|c| matches!(c, '"' | '\''))?;
     let v = &v[1..];
     Some(xml_unescape(&v[..v.find(quote)?]))
 }
@@ -766,15 +832,33 @@ pub async fn add_citation(
     bib: &Path,
     cite: Option<&Rc<Editor>>,
 ) -> Result<Added, String> {
+    add_citation_unless(state, input, bib, cite, &|| false).await
+}
+
+/// [`add_citation`], given up when `cancelled()` is true once the entry has arrived (the dialog
+/// was closed while it was fetched): then nothing is appended, and no `\cite` lands where the
+/// cursor happens to be by then.
+async fn add_citation_unless(
+    state: &Rc<WindowState>,
+    input: &str,
+    bib: &Path,
+    cite: Option<&Rc<Editor>>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Added, String> {
     let id = parse_identifier(input)?;
     let bib = normalize(bib);
-    let new_file = state.workspace.get(&bib).is_none() && !bib.exists();
-    let doc = if new_file {
-        state.workspace.create_closed(&bib)
+    let is_new = |bib: &Path| state.workspace.get(bib).is_none() && !bib.exists();
+    // A new file gets a document only once there is an entry to put in it: an import that fails
+    // leaves nothing behind.
+    let existing = if is_new(&bib) {
+        None
     } else {
-        state.workspace.get_or_load(&bib).await?
+        Some(state.workspace.get_or_load(&bib).await?)
     };
-    let added = match doc.with_text(|text| find_duplicate(text, &id)) {
+    let duplicate = existing
+        .as_ref()
+        .and_then(|doc| doc.with_text(|text| find_duplicate(text, &id)));
+    let added = match duplicate {
         Some(key) => Added {
             key,
             appended: false,
@@ -785,26 +869,81 @@ pub async fn add_citation(
             let mut entry = gio::spawn_blocking(move || fetch(&endpoints, &fetched))
                 .await
                 .unwrap_or_else(|_| Err("Fetching the entry failed".into()))?;
-            // The text may have changed while the request ran.
-            let edit = doc.with_text(|text| {
-                entry.key = unique_key(&entry.key, &existing_keys(text));
-                append_edit(text, &entry.to_bibtex())
+            if cancelled() {
+                return Err("The entry arrived after the dialog was closed".into());
+            }
+            // The file may have been made while the request ran. A document that left the
+            // workspace meanwhile (its tab closed, its unsaved changes discarded) still holds
+            // those changes: the file is read again instead, so they are never saved.
+            let existing = existing.filter(|doc| {
+                state
+                    .workspace
+                    .get(&bib)
+                    .is_some_and(|now| Rc::ptr_eq(&now, doc))
             });
-            review_ui::start_review(&doc, new_file);
-            review_ui::outside_turn(&doc, || doc.apply_edits(&[edit], Origin::Agent { call: 0 }))
-                .map_err(|e| format!("Cannot add the entry to {}: {e}", doc.display_name()))?;
-            review_ui::recompute(&doc);
-            doc.save()
-                .await
-                .map_err(|e| format!("Added, but saving {} failed: {e}", doc.display_name()))?;
-            Added {
-                key: entry.key,
-                appended: true,
+            let new_file = existing.is_none() && is_new(&bib);
+            let doc = match existing {
+                Some(doc) => doc,
+                None if new_file => state.workspace.create_closed(&bib),
+                None => state.workspace.get_or_load(&bib).await?,
+            };
+            // The text may have changed while the request ran (the same entry added meanwhile,
+            // by another request).
+            let edit = doc.with_text(|text| match find_duplicate(text, &id) {
+                Some(key) => Err(key),
+                None => {
+                    entry.key = unique_key(&entry.key, &existing_keys(text));
+                    Ok(append_edit(text, &entry.to_bibtex()))
+                }
+            });
+            match edit {
+                Err(key) => Added {
+                    key,
+                    appended: false,
+                },
+                Ok(edit) => {
+                    // A file in another encoding keeps it (the saver writes the text in the
+                    // charset it was read with): an entry it cannot hold is refused before
+                    // anything changes.
+                    if let Some(charset) = doc.charset() {
+                        let missing = crate::saver::unwritable(&edit.text, &charset);
+                        if !missing.is_empty() {
+                            return Err(format!(
+                                "Nothing was added: {} is in the {charset} encoding, which \
+                                 cannot hold {} of the new entry",
+                                doc.display_name(),
+                                crate::saver::quoted_chars(&missing)
+                            ));
+                        }
+                    }
+                    review_ui::start_review(&doc, new_file);
+                    let turn = review_ui::begin_named_change(state, "Add Citation");
+                    review_ui::in_turn(&doc, turn, || {
+                        doc.apply_edits(&[edit], Origin::Agent { call: 0 })
+                    })
+                    .map_err(|e| format!("Cannot add the entry to {}: {e}", doc.display_name()))?;
+                    review_ui::recompute(&doc);
+                    if let Err(e) = doc.save().await {
+                        let name = doc.display_name();
+                        // A new file that could not be made goes again, with its hunk.
+                        if new_file && !doc.is_open() {
+                            review_ui::drop_review(&doc);
+                            state.workspace.release(&doc);
+                            return Err(format!("Could not create {name}: {e}"));
+                        }
+                        return Err(format!("Added, but saving {name} failed: {e}"));
+                    }
+                    Added {
+                        key: entry.key,
+                        appended: true,
+                    }
+                }
             }
         }
     };
     if let Some(editor) = cite
         && editor.document().is_open()
+        && !cancelled()
     {
         let buffer = editor.buffer();
         buffer.begin_user_action();
@@ -854,6 +993,8 @@ pub struct CitationDialog {
     /// The editor `\cite` goes into.
     editor: Option<Weak<Editor>>,
     busy: Cell<bool>,
+    /// The dialog was closed: an entry still being fetched is given up.
+    closed: Cell<bool>,
 }
 
 thread_local! {
@@ -930,7 +1071,15 @@ pub fn show(state: &Rc<WindowState>) {
         let d = CitationDialog::new(&state, bibs, editor.as_ref());
         DIALOGS.with_borrow_mut(|list| list.push(d.clone()));
         d.dialog.connect_closed(|dialog| {
-            DIALOGS.with_borrow_mut(|list| list.retain(|d| &d.dialog != dialog));
+            DIALOGS.with_borrow_mut(|list| {
+                list.retain(|d| {
+                    let this = &d.dialog == dialog;
+                    if this {
+                        d.closed.set(true);
+                    }
+                    !this
+                });
+            });
         });
         d.dialog.set_focus(Some(&d.entry));
         d.dialog.present(Some(&state.window));
@@ -1029,6 +1178,7 @@ impl CitationDialog {
             error,
             editor: tex_editor.map(Rc::downgrade),
             busy: Cell::new(false),
+            closed: Cell::new(false),
         });
         let weak = Rc::downgrade(&this);
         this.entry.connect_changed(move |entry| {
@@ -1093,13 +1243,16 @@ impl CitationDialog {
             .flatten();
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let result = add_citation(&state, &input, &bib, editor.as_ref()).await;
+            let closed = || this.closed.get();
+            let result = add_citation_unless(&state, &input, &bib, editor.as_ref(), &closed).await;
             this.busy.set(false);
             this.spinner.set_visible(false);
             this.add_button.set_sensitive(true);
             match result {
                 Ok(added) => {
-                    this.dialog.close();
+                    if !this.closed.get() {
+                        this.dialog.close();
+                    }
                     let name = bib
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -1170,6 +1323,27 @@ mod tests {
         assert_eq!(
             parse_identifier("https://arxiv.org/pdf/2301.01234v1.pdf"),
             Ok(arxiv("2301.01234v1"))
+        );
+        // Other links that point at the same records, and what a copy from a web page brings.
+        assert_eq!(
+            parse_identifier("https://www.doi.org/10.1000/x"),
+            Ok(doi("10.1000/x"))
+        );
+        assert_eq!(
+            parse_identifier("https://export.arxiv.org/abs/2301.01234"),
+            Ok(arxiv("2301.01234"))
+        );
+        assert_eq!(
+            parse_identifier("arxiv.org/pdf/2301.01234"),
+            Ok(arxiv("2301.01234"))
+        );
+        assert_eq!(
+            parse_identifier("https://arxiv.org/abs/2301.01234/"),
+            Ok(arxiv("2301.01234"))
+        );
+        assert_eq!(
+            parse_identifier("\u{feff}10.1000/\u{200b}x"),
+            Ok(doi("10.1000/x"))
         );
         for bad in [
             "",
@@ -1292,6 +1466,45 @@ mod tests {
         );
     }
 
+    /// An `@` inside a field (a URL, an e-mail address) before the ID does not start an entry:
+    /// the duplicate is the entry that holds the ID.
+    #[test]
+    fn duplicates_with_an_at_sign_in_a_field() {
+        let bib = "@article{a, url = {https://medium.com/@me/post}, doi = {10.1000/x}}\n\
+                   @article{b, title = {B}}\n";
+        assert_eq!(
+            find_duplicate(bib, &Identifier::Doi("10.1000/x".into())).as_deref(),
+            Some("a")
+        );
+        let bib = "@misc{only, note = \"mail me@example.org\", eprint = {2301.01234}}\n";
+        assert_eq!(
+            find_duplicate(bib, &Identifier::Arxiv("2301.01234".into())).as_deref(),
+            Some("only")
+        );
+        let bib = "@misc{paren, title = {The @ operator}, doi = {10.1000/p}}\n";
+        assert_eq!(
+            find_duplicate(bib, &Identifier::Doi("10.1000/p".into())).as_deref(),
+            Some("paren")
+        );
+    }
+
+    /// What arXiv answers is checked before it reaches the `.bib`: an odd record ID does not
+    /// break the entry, and an attribute that starts with a multi-byte character does not panic.
+    #[test]
+    fn odd_arxiv_answers_are_refused_or_ignored() {
+        let odd_id = ATOM.replace(
+            "http://arxiv.org/abs/2301.01234v2",
+            "http://arxiv.org/abs/a}b,c",
+        );
+        let e = arxiv_to_bibtex(&odd_id, "2301.01234").unwrap();
+        assert_eq!(e.field("eprint"), Some("2301.01234"));
+        assert_eq!(e.field("url"), Some("https://arxiv.org/abs/2301.01234"));
+        assert_eq!(parse_bibtex(&e.to_bibtex()).unwrap(), e);
+        let odd_term = ATOM.replace("term=\"math.AG\"", "term=é\"x\"");
+        let e = arxiv_to_bibtex(&odd_term, "2301.01234").unwrap();
+        assert_eq!(e.field("primaryclass"), None);
+    }
+
     #[test]
     fn appending_leaves_one_blank_line() {
         let e = "@misc{k,\n}\n";
@@ -1300,6 +1513,13 @@ mod tests {
         assert_eq!(append_edit("@a{x,}", e).text, format!("\n\n{e}"));
         assert_eq!(append_edit("@a{x,}\n\n", e).text, e);
         assert_eq!(append_edit("@a{x,}", e).range, 6..6);
+        // A file with CRLF line breaks keeps them.
+        assert_eq!(append_edit("@a{x,}\r\n", e).text, "\r\n@misc{k,\r\n}\r\n");
+        assert_eq!(append_edit("@a{x,}\r\n\r\n", e).text, "@misc{k,\r\n}\r\n");
+        assert_eq!(
+            append_edit("@a{x,}\r\n@b{y,}", e).text,
+            "\r\n\r\n@misc{k,\r\n}\r\n"
+        );
     }
 
     pub(super) const ATOM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

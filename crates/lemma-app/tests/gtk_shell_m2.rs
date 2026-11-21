@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use gtk::gdk;
 use lemma_agent::{AgentEvent, EditorRequest, PromptBlock, StopReason, ToolReply};
@@ -341,7 +343,11 @@ fn key_layer() {
 }
 
 fn editor_menus() {
-    let f = fixture("editor-menus", &[("main.tex", "x\n")]);
+    // Without spell checking: its own section comes with the first frame, where there is a
+    // dictionary (the test puts a stand-in for it below).
+    let f = fixture_with("editor-menus", &[("main.tex", "x\n")], |c| {
+        c.spell.enabled = false;
+    });
     // WP2.5's quick actions already fill the section (a "Claude" submenu).
     let before = f.state.editor_menu.n_items();
     f.state
@@ -563,9 +569,11 @@ fn settings_watcher() {
     common::pump_for(Duration::from_millis(500));
     assert!(seen.borrow().is_empty(), "a dropped watcher is silent");
 
-    // `/dev/null` (LEMMA_CONFIG in golden tests) is not watched.
-    let null = settings::Watcher::start(&SettingsFiles::next_to("/dev/null".into()), |_| {});
-    assert_eq!(null.len(), 2, "only the two missing files next to it");
+    // `/dev/null` (LEMMA_CONFIG in golden tests) is not watched. (Windows has no such file.)
+    if !cfg!(windows) {
+        let null = settings::Watcher::start(&SettingsFiles::next_to("/dev/null".into()), |_| {});
+        assert_eq!(null.len(), 2, "only the two missing files next to it");
+    }
 }
 
 // ----- saves, problems, notifications, root -----
@@ -585,7 +593,7 @@ fn saves_are_announced() {
     assert_eq!(
         *saved.borrow(),
         [(
-            f.path("main.tex").canonicalize().unwrap(),
+            f.path("main.tex").canonical().unwrap(),
             "typed\nx\n".to_owned()
         )]
     );
@@ -606,7 +614,7 @@ fn ask_agent_to_fix() {
         &[("main.tex", "a\nb\nc\nd\n"), ("ch.tex", "x\ny\n")],
     );
     let build = f.state.build.get().unwrap();
-    let path = f.path("main.tex").canonicalize().unwrap();
+    let path = f.path("main.tex").canonical().unwrap();
     let problem = Problem {
         path: path.clone(),
         line: Some(3),
@@ -616,7 +624,7 @@ fn ask_agent_to_fix() {
         source: DiagSource::Tex,
     };
     let closed = Problem {
-        path: f.path("ch.tex").canonicalize().unwrap(),
+        path: f.path("ch.tex").canonical().unwrap(),
         line: Some(2),
         ..problem.clone()
     };
@@ -706,7 +714,7 @@ fn root_changes() {
             .push(state.workspace.root().path().to_path_buf());
     });
     block_on(f.state.open_file(&other.join("doc.tex"))).unwrap();
-    assert_eq!(*roots.borrow(), [other.canonicalize().unwrap()]);
+    assert_eq!(*roots.borrow(), [other.canonical().unwrap()]);
     // Not empty any more: the root stays.
     std::fs::write(f.dir.join("x.tex"), "y\n").unwrap();
     block_on(f.state.open_file(&f.dir.join("x.tex"))).unwrap();
@@ -750,7 +758,8 @@ fn tool_dispatch() {
 fn sibling_binaries() {
     // This test runs from `target/<profile>/deps/`; the `lemma` binary is one level up.
     let lemma = testmode::sibling_binary("lemma").expect("lemma next to the test's directory");
-    assert_eq!(lemma.file_name().unwrap(), "lemma");
+    let name = format!("lemma{}", std::env::consts::EXE_SUFFIX);
+    assert_eq!(lemma.file_name().unwrap(), name.as_str());
     assert!(testmode::sibling_binary("no-such-helper").is_none());
 }
 

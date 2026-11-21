@@ -466,6 +466,11 @@ impl ViewReview {
             .unwrap_or_default()
     }
 
+    /// The x (buffer coordinates) the deleted text starts at (tests).
+    pub fn phantom_origin(&self) -> Option<i32> {
+        self.view.upgrade().map(|view| text_origin(&view))
+    }
+
     /// Reading mode: bands shrink to their header and deleted text is hidden.
     pub fn set_reading(&self, on: bool) {
         if self.reading.replace(on) != on {
@@ -717,14 +722,21 @@ impl ViewReview {
                     base + bytes.start as usize..base + bytes.end as usize
                 }),
         );
-        // The anchor lines by the space they reserve, above or below them.
+        // The anchor lines by the space they reserve, above or below them. While GTK breaks
+        // lines that `LineIndex` does not (a lone `\r`, U+2029), only the part of an anchor line
+        // that reserves the space is tagged (see `gtk_line_part`), found in one copy of the text.
+        let gtk_breaks = u32::try_from(self.buffer.line_count()).ok() != Some(line_count);
+        let text = gtk_breaks.then(|| crate::document::buffer_text(&self.buffer));
         let mut top = 0;
         let mut lines: Vec<((bool, i32), Range<usize>)> = Vec::new();
         for group in &plan.groups {
             match group.anchor {
                 Anchor::Above(line) | Anchor::Below(line) if line < line_count => {
                     let below = matches!(group.anchor, Anchor::Below(_));
-                    let range = index.line_start(line)..line_end(&index, line + 1);
+                    let mut range = index.line_start(line)..line_end(&index, line + 1);
+                    if let Some(text) = &text {
+                        range = gtk_line_part(text, range, below);
+                    }
                     lines.push(((below, group.space), range));
                 }
                 Anchor::Top => top += group.space,
@@ -1018,7 +1030,11 @@ impl ViewReview {
             .iter()
             .find(|a| a.below == below && a.space == group.space)?
             .tag;
-        let mut iter = doc.iter_at_byte(index.line_start(line))?;
+        let mut iter = if below {
+            last_gtk_line(doc, index, line)?
+        } else {
+            doc.iter_at_byte(index.line_start(line))?
+        };
         if iter.has_tag(tag) {
             return Some(line);
         }
@@ -1032,11 +1048,16 @@ impl ViewReview {
 
     /// Top of the space `group` reserves when its anchor is on `line` (buffer coordinates).
     fn group_top(&self, view: &TexView, doc: &Document, group: &Group, line: u32) -> Option<i32> {
-        let offset = doc.line_index().line_start(line);
-        let (y, height) = view.line_yrange(&doc.iter_at_byte(offset)?);
+        let index = doc.line_index();
         Some(match group.anchor {
-            Anchor::Below(_) => y + height - group.space,
-            _ => y,
+            Anchor::Below(_) => {
+                let (y, height) = view.line_yrange(&last_gtk_line(doc, &index, line)?);
+                y + height - group.space
+            }
+            _ => {
+                view.line_yrange(&doc.iter_at_byte(index.line_start(line))?)
+                    .0
+            }
         })
     }
 
@@ -1166,9 +1187,9 @@ impl ViewReview {
                 Some(last) if !lines.is_empty() => {
                     let index = doc.line_index();
                     let last = last.min(index.line_count().saturating_sub(1));
-                    let offset = index.line_start(last);
+                    let iter = last_gtk_line(&doc, &index, last);
                     drop(index);
-                    doc.iter_at_byte(offset).map_or(y0 + header, |iter| {
+                    iter.map_or(y0 + header, |iter| {
                         let (y, h) = view.line_yrange(&iter);
                         y + h - self.below_space_on(&doc, &plan, last)
                     })
@@ -1223,9 +1244,23 @@ impl ViewReview {
                     .is_some_and(|h| h.user_touched && h.cur_lines.contains(&line))
             })
         };
+        // GTK also ends a line after a lone `\r` and after U+2029: of the GTK lines of `line`,
+        // the first has its space above and the last its space below.
+        let first = || {
+            let mut previous = *iter;
+            !previous.backward_char() || previous.char() == '\n'
+        };
+        let last = || {
+            let mut next = *iter;
+            !next.forward_line() || (next.backward_char() && next.char() == '\n')
+        };
         for (g, _) in self.groups_on(&doc, &plan, line..line + 1) {
             let group = &plan.groups[g];
             let below = matches!(group.anchor, Anchor::Below(_));
+            let reserved_here = if below { last() } else { first() };
+            if !reserved_here {
+                continue;
+            }
             if below {
                 marks.below_total = group.space;
             }
@@ -1641,24 +1676,65 @@ fn line_end(index: &LineIndex, line: u32) -> usize {
     }
 }
 
+/// The part of the line `range` of `text` (a `\n` line and its `\n`) that an anchor tag covers.
+/// GTK also ends a line after a lone `\r` and after U+2029, and gives each of its lines the
+/// spacing of the tags at its start: tagged whole, such a line would reserve the space once per
+/// GTK line. So space above is reserved by the first of its GTK lines, and space below by the
+/// last.
+fn gtk_line_part(text: &str, range: Range<usize>, below: bool) -> Range<usize> {
+    let line = &text[range.clone()];
+    let bytes = line.as_bytes();
+    // Where GTK starts a line inside this one (not after its last character).
+    let mut starts = line
+        .char_indices()
+        .filter_map(|(i, c)| match c {
+            '\r' if bytes.get(i + 1) != Some(&b'\n') => Some(i + 1),
+            '\u{2029}' => Some(i + c.len_utf8()),
+            _ => None,
+        })
+        .filter(|&start| start < line.len());
+    if below {
+        starts
+            .next_back()
+            .map_or(range.clone(), |start| range.start + start..range.end)
+    } else {
+        starts
+            .next()
+            .map_or(range.clone(), |start| range.start..range.start + start)
+    }
+}
+
+/// The start of the last GTK line of `line` (in `index`'s numbering) of `doc`'s text, where
+/// space below it is reserved (see [`gtk_line_part`]).
+fn last_gtk_line(doc: &Document, index: &LineIndex, line: u32) -> Option<gtk::TextIter> {
+    let mut iter = doc.iter_at_byte(line_end(index, line + 1))?;
+    if line + 1 < index.line_count() {
+        iter.backward_line();
+    } else {
+        iter.set_line_offset(0);
+    }
+    Some(iter)
+}
+
 /// Height of one line of the view's font.
 fn line_height(view: &TexView) -> i32 {
     view.create_pango_layout(Some("Xg")).pixel_size().1.max(1)
 }
 
-/// x of the start of a line's text (left margin plus CSS padding), in buffer coordinates.
+/// x of the start of a left-to-right line's text, in buffer coordinates: the left margin (the
+/// view's CSS padding is outside the visible rectangle). Not the x of the buffer's first
+/// character: a first line in Hebrew or Arabic starts at the right edge.
 fn text_origin(view: &TexView) -> i32 {
-    view.iter_location(&view.buffer().start_iter()).x()
+    view.left_margin()
 }
 
-/// Width the view wraps text at, or `None` without wrapping (or before the first allocation).
+/// Width the view wraps text at (the visible width less the margins and the pixel GTK keeps
+/// for the cursor), or `None` without wrapping (or before the first allocation).
 fn wrap_width(view: &TexView) -> Option<i32> {
     if view.wrap_mode() == gtk::WrapMode::None {
         return None;
     }
-    let left = text_origin(view);
-    let right = view.right_margin() + (left - view.left_margin()).max(0);
-    let width = view.visible_rect().width() - left - right - 1;
+    let width = view.visible_rect().width() - text_origin(view) - view.right_margin() - 1;
     (width > 20).then_some(width)
 }
 
@@ -1940,6 +2016,22 @@ mod tests {
         // A lone '\r' inside a line is content.
         assert_eq!(texts(&phantom_lines("a\rb\n")), ["a\rb"]);
         assert_eq!(texts(&phantom_lines("\n\n")), ["", ""]);
+    }
+
+    #[test]
+    fn anchors_tag_the_gtk_line_that_reserves_the_space() {
+        // `LineIndex` line 1 is GTK's lines "b\r", "c\u{2029}" and "d\r\n".
+        let text = "a\nb\rc\u{2029}d\r\ne\r";
+        assert_eq!(gtk_line_part(text, 2..11, false), 2..4, "the first");
+        assert_eq!(gtk_line_part(text, 2..11, true), 8..11, "the last");
+        assert_eq!(
+            gtk_line_part(text, 0..2, false),
+            0..2,
+            "a line GTK does not break"
+        );
+        assert_eq!(gtk_line_part(text, 0..2, true), 0..2);
+        // GTK's empty line after a lone `\r` at the end has no text to tag.
+        assert_eq!(gtk_line_part(text, 11..13, true), 11..13);
     }
 
     #[test]

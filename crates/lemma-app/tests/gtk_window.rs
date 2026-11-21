@@ -16,7 +16,7 @@ use lemma_app::workspace::{Workspace, normalize};
 use lemma_config::{Config, KeysCfg};
 use lemma_core::{Origin, ProjectRoot, TextEdit};
 use sourceview5::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -25,6 +25,11 @@ use std::time::Duration;
 fn main() -> ExitCode {
     common::run(&[
         ("opening_files_creates_and_selects_tabs", opening_files),
+        #[cfg(unix)]
+        (
+            "opening_a_pipe_or_a_device_is_refused",
+            opening_special_files,
+        ),
         ("status_bar_and_titles_follow_the_editor", status_and_titles),
         ("pane_toggles", pane_toggles),
         (
@@ -32,12 +37,32 @@ fn main() -> ExitCode {
             sidebar_overlay_is_dismissed,
         ),
         ("closing_a_dirty_tab_asks_first", closing_a_dirty_tab),
+        (
+            "discarding_the_undo_of_an_agent_edit_brings_it_back_for_review",
+            discarding_the_undo_of_an_agent_edit,
+        ),
         ("closing_the_window_saves_on_request", closing_the_window),
+        (
+            "closing_without_asking_closes_under_an_open_dialog",
+            closing_without_asking_under_a_dialog,
+        ),
+        (
+            "closing_keeps_what_is_typed_while_it_saves",
+            closing_keeps_typing_during_the_save,
+        ),
+        (
+            "closing_offers_to_overwrite_a_file_changed_on_disk",
+            closing_offers_overwrite,
+        ),
         ("new_file_opens_a_tab_its_save_creates", new_file),
         ("save_as_writes_the_file_and_takes_the_tab", save_as),
         (
             "save_as_keeps_the_encoding_and_line_breaks",
             save_as_encoding,
+        ),
+        (
+            "a_save_the_encoding_cannot_hold_offers_utf8",
+            save_offers_utf8,
         ),
         (
             "save_as_refuses_reviews_turns_and_open_files",
@@ -256,6 +281,66 @@ fn pane_toggles() {
     }
 }
 
+/// Ctrl+Z of an agent edit, which its file holds (the agent's edits are saved), leaves nothing to
+/// review; then the tab closes discarding that: the file still holds the agent's text, and the
+/// document stays under review with it as a change to review (the buffer's redo of the agent's
+/// edit), not taken in as the user's own text. So does `:e!` after Ctrl+Z.
+fn discarding_the_undo_of_an_agent_edit() {
+    let f = fixture("discard-undo", &[("a.tex", "one\ntwo\n")]);
+    let edit = || {
+        let reply = block_on(agent_edits::apply(
+            &f.state.workspace,
+            1,
+            EditorRequest::Edit {
+                path: "a.tex".into(),
+                old_string: "two".into(),
+                new_string: "TWO".into(),
+                replace_all: false,
+            },
+        ));
+        assert!(!reply.is_error, "{reply:?}");
+    };
+    let reviewed = |doc: &lemma_app::document::DocRef| {
+        let review = doc.review.borrow();
+        let review = review.as_ref().expect("a review");
+        (review.baseline().to_owned(), review.hunks().len())
+    };
+    let a = f.open("a.tex");
+    edit();
+    assert_eq!(read(&f.path("a.tex")), "one\nTWO\n");
+    let doc = a.document().clone();
+    // `:e!` after Ctrl+Z.
+    a.buffer().undo();
+    assert_eq!(doc.text(), "one\ntwo\n");
+    assert!(doc.is_dirty());
+    f.state.revert(&doc);
+    common::pump_until(TIMEOUT, || doc.text() == "one\nTWO\n");
+    assert_eq!(reviewed(&doc), ("one\ntwo\n".to_owned(), 1));
+    assert!(!doc.is_dirty());
+    // Discard on closing the tab after Ctrl+Z.
+    a.buffer().undo();
+    assert_eq!(doc.text(), "one\ntwo\n");
+    assert!(doc.is_dirty());
+    f.state
+        .tab_view
+        .close_page(&f.state.tab_view.page(a.widget()));
+    f.answer("discard");
+    common::pump_until(TIMEOUT, || f.state.tab_view.n_pages() == 0);
+    common::pump_for(Duration::from_millis(100));
+    assert_eq!(
+        read(&f.path("a.tex")),
+        "one\nTWO\n",
+        "discard leaves the file alone"
+    );
+    let doc = f
+        .state
+        .workspace
+        .get(&f.path("a.tex"))
+        .expect("the document stays, under review");
+    assert_eq!(doc.text(), "one\nTWO\n");
+    assert_eq!(reviewed(&doc), ("one\ntwo\n".to_owned(), 1));
+}
+
 fn closing_a_dirty_tab() {
     let f = fixture("close-tab", &[("a.tex", "A\n")]);
     let a = f.open("a.tex");
@@ -294,6 +379,29 @@ fn closing_a_dirty_tab() {
     assert!(f.state.window.visible_dialog().is_none());
 }
 
+/// The system ends the process (`SIGTERM` at a logout) while a dialog is open: the window still
+/// closes. libadwaita gives a window's close to its open dialog, which used to close only the
+/// dialog and leave the window, and so the process, until a second signal.
+fn closing_without_asking_under_a_dialog() {
+    let f = fixture("close-under-dialog", &[("a.tex", "A\n")]);
+    f.open("a.tex");
+    let dialog = adw::AlertDialog::new(Some("A question"), None);
+    dialog.add_response("ok", "OK");
+    dialog.present(Some(&f.state.window));
+    common::pump_until(TIMEOUT, || dialog.is_mapped());
+    // The window's close-request handlers (the session is saved in one) still run first.
+    let asked = Rc::new(Cell::new(false));
+    let seen = asked.clone();
+    f.state.window.connect_close_request(move |_| {
+        seen.set(true);
+        glib::Propagation::Proceed
+    });
+    f.state.close_without_asking();
+    common::pump_for(Duration::from_millis(100));
+    assert!(asked.get(), "the close-request handlers ran");
+    assert!(!f.state.window.is_visible(), "the window closed");
+}
+
 fn closing_the_window() {
     let f = fixture("close-window", &[("a.tex", "A\n"), ("b.tex", "B\n")]);
     let a = f.open("a.tex");
@@ -309,6 +417,109 @@ fn closing_the_window() {
     common::pump_until(TIMEOUT, || !f.state.window.is_visible());
     assert_eq!(read(&f.path("a.tex")), "1A\n");
     assert_eq!(read(&f.path("b.tex")), "2B\n");
+}
+
+/// Save in "Save changes?" writes the text the document had when the write started; what is
+/// typed while the file is written (a slow disk) is not in it, so the tab or the window must
+/// not close over it: they ask again.
+fn closing_keeps_typing_during_the_save() {
+    // Types `typed` into `editor` once, right after the next save of its document is written.
+    let type_after_next_save = |editor: &Rc<lemma_app::editor::Editor>, typed: &'static str| {
+        let buffer = editor.buffer().clone();
+        let done = std::cell::Cell::new(false);
+        lemma_app::saver::connect_saved(move |_, _| {
+            if !done.replace(true) {
+                buffer.insert(&mut buffer.start_iter(), typed);
+            }
+        })
+    };
+    let f = fixture("close-typing", &[("a.tex", "A\n"), ("b.tex", "B\n")]);
+    let a = f.open("a.tex");
+    a.buffer().insert_at_cursor("1");
+    let hook = type_after_next_save(&a, "2");
+    let page = f.state.tab_view.page(a.widget());
+    f.state.tab_view.close_page(&page);
+    f.answer("save");
+    common::pump_until(TIMEOUT, || read(&f.path("a.tex")) == "1A\n");
+    common::pump_until(TIMEOUT, || f.state.window.visible_dialog().is_some());
+    lemma_app::saver::disconnect_saved(hook);
+    assert_eq!(f.state.tab_view.n_pages(), 1, "the tab with “2” stays");
+    assert_eq!(a.document().text(), "21A\n");
+    f.answer("save");
+    common::pump_until(TIMEOUT, || f.state.tab_view.n_pages() == 0);
+    assert_eq!(read(&f.path("a.tex")), "21A\n");
+
+    let b = f.open("b.tex");
+    b.buffer().insert_at_cursor("1");
+    let hook = type_after_next_save(&b, "2");
+    f.state.window.close();
+    f.answer("save");
+    common::pump_until(TIMEOUT, || read(&f.path("b.tex")) == "1B\n");
+    common::pump_until(TIMEOUT, || f.state.window.visible_dialog().is_some());
+    lemma_app::saver::disconnect_saved(hook);
+    assert!(f.state.window.is_visible(), "the window with “2” stays");
+    f.answer("save");
+    common::pump_until(TIMEOUT, || !f.state.window.is_visible());
+    assert_eq!(read(&f.path("b.tex")), "21B\n");
+}
+
+/// A save in "Save changes?" that is refused because another program changed the file keeps the
+/// tab (or the window) open and offers to overwrite the file, as Ctrl+S does.
+fn closing_offers_overwrite() {
+    let f = fixture("close-overwrite", &[("a.tex", "A\n")]);
+    let a = f.open("a.tex");
+    a.buffer().insert_at_cursor("1");
+    std::fs::write(f.path("a.tex"), "theirs\n").unwrap();
+    let later = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(f.path("a.tex"))
+        .and_then(|file| file.set_modified(later))
+        .unwrap();
+    let page = f.state.tab_view.page(a.widget());
+    f.state.tab_view.close_page(&page);
+    f.answer("save");
+    common::pump_until(TIMEOUT, || !overwrite_buttons(&f.state).is_empty());
+    assert_eq!(f.state.tab_view.n_pages(), 1);
+    assert_eq!(read(&f.path("a.tex")), "theirs\n");
+    overwrite_buttons(&f.state)[0].emit_clicked();
+    common::pump_until(TIMEOUT, || read(&f.path("a.tex")) == "1A\n");
+
+    // The window's dialog too.
+    a.buffer().insert_at_cursor("2");
+    std::fs::write(f.path("a.tex"), "theirs again\n").unwrap();
+    let later = std::time::SystemTime::now() + Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(f.path("a.tex"))
+        .and_then(|file| file.set_modified(later))
+        .unwrap();
+    f.state.window.close();
+    f.answer("save");
+    common::pump_until(TIMEOUT, || !overwrite_buttons(&f.state).is_empty());
+    assert!(f.state.window.is_visible());
+    assert_eq!(read(&f.path("a.tex")), "theirs again\n");
+}
+
+/// Every widget below `widget`.
+fn descendants(widget: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+    let mut out = Vec::new();
+    let mut child = widget.as_ref().first_child();
+    while let Some(c) = child {
+        out.extend(descendants(&c));
+        child = c.next_sibling();
+        out.push(c);
+    }
+    out
+}
+
+/// The Overwrite buttons of the toast on screen.
+fn overwrite_buttons(state: &WindowState) -> Vec<gtk::Button> {
+    descendants(&state.toasts)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .filter(|b| b.label().is_some_and(|l| l.contains("Overwrite")))
+        .collect()
 }
 
 fn style_scheme_follows_style() {
@@ -410,6 +621,39 @@ fn active_path(f: &Fixture) -> Option<PathBuf> {
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     glib::MainContext::default().block_on(f)
+}
+
+/// A named pipe would keep the document waiting until another program writes to it (and the
+/// window blank at start), and a device is no document: opening either is refused at once, with
+/// the reason, and leaves no tab or document behind.
+#[cfg(unix)]
+fn opening_special_files() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let f = fixture("special-files", &[("a.tex", "A\n")]);
+    let pipe = f.path("pipe.tex");
+    let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let result: Rc<RefCell<Option<Result<(), String>>>> = Rc::default();
+    for path in [pipe.clone(), PathBuf::from("/dev/null")] {
+        result.replace(None);
+        let (state, out) = (f.state.clone(), result.clone());
+        glib::spawn_future_local(async move {
+            let opened = state.open_file(&path).await.map(|_| ());
+            out.replace(Some(opened));
+        });
+        common::pump_until(TIMEOUT, || result.borrow().is_some());
+        let error = result.take().unwrap().unwrap_err();
+        assert!(
+            error.ends_with("it is not a regular file (a named pipe, a socket or a device)"),
+            "{error}"
+        );
+    }
+    assert_eq!(f.state.tab_view.n_pages(), 0);
+    assert!(f.state.workspace.documents().is_empty());
+    // A regular file opens as before.
+    f.open("a.tex");
+    assert_eq!(f.state.tab_view.n_pages(), 1);
 }
 
 fn new_file() {
@@ -528,6 +772,59 @@ fn save_as() {
     common::pump_until(TIMEOUT, || !c.document().is_dirty());
     assert_eq!(read(&dir.join("c.tex")), "one\ntwXYo\nthree\n");
     assert_eq!(f.state.tab_view.n_pages(), 2);
+}
+
+/// A file that is not UTF-8 (Latin-1) with a character its encoding lacks cannot be saved as it
+/// is. The toast that says so offers to save the file as UTF-8, which keeps the character;
+/// from then on the document is a UTF-8 one.
+fn save_offers_utf8() {
+    let f = fixture("save-utf8", &[]);
+    let dir = normalize(&f.dir);
+    std::fs::write(dir.join("latin.tex"), b"caf\xe9\n").unwrap();
+    let latin = f.open("latin.tex");
+    let doc = latin.document().clone();
+    assert!(doc.charset().is_some(), "not UTF-8");
+    let utf8_buttons = || -> Vec<gtk::Button> {
+        descendants(&f.state.toasts)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .filter(|b| b.label().is_some_and(|l| l.contains("UTF-8")))
+            .collect()
+    };
+    // What the encoding holds is saved in it, and nothing is offered.
+    latin.buffer().insert_at_cursor("é");
+    f.state.save_document(&doc);
+    common::pump_until(TIMEOUT, || !doc.is_dirty());
+    assert_eq!(
+        std::fs::read(dir.join("latin.tex")).unwrap(),
+        b"\xe9caf\xe9\n"
+    );
+    assert!(utf8_buttons().is_empty());
+    // An arrow is not in Latin-1: the save fails, the file stays, and the toast offers UTF-8.
+    latin.buffer().insert_at_cursor("→");
+    f.state.save_document(&doc);
+    common::pump_until(TIMEOUT, || !utf8_buttons().is_empty());
+    assert!(doc.is_dirty());
+    assert_eq!(
+        std::fs::read(dir.join("latin.tex")).unwrap(),
+        b"\xe9caf\xe9\n"
+    );
+    assert!(doc.charset().is_some());
+    utf8_buttons()[0].emit_clicked();
+    common::pump_until(TIMEOUT, || !doc.is_dirty());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("latin.tex")).unwrap(),
+        "é→café\n"
+    );
+    assert_eq!(doc.charset(), None, "a UTF-8 document from now on");
+    // The next saves are UTF-8 too.
+    latin.buffer().insert_at_cursor("ő");
+    f.state.save_document(&doc);
+    common::pump_until(TIMEOUT, || !doc.is_dirty());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("latin.tex")).unwrap(),
+        "é→őcafé\n"
+    );
 }
 
 fn save_as_encoding() {

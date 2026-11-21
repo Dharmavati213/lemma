@@ -409,8 +409,63 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_added_after_a_final_line_break() {
+        // Every line gets its `;` or `% `, and no stray one ends the file (as with sed).
+        assert_eq!(replace(&Query::regex("$"), ";", "a\nb\n"), "a;\nb;\n");
+        assert_eq!(
+            replace(&Query::regex("^"), "% ", "a\n\nb\n"),
+            "% a\n% \n% b\n"
+        );
+        assert_eq!(replace(&Query::regex("^"), "% ", "a\n\nb"), "% a\n% \n% b");
+    }
+
+    #[test]
     fn crlf_lines_keep_their_ends() {
         let q = Query::plain("x");
         assert_eq!(replace(&q, "yy", "x\r\nax\r\n"), "yy\r\nayy\r\n");
+        // Stripping trailing spaces, or replacing up to the end of the line, keeps the `\r\n`.
+        let text = "a  \r\nb\r\n\t\r\n\\foo x  \r\nlast ";
+        assert_eq!(
+            replace(&Query::regex(r"\s+$"), "", text),
+            "a\r\nb\r\n\r\n\\foo x\r\nlast"
+        );
+        assert_eq!(
+            replace(&Query::regex(r"\\foo.*"), r"\bar", text),
+            "a  \r\nb\r\n\t\r\n\\bar\r\nlast "
+        );
+        assert_eq!(
+            replace(&Query::regex("$"), ";", "a\r\nb\r\n"),
+            "a;\r\nb;\r\n"
+        );
+        // Removing the rest of the line with a class that excludes the line break.
+        let text = "a % one\r\nb  % two\r\nc\t\r\n";
+        assert_eq!(
+            replace(&Query::regex(r"%[^\n]*"), "", text),
+            "a \r\nb  \r\nc\t\r\n"
+        );
+        assert_eq!(
+            replace(&Query::regex(r"\s*%[^\r\n]*$"), "", text),
+            "a\r\nb\r\nc\t\r\n"
+        );
+        // A pattern that names the `\r` may change the line break.
+        assert_eq!(replace(&Query::regex(r"\r$"), "", "a\r\nb\r\n"), "a\nb\n");
+    }
+
+    /// What the search highlights is what a replace changes, in a CRLF text too.
+    #[test]
+    fn replace_changes_what_the_search_finds() {
+        let text = "x = 1;  \r\ny=2;\r\n\r\nz\t\r\n";
+        for pattern in [r"\s+$", r"\s*=\s*", r";.*", r"\r", "$"] {
+            let q = Query::regex(pattern);
+            let m = q.matcher().unwrap();
+            let mut expected = text.to_owned();
+            for hits in m.find_lines(text).iter().rev() {
+                for r in hits.ranges.iter().rev() {
+                    let at = hits.span.start + r.start..hits.span.start + r.end;
+                    expected.replace_range(at, "<>");
+                }
+            }
+            assert_eq!(replace(&q, "<>", text), expected, "{pattern}");
+        }
     }
 }

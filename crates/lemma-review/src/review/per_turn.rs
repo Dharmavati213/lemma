@@ -442,7 +442,9 @@ impl FileReview {
                 }
                 Some(_) => None,
                 // Recognized without a record: the turn of the segment it undoes.
-                None => self.only_turn_touching(a, b).map(Pick::Turn),
+                None if c.record.is_none() => self.only_turn_touching(a, b).map(Pick::Turn),
+                // A reload's record: no turn's change, as the reload itself.
+                None => None,
             },
             // Typing inside a hunk becomes part of the one change it edits.
             (Origin::User | Origin::History, None) if matches!(class, EditClass::Inside(_)) => {

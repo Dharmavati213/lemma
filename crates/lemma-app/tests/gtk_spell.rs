@@ -8,6 +8,10 @@
 //! The words a word list adds stay accepted for the rest of the process (enchant's session list
 //! of the language), so each test uses words of its own.
 //!
+//! Enchant gets a configuration directory of the tests' own (`test_dictionary`): the user's
+//! personal word lists are not read, and a tiny dictionary of a made-up language lets the tests
+//! that need a dictionary but no English words run on machines without an English one.
+//!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_spell`.
 
 mod common;
@@ -26,7 +30,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
-    common::run(&[
+    let mut tests: Vec<common::Test> = vec![
         (
             "misspellings_in_text_are_flagged_and_latex_is_not",
             text_and_latex,
@@ -42,7 +46,84 @@ fn main() -> ExitCode {
             offscreen_latex,
         ),
         ("detach_removes_everything", detach),
-    ])
+        (
+            "switching_off_and_on_leaves_no_tags",
+            switching_leaves_no_tags,
+        ),
+        (
+            "an_adapter_held_elsewhere_keeps_its_tag",
+            a_held_adapter_keeps_its_tag,
+        ),
+        (
+            "math_environments_of_a_config_reload_are_followed_off_screen",
+            math_envs_reload,
+        ),
+        (
+            "checking_stopped_at_work_or_while_starting_is_quiet",
+            stopped_at_work_or_starting,
+        ),
+    ];
+    test_dictionary();
+    // The words flagged are English ones: without an English dictionary nothing is checked.
+    // (libspelling needs GTK; without a display `common::run` skips everything.)
+    if gtk::init().is_ok() && !common::english_dictionary() {
+        println!("SKIP: no en_US spelling dictionary installed; only the tests that need none");
+        tests.retain(|(name, _)| {
+            [
+                "bib_files_are_not_checked",
+                "switching_off_and_on_leaves_no_tags",
+                "an_adapter_held_elsewhere_keeps_its_tag",
+                "math_environments_of_a_config_reload_are_followed_off_screen",
+                "checking_stopped_at_work_or_while_starting_is_quiet",
+            ]
+            .contains(name)
+        });
+    }
+    common::run(&tests)
+}
+
+/// The language of the tests' own dictionary, [`TEST_WORDS`]: tests that need a dictionary but
+/// not English words use it, so they run on every machine with enchant's hunspell module.
+const TEST_LANGUAGE: &str = "zz";
+const TEST_WORDS: &[&str] = &["fine", "here", "text", "words"];
+
+/// Gives enchant a configuration directory of the tests' own (before anything loads it), with
+/// the [`TEST_LANGUAGE`] dictionary and the hunspell dictionaries of the user's own enchant
+/// directory (not their personal word lists).
+fn test_dictionary() {
+    let dir = common::target_tmpdir().join(format!("lemma-app-{}-enchant", std::process::id()));
+    let hunspell = dir.join("hunspell");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&hunspell).expect("create the dictionary directory");
+    // (`scripts/broadway.sh` names another directory on a machine without an English one.)
+    let user = std::env::var_os("ENCHANT_CONFIG_DIR").map_or_else(
+        || glib::user_config_dir().join("enchant/hunspell"),
+        |dir| PathBuf::from(dir).join("hunspell"),
+    );
+    for entry in std::fs::read_dir(user).into_iter().flatten().flatten() {
+        let _ = std::fs::copy(entry.path(), hunspell.join(entry.file_name()));
+    }
+    std::fs::write(
+        hunspell.join(format!("{TEST_LANGUAGE}.aff")),
+        "SET UTF-8\nWORDCHARS ’0123456789\n",
+    )
+    .unwrap();
+    std::fs::write(
+        hunspell.join(format!("{TEST_LANGUAGE}.dic")),
+        format!("{}\n{}\n", TEST_WORDS.len(), TEST_WORDS.join("\n")),
+    )
+    .unwrap();
+    // SAFETY: no other thread exists yet.
+    unsafe { std::env::set_var("ENCHANT_CONFIG_DIR", &dir) };
+}
+
+/// Whether enchant has the tests' own dictionary (see [`test_dictionary`]).
+fn has_test_dictionary() -> bool {
+    let ok = libspelling::Provider::default().supports_language(TEST_LANGUAGE);
+    if !ok {
+        println!("    SKIP: enchant cannot load the test dictionary (no hunspell module)");
+    }
+    ok
 }
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -653,4 +734,169 @@ fn detach() {
     f.state.close_editor(&editor, true);
     common::pump_for(Duration::from_millis(50));
     assert!(spell::adapter(&editor).is_none());
+}
+
+/// Switching checking off and on, and closing the tab, take the adapter's underline tag out of
+/// the buffer's tag table: each switch used to leave one more tag there (libspelling does not
+/// remove it), and every tag in a buffer slows each of GTK's tag operations.
+fn switching_leaves_no_tags() {
+    if !has_test_dictionary() {
+        return;
+    }
+    let mut config = config(Vec::new());
+    config.spell.language = TEST_LANGUAGE.into();
+    let f = fixture("no-tags", "main.tex", "fine qqzzwrong text here\n", config);
+    f.expect_flagged(&["qqzzwrong"], "on");
+    let table = f.editor.buffer().tag_table();
+    let tags = table.size();
+    let action = f
+        .state
+        .window
+        .lookup_action(spell::TOGGLE_ACTION)
+        .expect("win.toggle-spell");
+    for _ in 0..3 {
+        action.activate(None);
+        common::pump_for(Duration::from_millis(20));
+        assert_eq!(table.size(), tags - 1, "off: the underline tag is gone");
+        action.activate(None);
+        f.expect_flagged(&["qqzzwrong"], "on again");
+        assert_eq!(table.size(), tags, "on again: one underline tag");
+    }
+    spell::detach(&f.state, &f.editor);
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(table.size(), tags - 1, "detached");
+}
+
+/// The adapter keeps a plain pointer to its underline tag and uses it for as long as it lives,
+/// so the tag leaves the tag table only once the adapter is gone. Something else may hold the
+/// adapter after checking is switched off (here the test does): with the tag freed under it,
+/// the highlighter's next no-spell tag made GTK log criticals about a text tag that is none,
+/// or crashed (seen when a file opened from the PDF was highlighted).
+fn a_held_adapter_keeps_its_tag() {
+    if !has_test_dictionary() {
+        return;
+    }
+    let mut config = config(Vec::new());
+    config.spell.language = TEST_LANGUAGE.into();
+    let f = fixture("held", "main.tex", "fine qqzzwrong text here\n", config);
+    f.expect_flagged(&["qqzzwrong"], "on");
+    let buffer = f.editor.buffer();
+    let table = buffer.tag_table();
+    let tags = table.size();
+    let held = spell::adapter(&f.editor).expect("the adapter");
+    let action = f
+        .state
+        .window
+        .lookup_action(spell::TOGGLE_ACTION)
+        .expect("win.toggle-spell");
+    action.activate(None);
+    common::pump_for(Duration::from_millis(20));
+    assert!(spell::adapter(&f.editor).is_none(), "switched off");
+    // What the highlighter does to a line: the held adapter still listens to it.
+    let no_spell = table
+        .lookup(lemma_app::editor::highlight::NO_SPELL_TAG)
+        .expect("the no-spell tag");
+    let (start, end) = buffer.bounds();
+    let problems = common::logged_problems();
+    buffer.apply_tag(&no_spell, &start, &end);
+    buffer.remove_tag(&no_spell, &start, &end);
+    held.set_enabled(true);
+    held.set_enabled(false);
+    common::pump_for(Duration::from_millis(20));
+    common::assert_no_new_problems(problems);
+    assert_eq!(table.size(), tags, "the tag stays while its adapter lives");
+    drop(held);
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(table.size(), tags - 1, "and leaves with it");
+}
+
+/// An adapter that checking has let go of (switched off, or its window closed) can live a
+/// little longer, and listens to the buffer meanwhile: when the highlighter then applies a
+/// no-spell tag (a line comes on screen), it removes its underline tag there. That tag was out
+/// of the buffer's tag table already, which GTK answered with a critical for every such line
+/// (`gtk_text_buffer_remove_tag: assertion 'GTK_IS_TEXT_TAG (tag)' failed`); it leaves the table
+/// with the adapter now. And checking that is switched off while it still starts, before its
+/// word lists are read and the scanner's states are there, lets go of the adapter at once: the
+/// task that was starting it kept it until it ran again.
+fn stopped_at_work_or_starting() {
+    if !has_test_dictionary() {
+        return;
+    }
+    let mut config = config(Vec::new());
+    config.spell.language = TEST_LANGUAGE.into();
+    let f = fixture("stop-starting", "main.tex", "fine text here\n", config);
+    f.expect_flagged(&[], "on");
+    let action = f
+        .state
+        .window
+        .lookup_action(spell::TOGGLE_ACTION)
+        .expect("win.toggle-spell");
+    let buffer = f.editor.buffer();
+    let tags = buffer.tag_table().size();
+    // What the highlighter does when a line comes on screen.
+    let retag = || {
+        let (start, end) = buffer.bounds();
+        buffer.apply_tag_by_name(highlight::NO_SPELL_TAG, &start, &end);
+        buffer.remove_tag_by_name(highlight::NO_SPELL_TAG, &start, &end);
+    };
+    // Off while libspelling has work queued (for the text just typed), which holds the adapter.
+    let before = common::logged_problems();
+    buffer.insert_at_cursor("qqzzwrong words\n");
+    action.activate(None);
+    retag();
+    common::assert_no_new_problems(before);
+    assert!(spell::adapter(&f.editor).is_none(), "off");
+    // The underline tag goes with the adapter, once libspelling's queued work has let go of it.
+    common::pump_until(TIMEOUT, || buffer.tag_table().size() == tags - 1);
+    common::pump_for(Duration::from_millis(100));
+    // On, and off again before the main loop runs the task that starts the checking.
+    action.activate(None);
+    let adapter = spell::adapter(&f.editor)
+        .expect("an adapter, not checking yet")
+        .downgrade();
+    assert!(!spell::is_checking(&f.editor));
+    action.activate(None);
+    assert!(spell::adapter(&f.editor).is_none(), "off again");
+    assert!(adapter.upgrade().is_none(), "the adapter is gone");
+    // (The tag leaves from an idle callback, after the adapter's own clean-up.)
+    common::pump_for(Duration::from_millis(20));
+    assert_eq!(
+        buffer.tag_table().size(),
+        tags - 1,
+        "with its underline tag"
+    );
+    retag();
+    common::assert_no_new_problems(before);
+    common::pump_for(Duration::from_millis(100));
+    assert!(spell::adapter(&f.editor).is_none() && !spell::is_checking(&f.editor));
+    // And it starts again.
+    action.activate(None);
+    f.expect_flagged(&["qqzzwrong"], "on again");
+}
+
+/// A config reload that makes an environment math (`[editor] math_envs`), or prose again,
+/// changes the scanner's view of lines no one edited: on a line never on screen, the word in
+/// it loses its underline, and gets it back. The text does not change, so the tokens the filter
+/// keeps for the last line it looked at must not outlive the rules they were scanned with.
+fn math_envs_reload() {
+    if !has_test_dictionary() {
+        return;
+    }
+    let mut config = config(Vec::new());
+    config.spell.language = TEST_LANGUAGE.into();
+    // Only words of the test dictionary before it, so that the line below is the last one the
+    // filter is asked about.
+    let mut text = "fine text here\n".repeat(200);
+    text.push_str("\\begin{qqzzmath} qqzzinside \\end{qqzzmath}\n");
+    let f = fixture("math-envs", "main.tex", &text, config);
+    f.expect_flagged(&["qqzzinside"], "an environment the scanner does not know");
+    let h = highlight::highlighter(&f.editor).expect("highlighted");
+    assert!(
+        !h.is_tagged(200),
+        "the environment's line was never on screen"
+    );
+    f.config(|c| c.editor.math_envs = vec!["qqzzmath".into()]);
+    f.expect_flagged(&[], "a math environment");
+    f.config(|c| c.editor.math_envs = Vec::new());
+    f.expect_flagged(&["qqzzinside"], "prose again");
 }

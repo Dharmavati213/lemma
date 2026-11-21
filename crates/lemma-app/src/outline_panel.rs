@@ -2560,7 +2560,8 @@ struct Panel {
     aux_generation: Cell<u64>,
     aux_reading: Cell<bool>,
     aux_stale: Cell<bool>,
-    aux_hint: RefCell<Option<PathBuf>>,
+    /// The root of the last build and the `.aux` beside its PDF.
+    aux_hint: RefCell<Option<(PathBuf, PathBuf)>>,
     /// Rows per file in line order (headings, theorems, floats), and file rows by path.
     by_file: RefCell<HashMap<PathBuf, Vec<Rc<Node>>>>,
     /// The files with rows on lines that a change replaced, moved by `shift_lines` since the
@@ -2889,9 +2890,13 @@ impl Panel {
             build.connect_finished(move |outcome| {
                 if let Some(panel) = weak.upgrade() {
                     panel.aux_stale.set(true);
-                    panel
-                        .aux_hint
-                        .replace(outcome.pdf.as_ref().map(|p| p.with_extension("aux")));
+                    // The `.aux` beside the PDF belongs to the root that was built: another
+                    // root shown later (`slides/main.tex` after `paper/main.tex`) has its own.
+                    let root = panel
+                        .state()
+                        .and_then(|s| s.build.get().and_then(|b| b.last_root()));
+                    let aux = outcome.pdf.as_ref().map(|p| p.with_extension("aux"));
+                    panel.aux_hint.replace(root.zip(aux));
                     panel.poke();
                 }
             });
@@ -3321,7 +3326,8 @@ impl Panel {
             .aux_hint
             .borrow()
             .clone()
-            .filter(|h| h.file_stem() == root.file_stem());
+            .filter(|(built, _)| *built == root)
+            .map(|(_, aux)| aux);
         let candidates = aux_candidates(&root, &state.config.build.outdir, hint.as_deref());
         let fallback = root.parent().unwrap_or(Path::new("/")).to_path_buf();
         self.aux_reading.set(true);
@@ -4504,6 +4510,35 @@ mod tests {
         let titles: Vec<&str> = aux.toc.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, ["A", "B", "C"]);
         assert_eq!(aux.labels["lem"].0, "2.1");
+    }
+
+    /// Include cycles (a file that includes itself, the file that included it, or the root) and
+    /// a file included twice give a finite outline that shows each file once, where it is first
+    /// included.
+    #[test]
+    fn include_cycles_and_files_included_twice() {
+        let mut index = ProjectIndex::default();
+        for (path, text) in [
+            (
+                "/p/main.tex",
+                "\\documentclass{book}\n\\begin{document}\n\\include{a}\n\\input{a}\n\
+                 \\input{main}\n\\end{document}\n",
+            ),
+            ("/p/a.tex", "\\chapter{Alpha}\n\\input{b}\n\\input{a}\n"),
+            (
+                "/p/b.tex",
+                "\\section{Beta}\n\\input{a}\n\\input{main.tex}\n",
+            ),
+        ] {
+            index.update_file(PathBuf::from(path), Arc::new(index_file(text)));
+        }
+        let entries = build_outline(&index, Path::new("/p/main.tex"), &AuxData::default());
+        let text = tree_text_of(&entries);
+        for row in ["[a.tex]", "[b.tex]", "Alpha", "Beta"] {
+            let count = text.lines().filter(|l| l.trim() == row).count();
+            assert_eq!(count, 1, "{row} in\n{text}");
+        }
+        assert!(!text.contains("[main.tex]"), "{text}");
     }
 
     #[test]

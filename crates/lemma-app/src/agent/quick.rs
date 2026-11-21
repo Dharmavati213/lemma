@@ -5,17 +5,21 @@
 //!
 //! - [`install`] (once per window) adds one action `win.quick-<slug>` per template, with the
 //!   template's `key` as its default accelerator, and puts them into two menus: the editor's
-//!   context menu (`state.editor_menu`, a "Claude" submenu that also holds "Edit with Claude…"
-//!   for Ctrl+K) and the panel's "Quick Actions" menu. Templates with `needs_selection` are
+//!   context menu (`state.editor_menu`, a submenu named after the window's agent, "Claude",
+//!   "Codex", …, that also holds "Edit with Claude…" for Ctrl+K; renamed when it changes: a
+//!   backend `config.toml` selects applies once a session that runs has ended, see
+//!   `panel::backend`) and the panel's "Quick Actions" menu. Templates with `needs_selection` are
 //!   disabled while the active editor has no selection. Templates with the `diagnostic`
 //!   context ("Fix this error") are not in these menus: they run from the Problems list (or as
 //!   `:Agent fix-this-error`, on the build error nearest the cursor). Everything is rebuilt on
 //!   `WindowState::connect_config_changed(ConfigFile::Prompts)`.
 //! - [`run`] runs a template by name or slug (`lemma_config::find_prompt`), filling it with
 //!   `PromptTemplate::fill`: `{selection}` is the selection (or the paragraph at the cursor for
-//!   templates that do not need a selection), `{file}` the path relative to the project root,
+//!   templates that do not need a selection), `{file}` the path relative to the project root
+//!   (with `/` on every system, as the agent is shown every path),
 //!   `{line}` the selection's first line. The prompt goes out with
-//!   `PromptOrigin::QuickAction(name)` and the agent pane is shown.
+//!   `PromptOrigin::QuickAction(name)` and the agent pane is shown. While the agent is busy
+//!   nothing is sent, and `panel::send_prompt`'s toast is the only one that says so.
 //! - [`agent_command`] is `:Agent <arg>`: a template name or slug runs that quick action, other
 //!   text is sent as a prompt, and no text focuses the prompt box.
 //! - [`fix_diagnostic`] is the Problems list's "Ask agent to fix": the "Fix this error" template
@@ -50,6 +54,8 @@ struct Quick {
     /// (action name without `win.`, needs a selection).
     actions: RefCell<Vec<(String, bool)>>,
     watch: RefCell<Option<(glib::WeakRef<sourceview5::Buffer>, glib::SignalHandlerId)>>,
+    /// The quick actions' menu items (in the editor's context menu and the panel's menu).
+    items: RefCell<Option<gio::Menu>>,
 }
 
 thread_local! {
@@ -72,10 +78,10 @@ pub fn install(state: &Rc<WindowState>) {
     let quick = Rc::new(Quick::default());
     WINDOWS.with_borrow_mut(|windows| windows.push((state.window.downgrade(), quick)));
     rebuild(state);
-    state.connect_config_changed(|state, file| {
-        if file == ConfigFile::Prompts {
-            rebuild(state);
-        }
+    state.connect_config_changed(|state, file| match file {
+        ConfigFile::Prompts => rebuild(state),
+        ConfigFile::Config => agent_changed(state),
+        _ => {}
     });
     let weak = Rc::downgrade(state);
     state.tab_view.connect_selected_page_notify(move |_| {
@@ -165,20 +171,44 @@ fn rebuild(state: &Rc<WindowState>) {
         actions.push((name, template.needs_selection));
     }
     quick.actions.replace(actions);
-
-    let claude = gio::Menu::new();
-    let edit = gio::Menu::new();
-    edit.append(Some("_Edit with Claude…"), Some("win.agent-inline-edit"));
-    claude.append_section(None, &edit);
-    claude.append_section(None, &items);
-    state.editor_menu.remove_all();
-    state.editor_menu.append_submenu(Some("_Claude"), &claude);
+    fill_editor_menu(state, &items);
+    quick.items.replace(Some(items.clone()));
     if let Some(panel) = panel::get(state) {
         let menu = panel.quick_menu();
         menu.remove_all();
         menu.append_section(None, &items);
     }
     refresh_enabled(state);
+}
+
+/// The editor's context menu: a submenu named after the agent ("Claude", "Codex", …: the one
+/// that runs, see [`panel::backend`]) with Edit with it… (Ctrl+K) and the quick actions `items`.
+fn fill_editor_menu(state: &WindowState, items: &gio::Menu) {
+    let label = super::bridge::agent_label(panel::backend(state), &state.config.agent);
+    // A `_` of the name is not a mnemonic.
+    let name = label.replace('_', "__");
+    let submenu = gio::Menu::new();
+    let edit = gio::Menu::new();
+    edit.append(
+        Some(&format!("_Edit with {name}…")),
+        Some("win.agent-inline-edit"),
+    );
+    submenu.append_section(None, &edit);
+    submenu.append_section(None, items);
+    state.editor_menu.remove_all();
+    state
+        .editor_menu
+        .append_submenu(Some(&format!("_{name}")), &submenu);
+}
+
+/// The agent's name in the editor's context menu follows `config.toml`, and the panel, which
+/// calls this when the backend it shows changes (a change of `config.toml` waits for a running
+/// session to end).
+pub(super) fn agent_changed(state: &WindowState) {
+    let items = quick_of(state).and_then(|q| q.items.borrow().clone());
+    if let Some(items) = items {
+        fill_editor_menu(state, &items);
+    }
 }
 
 fn watch_selection(state: &Rc<WindowState>) {
@@ -236,7 +266,7 @@ pub fn run(state: &Rc<WindowState>, name: &str) -> Result<(), String> {
     let editor = state.active_editor().ok_or("No document is open")?;
     let doc = editor.document().clone();
     let buffer = editor.buffer();
-    let file = crate::review_ui::relative_name(state, doc.path());
+    let file = state.workspace.root().agent_name(doc.path());
     let (selection, line) = match template.context {
         PromptContext::File => {
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
@@ -266,19 +296,28 @@ pub fn run(state: &Rc<WindowState>, name: &str) -> Result<(), String> {
         line: u32::try_from(line).ok(),
         diagnostic: "",
     });
-    if panel::send_prompt(
+    send(
         state,
         vec![PromptBlock::Text(text)],
         PromptOrigin::QuickAction(template.name.clone()),
-    ) {
-        state.agent.split.set_show_sidebar(true);
-        Ok(())
-    } else {
-        Err(format!(
-            "{} is busy",
-            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
-        ))
+    )
+}
+
+/// Sends a prompt of a quick action or `:Agent` and shows the pane. A prompt the agent is too
+/// busy for is not an error here: `panel::send_prompt` says so itself (a second toast said "…
+/// is busy" again).
+fn send(
+    state: &Rc<WindowState>,
+    blocks: Vec<PromptBlock>,
+    origin: PromptOrigin,
+) -> Result<(), String> {
+    if state.agent_controller().is_none() {
+        return Err("This window has no agent".into());
     }
+    if panel::send_prompt(state, blocks, origin) {
+        state.agent.split.set_show_sidebar(true);
+    }
+    Ok(())
 }
 
 /// `:Agent <arg>` (see the module docs).
@@ -291,19 +330,11 @@ pub fn agent_command(state: &Rc<WindowState>, arg: &str) -> Result<(), String> {
     if find_prompt(&state.prompts(), arg).is_some() {
         return run(state, arg);
     }
-    if panel::send_prompt(
+    send(
         state,
         vec![PromptBlock::Text(arg.to_owned())],
         PromptOrigin::Panel,
-    ) {
-        state.agent.split.set_show_sidebar(true);
-        Ok(())
-    } else {
-        Err(format!(
-            "{} is busy",
-            super::bridge::agent_label(state.config.agent.backend, &state.config.agent)
-        ))
-    }
+    )
 }
 
 /// The build problem `:Agent fix-this-error` works on: the active file's problem nearest the
@@ -383,7 +414,7 @@ pub fn diagnostic_prompt(
     problem: &Problem,
     text: Option<&str>,
 ) -> String {
-    let file = crate::review_ui::relative_name(state, &problem.path);
+    let file = state.workspace.root().agent_name(&problem.path);
     let context = match (text, problem.line) {
         (Some(text), Some(line)) => numbered_context(text, line, CONTEXT_LINES),
         _ => String::new(),
@@ -443,10 +474,10 @@ fn truncate_chars(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Reads `path` as text (lossy UTF-8) without blocking the main thread.
+/// Reads `path` as text (lossy UTF-8) without blocking the main thread; `None` for a named pipe,
+/// a socket or a device too.
 async fn read_text(path: &Path) -> Option<String> {
-    let file = gio::File::for_path(path);
-    let (bytes, _) = file.load_contents_future().await.ok()?;
+    let (bytes, _) = crate::workspace::load_file(path).await.ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 

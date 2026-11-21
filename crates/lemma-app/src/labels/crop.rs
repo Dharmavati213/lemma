@@ -53,6 +53,9 @@ struct Worker {
     /// A crop is being prepared.
     busy: Cell<bool>,
     idle: RefCell<Option<glib::SourceId>>,
+    /// The window's `destroy` handler that stops the worker: it goes with the worker, so the
+    /// workers started one after the other (one per spell of hovers) leave none behind.
+    destroy: Cell<Option<glib::SignalHandlerId>>,
 }
 
 #[derive(Clone)]
@@ -67,6 +70,9 @@ impl Drop for Worker {
     fn drop(&mut self) {
         if let Some(idle) = self.idle.get_mut().take() {
             idle.remove();
+        }
+        if let (Some(handler), Some(window)) = (self.destroy.take(), self.window.upgrade()) {
+            window.disconnect(handler);
         }
         // The thread lets go of its poppler document before the process may exit.
         self.handle.shutdown_and_join(Duration::from_secs(2));
@@ -107,15 +113,17 @@ fn start_worker(state: &WindowState) -> Rc<Worker> {
         generation: Cell::new(0),
         busy: Cell::new(false),
         idle: RefCell::new(None),
+        destroy: Cell::new(None),
     });
     WORKERS.with_borrow_mut(|workers| workers.push(worker.clone()));
     // Closing the window stops it.
     let window = state.window.downgrade();
-    state.window.connect_destroy(move |_| {
+    let handler = state.window.connect_destroy(move |_| {
         if let Some(window) = window.upgrade() {
             stop_worker_of(&window);
         }
     });
+    worker.destroy.set(Some(handler));
     worker
 }
 
@@ -392,6 +400,27 @@ pub fn region_of(boxes: &[SyncBox], size: (f64, f64)) -> Option<(f64, f64, f64, 
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
 }
 
+/// `region` (bp) in the pixels of a page of `page` pixels at `scale`: inside the page and at
+/// least one pixel each way, also for a region that starts in the page's last pixel (a box at
+/// its very edge) or beyond it.
+fn pixel_region(
+    region: (f64, f64, f64, f64),
+    scale: f64,
+    page: (i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (page_w, page_h) = (page.0.max(1), page.1.max(1));
+    let px = |v: f64| (v * scale).round() as i32;
+    let (rx, ry) = (
+        px(region.0).clamp(0, page_w - 1),
+        px(region.1).clamp(0, page_h - 1),
+    );
+    let (rw, rh) = (
+        (px(region.0 + region.2) - rx).clamp(1, page_w - rx),
+        (px(region.1 + region.3) - ry).clamp(1, page_h - ry),
+    );
+    (rx, ry, rw, rh)
+}
+
 /// Renders `region` of `page` at twice [`DISPLAY_ZOOM`]: the tiles that cover it (or the
 /// whole page when it is not tiled at that scale), put together into one texture.
 async fn render_region(
@@ -405,12 +434,7 @@ async fn render_region(
     let scale_q = lemma_pdf::scale_q(DISPLAY_ZOOM, OVERSAMPLE);
     let scale = lemma_pdf::scale_of(scale_q);
     let (page_w, page_h) = lemma_pdf::page_pixels(size, scale_q);
-    let px = |v: f64| (v * scale).round() as i32;
-    let (rx, ry) = (px(region.0).clamp(0, page_w), px(region.1).clamp(0, page_h));
-    let (rw, rh) = (
-        (px(region.0 + region.2) - rx).clamp(1, page_w - rx),
-        (px(region.1 + region.3) - ry).clamp(1, page_h - ry),
-    );
+    let (rx, ry, rw, rh) = pixel_region(region, scale, (page_w, page_h));
     let tiles: Vec<Option<(u16, u16)>> =
         match lemma_pdf::tiles_covering(size, scale_q, (rx, ry, rw, rh)) {
             None => vec![None],
@@ -555,6 +579,32 @@ impl CropView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region at the very edge of the page (its first pixel the page's last, or beyond it)
+    /// still gives a region of the page: clamping its size between 1 and nothing panicked.
+    #[test]
+    fn a_region_at_the_edge_of_the_page_stays_in_it() {
+        let page = (1224, 1584);
+        assert_eq!(
+            pixel_region((10.0, 20.0, 100.0, 50.0), 2.0, page),
+            (20, 40, 200, 100)
+        );
+        for region in [
+            (611.9, 791.9, 0.05, 0.05),
+            (612.0, 792.0, 5.0, 5.0),
+            (700.0, 900.0, 5.0, 5.0),
+        ] {
+            assert_eq!(pixel_region(region, 2.0, page), (1223, 1583, 1, 1));
+        }
+        assert_eq!(
+            pixel_region((-5.0, -5.0, 2.0, 2.0), 2.0, page),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(
+            pixel_region((0.0, 0.0, 1.0, 1.0), 2.0, (0, 0)),
+            (0, 0, 1, 1)
+        );
+    }
 
     fn sync_box(page: u32, h: f32, v_top: f32, width: f32, height: f32) -> SyncBox {
         SyncBox {

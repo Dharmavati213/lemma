@@ -322,6 +322,13 @@ fn inline_verbatim() {
         ("\\verb+a%b+ x‸", Context::Text),
         ("\\verb*|$ $| x‸", Context::Text),
         ("\\verb!{! x‸", Context::Text),
+        // LaTeX skips spaces before the delimiter; after a space a star is the delimiter.
+        ("\\verb |$| x‸", Context::Text),
+        ("\\verb  |$‸|", Context::Verbatim),
+        ("\\verb* |$ $| x‸", Context::Text),
+        ("\\verb *$* x‸", Context::Text),
+        ("\\lstinline |$| a‸", Context::Text),
+        ("\\lstinline[language=C] |$| a‸", Context::Text),
         ("$\\verb|$| x‸$", inline()),
         ("\\lstinline|$| a‸", Context::Text),
         ("\\lstinline{$} a‸", Context::Text),

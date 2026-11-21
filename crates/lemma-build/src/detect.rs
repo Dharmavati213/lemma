@@ -217,10 +217,12 @@ fn reaches(files: &HashMap<PathBuf, &FileIndex>, root: &Path, target: &Path) -> 
         };
         let current_dir = current.parent().unwrap_or(Path::new(""));
         if target_is_bib {
-            let bibliographies = fi
-                .includes
-                .iter()
-                .filter(|inc| inc.kind == IncludeKind::Bibliography);
+            let bibliographies = fi.includes.iter().filter(|inc| {
+                matches!(
+                    inc.kind,
+                    IncludeKind::Bibliography | IncludeKind::BibResource
+                )
+            });
             for inc in bibliographies {
                 for base in [root_dir, current_dir] {
                     let written = resolve(base, Path::new(inc.target.trim()));

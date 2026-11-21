@@ -102,7 +102,20 @@ enum Behaviour {
 
 /// Accepts one connection. A bad token closes it without a reply, like the real MCP server.
 fn spawn_server(listener: Listener, behaviour: Behaviour) -> JoinHandle<ServerLog> {
+    spawn_server_after_refusing(listener, 0, behaviour)
+}
+
+/// [`spawn_server`], after closing the first `refused` connections at once, unread, as the
+/// editor turns new connections away while a program floods its socket.
+fn spawn_server_after_refusing(
+    listener: Listener,
+    refused: usize,
+    behaviour: Behaviour,
+) -> JoinHandle<ServerLog> {
     thread::spawn(move || {
+        for _ in 0..refused {
+            drop(listener.accept().expect("accept"));
+        }
         let (stream, _) = listener.accept().expect("accept");
         let mut writer = stream.try_clone().expect("clone");
         let mut lines = BufReader::new(stream).lines();
@@ -284,6 +297,31 @@ fn stops_relaying_after_a_bad_token() {
     assert!(log.requests.is_empty());
 }
 
+/// The editor closes the connection before it answers anything (it turns new connections away
+/// for a moment while a program floods its socket): the bridge connects again and sends the
+/// token and the requests again, so the agent still gets its answers and the editor sees each
+/// request once.
+#[test]
+fn connects_again_when_the_editor_turns_it_away() {
+    let dir = SocketDir::new();
+    let server = spawn_server_after_refusing(bind(&dir.socket()), 2, Behaviour::EchoUntilEof);
+    let mut bridge = Bridge::spawn(&dir.socket(), TOKEN, None);
+
+    let first = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let second = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+    bridge.send(first);
+    assert_eq!(bridge.recv(), format!("{{\"reply_to\":{first}}}"));
+    bridge.send(second);
+    assert_eq!(bridge.recv(), format!("{{\"reply_to\":{second}}}"));
+
+    bridge.close_stdin();
+    assert!(bridge.wait().success());
+    let log = server.join().unwrap();
+    assert_eq!(log.handshake, format!("{{\"lemma_token\":\"{TOKEN}\"}}"));
+    assert_eq!(log.requests, [first, second]);
+    assert!(bridge.remaining_output().is_empty());
+}
+
 #[test]
 fn exits_when_the_editor_hangs_up() {
     let dir = SocketDir::new();
@@ -312,7 +350,9 @@ fn fails_without_environment_or_server() {
     assert_eq!(missing_env.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&missing_env.stderr).contains("LEMMA_MCP_SOCKET"));
 
-    // Nobody listens on this path.
+    // Nobody listens on this path, and no socket is there: the editor is gone (it removes its
+    // socket when it stops), so the bridge does not wait and try again.
+    let started = std::time::Instant::now();
     let no_server = Command::new(env!("CARGO_BIN_EXE_lemma-mcp"))
         .env("LEMMA_MCP_SOCKET", dir.socket())
         .env("LEMMA_MCP_TOKEN", TOKEN)
@@ -321,6 +361,11 @@ fn fails_without_environment_or_server() {
         .expect("run lemma-mcp");
     assert_eq!(no_server.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&no_server.stderr).contains("cannot connect"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "gave up after {:?}",
+        started.elapsed()
+    );
 }
 
 #[cfg(unix)]

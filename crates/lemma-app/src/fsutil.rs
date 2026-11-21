@@ -1,11 +1,13 @@
 //! File system helpers whose details differ between Unix and Windows: private files and
-//! directories, opening a file that may be a FIFO, and executable files.
+//! directories, opening a file that may be a FIFO, and executable files; and temporary
+//! directories that go when the app ends.
 //!
 //! Windows has no permission bits. Lemma's files there live in the user's profile (`%APPDATA%`,
 //! `%LOCALAPPDATA%`), whose access control list already keeps other users out, so "private"
 //! adds nothing; there are no FIFOs in the file system, and a file is a program by its extension
 //! (`.exe`, `.cmd` and the rest of `PATHEXT`).
 
+use std::cell::RefCell;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,47 @@ pub fn private_dir_builder() -> DirBuilder {
         builder.mode(0o700);
     }
     builder
+}
+
+/// A new directory in the system's temporary directory, with a random name that starts with
+/// `prefix`, created anew (never one that existed) and only the user can enter (mode 0700): no
+/// other user of the machine can have made it first, planted files or links in it, or read
+/// it. It stays until the caller removes it. A fixed name (`/tmp/lemma-demo-<pid>`) could be
+/// made in advance by someone else, with a link that a write then follows.
+pub fn private_temp_dir(prefix: &str) -> io::Result<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(builder.tempdir()?.keep())
+}
+
+thread_local! {
+    /// The directories of [`remove_at_exit`].
+    static AT_EXIT: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Removes the temporary directory `dir`, with what it holds, when the app ends
+/// ([`remove_dirs_at_exit`]), if nothing removed it before. A directory that is to go with its
+/// window needs this too: a run that quits by itself (`--quit-after-ms`) ends without destroying
+/// its window.
+pub fn remove_at_exit(dir: &Path) {
+    AT_EXIT.with_borrow_mut(|dirs| dirs.push(dir.to_path_buf()));
+}
+
+/// Removes the directories of [`remove_at_exit`]; the app calls it once its main loop has ended.
+pub fn remove_dirs_at_exit() {
+    for dir in AT_EXIT.take() {
+        match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                tracing::info!("cannot remove {}: {e}", dir.display());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Opens `path` for reading. On Unix with `O_NONBLOCK`: opening a FIFO would otherwise wait for a
@@ -111,6 +154,27 @@ fn program_extensions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_temp_dirs_are_new_and_private() {
+        let a = private_temp_dir("lemma-test-").unwrap();
+        let b = private_temp_dir("lemma-test-").unwrap();
+        assert_ne!(a, b);
+        assert!(a.is_dir() && b.is_dir());
+        assert!(
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("lemma-test-"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        std::fs::remove_dir(a).unwrap();
+        std::fs::remove_dir(b).unwrap();
+    }
 
     #[test]
     fn programs_are_found_by_name() {

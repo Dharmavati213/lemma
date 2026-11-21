@@ -65,6 +65,17 @@ use std::time::{Duration, Instant};
 
 /// How long open documents' text copies are kept after the last search.
 pub const LIVE_CACHE_LIFETIME: Duration = Duration::from_secs(30);
+
+thread_local! {
+    /// [`LIVE_CACHE_LIFETIME`], or what a test set ([`set_live_cache_lifetime`]).
+    static LIVE_CACHE_TIME: Cell<Duration> = const { Cell::new(LIVE_CACHE_LIFETIME) };
+}
+
+/// Keeps open documents' text copies `lifetime` after the last search (tests).
+pub fn set_live_cache_lifetime(lifetime: Duration) {
+    LIVE_CACHE_TIME.with(|t| t.set(lifetime));
+}
+
 /// Delay of search-as-you-type after the last change of the query.
 const SEARCH_DELAY_MS: u32 = 150;
 /// Characters of a line shown before its first match at most (the rest of the line is
@@ -591,14 +602,20 @@ pub fn install(state: &Rc<WindowState>) {
 }
 
 /// `win.project-search` (Ctrl+Shift+F): shows the page and focuses the query, prefilled with
-/// the active editor's selection when it is one line.
+/// the active editor's selection when it is one line (escaped with Regular Expression on).
 pub fn show(state: &Rc<WindowState>) {
     let panel = ensure(state);
     state.sidebar.show_page(PAGE_SEARCH);
-    if let Some(selection) = selection_text(state)
-        && selection != panel.query.text().as_str()
-    {
-        panel.query.set_text(&selection);
+    if let Some(selection) = selection_text(state) {
+        // With Regular Expression on, the selection is looked for as it is, as the find bar does.
+        let query = if panel.regex.is_active() {
+            glib::Regex::escape_string(&selection).to_string()
+        } else {
+            selection
+        };
+        if query != panel.query.text().as_str() {
+            panel.query.set_text(&query);
+        }
     }
     panel.query.grab_focus();
     panel.query.select_region(0, -1);
@@ -1093,7 +1110,7 @@ impl Panel {
         self.results.set_sensitive(results);
     }
 
-    /// The description of the "No Results" or "Invalid Regular Expression" page.
+    /// The description of the "No Results" or "Invalid Regular Expression" page (Pango markup).
     pub fn message(&self) -> String {
         match self.page().as_str() {
             "none" => self.none_page.description().map(|d| d.to_string()),
@@ -1247,7 +1264,9 @@ impl Panel {
                 match e {
                     QueryError::Empty => self.show_page("empty"),
                     QueryError::Invalid(message) => {
-                        self.error_page.set_description(Some(&message));
+                        // Text, not markup: the message may quote the pattern.
+                        self.error_page
+                            .set_description(Some(&glib::markup_escape_text(&message)));
                         self.show_page("error");
                     }
                 }
@@ -1334,14 +1353,15 @@ impl Panel {
             for f in files {
                 current.files += 1;
                 current.matches += f.matches;
-                let doc = state.workspace.get(&f.path);
                 let (name, dir) = name_and_dir(&f.path, &current.root_dir);
                 pending.push_back(Rc::new(FileEntry {
                     version: f
                         .live
                         .then(|| current.versions.get(&f.path).copied())
                         .flatten(),
-                    dirty: f.live && doc.is_some_and(|d| d.is_dirty()),
+                    // Only a live file can have a document (looking one up resolves the path
+                    // on the file system).
+                    dirty: f.live && state.workspace.get(&f.path).is_some_and(|d| d.is_dirty()),
                     path: f.path,
                     name,
                     dir,
@@ -1488,6 +1508,8 @@ impl Panel {
         }
         if summary.files_with_matches == 0 {
             let searched = count(summary.files_searched, "file", "files");
+            // The description is markup: the pattern is text.
+            let pattern = glib::markup_escape_text(&pattern);
             self.none_page
                 .set_description(Some(&format!("Nothing matches “{pattern}” in {searched}")));
             self.show_page("none");
@@ -1550,7 +1572,7 @@ impl Panel {
     }
 
     /// The text of the workspace's open (or unsaved) documents, copied once per version.
-    fn live_texts(&self, state: &WindowState) -> LiveTexts {
+    fn live_texts(self: &Rc<Self>, state: &WindowState) -> LiveTexts {
         let mut cache = self.live_cache.borrow_mut();
         let mut live = Vec::new();
         let mut versions = HashMap::new();
@@ -1579,11 +1601,12 @@ impl Panel {
         if let Some(timer) = self.live_cache_timer.take() {
             timer.remove();
         }
-        let weak = self.state.clone();
-        let timer = glib::timeout_add_local_once(LIVE_CACHE_LIFETIME, move || {
-            if let Some(state) = weak.upgrade()
-                && let Some(panel) = panel(&state)
-            {
+        // The page, not the window: once the timer has run its id is no source any more, and
+        // the page's destructor must not remove it again (glib-rs panics), also when the page
+        // outlives its window.
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(LIVE_CACHE_TIME.with(Cell::get), move || {
+            if let Some(panel) = weak.upgrade() {
                 panel.live_cache_timer.replace(None);
                 panel.live_cache.borrow_mut().clear();
             }
@@ -2198,6 +2221,8 @@ fn visit_includes(
                     vec![format!("{target}.bib")]
                 }
             }
+            // biber reads a data source as written.
+            IncludeKind::BibResource => vec![target.to_owned()],
             IncludeKind::Graphics | IncludeKind::Package => continue,
         };
         let found = names
@@ -2232,25 +2257,67 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// The build output directory, when it is not hidden (a hidden one is skipped anyway).
+/// The build output directory, which the walk leaves out (see [`output_dir`]).
 fn skip_dirs(state: &WindowState) -> Vec<PathBuf> {
-    let outdir = state.config.build.outdir.trim().to_owned();
-    if outdir.is_empty() || outdir == "." || outdir.starts_with('.') {
-        return Vec::new();
-    }
     let base = state
         .build
         .get()
         .and_then(|b| b.root())
         .and_then(|r| r.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| state.workspace.root().path().to_path_buf());
-    vec![lexical(&base.join(outdir))]
+    output_dir(&state.config.build.outdir, &base)
+        .into_iter()
+        .collect()
+}
+
+/// The build output directory `outdir` (`[build] outdir`) of a main document in `base`, as
+/// the walk spells the directories it meets (`.` and `..` folded: `./build` is `build`);
+/// `None` when it is `base` itself (`.`, `./`), where the sources are.
+fn output_dir(outdir: &str, base: &Path) -> Option<PathBuf> {
+    let outdir = outdir.trim();
+    if outdir.is_empty() {
+        return None;
+    }
+    let dir = lexical(&base.join(outdir));
+    (dir != lexical(base)).then_some(dir)
 }
 
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)] // match ranges are lists
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_output_directory_is_named_as_the_walk_names_it() {
+        let base = Path::new("/p/thesis");
+        let build = Some(PathBuf::from("/p/thesis/build"));
+        for outdir in [
+            "build",
+            "./build",
+            "build/",
+            "./build/",
+            " build ",
+            "x/../build",
+        ] {
+            assert_eq!(output_dir(outdir, base), build, "{outdir:?}");
+        }
+        assert_eq!(
+            output_dir("out/pdf", base),
+            Some(PathBuf::from("/p/thesis/out/pdf"))
+        );
+        // Hidden: the walk skips it anyway.
+        assert_eq!(
+            output_dir("./.build", base),
+            Some(PathBuf::from("/p/thesis/.build"))
+        );
+        assert_eq!(
+            output_dir("../build", base),
+            Some(PathBuf::from("/p/build"))
+        );
+        for here in ["", " ", ".", "./", "build/.."] {
+            assert_eq!(output_dir(here, base), None, "{here:?}");
+        }
+    }
 
     #[test]
     fn markup_highlights_and_previews() {

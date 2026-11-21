@@ -13,7 +13,7 @@ Windows itself or on Linux as a cross build.
 
 ```sh
 packaging/windows/build.sh            # build, the folder, the zip and the installer
-packaging/windows/build.sh --test     # also run the tests of the crates without GTK windows
+packaging/windows/build.sh --test     # also run the tests (on Linux under Wine)
 packaging/windows/build.sh --smoke    # also start the packaged app and snapshot its window
 packaging/windows/build.sh --help     # every option
 ```
@@ -22,7 +22,8 @@ packaging/windows/build.sh --help     # every option
 
 Needs `rustup`, `curl`, `python3`, `tar` with zstd, `pkg-config` and `glib-compile-schemas`
 (Arch: `pacman -S rustup curl python tar zstd pkgconf glib2`), and for `--test` the Liberation
-fonts (`ttf-liberation`), which stand in for Arial and Times in Wine. The first run downloads,
+fonts (`ttf-liberation`), which stand in for Arial and Times in Wine, and `xvfb-run` for the GUI
+tests (`xorg-server-xvfb`; without it they are skipped). The first run downloads,
 into `target/windows-sdk/` (about 3.5 GB with the Wine prefix; `LEMMA_WINDOWS_SDK` moves it):
 
 | What | Why | Checked against |
@@ -49,6 +50,24 @@ packaging/windows/build.sh
 
 For the installer, install Inno Setup 6 (or pass `--no-installer`).
 
+## The tests
+
+`--test` runs, before the app is packaged (a failure is reported at the end):
+
+- the tests of the crates without GTK windows and the app's unit tests (`lemma-app --lib`): on
+  Windows natively, on Linux under Wine;
+- on Linux, the GUI test programs of `crates/lemma-app/tests` that pass under Wine (`GUI_TESTS`
+  in `build.sh`; [docs/testing.md](../../docs/testing.md) says which and why not the others).
+  Each runs under `xvfb-run`, on an X display of its own, so no window opens on your desktop,
+  and with a time limit of 20 minutes; its output goes to
+  `target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Without `xvfb-run` a line says that
+  they were skipped.
+
+On Windows itself the GUI tests are left out: they have only been run under Wine, in a prefix
+of their own. They keep what they write out of your own files with `HOME` and `XDG_*`
+directories, which is enough on Linux; on Windows some of it would go to your own `%APPDATA%`
+and `%LOCALAPPDATA%` (docs/testing.md has the details), so do not run them there as they are.
+
 ## What is in the folder
 
 | Path | Contents |
@@ -58,7 +77,7 @@ For the installer, install Inno Setup 6 (or pass `--no-installer`).
 | `lib/enchant-2/` | spell checking with Hunspell, and with Windows' own spell checker (`winspell`) |
 | `share/` | compiled GSettings schemas, the Adwaita and hicolor icon themes, GtkSourceView's languages and styles, Hunspell's English dictionaries, Lemma's default snippets, prompts and templates |
 | `etc/fonts/` | fontconfig's configuration (cairo uses it) |
-| `share/licenses/` | Lemma's licence, the licences of the bundled MSYS2 packages, and `msys2-packages.txt` with their versions |
+| `share/licenses/` | Lemma's licence and the notice of the SyncTeX parser compiled into `lemma.exe` (`lemma/LICENSE.synctex`, printed from the vendored files by `packaging/synctex-notice.sh`), the licences of the Rust crates compiled into the two programs (`lemma/LICENSE.crates`, printed by `cargo run -p xtask -- licenses`), the licences of the bundled MSYS2 packages, and `msys2-packages.txt` with their versions |
 
 GLib, GTK and the rest find `share`, `lib` and `etc` next to `bin` by themselves, so the folder
 needs no environment variables. `lemma.exe` attaches to the console of a terminal that starts
@@ -90,6 +109,10 @@ gh release upload <tag> dist/Lemma-*-windows-x86_64.zip dist/Lemma-*-windows-x86
 
 - Paths inside Lemma are canonical without Windows' `\\?\` prefix (`lemma_core::canonicalize`),
   so TeX, GTK and comparisons see `C:\…`.
+- The window shows paths as Windows writes them (`chapters\intro.tex`). What the agent is told
+  names files with `/` (`chapters/intro.tex`, `C:/Users/u/paper`; `lemma_core::agent_path`), so
+  that a name it copies into `\input{…}` is not read as a command; from the agent, either
+  spelling is taken.
 - latexmk, the agent and the other programs run without console windows, each in a job object
   that ends everything they started when Lemma stops them (or when Lemma ends).
 - The agent's MCP bridge reaches Lemma through a loopback TCP port named in a file where the
@@ -98,3 +121,7 @@ gh release upload <tag> dist/Lemma-*-windows-x86_64.zip dist/Lemma-*-windows-x86
   Manager.
 - Under Wine (`--smoke`) the window's text looks rough: Wine lacks Windows' fonts (Segoe UI,
   Consolas). On Windows it does not.
+- `--smoke` on Linux opens the window on your desktop for a few seconds. To keep it off the
+  desktop, give Wine a display of its own:
+  `env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1600x1000x24" packaging/windows/build.sh
+  --smoke` (Xvfb is `xorg-server-xvfb` on Arch, `xvfb` on Debian and Ubuntu).

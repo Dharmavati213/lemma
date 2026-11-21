@@ -8,11 +8,11 @@
 # (LEMMA_RSS_WAYLAND=1), and Broadway runs just print the numbers.
 # Paths are relative to the repository root; target/fixtures/* comes from scripts/build-fixtures.sh.
 #
-# Set from real-Wayland measurements of the release build with the default renderer, cairo: idle 99.3–100.0 / 76.3–76.5 MB, pdf50
-# 146.2–147.1 / 122.5–123.5 MB, large 103.7–115.1 / 91.1–91.6 MB. PSS is the figure with no other
-# GTK process running: each one that maps the same libraries and fonts takes a share of them (with
-# the other agents' GTK tests running, PSS measured 62–63 / 109 / 78 MB). With `[editor] renderer
-# = "vulkan"` RSS is about 27 MB higher (idle 127 MB).
+# Set from real-Wayland measurements of the release build with the default renderer, cairo: idle
+# 99.3–100.0 / 76.3–76.5 MB, pdf50 146.2–147.1 / 122.5–123.5 MB, large 103.7–115.1 / 91.1–91.6 MB.
+# PSS is the figure with no other GTK process running: each one that maps the same libraries and
+# fonts takes a share of them (with the other agents' GTK tests running, PSS measured 62–63 / 109 /
+# 78 MB). With `[editor] renderer = "vulkan"` RSS is about 27 MB higher (idle 127 MB).
 
 tolerance = 1.10
 
@@ -24,7 +24,8 @@ rss_mb = 100
 pss_mb = 76
 
 [pdf50]
-# Plus a 50-page PDF with a full page cache (48 MiB). WP1.6 defines how `--demo pdf` fills the cache.
+# Plus a 50-page PDF with a full page cache (48 MiB). WP1.6 defines how `--demo pdf` fills the
+# cache.
 args = ["--demo", "pdf", "target/fixtures/pdf50.tex"]
 quit_after_ms = 5000
 rss_mb = 148

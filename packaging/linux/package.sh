@@ -55,8 +55,19 @@ done
 mkdir -p "$OUT"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+# The binaries contain the SyncTeX parser (LEMMA_SYNCTEX_BUNDLED=1), whose licence asks for its
+# notice to go with them.
+sh packaging/synctex-notice.sh >"$work/LICENSE.synctex"
+# The Rust crates compiled into the binaries: most of their licences ask for their notices and
+# texts to go with them (xtask reads them from the crates' sources, which the build fetched).
+command -v cargo >/dev/null || die "cargo is needed for the crates' licences (LICENSE.crates)"
+cargo run -q --locked -p xtask -- licenses >"$work/LICENSE.crates"
+[ -s "$work/LICENSE.crates" ] || die "xtask licenses printed nothing"
 
-# stage DEST PREFIX LICENSE_PATH: Lemma's files under DEST/PREFIX (the layout of the PKGBUILD).
+# stage DEST PREFIX LICENSE_PATH NOTICE_PATH CRATES_PATH: Lemma's files under DEST/PREFIX (the
+# layout of the PKGBUILD), Lemma's licence at LICENSE_PATH, the SyncTeX parser's notice at
+# NOTICE_PATH, after the licence when that is the same file (the .deb's one copyright file), and
+# the licences of the Rust crates at CRATES_PATH.
 stage() {
   local dest="$1$2"
   install -Dm755 "$TARGET_DIR/release/lemma" "$dest/bin/lemma"
@@ -66,6 +77,8 @@ stage() {
     "$dest/share/applications/io.github.lemma_editor.Lemma.desktop"
   install -Dm644 packaging/io.github.lemma_editor.Lemma.svg \
     "$dest/share/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg"
+  install -Dm644 packaging/io.github.lemma_editor.Lemma.metainfo.xml \
+    "$dest/share/metainfo/io.github.lemma_editor.Lemma.metainfo.xml"
   # The defaults built into lemma, as examples for ~/.config/lemma/.
   install -Dm644 -t "$dest/share/lemma" data/snippets.default.toml data/prompts.default.toml
   if [ -d data/templates ]; then
@@ -74,6 +87,13 @@ stage() {
   fi
   install -Dm644 README.md "$dest/share/doc/lemma/README.md"
   install -Dm644 LICENSE "$dest/$3"
+  if [ "$4" = "$3" ]; then
+    printf '\n\n' >>"$dest/$3"
+    cat "$work/LICENSE.synctex" >>"$dest/$3"
+  else
+    install -Dm644 "$work/LICENSE.synctex" "$dest/$4"
+  fi
+  install -Dm644 "$work/LICENSE.crates" "$dest/$5"
 }
 
 deb() {
@@ -81,7 +101,8 @@ deb() {
     die "deb needs dpkg-dev (Debian or Ubuntu)"
   fi
   local root="$work/root" arch deps size file
-  stage "$root" /usr share/doc/lemma/copyright
+  stage "$root" /usr share/doc/lemma/copyright share/doc/lemma/copyright \
+    share/doc/lemma/LICENSE.crates
   # dpkg-shlibdeps reads debian/control of a source package: give it a minimal one.
   mkdir -p "$work/src/debian"
   printf 'Source: lemma\n\nPackage: lemma\nArchitecture: any\n' >"$work/src/debian/control"
@@ -120,7 +141,8 @@ EOF
 rpm() {
   command -v rpmbuild >/dev/null || die "rpm needs rpmbuild (Fedora: dnf install rpm-build)"
   local root="$work/root"
-  stage "$root" /usr share/licenses/lemma/LICENSE
+  stage "$root" /usr share/licenses/lemma/LICENSE share/licenses/lemma/LICENSE.synctex \
+    share/licenses/lemma/LICENSE.crates
   rpmbuild -bb --quiet \
     --define "_topdir $work/rpmbuild" \
     --define "lemma_version $VERSION" \
@@ -133,7 +155,7 @@ tarball() {
   local name dir
   name="lemma-$LABEL-linux-$(uname -m)"
   dir="$work/$name"
-  stage "$dir" "" LICENSE
+  stage "$dir" "" LICENSE LICENSE.synctex LICENSE.crates
   install -Dm755 "$HERE/install.sh" "$dir/install.sh"
   tar -C "$work" -czf "$OUT/$name.tar.gz" "$name"
   echo "$OUT/$name.tar.gz"

@@ -125,7 +125,8 @@ pub fn list_words(text: &str) -> Vec<String> {
             out.push(word);
         }
     };
-    for part in text.split(|c: char| c.is_whitespace() || c == '-') {
+    // A byte-order mark (Notepad's "UTF-8 with BOM") is no part of the first word.
+    for part in text.split(|c: char| c.is_whitespace() || c == '-' || c == '\u{feff}') {
         let mut chars = part.chars();
         let Some(first) = chars.next() else {
             continue;
@@ -646,7 +647,9 @@ struct ProseFilter {
     buffer: sourceview5::Buffer,
     /// The adapter's underline tag.
     tag: gtk::TextTag,
-    /// The tokens of the line last asked about: (document version, line, tokens).
+    /// The tokens of the line last asked about: (document version, line, tokens). A version of
+    /// `u64::MAX` marks them stale: the scanner states of their line changed without an edit (a
+    /// rebuild with other rules, `[editor] math_envs`).
     tokens: RefCell<(u64, u32, Vec<lemma_syntax::Token>)>,
     /// Lines whose scanner states changed since the last recheck (`start..end`, kept in step
     /// with later changes).
@@ -772,6 +775,12 @@ impl ProseFilter {
     /// The scanner states of `lines` changed: recheck them (see the module docs) before the
     /// next frame.
     fn retagged(self: &Rc<Self>, lines: Range<u32>) {
+        {
+            let mut cached = self.tokens.borrow_mut();
+            if lines.contains(&cached.1) {
+                cached.0 = u64::MAX;
+            }
+        }
         let range = match self.pending.get() {
             Some((start, end)) => (start.min(lines.start), end.max(lines.end)),
             None => (lines.start, lines.end),
@@ -1177,6 +1186,10 @@ impl WindowSpell {
         }));
         let weak = Rc::downgrade(entry);
         let doc = Rc::downgrade(editor.document());
+        // The task must not keep the adapter: one that `stop` let go of while this waits would
+        // go on listening to the buffer without its underline tag (the highlighter's next
+        // no-spell tag made it remove that tag: a GTK critical).
+        let adapter = adapter.downgrade();
         glib::spawn_future_local(async move {
             if load_lists(checker, language.clone(), lists).await > 0 {
                 // Words other documents of the language did not accept so far.
@@ -1197,7 +1210,9 @@ impl WindowSpell {
                 glib::timeout_future(Duration::from_millis(50)).await;
             }
             // Still the same adapter, and checking still on.
-            if current() {
+            if current()
+                && let Some(adapter) = adapter.upgrade()
+            {
                 adapter.set_enabled(true);
             }
         });
@@ -1234,6 +1249,27 @@ fn stop(entry: &EditorSpell, editor: Option<&Rc<Editor>>) {
     }
     // Off first: the adapter removes its tags from the buffer.
     checking.adapter.set_enabled(false);
+    // Then its underline tag leaves the tag table, which libspelling does not do: every
+    // switching off and on (or another language) left one more tag in the buffer, and each tag
+    // there slows every tag operation of GTK's (the highlighter's, every keystroke's).
+    //
+    // Only once the adapter is gone, though. It keeps a plain pointer to its tag, which the tag
+    // table alone owns, and uses it for as long as it lives (whenever the no-spell tag is
+    // applied to its buffer, and when it is switched): something else may hold the adapter a
+    // little longer than this (its menu model in an open menu, a pending check). With the tag
+    // freed under it, the next highlighted line made GTK log criticals about a text tag that
+    // is none, or crashed.
+    if let (Some(tag), Some(buffer)) = (checking.adapter.tag(), checking.adapter.buffer()) {
+        let buffer = buffer.downgrade();
+        checking.adapter.add_weak_ref_notify_local(move || {
+            // After the adapter's own clean-up, not in the middle of it.
+            glib::idle_add_local_once(move || {
+                if let Some(buffer) = buffer.upgrade() {
+                    buffer.tag_table().remove(&tag);
+                }
+            });
+        });
+    }
     let editor = editor.cloned().or_else(|| entry.editor.upgrade());
     if let Some(view) = entry.view.upgrade() {
         view.remove_controller(&checking.menu_key);
@@ -1359,8 +1395,16 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_order_mark_is_not_part_of_the_first_word() {
+        assert_eq!(
+            list_words("\u{feff}Barr\r\ncolimit\r\n"),
+            ["Barr", "Barr's", "Barr’s", "colimit"]
+        );
+    }
+
+    #[test]
     fn missing_lists_are_skipped() {
-        let dir = std::env::temp_dir().join(format!("lemma-spell-{}", std::process::id()));
+        let dir = crate::fsutil::private_temp_dir("lemma-spell-").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let list = dir.join("words.txt");
         std::fs::write(&list, "qqword\n").unwrap();

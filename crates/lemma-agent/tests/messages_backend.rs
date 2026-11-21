@@ -566,6 +566,48 @@ fn streams_thinking_and_text_with_the_documented_request() {
 }
 
 #[test]
+fn a_mid_response_fallback_is_echoed_with_its_marker_in_place() {
+    let marker = json!({"type": "fallback", "from": {"model": OPUS},
+        "to": {"model": "claude-opus-4-8"}});
+    let fake = Fake::start(vec![
+        Script::new(OPUS)
+            .thinking(&["Declined "], "sig-declined")
+            .text(&["Part one. "])
+            .block(marker.clone(), &[])
+            .thinking(&["Continuing"], "sig-kept")
+            .text(&["Part two."])
+            .end("end_turn", 5),
+        Script::new("claude-opus-4-8")
+            .text(&["Again"])
+            .end("end_turn", 5),
+    ]);
+    let mut s = Session::simple(&fake);
+    s.prompt("Hi");
+    assert_eq!(s.turn(), StopReason::EndTurn);
+    assert_eq!(
+        notices(&s.events),
+        [format!(
+            "{OPUS} declined part of this response; claude-opus-4-8 continues it."
+        )]
+    );
+    s.prompt("More");
+    assert_eq!(s.turn(), StopReason::EndTurn);
+    let rs = fake.wait_requests(2);
+    assert_append_only(&rs[0], &rs[1]);
+    // The declined model's thinking goes; the marker stays, unchanged, where it arrived.
+    assert_eq!(
+        rs[1].body["messages"][1],
+        json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Part one. "},
+            marker,
+            {"type": "thinking", "thinking": "Continuing", "signature": "sig-kept"},
+            {"type": "text", "text": "Part two."}
+        ]})
+    );
+    s.shutdown();
+}
+
+#[test]
 fn a_tool_round_trip_runs_parallel_calls_in_order_and_answers_in_one_message() {
     let fake = Fake::start(vec![
         Script::new(OPUS)
@@ -864,6 +906,78 @@ fn gives_up_after_three_retries() {
         )
     );
     assert_eq!(notices(&s.events).len(), 3);
+    s.shutdown();
+}
+
+/// The retry rules of Anthropic's SDKs: 408 and 409 are retried too, an `x-should-retry` header
+/// decides over the status, and a 429 for a reached spend limit (which no wait lifts) is not
+/// retried.
+#[test]
+fn retries_408_and_409_and_follows_x_should_retry() {
+    let err =
+        |code: u16, kind: &str, msg: &str, headers: Vec<(&'static str, String)>| Reply::Status {
+            code,
+            headers,
+            body: json!({"type": "error", "error": {"type": kind, "message": msg}}).to_string(),
+        };
+    let fake = Fake::start(vec![
+        err(408, "timeout_error", "Request timed out", vec![]),
+        err(409, "api_error", "Conflict", vec![]),
+        Script::new(OPUS).text(&["One"]).end("end_turn", 2),
+        // The server says no retry, whatever the status.
+        err(
+            503,
+            "api_error",
+            "Not this time",
+            vec![("x-should-retry", "false".into())],
+        ),
+        // A spend limit: no retry.
+        Reply::Status {
+            code: 429,
+            headers: vec![],
+            body: json!({"type": "error", "error": {"type": "rate_limit_error",
+                "message": "You have reached your specified API usage limits.",
+                "details": {"error_code": "enforced_spend_limit_reached"}}})
+            .to_string(),
+        },
+        // The server asks for a retry of a status that is otherwise final.
+        err(
+            400,
+            "invalid_request_error",
+            "Try again",
+            vec![("x-should-retry", "true".into())],
+        ),
+        Script::new(OPUS).text(&["Two"]).end("end_turn", 2),
+    ]);
+    let mut s = Session::simple(&fake);
+    s.prompt("Hi");
+    assert_eq!(s.turn(), StopReason::EndTurn);
+    assert_eq!(fake.requests().len(), 3);
+    let n = notices(&s.events);
+    assert!(
+        n.len() == 2 && n[0].contains("(408)") && n[1].contains("(409)"),
+        "{n:?}"
+    );
+    assert!(s.events.contains(&AgentEvent::MessageChunk("One".into())));
+
+    for expected in ["(503)", "(429)"] {
+        s.events.clear();
+        s.prompt("Again");
+        assert_eq!(s.turn(), StopReason::EndTurn);
+        let error = last_error(&s.events).expect("an error");
+        assert!(
+            error.contains(expected) && !error.contains("gave up"),
+            "{error}"
+        );
+        assert!(notices(&s.events).is_empty(), "not retried: {:?}", s.events);
+    }
+    assert_eq!(fake.requests().len(), 5);
+
+    s.events.clear();
+    s.prompt("Last");
+    assert_eq!(s.turn(), StopReason::EndTurn);
+    assert!(s.events.contains(&AgentEvent::MessageChunk("Two".into())));
+    assert_eq!(fake.requests().len(), 7);
     s.shutdown();
 }
 

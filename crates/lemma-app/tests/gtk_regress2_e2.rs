@@ -23,7 +23,7 @@ use lemma_app::agent::AgentState;
 use lemma_app::agent::panel::{self, PanelCommand};
 use lemma_app::editor::completion;
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, VimMode, vim};
+use lemma_app::editor::{Editor, VimMode};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
@@ -238,7 +238,7 @@ impl Fixture {
         if layer == glib::Propagation::Proceed && !editor.vim_blocks_key(keyval, state) {
             let consumed = editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, editor.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, editor.view(), keyval, state));
             let modified =
                 state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
             if !consumed && !modified {
@@ -531,6 +531,8 @@ fn regress2_tab_step_out_skips_opening_and_escaped_dollars() {
 // ───────────── E2-10: counted and repeated joins at the end of a file ─────────────
 
 fn regress2_vim_counted_join_at_the_end_returns() {
+    // The child types keys.
+    common::require_keymap();
     let status = hang_child("counted_join", Duration::from_secs(30));
     assert_eq!(
         status,
@@ -540,6 +542,8 @@ fn regress2_vim_counted_join_at_the_end_returns() {
 }
 
 fn regress2_vim_dot_repeated_join_at_the_end_returns() {
+    // The child types keys.
+    common::require_keymap();
     let status = hang_child("dot_join", Duration::from_secs(30));
     assert_eq!(
         status,

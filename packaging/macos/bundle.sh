@@ -4,8 +4,13 @@
 #
 #   packaging/macos/bundle.sh [--skip-build]
 #
+# --skip-build packages the release build of an earlier run. A plain `cargo build --release` is
+# not enough: the build here leaves room in the binaries' headers for the bundle's longer library
+# paths and builds for MACOSX_DEPLOYMENT_TARGET.
+#
 # Needs: macOS on Apple silicon, Rust, Xcode's command line tools, and
-#   brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme librsvg
+#   brew install gtk4 libadwaita gtksourceview5 libspelling poppler adwaita-icon-theme \
+#     librsvg pkgconf
 #
 # Env: LEMMA_DIST_DIR   output directory (default: dist)
 #      LEMMA_DMG_NAME   the DMG's file name without .dmg (default: Lemma-VERSION-macos-ARCH)
@@ -50,6 +55,8 @@ LIB="$RES/lib"
 SHARE="$RES/share"
 
 if [ "${1:-}" != --skip-build ]; then
+  # The -sys crates find GTK through it; macOS has none of its own.
+  command -v pkg-config >/dev/null || die "pkg-config is needed to build: brew install pkgconf"
   step "cargo build --release (macOS $MIN_MACOS and later)"
   export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
   # Room in the load commands for the bundle's longer library paths (install_name_tool).
@@ -116,7 +123,13 @@ fi
 mkdir -p "$LIB/gio/modules"
 
 step "libraries"
-python3 "$HERE/bundle_dylibs.py" "$APP" "$CONTENTS/MacOS/lemma" "$CONTENTS/MacOS/lemma-mcp" \
+# --data: what this script copies from Homebrew itself, for the licences of its formulae (the
+# libraries' formulae are found from the libraries).
+python3 "$HERE/bundle_dylibs.py" "$APP" \
+  --data="$pixbuf_src" --data="$BREW/lib/enchant-2" --data="$BREW/share/enchant-2" \
+  --data="$BREW/share/icons/Adwaita" --data="$BREW/share/icons/hicolor/index.theme" \
+  --data="$BREW/share/gtksourceview-5" \
+  "$CONTENTS/MacOS/lemma" "$CONTENTS/MacOS/lemma-mcp" \
   ${modules[@]+"${modules[@]}"}
 
 step "data: GSettings schemas, icon themes, GtkSourceView"
@@ -136,6 +149,10 @@ mkdir -p "$SHARE/lemma"
 cp data/snippets.default.toml data/prompts.default.toml "$SHARE/lemma/"
 if [ -d data/templates ]; then cp -R data/templates "$SHARE/lemma/templates"; fi
 cp LICENSE "$RES/"
+# The SyncTeX parser compiled into lemma: its licence asks for its notice to go with it.
+sh packaging/synctex-notice.sh > "$RES/LICENSE.synctex"
+# The Rust crates compiled into lemma and lemma-mcp: their licences' notices and texts.
+cargo run -q --locked -p xtask -- licenses > "$RES/LICENSE.crates"
 
 step "ad-hoc signature"
 # Inside out: libraries and modules, the helper, then the app (which signs the main executable).

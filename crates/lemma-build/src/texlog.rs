@@ -64,8 +64,11 @@ impl Patterns {
     fn new() -> Self {
         let re = |pattern: &str| Regex::new(pattern).expect("valid regex");
         Patterns {
+            // A path (`./`, `/`, a drive) may hold colons (`./a:b.tex:3: …`): it ends at the
+            // first `:<line>: `. A bare name has none, or a message (`Package x Error: …`)
+            // could pass for one.
             file_line_error: re(
-                r"^(?P<file>(?:\.{1,2}/|/|[A-Za-z]:[/\\])[^:]*|[^\s:/(][^:]*\.(?:tex|sty|cls|ltx|def|cfg|clo|fd|bbl|aux|toc|lof|lot|out|nav|snm|vrb|bib|lbx|cbx|bbx|dbx|ldf|tikz|pgf|lua)):(?P<line>\d+): (?P<msg>.*)$",
+                r"^(?P<file>(?:\.{1,2}/|/|[A-Za-z]:[/\\]).*?|[^\s:/(][^:]*\.(?:tex|sty|cls|ltx|def|cfg|clo|fd|bbl|aux|toc|lof|lot|out|nav|snm|vrb|bib|lbx|cbx|bbx|dbx|ldf|tikz|pgf|lua)):(?P<line>\d+): (?P<msg>.*)$",
             ),
             line_number: re(r"^l\.(?P<line>\d+) (?P<pre>.*)$"),
             warning: re(
@@ -537,8 +540,13 @@ impl<'a> Parser<'a> {
         while i < bytes.len() {
             match bytes[i] {
                 b'(' => {
-                    let (token, len) = file_token(&line[i + 1..]);
-                    if let Some(id) = self.file_id(token) {
+                    let rest = &line[i + 1..];
+                    let (token, len) = file_token(rest);
+                    let found = match self.file_id(token) {
+                        Some(id) => Some((id, len)),
+                        None => self.spaced_file(rest, len),
+                    };
+                    if let Some((id, len)) = found {
                         if self.stack.is_empty() && self.root.is_none() {
                             self.root = Some(id);
                         }
@@ -570,6 +578,30 @@ impl<'a> Parser<'a> {
         });
         self.known.insert(token.to_owned(), id);
         id
+    }
+
+    /// A file whose name has spaces or parentheses, which TeX Live writes without quotes
+    /// (`(./my chapter.tex`, `(./fig (a)/x.tex`): the shortest longer stretch of `rest` that ends
+    /// before a delimiter and names a file, when the name up to the first delimiter (`len`
+    /// bytes) is a path that is not one. Returns the file and the length of its name.
+    fn spaced_file(&mut self, rest: &str, len: usize) -> Option<(usize, usize)> {
+        /// Names tried after the first: enough for a few spaces and parentheses.
+        const TRIES: usize = 8;
+        let path_like = rest.starts_with("./")
+            || rest.starts_with("../")
+            || rest.starts_with('/')
+            || rest.get(1..3).is_some_and(|s| s == ":/" || s == ":\\");
+        if !path_like {
+            return None;
+        }
+        rest.char_indices()
+            .skip_while(|&(k, _)| k <= len)
+            .filter(|&(_, c)| matches!(c, ')' | '(' | ' ' | '[' | '{' | '"' | '<'))
+            .map(|(k, _)| k)
+            .chain([rest.len()])
+            .filter(|&k| !rest[..k].ends_with(' '))
+            .take(TRIES)
+            .find_map(|k| Some((self.file_id(&rest[..k])?, k)))
     }
 
     /// The innermost open file, else the root document.
@@ -814,13 +846,86 @@ mod tests {
         );
     }
 
+    /// A Unix file name may hold colons; the `file:line:` header (`-file-line-error`) of an
+    /// error in it still names the file and the line, relative or absolute. A colon in the
+    /// message does not end the name early, and the file is the error's even when the log's
+    /// file nesting says otherwise. (Unix only: a Windows file name has no colon, and a path with
+    /// one names a drive there.)
+    #[cfg(unix)]
+    #[test]
+    fn file_line_errors_in_file_names_with_colons() {
+        let log = "(./main.tex (./notes: draft/a:b.tex\n\
+                   ./notes: draft/a:b.tex:3: Undefined control sequence.\n\
+                   l.3 \\foo\n\n\
+                   /w/12:30/c.tex:7: Package x Error: y:2: z.\n\n\
+                   l.7 \\bar\n\n\
+                   )\n)\n";
+        let r = parse(log);
+        assert_eq!(
+            located(&r),
+            [
+                (
+                    "/w/notes: draft/a:b.tex".to_owned(),
+                    Some(3),
+                    Severity::Error,
+                    "Undefined control sequence."
+                ),
+                (
+                    "/w/12:30/c.tex".to_owned(),
+                    Some(7),
+                    Severity::Error,
+                    "Package x: y:2: z."
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn quoted_file_names_with_spaces() {
         let log =
             "(\"./my file.tex\" (./a (b).tex\n\nLaTeX Warning: W1.\n\n)\nLaTeX Warning: W2.\n\n";
         let r = parse(log);
-        assert_eq!(r.diagnostics[0].path, Path::new("/w/my file.tex"));
+        // W1 is in `a (b).tex`, whose parentheses do not unbalance the file stack.
+        assert_eq!(r.diagnostics[0].path, Path::new("/w/a (b).tex"));
         assert_eq!(r.diagnostics[1].path, Path::new("/w/my file.tex"));
+    }
+
+    /// TeX Live writes the names of files with spaces or parentheses as they are, without
+    /// quotes (pdfTeX and XeTeX of TeX Live 2026, `\input{"my chapter"}`).
+    #[test]
+    fn unquoted_file_names_with_spaces_and_parentheses() {
+        let files = [
+            "main.tex",
+            "chap (1).tex",
+            "my chapter.tex",
+            "fig (a)/x.tex",
+        ];
+        let exists = |p: &Path| files.iter().any(|f| p == Path::new(".").join(f));
+        let log = "(./main.tex (/usr/share/texmf-dist/tex/latex/base/article.cls\n\
+                   Document Class: article 2025/01/22 v1.4n Standard LaTeX document class\n\
+                   )\n\nLaTeX Warning: Reference `n1' on page 1 undefined on input line 3.\n\n\
+                   (./chap (1).tex\n\nLaTeX Warning: Reference `n2' on page 1 undefined on input line 1.\n\n\
+                   ) (./my chapter.tex\n\nLaTeX Warning: Reference `n3' on page 1 undefined on input line 1.\n\n\
+                   ) (./fig (a)/x.tex\n\nLaTeX Warning: Reference `n4' on page 1 undefined on input line 1.\n\n\
+                   ./fig (a)/x.tex:1: Undefined control sequence.\nl.1 Fig x \\undefinedmacro\n\n\
+                   ) (./my chapter.tex) (./chap (1).tex)\n\n\
+                   LaTeX Warning: Reference `n5' on page 1 undefined on input line 8.\n\n)\n";
+        let found: Vec<(String, Option<u32>)> = parse_log(log, Path::new("/w"), &exists)
+            .diagnostics
+            .iter()
+            .map(|d| (d.path.to_string_lossy().replace('\\', "/"), d.line))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("/w/main.tex".to_owned(), Some(3)),
+                ("/w/chap (1).tex".to_owned(), Some(1)),
+                ("/w/my chapter.tex".to_owned(), Some(1)),
+                ("/w/fig (a)/x.tex".to_owned(), Some(1)),
+                ("/w/fig (a)/x.tex".to_owned(), Some(1)),
+                ("/w/main.tex".to_owned(), Some(8)),
+            ]
+        );
     }
 
     #[test]

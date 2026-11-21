@@ -9,6 +9,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use lemma_app::testmode;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ fn demo(name: &str, scenario: &str, env: &[(&str, &str)]) -> (PathBuf, HashMap<S
             common::fixtures()
                 .join("agent")
                 .join(scenario)
-                .canonicalize()
+                .canonical()
                 .unwrap(),
         )
         .args(["--quit-after-ms", "500"])
@@ -88,9 +90,15 @@ fn copy_dir(from: &Path, to: &Path) {
 
 fn expect(fields: &HashMap<String, String>, want: &[(&str, &str)]) {
     for (key, value) in want {
+        // The files of the hunks are named as Lemma shows paths (`\` on Windows).
+        let value = if *key == "hunks" {
+            common::shown(value)
+        } else {
+            (*value).to_owned()
+        };
         assert_eq!(
             fields.get(*key).map(String::as_str),
-            Some(*value),
+            Some(value.as_str()),
             "{key} in {fields:?}"
         );
     }
@@ -182,7 +190,8 @@ fn basic() {
         &fields,
         &[
             ("stop", "EndTurn"),
-            ("tool_errors", "0"),
+            // The scenario's `compile` is its only call that can fail: without latexmk.
+            ("tool_errors", if latexmk { "0" } else { "1" }),
             ("hunks", "chapters/yoneda.tex:1,main.tex:2"),
             ("disk", "same"),
         ],

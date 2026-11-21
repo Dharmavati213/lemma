@@ -5,7 +5,7 @@
 //! first and after the last) is identical in baseline and current. `cur_lines`/`base_lines` follow
 //! `text::line_span` from the line of the range start.
 
-use super::records::{Claim, Kind, Step};
+use super::records::{Claim, Kind, Pieces, Placement, Step, add_piece};
 use super::{FileReview, Meta, hunk_id, pair_hash};
 use crate::text::{
     count_newlines, line_span, newlines, offset, shift_bytes, shift_lines, signed, to_u32,
@@ -17,6 +17,56 @@ use std::ops::Range;
 fn inside(cur: &Range<usize>, a: usize, b: usize) -> bool {
     let (s, e) = (cur.start, cur.end);
     (a < b && a < e && b > s) || (a == b && s <= a && a < e) || (s == e && a < s && b > s)
+}
+
+/// Bytes looked at, at most, at either end of a hunk's two texts for the text they have in common
+/// there (see [`FileReview::aligned`]): an edit further into a hunk than this counts as within
+/// its change, so that the edits of a replace_all deep inside one long hunk cost nothing more.
+const ALIGN_MAX: usize = 4096;
+
+/// How many bytes `x` and `y` have in common at their start, up to `max`, ending on a char
+/// boundary.
+fn common_start(x: &str, y: &str, max: usize) -> usize {
+    let n = x
+        .bytes()
+        .zip(y.bytes())
+        .take(max)
+        .take_while(|(p, q)| p == q)
+        .count();
+    (0..=n).rev().find(|&k| x.is_char_boundary(k)).unwrap_or(0)
+}
+
+/// How many bytes `x` and `y` have in common at their end, up to `max`, starting on a char
+/// boundary.
+fn common_end(x: &str, y: &str, max: usize) -> usize {
+    let n = x
+        .bytes()
+        .rev()
+        .zip(y.bytes().rev())
+        .take(max)
+        .take_while(|(p, q)| p == q)
+        .count();
+    (0..=n)
+        .rev()
+        .find(|&k| x.is_char_boundary(x.len() - k))
+        .unwrap_or(0)
+}
+
+/// `0..len` in pieces, each with whether it is one of `both`'s.
+fn split(len: usize, both: &Pieces) -> Vec<(Range<usize>, bool)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for x in both.iter().filter(|x| x.start < len) {
+        if pos < x.start {
+            out.push((pos..x.start, false));
+        }
+        out.push((x.start..x.end.min(len), true));
+        pos = x.end.min(len);
+    }
+    if pos < len {
+        out.push((pos..len, false));
+    }
+    out
 }
 
 /// Net length change of a hunk (current minus baseline).
@@ -61,12 +111,13 @@ impl FileReview {
             None => {
                 let all = signed(self.current_len) - signed(self.baseline.len());
                 let before = all - self.hunks[i..].iter().map(growth).sum::<isize>();
-                #[cfg(test)]
-                assert_eq!(
-                    before,
-                    self.hunks[..i].iter().map(growth).sum::<isize>(),
-                    "current_len is not the baseline's length plus the growth of the hunks"
-                );
+                if self.checks() {
+                    assert_eq!(
+                        before,
+                        self.hunks[..i].iter().map(growth).sum::<isize>(),
+                        "current_len is not the baseline's length plus the growth of the hunks"
+                    );
+                }
                 before
             }
         }
@@ -122,7 +173,6 @@ impl FileReview {
     /// before `range.start` and grow the text by `grown`: a walk from hunk `i` on, so that
     /// `check_records` checks every record in one pass over the hunks. The bytes are
     /// compared: equal to a string's, they start and end on char boundaries.
-    #[cfg(test)]
     pub(super) fn text_is_at(
         &self,
         range: &Range<usize>,
@@ -304,6 +354,119 @@ impl FileReview {
             && self.fold_at(i, base_at, a, a, text)
     }
 
+    /// The buffer's undo or redo of the user's edits that went into the baseline (see `user`):
+    /// `[a, b)` of the current text and `[base, base + b - a)` of the baseline, which hold the
+    /// same text, replaced by `text` in both, wherever the hunks lie now. A recompute since may
+    /// have widened a hunk over the place (the line it is on holds a change), where the Inside
+    /// rule would take the edit for one of the proposal, or paired equal lines differently, so
+    /// that the place in one text is no longer the other's: the hunks touching either place then
+    /// become one, with the edit made in both of its texts, which gives both texts back exactly.
+    /// False (nothing changed) when the two places do not hold the same text.
+    pub(super) fn fold_both(&mut self, a: usize, b: usize, base: usize, text: &str) -> bool {
+        let n = b - a;
+        if self.batch.is_some()
+            || base + n > self.baseline.len()
+            || !self.baseline.is_char_boundary(base)
+            || !self.baseline.is_char_boundary(base + n)
+        {
+            return false;
+        }
+        let (c1, c2) = self.touching(a, b);
+        let d1 = self.hunks.partition_point(|h| h.base_bytes.end < base);
+        let d2 = d1
+            + self.hunks[d1..]
+                .iter()
+                .take_while(|h| h.base_bytes.start <= base + n)
+                .count();
+        let (i, j) = (c1.min(d1), c2.max(d2));
+        let before = self.growth_before(i);
+        if i == j && offset(base, before) == a {
+            // The same place between hunks in both texts, whose text is the same there.
+            return self.fold_at(i, base, a, b, text);
+        }
+        let after = before + self.hunks[i..j].iter().map(growth).sum::<isize>();
+        // The region: the hunks, and the places in the gaps next to them.
+        let (mut start, mut end) = (a.min(offset(base, before)), b.max(offset(base + n, after)));
+        if let (Some(first), Some(last)) = (self.hunks[i..j].first(), self.hunks[i..j].last()) {
+            start = start.min(first.cur_bytes.start);
+            end = end.max(last.cur_bytes.end);
+        }
+        let (base_start, base_end) = (offset(start, -before), offset(end, -after));
+        let (cur_line, base_line) = match self.hunks.get(i) {
+            Some(first) if i < j && start == first.cur_bytes.start => {
+                (first.cur_lines.start, first.base_lines.start)
+            }
+            _ => self.gap_lines(i, base_start),
+        };
+        let mut cur = String::with_capacity(end - start + text.len());
+        let mut pos = base_start;
+        for (h, m) in self.hunks[i..j].iter().zip(&self.meta[i..j]) {
+            cur.push_str(&self.baseline[pos..h.base_bytes.start]);
+            cur.push_str(&m.new_text);
+            pos = h.base_bytes.end;
+        }
+        cur.push_str(&self.baseline[pos..base_end]);
+        let mut old = self.baseline[base_start..base_end].to_owned();
+        let (at, base_at) = (a - start, base - base_start);
+        if cur.get(at..at + n).is_none() || cur.get(at..at + n) != old.get(base_at..base_at + n) {
+            return false;
+        }
+        let lines = i64::from(newlines(text)) - i64::from(newlines(&cur[at..at + n]));
+        let delta = signed(text.len()) - signed(n);
+        cur.replace_range(at..at + n, text);
+        old.replace_range(base_at..base_at + n, text);
+        self.baseline.replace_range(base..base + n, text);
+        let (id, meta) = if i < j {
+            let merged = &self.meta[i..j];
+            let meta = Meta {
+                new_text: cur,
+                occurrence: merged[0].occurrence,
+                pair: None,
+                edit_reported: merged.iter().filter_map(|m| m.edit_reported).max(),
+                undo_reported: merged.iter().filter_map(|m| m.undo_reported).max(),
+                reopen: merged.iter().find_map(|m| m.reopen),
+                exact_words: false,
+            };
+            (self.hunks[i].id, meta)
+        } else {
+            let occurrence = self.free_occurrence(&old, &cur, None);
+            let meta = Meta {
+                pair: Some(pair_hash(&old, &cur)),
+                new_text: cur,
+                occurrence,
+                edit_reported: None,
+                undo_reported: None,
+                reopen: None,
+                exact_words: false,
+            };
+            (hunk_id(&old, &meta.new_text, occurrence), meta)
+        };
+        let hunk = Hunk {
+            id,
+            base_lines: line_span(base_line, &old),
+            cur_lines: line_span(cur_line, &meta.new_text),
+            cur_bytes: start..offset(end, delta),
+            base_bytes: base_start..offset(base_end, delta),
+            old_text: old,
+            words: Vec::new(),
+            user_touched: self.hunks[i..j].iter().any(|h| h.user_touched),
+            turns: Vec::new(),
+        };
+        if j > i + 1 {
+            // The ids of the hunks merged into the first one are gone.
+            self.forget_free_hints();
+        }
+        self.hunks.splice(i..j, [hunk]);
+        self.meta.splice(i..j, [meta]);
+        for h in &mut self.hunks[i + 1..] {
+            shift_bytes(&mut h.cur_bytes, delta);
+            shift_bytes(&mut h.base_bytes, delta);
+            shift_lines(&mut h.cur_lines, lines);
+            shift_lines(&mut h.base_lines, lines);
+        }
+        true
+    }
+
     /// Replaces `[a, b)` of the current text, which is `[at, at + b - a)` of the baseline in the
     /// gap before `hunks[i]`, by `text` in both texts.
     fn fold_at(&mut self, i: usize, at: usize, a: usize, b: usize, text: &str) -> bool {
@@ -323,6 +486,35 @@ impl FileReview {
         true
     }
 
+    /// A User or History edit where the Inside rule puts it: into the baseline between hunks,
+    /// into the proposal inside one, into both texts inside hunks that hold no change any more
+    /// (see `on_edit`). Returns where it went in the baseline, `None` for the proposal.
+    pub(super) fn edit_as_classified(&mut self, a: usize, b: usize, text: &str) -> Option<usize> {
+        match self.classify(a, b) {
+            (EditClass::Outside, first) => self.fold_into_baseline(first, a, b, text),
+            (EditClass::Inside(_), first) => {
+                if self.inside_unchanged(first, a, b) {
+                    let at = offset(a, -self.growth_before(first));
+                    if self.fold_both(a, b, at, text) {
+                        return Some(at);
+                    }
+                }
+                self.edit_inside(first, a, b, text);
+                None
+            }
+        }
+    }
+
+    /// Whether every hunk the edit `[a, b)` is inside (from `first` on) holds no change: its
+    /// texts are equal (a provisional hunk the next recompute drops).
+    pub(super) fn inside_unchanged(&self, first: usize, a: usize, b: usize) -> bool {
+        self.hunks[first..]
+            .iter()
+            .zip(&self.meta[first..])
+            .take_while(|(h, _)| inside(&h.cur_bytes, a, b))
+            .all(|(h, m)| h.old_text == m.new_text)
+    }
+
     /// A user edit overlapping hunks (`first` is the first of them): it becomes part of the
     /// proposal and marks the hunk touched.
     pub(super) fn edit_inside(&mut self, first: usize, a: usize, b: usize, text: &str) {
@@ -331,6 +523,33 @@ impl FileReview {
                 .iter()
                 .take_while(|h| inside(&h.cur_bytes, a, b))
                 .count();
+        self.edit_hunks_inside(first, end, a, b, text);
+    }
+
+    /// The undo (or redo) of a user change that took text out of a hunk's proposal: it puts the
+    /// text back into the proposal, merged with every hunk it touches, including at their
+    /// boundaries (at the end of what the change left of a hunk, or at the pure deletion it left),
+    /// or as a hunk of its own when none is left there (a recompute dropped one the change had
+    /// made equal to the baseline).
+    pub(super) fn edit_inside_touching(&mut self, a: usize, b: usize, text: &str) {
+        let (first, end) = self.touching(a, b);
+        self.edit_hunks_inside(first, end, a, b, text);
+    }
+
+    /// The hunks `[first, end)` touching the closed interval `[a, b]`, boundaries included.
+    pub(super) fn touching(&self, a: usize, b: usize) -> (usize, usize) {
+        let first = self.hunks.partition_point(|h| h.cur_bytes.end < a);
+        let end = first
+            + self.hunks[first..]
+                .iter()
+                .take_while(|h| h.cur_bytes.start <= b)
+                .count();
+        (first, end)
+    }
+
+    /// A user edit merged with the hunks `[first, end)` into one: it becomes part of the proposal
+    /// and marks the hunk touched.
+    fn edit_hunks_inside(&mut self, first: usize, end: usize, a: usize, b: usize, text: &str) {
         for k in first..end {
             if self.meta[k].edit_reported != Some(self.turn) {
                 self.events.push(ReviewEvent::UserEditedInHunk {
@@ -346,13 +565,259 @@ impl FileReview {
     /// An edit that is part of a proposal (agent, review, reload, recognized undo/redo): merged
     /// with every hunk it touches, including at their boundaries, or a new hunk of its own.
     pub(super) fn edit_proposal(&mut self, a: usize, b: usize, text: &str) -> Merged {
-        let first = self.hunks.partition_point(|h| h.cur_bytes.end < a);
-        let end = first
-            + self.hunks[first..]
-                .iter()
-                .take_while(|h| h.cur_bytes.start <= b)
-                .count();
+        let (first, end) = self.touching(a, b);
         self.merge_edit(first, end, a, b, text)
+    }
+
+    /// The pieces of the current text's `[a, b)` that the baseline holds at the same place (from
+    /// `a`): in the gaps between hunks, and in what a hunk's two texts have in common at its start
+    /// or its end (looked for within [`ALIGN_MAX`] bytes of them). Not what a diff of a hunk's
+    /// texts would pair up inside it: the agent's text has characters the baseline has too, and
+    /// those are not the baseline's.
+    pub(super) fn aligned(&self, a: usize, b: usize) -> Pieces {
+        let mut out = Pieces::new();
+        let mut i = self.first_ending_after(a);
+        let mut pos = a;
+        while pos < b {
+            match self.hunks.get(i) {
+                Some(h) if h.cur_bytes.start < b => {
+                    let (s, e) = (h.cur_bytes.start, h.cur_bytes.end);
+                    if pos < s {
+                        add_piece(&mut out, pos - a..s - a);
+                        pos = s;
+                    }
+                    let end = e.min(b);
+                    let (new, old) = (self.meta[i].new_text.as_str(), h.old_text.as_str());
+                    let room = new.len().min(old.len());
+                    let mut start = 0;
+                    if pos - s < ALIGN_MAX {
+                        start = common_start(new, old, (end - s).min(room));
+                        if s + start > pos {
+                            add_piece(&mut out, pos - a..(s + start).min(end) - a);
+                        }
+                    }
+                    if e - end < ALIGN_MAX {
+                        let tail = common_end(new, old, (e - pos).min(room - start));
+                        if e - tail < end {
+                            add_piece(&mut out, (e - tail).max(pos) - a..end - a);
+                        }
+                    }
+                    pos = end;
+                    i += 1;
+                }
+                _ => {
+                    add_piece(&mut out, pos - a..b - a);
+                    pos = b;
+                }
+            }
+        }
+        out
+    }
+
+    /// Where the current text's `[x, y)` is in the baseline, if both texts hold it at one place
+    /// (see [`aligned`](Self::aligned)); for an empty range, the place in the baseline where text
+    /// inserted there goes as well.
+    fn base_of(&self, x: usize, y: usize) -> Option<usize> {
+        let i = self.first_ending_after(x);
+        let Some(h) = self
+            .hunks
+            .get(i)
+            .filter(|h| h.cur_bytes.start < y.max(x + 1))
+        else {
+            return Some(offset(x, -self.growth_before(i)));
+        };
+        let (s, e) = (h.cur_bytes.start, h.cur_bytes.end);
+        if x == y && x == s {
+            return Some(offset(x, -self.growth_before(i)));
+        }
+        // One hunk only, and the range reaches past it only where its texts are equal.
+        if y > e
+            && self
+                .hunks
+                .get(i + 1)
+                .is_some_and(|next| next.cur_bytes.start < y)
+        {
+            return None;
+        }
+        let (new, old) = (self.meta[i].new_text.as_str(), h.old_text.as_str());
+        let equal = new == old;
+        if (x < s || y > e) && !equal {
+            // Its common start or end reaches the gap next to it.
+            if x < s && y <= e {
+                let k = y - s;
+                let fits = k <= ALIGN_MAX.min(new.len()).min(old.len());
+                return (fits && common_start(new, old, k) == k)
+                    .then(|| offset(x, -self.growth_before(i)));
+            }
+            if x >= s && y > e {
+                let k = e - x;
+                let fits = k <= ALIGN_MAX.min(new.len()).min(old.len());
+                return (fits && common_end(new, old, k) == k).then(|| h.base_bytes.end - (e - x));
+            }
+            return None;
+        }
+        if equal {
+            return Some(offset(x, -self.growth_before(i)));
+        }
+        let room = new.len().min(old.len());
+        if y - s <= ALIGN_MAX.min(room) && common_start(new, old, y - s) == y - s {
+            return Some(h.base_bytes.start + (x - s));
+        }
+        if e - x <= ALIGN_MAX.min(room) && common_end(new, old, e - x) == e - x {
+            return Some(h.base_bytes.end - (e - x));
+        }
+        None
+    }
+
+    /// Where in `[a, b)` the pieces of `placement.deleted` (from `a`) go out of both texts, and
+    /// where they are in the baseline: where the step before put them (`deleted_at`), if the
+    /// baseline holds them there; else where both texts hold them, or else where both hold the
+    /// same text within `[a, b)` (a run of equal characters, whose proposal a recompute may have
+    /// paired with another of them). A piece none fits is left out (it goes out of the current
+    /// text only).
+    fn deletion_targets(
+        &self,
+        a: usize,
+        b: usize,
+        placement: &Placement,
+    ) -> Vec<(Range<usize>, usize)> {
+        let Some(text) = self.current_text(&(a..b)) else {
+            return Vec::new();
+        };
+        let at = |r: &Range<usize>| {
+            (text.is_char_boundary(r.start) && text.is_char_boundary(r.end))
+                .then(|| self.base_of(a + r.start, a + r.end))
+                .flatten()
+        };
+        let mut out: Vec<(Range<usize>, usize)> = Vec::new();
+        let hints = placement
+            .deleted_at
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(None));
+        for (r, hint) in placement.deleted.iter().zip(hints) {
+            let Some(piece) = text.get(r.clone()) else {
+                continue;
+            };
+            let n = r.len();
+            let free = |k: usize, out: &[(Range<usize>, usize)]| {
+                out.iter().all(|(x, _)| x.end <= k || k + n <= x.start)
+            };
+            // Where the step before put it: checked once the pieces after it are out (the
+            // pieces went in from the first one on, each where the ones before it had gone).
+            let found = hint.map(|base| (r.clone(), base)).or_else(|| {
+                at(r).map(|base| (r.clone(), base)).or_else(|| {
+                    (0..=text.len().saturating_sub(n)).find_map(|k| {
+                        let x = k..k + n;
+                        (free(k, &out) && text.get(x.clone()) == Some(piece))
+                            .then(|| at(&x).map(|base| (x, base)))
+                            .flatten()
+                    })
+                })
+            });
+            if let Some((x, base)) = found.filter(|(x, _)| free(x.start, &out)) {
+                let i = out.partition_point(|(y, _)| y.start < x.start);
+                out.insert(i, (x, base));
+            }
+        }
+        out
+    }
+
+    /// The edit `[a, b) → text`, the step of a record, with the pieces `placement` names going
+    /// into both texts where both hold the same place (where the step before took them out or
+    /// put them in, if that is known), and the others into the current text only (a proposal).
+    /// `current_len` follows it. Returns the pieces that went into both, with where they are in
+    /// the baseline, and the hunk the others went into, if any.
+    pub(super) fn edit_placed(
+        &mut self,
+        a: usize,
+        b: usize,
+        text: &str,
+        placement: &Placement,
+    ) -> (Placement, Option<usize>) {
+        let mut placed = Placement::default();
+        let mut proposal = false;
+        let targets = self.deletion_targets(a, b, placement);
+        let both: Pieces = targets.iter().map(|(x, _)| x.clone()).collect();
+        // The deleted pieces from the last one down, so that those before stay where they are.
+        let mut gone = Vec::new();
+        for (r, is_both) in split(b - a, &both).into_iter().rev() {
+            let (x, y) = (a + r.start, a + r.end);
+            let base = targets
+                .iter()
+                .find(|(t, _)| *t == r)
+                .map(|(_, base)| *base)
+                .filter(|_| is_both);
+            // There, if the baseline holds the piece there; else where both texts hold it.
+            let held = |base: &usize| {
+                let piece = self.current_text(&(x..y));
+                piece.is_some() && self.baseline.get(*base..*base + (y - x)) == piece.as_deref()
+            };
+            let base = base
+                .filter(held)
+                .or_else(|| base.and_then(|_| self.base_of(x, y)))
+                .filter(|&base| self.fold_both(x, y, base, ""));
+            if let Some(base) = base {
+                gone.push((r, base));
+            } else {
+                self.edit_proposal(x, y, "");
+                proposal = true;
+            }
+            self.current_len -= y - x;
+        }
+        gone.reverse();
+        for (r, base) in gone {
+            placed.deleted.push(r);
+            placed.deleted_at.push(Some(base));
+        }
+        let mut pos = a;
+        let hints = placement
+            .inserted_at
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(None));
+        let mut hinted = placement.inserted.iter().cloned().zip(hints);
+        for (r, is_both) in split(text.len(), &placement.inserted) {
+            let (Some(piece), true) = (text.get(r.clone()), text.is_char_boundary(r.end)) else {
+                // Not on char boundaries: what is left goes as a proposal.
+                let rest = &text[r.start..];
+                self.edit_proposal(pos, pos, rest);
+                self.current_len += rest.len();
+                proposal = true;
+                break;
+            };
+            let hint = is_both
+                .then(|| hinted.find(|(x, _)| *x == r).and_then(|(_, h)| h))
+                .flatten();
+            let base = is_both
+                .then(|| {
+                    hint.filter(|&base| {
+                        self.baseline.is_char_boundary(base)
+                            && self.fold_both(pos, pos, base, piece)
+                    })
+                    .or_else(|| {
+                        self.base_of(pos, pos)
+                            .filter(|&base| self.fold_both(pos, pos, base, piece))
+                    })
+                })
+                .flatten();
+            if let Some(base) = base {
+                placed.inserted.push(r);
+                placed.inserted_at.push(Some(base));
+            } else {
+                self.edit_proposal(pos, pos, piece);
+                proposal = true;
+            }
+            self.current_len += piece.len();
+            pos += piece.len();
+        }
+        let index = proposal
+            .then(|| {
+                let (first, end) = self.touching(a, a + text.len());
+                (first < end).then_some(first)
+            })
+            .flatten();
+        (placed, index)
     }
 
     /// The pure deletion at `a` whose deleted text is exactly `text`, for an insertion `[a, a)`:
@@ -369,8 +834,10 @@ impl FileReview {
     /// Follow-up for an edit recognized as undo/redo of one of our own edits.
     pub(super) fn apply_claim(&mut self, claim: Claim, merged: &Merged) {
         let k = merged.index;
+        // A reload's record (no turn) is not the agent's edit: its undo is no news for it.
+        let reload = claim.record.is_some() && claim.turn.is_none();
         match (claim.kind, claim.step) {
-            (Kind::Agent, Step::Undo) if claim.done => {
+            (Kind::Agent, Step::Undo) if claim.done && !reload => {
                 if self.meta[k].undo_reported != Some(self.turn) {
                     self.events.push(ReviewEvent::UndoneByUser {
                         lines: self.hunks[k].cur_lines.clone(),

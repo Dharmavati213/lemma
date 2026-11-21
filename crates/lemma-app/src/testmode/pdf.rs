@@ -58,14 +58,14 @@ pub async fn run_demo(state: Rc<WindowState>) -> Result<(), String> {
     .await?;
     println!(
         "demo pdf: {} ({} pages); cache filled to {:.1} MiB of {:.0} MiB; showing pages 1–{} at \
-         {:.0}% (render scale {}/8, surface scale {})",
+         {:.0}% (render scale {:.3}, surface scale {})",
         pdf.display(),
         filled.1,
         filled.0 as f64 / f64::from(1 << 20),
         view.cache_cap() as f64 / f64::from(1 << 20),
         shown.end,
         view.zoom() * 100.0,
-        view.render_scale_q(),
+        lemma_pdf::scale_of(view.render_scale_q()),
         view.device_scale(),
     );
     Ok(())

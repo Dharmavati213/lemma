@@ -9,12 +9,15 @@ performance tests, golden images and memory budgets work. The conventions come f
 | What | Command |
 |---|---|
 | Everything CI checks | `scripts/ci.sh` |
+| The Windows and macOS code, linted on Linux | `scripts/check-cross.sh [target…]` |
+| The tests as Windows programs (on Linux under Wine, the GUI ones under `xvfb-run`) | `packaging/windows/build.sh --test` |
 | One crate | `cargo fmt -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`, `cargo test -p <crate>` |
 | A GUI test or the app | `scripts/broadway.sh cargo test -p lemma-app` or `scripts/broadway.sh <binary> …` |
 | Performance tests | `scripts/broadway.sh cargo test --release --workspace -- --ignored perf --test-threads=1` |
 | The agent end to end (fake agent, real binary) | `scripts/e2e-agent.sh [case…]` |
 | Every documentation screenshot | `scripts/shots.sh [name…]` |
 | Large fixtures (50-page PDF, 1k-line document) | `scripts/build-fixtures.sh` |
+| English dictionary for the spell tests, on a machine without one | `scripts/fetch-dictionary.sh` |
 | Screenshot | `scripts/shot.sh out.png tests/fixtures/proj/main.tex` |
 | Memory budgets | `scripts/rss.sh [idle\|pdf50\|large]` |
 | Timing gate on the real Wayland desktop (by hand; opens windows) | `scripts/perf-wayland.sh [startup] [typing] [pdf]` |
@@ -25,16 +28,142 @@ All scripts respect `CARGO_TARGET_DIR`.
 
 Runs, in order, and stops at the first failure:
 
-1. `bash -n` on every `scripts/*.sh`;
+1. `bash -n` on every `scripts/*.sh`, `packaging/*.sh` and `packaging/*/*.sh`, and
+   `packaging/synctex-notice.sh` (every vendored SyncTeX file still has its notice); where
+   `shellcheck` and `actionlint` are installed, they check the scripts and the workflows;
 2. `cargo fmt --all --check`;
 3. `cargo run -p xtask -- gen-completion --check` (the generated completion tables are current);
 4. `cargo clippy --workspace --all-targets -- -D warnings`;
 5. `cargo test --workspace` under `scripts/broadway.sh`, so the GTK tests run offscreen.
 
-The tests get a **private Broadway display** that `ci.sh` starts (displays 100–199, a free
-loopback port) and stops: windows of other processes on the shared `:7` can take the keyboard
-focus from focus-dependent tests. `LEMMA_BROADWAY_DISPLAY=:N` makes it use that display instead.
-Extra arguments go to `cargo test`, e.g. `scripts/ci.sh --release`.
+The tests get a **private Broadway display** that `ci.sh` starts (displays 100–199, a free loopback
+port) and stops: windows of other processes on the shared `:7` can take the keyboard focus from
+focus-dependent tests. `LEMMA_BROADWAY_DISPLAY=:N` makes it use that display instead. Extra
+arguments go to `cargo test`, e.g. `scripts/ci.sh --release`. Where `XDG_RUNTIME_DIR` is not set (a
+container, a `su` session), `ci.sh` and `broadway.sh` set it to `/tmp/lemma-runtime-<uid>`: GLib
+would put the daemon's socket in the cache directory, which follows `HOME` and `XDG_CACHE_HOME`, and
+a test that changes those would find no display.
+
+On Linux, `.cargo/config.toml` keeps the debug information beside the object files
+(`-C split-debuginfo=unpacked`) instead of copying it into every program. The 46 GUI test
+programs each link the whole app: with the debug information inside they were 598 MB each, and a
+change to the app rewrote 28.7 GB before a test ran; they are 229 MB each now (10.5 GB), and the
+debug information (2 GB of `.dwo` files) is written once. Backtraces and debuggers read it from
+`target/`.
+
+## The tests on another machine: `.github/workflows/tests.yml`
+
+The workflow **Tests** runs `scripts/build-fixtures.sh` and `scripts/ci.sh` in an Arch Linux
+container, as a new user with no configuration, no session bus and no runtime directory. It is
+started by hand (Actions, Tests, Run workflow): from day to day the tests run on your machine, and
+this run finds what they took from it (a program, a font, a setting, a directory). Its package list
+is what the tests use beyond Lemma's own libraries: TeX with biber, poppler's tools, an English
+dictionary, node, ripgrep and three font families.
+
+## `scripts/check-cross.sh`
+
+Runs `cargo clippy --workspace --all-targets -- -D warnings` for `x86_64-pc-windows-msvc` and
+`aarch64-apple-darwin` (install them once with `rustup target add`; a target that is missing
+prints `SKIP`). It finds code behind `cfg(windows)` or `cfg(target_os = "macos")` that no
+longer compiles or lints, in a minute, without a Windows or macOS machine. Nothing is linked and
+no test runs: the C compiler and archiver of the other system are stood in for by a script that
+only creates their output files, and pkg-config answers with this machine's libraries, whose
+versions are all the `-sys` crates need. The release workflows still build and start the real
+programs.
+
+## The tests for Windows: `packaging/windows/build.sh --test`
+
+`--test` runs the tests as Windows programs: natively in MSYS2, and on Linux under the Wine that
+`build.sh` downloads (`packaging/windows/README.md`). It runs the crates without GTK windows,
+the app's unit tests and, on Linux only, the GUI test programs listed in `GUI_TESTS` in
+`build.sh`: those that pass under Wine. Each GUI program runs under `xvfb-run` (an X display of
+its own; a Wine window never opens on the desktop) with `WAYLAND_DISPLAY` and `GDK_BACKEND`
+unset and a limit of 20 minutes, and logs to
+`target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Where `xvfb-run` is not installed they
+are skipped with a line that says so. On Windows itself they are not run: nobody has run them
+there yet.
+
+To run one program by hand (never without `xvfb-run`: Wine would open its windows on your
+desktop), set the variables `build.sh` sets for the cross build (its "cross, from Linux" part:
+the linker, `PKG_CONFIG_*`, `WINEPATH`, the runner, `LEMMA_FAKE_AGENT`, `LEMMA_MCP_BRIDGE`) and
+then: `env -u WAYLAND_DISPLAY -u GDK_BACKEND xvfb-run -a -s "-screen 0 1600x1000x24" cargo test
+--target x86_64-pc-windows-gnullvm -p lemma-app --test gtk_review -- a_test_name`. The output
+is long (GDK warns about what Wine lacks at every frame): send it to a file under `target/`.
+
+**What the harness does for Windows** (`tests/common`):
+
+- A Windows test program built on Linux has Linux's paths compiled in (`CARGO_TARGET_TMPDIR`,
+  `CARGO_MANIFEST_DIR`: `/home/…`), which Windows reads as relative to the current drive.
+  `common::target_tmpdir`, `manifest_dir`, `temp_dir` and `fixtures` give them as the system
+  spells them (`Z:\home\…` under Wine; `common::native`): use these, not `env!`, in a GUI test.
+- `path.canonical()` (`common::Canonical`) is `lemma_core::canonicalize`: `std`'s `canonicalize`
+  gives `\\?\C:\…` on Windows, which no path of Lemma's has. `common::shown("a/b.tex")` is that
+  name as Lemma shows it to the user below the project (`a\b.tex` on Windows): tab titles, the
+  sidebar, toasts, the session file. What the agent is told (tool replies, review feedback, the
+  prompt, the names `@` proposes) is written with `/` on every system
+  (`lemma_core::agent_path`): a test compares it with the plain `"a/b.tex"`, never with `shown`.
+- GDK's and enchant's warnings about what Wine lacks are not counted
+  (`common::is_environment_noise`).
+- `common::skip(reason)` ends the running test as skipped (it prints `SKIP: reason` and counts
+  as passed), for a test that finds out inside a helper that it cannot run. The helpers that
+  use it, each a no-op on Linux: `require_keymap` (key events made from the display's keymap:
+  GDK finds no keyboard layout under Wine, so no keyval has a keycode; `feed_vim_key` calls it),
+  `require_private_trash` (the tests' trash is a temporary `XDG_DATA_HOME`; on Windows it
+  would be the user's Recycle Bin, and Wine asks in a dialog before each file),
+  `require_stand_in_keyring` (the tests' keyring is a stand-in `secret-tool`; on Windows the
+  key is in the user's Credential Manager), `require_shell_scripts` (stand-ins for latexmk,
+  npm, node, latexindent: `#!/bin/sh` files made with `cp` and `chmod`), `require_symlinks` and
+  `require_any_file_name` (names with `<` or `>`).
+- `common::restore_home` puts `HOME` back before a program reads it again
+  (`Paths::from_env`): on Windows enchant replaces it with the user's profile directory when
+  the spell checker first loads its providers.
+- `common::path_without` is the `PATH` of the programs that hide the host's node, npm and
+  claude: on Windows it keeps the directories of the old `PATH` that hold none of them, since
+  Windows finds a program's libraries there.
+- `common::require_agent_binaries` builds nothing when `LEMMA_FAKE_AGENT` and
+  `LEMMA_MCP_BRIDGE` are set: `build.sh` built them, and a Windows program under Wine cannot run
+  Linux's cargo.
+- With `LEMMA_TEST_BACKTRACE` set (on any system), the harness prints a backtrace before each
+  GLib warning or critical it counts: the Rust frames show who made the C library log it.
+
+**What runs.** 41 of the 46 programs are in `GUI_TESTS` and pass under Wine (wine 11.20, GTK
+4.24 from MSYS2, November 2026): about 700 tests, of which about 90 skip themselves with the
+helpers above (52 of them for the missing keymap: nearly all of `gtk_vim`, `gtk_keys` and the
+Vim tests elsewhere) and about 45 because Wine has no latexmk, pdflatex, chktex, texcount or
+git, as they do on a Linux machine without them. Two of the listed programs have a test that
+has failed once on a loaded machine and passes otherwise: `gtk_pdf`
+(`zoom_out_in_notches_keeps_one_scale_of_bands`) and `gtk_regress2_f`
+(`regress2_inactive_window_gives_memory_back`).
+
+**What does not pass under Wine**, and why (these five programs are not in `GUI_TESTS`):
+
+| Program | Test | Why |
+|---|---|---|
+| `gtk_review` | `decisions_advance_to_the_next_hunk` | Not understood. The tab opened for the next file stays scrolled past its text: the view's offset is beyond the range of its scroll adjustment, and the scroll after the first frame (`review_ui::show_line`) does not bring it back. Whether Windows itself does the same needs a Windows machine. |
+| `gtk_review` | `bars_stay_pooled_and_off_the_text` | Fails only after the test above (it passes alone). |
+| `gtk_goto` | `hover_reference_shows_the_pdf_crop` | Not understood. The first hover shows its crop of the PDF; after the crop's worker was stopped and started again, the hover gets the SyncTeX boxes but no crop appears. Needs a Windows machine. |
+| `gtk_session` | `session_remembers_the_window_size` | Wine only: a window is never maximized on an Xvfb display without a window manager. |
+| `gtk_session` | `session_round_trip_tabs_positions_and_panes` | Wine only: with Wine's fonts the panes' smallest widths put the editor/PDF divider at 58% where the test sets 62%. |
+| `gtk_session` | `recovery_restores_tabs_never_saved` | Wine's timing: the session that the closed window's worker writes arrives after the one the test wrote in its place. |
+| `gtk_qol` | (the program) | Wine only, now and then: GDK fails to create a window (`CreateWindowExW failed with code 1400`), which is fatal, and Wine's crash dialog then waits until the time limit. About every second run. |
+| `gtk_git_gutter` | (all) | Wine runs no Linux git and has none of its own: the program prints `SKIP` and runs nothing. |
+
+The golden images of `gtk_review` are skipped on Windows (other fonts). `gtk_pdf_m3`'s
+`detach_and_reattach_keep_the_anchor` needs a `target/fixtures/pdf50.pdf` built in the same
+checkout (`scripts/build-fixtures.sh`): a copy from another checkout names that checkout's
+`pdf50.tex` in its SyncTeX file, on Linux too.
+
+**Not for Windows itself, as they are.** The tests isolate themselves with `HOME`, `XDG_*`,
+`LEMMA_CONFIG` and a `PATH` of their own. On Windows that leaves three things reaching the
+user's own data, which is why the helpers above skip the tests concerned there, and why
+`build.sh` runs the GUI tests only under Wine, whose prefix belongs to the build:
+
+- the trash is the user's Recycle Bin;
+- the API key is in the user's Credential Manager (a test that stores its test key would
+  replace the user's);
+- a `lemma` that a test starts with only `HOME` or some of the `XDG_*` variables set takes the
+  others from `%APPDATA%` and `%LOCALAPPDATA%`, not from `HOME`: the user's own `lemma`
+  folders there.
 
 ## GUI tests never touch the desktop
 
@@ -53,7 +182,9 @@ To watch a Broadway session, open `http://127.0.0.1:8087` (display `:7` serves o
 
 **GTK test conventions** (§10.1): GTK tests are integration tests named `tests/gtk_*.rs` with
 `harness = false` and their own `main`, so `gtk::init()` runs on a single thread. When init
-fails they print `SKIP: no display` and exit 0, so `cargo test` without Broadway still passes.
+fails they print `SKIP: no display` and exit 0, so `cargo test` without Broadway still passes
+(`scripts/ci.sh` sets `LEMMA_TESTS_NEED_DISPLAY`, with which no display is a failure: a test
+program that skipped everything would pass for a run of its tests).
 Their harness (`tests/common`) takes test-name substrings as filters (`cargo test -p lemma-app
 --test gtk_search -- replace`) and fails a test that makes GLib log an unexpected warning or
 critical.
@@ -62,9 +193,16 @@ critical.
 without its program): `pdflatex` with `mylatexformat` (math preview: `lemma-preview`,
 `gtk_math_preview`), `chktex` (`lemma-build` `chktex`, `gtk_lint`; its golden depends on chktex
 1.7.9 and TeX Live's `chktexrc`), `texcount` (`gtk_lint`'s word count tests) and `git`
-(`gtk_git_gutter`, `gtk_session`: throwaway repositories under the test's temporary directory,
-with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CEILING_DIRECTORIES`, so no
-user or system git configuration and no enclosing repository is read).
+(`gtk_git_gutter`, and a test each in `gtk_agent_tools` and `gtk_regress2_b`: throwaway
+repositories under the test's temporary directory, made with `GIT_CONFIG_GLOBAL=/dev/null` and
+the system configuration off, so no user or system git configuration is read; `gtk_git_gutter`
+also sets `GIT_CEILING_DIRECTORIES`, so that no enclosing repository is read). `gtk_git_gutter`'s
+`a_repository_cannot_make_git_run_a_command` makes a partial clone whose remote is an `ext::`
+command and checks that reading `HEAD` never runs it, for the gutter and for the text the
+watcher of the agent's writes reads (`git_gutter::head_bytes`). `a_git_that_hangs_is_stopped`
+puts named pipes in place of `.git/HEAD` and of a branch ref: with a 500 ms timeout
+(`git_gutter::set_timeout`) the files get no git information, `head_bytes` gives `None`, no git
+process is left, and another repository in the same window still gets its marks.
 
 **A fake latexmk:** build behaviour that does not depend on TeX is tested without it, with a
 shell script as `[build] latexmk` (copied into place with `cp`, so no forked child holds it open
@@ -82,9 +220,27 @@ none) and an in-memory `Config`; binary runs get `LEMMA_CONFIG=/dev/null` (or a 
 read or write a session, the palette's recent commands, local history, review state or the
 recovery copies of unsaved changes (test windows switch recovery on with
 `recovery::set_enabled` only with temporary `Paths`), and keep the math preview's formats in a
-temporary directory that goes with the window. Nothing reads or
+temporary directory that goes with the window, or with the process when it quits without
+destroying the window (as a run that quits by itself does); the documents the demos write without
+a FILE go with the process too (`gtk_app`'s `demo_documents_go_with_the_run`). Nothing reads or
 writes the user's `~/.config/lemma`, `~/.local/state/lemma`, `~/.local/share/lemma` or
 `~/.cache/lemma`.
+
+**Programs and dictionaries of the machine:** tests that look for programs on `PATH` (the
+agent's node, npm, claude, pi and the other agents' tools, `secret-tool`) put a temporary `bin`
+first and then `common::system_programs_without`: links to the programs of `/usr/bin` and `/bin`
+other than those, so whatever the machine has installed is never found. The tests that wait for
+spell checking (`gtk_spell`, and single tests of `gtk_completion`, `gtk_prefs`,
+`gtk_regress2_e1` and `gtk_session`) need an en_US dictionary (hunspell or aspell,
+`common::english_dictionary`) and print `SKIP` without one.
+On a machine without one, `scripts/fetch-dictionary.sh` fetches the en_US hunspell dictionary (the
+one LibreOffice ships, at a fixed release, checked by checksum) into `target/dictionaries/hunspell`,
+and `scripts/broadway.sh` then gives that directory to enchant (`ENCHANT_CONFIG_DIR`) unless the
+machine has an en_US hunspell dictionary of its own; nothing outside `target/` changes. `gtk_spell`
+gives enchant a configuration directory of its own (`ENCHANT_CONFIG_DIR`): a tiny dictionary of a
+made-up language `zz`, so that tests needing a dictionary but no English words run everywhere, and
+copies of the hunspell dictionaries of the user's enchant directory (or of the directory
+`broadway.sh` named), not their personal word lists.
 
 **Runaway logs:** a GTK bug can loop on a warning (a `GtkTextView` disposed with a popover still
 parented prints "GtkPopover is not a child of LemmaTexView" forever, 1.6 GB in two minutes). When
@@ -127,7 +283,10 @@ Where the agent is tested:
   the agent's `loadSession`: the replay is not reported); `mcp_*.rs`: the MCP server and the
   `lemma-mcp` bridge.
 - `tests/gtk_agent_tools.rs` (bridge, tools, watcher, history, the bounded text of the tool
-  records; e2e with `basic`, `bypass`, `errors`, `long`) and `tests/gtk_agent_panel.rs` (panel,
+  records; `paths_for_the_agent_have_forward_slashes_and_come_back_either_way`: every path the
+  agent is told has `/`, and a path it writes with `\`, with `/`, relative or absolute names the
+  file, which only the run under Wine can tell apart; e2e with `basic`, `bypass`, `errors`,
+  `long`) and `tests/gtk_agent_panel.rs` (panel,
   inline edit, quick actions, install branches with a fake `npm`/`claude` on a temporary
   `PATH`; the idle stop on a command channel: what holds an idle agent, `idle_stop_min = 0`
   (also set while the timer runs), a backend that `config.toml` replaced, the API backend; e2e
@@ -176,10 +335,12 @@ No backend's real counterpart runs in a test: no request reaches the Anthropic A
 - **API key** (`lemma_agent::messages`, `keys`): `crates/lemma-agent/tests/messages_backend.rs`
   serves scripted SSE from a std `TcpListener` on 127.0.0.1 through `LEMMA_ANTHROPIC_BASE_URL`
   (streaming, thinking, parallel tool calls, `INVALID_JSON`, `max_tokens` and refusal stops,
-  retries on 429/529 with `retry-after`, none on 401, cancel, image results, usage and cost,
+  retries on 408/409/429/529 with `retry-after` and as `x-should-retry` says, none on 401 or a reached
+  spend limit, cancel, image results, usage and cost,
   cache control, append-only history, and that the key appears in no log line);
-  `messages_keys.rs` uses a fake `secret-tool` script on a temporary `PATH` with
-  `ANTHROPIC_API_KEY` unset.
+  `messages_keys.rs` uses a fake `secret-tool` script on a temporary `PATH`, and passes the
+  value of `ANTHROPIC_API_KEY` to `keys::lookup_with` itself instead of reading the
+  environment.
 - **Pi and ACP `fs/*`** (`AcpFlavor::Generic`): `crates/lemma-agent/tests/acp_fs.rs` and
   `tests/gtk_agent_backends.rs` play Pi's adapter with `lemma-fake-agent` (`_options.fs`,
   `agent_name`, `session_new_error`, and the `fs_read`, `fs_write` and `fs_edit` steps):
@@ -305,7 +466,7 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   bridge binary against an in-test socket server. Unix socket paths must be **shorter than 108
   bytes**, so test sockets live under `$XDG_RUNTIME_DIR` (or a short temp dir), and one test passes
   the bridge a relative path. Do the same in any test that creates a socket.
-- `insta` snapshots (lemma-build, lemma-syntax) live in `snapshots/` next to the test. Review
+- `insta` snapshots (lemma-build) live in `snapshots/` next to the test. Review
   changes with `cargo insta review` if `cargo-insta` is installed; otherwise run the test with
   `INSTA_UPDATE=always` and inspect the diff in git.
 - **Regression tests of the review passes** keep the defect's id in their name:
@@ -339,7 +500,12 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   the session saved before such a tab is shown, the root kept when the first does not open),
   `startup_shows_a_blank_page_while_opening`, `session_panes_before_the_first_frame` and
   `session_remembers_the_window_size` (`last.json`'s window size, maximized under Broadway
-  too); `gtk_app`'s `several_files_and_lines` and `usage_errors_and_help` run the binary. The
+  too), `session_write_failure_keeps_what_is_carried_over` (a failed write keeps a restored PDF
+  place for the next save), `gtk_document`'s `closed_documents_are_never_read_from_a_pipe` and
+  `a_save_never_reads_a_pipe_its_file_became`, and `gtk_agent_tools`'s
+  `held_documents_whose_file_became_a_pipe` (the files of an open and of a closed held document
+  replaced by named pipes: the file monitor, `read_file`, a reload and a tab each answer at once);
+  `gtk_app`'s `several_files_and_lines` and `usage_errors_and_help` run the binary. The
   command line's parsing (with files on disk) and the sweep of old session files are unit
   tests in `cli.rs` and `session.rs`.
 - **Problems and Changes panels:** the Problems page's list view in `gtk_lint`
@@ -380,7 +546,14 @@ followed by `agent-demo-tool:` lines and an `agent-demo-message:` line.
   with temporary XDG directories, types into it, sends `SIGTERM` (and `SIGINT`) and checks that
   the window closed, the process ended successfully and the recovery file holds the typed text,
   which the next window offers; a child started with `SIGHUP` ignored, as `nohup` starts it,
-  keeps running when it gets one.
+  keeps running when it gets one. `recovery_keeps_each_lemmas_copy` runs the real app in a
+  child process beside a test window, both with the same document unsaved: `SIGTERM` to the
+  child leaves both copies, a save in the window removes only its own, the next window offers
+  the child's text and takes its file over; Lemma 0.2's shared file is offered and removed
+  too, and a file of the builds before the writers' tokens (named by a pid alone) is left alone
+  while that Lemma holds `<pid>.lock` and offered once it ended;
+  `recovery::tests::a_writer_with_this_pid_in_another_namespace_is_another_writer` checks that
+  a Lemma with this process's pid in another PID namespace is another writer.
 - **The find bar** (`find_bar.rs`, find and replace in the current file): `gtk_search`'s
   `find_bar_*` tests (counts and wrapping, the options and invalid expressions, steps before
   the search has counted looked for in the background, the steps and Replaces after them
@@ -550,11 +723,12 @@ check the budgets only in release builds:
 | `gtk_lint` `perf_problems_long_list` | replacing 3000 build problems in five files: the `set` call, then the main loop's longest step and its work until the next frame is drawn (with the open editor's marks): ≤ 150 ms with the Problems page hidden (no rows listed); showing the page (501 rows in a list view that makes widgets for about 200) adds ≤ 175 ms, and no step takes over 120 ms (measured at a load of 6–9: 117 ms and a 57 ms step, at 10–15 225 ms and 118 ms; 242 ms and 126 ms, 460 ms and 251 ms with a list box row per problem) |
 | `gtk_lint` `perf_problems_from_many_files` | `problems_from` of 24 000 diagnostics in 300 files ≤ 60 ms median (measured 39 ms at a load of 10–15; 693 ms when every diagnostic's path was canonicalized and the problems sorted by comparing paths) |
 | `gtk_math_preview` `perf_math_preview_hover_latency`, `lemma-preview` `perf_render_latency` | hover to rendered formula, p50 ≤ 250 ms with a built format (needs `pdflatex`; sensitive to load: run on a quiet machine) |
-| `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale_q 26, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
-| `lemma-pdf` `perf_dark_pages` | colouring a page for dark mode (stress and pdf50 pages at scale_q 10 and 21) takes under 1/2.5 of the time of the transform without its fast paths for white and grey pixels (measured 0.6 against 3.4 ms, and 2.7–2.9 against 15.5–16.2 ms), with the same bytes; through the PDF thread a dark stress page at scale_q 21 costs under 1.5 times a light one (measured 12.6 and 10.7 ms; 18.6 and 7.9 before) |
+| `lemma-pdf` `perf_tiled_page` | a stress.pdf page too large for one bitmap (scale 3.25, 1989 × 2574 px) in its 5 full-width bands through the PDF thread costs under half of the same page in 24 tiles of 512², rendered with poppler as the thread does; the whole page is printed too (measured 23–29, 77–93 and 10–12 ms). Zoomed in far (scale_q 96, 7344 × 9504 px), the 9 tiles of about 1024² under a 1800 × 2000 px view cost under two thirds of the 25 tiles of 512² there (measured 31–34 and 77–78 ms) |
+| `lemma-pdf` `perf_dark_pages` | colouring a page for dark mode (stress and pdf50 pages at scale 1.25 and 2.625) takes under 1/2.5 of the time of the transform without its fast paths for white and grey pixels (measured 0.6 against 3.4 ms, and 2.7–2.9 against 15.5–16.2 ms), with the same bytes; through the PDF thread a dark stress page at scale_q 21 costs under 1.5 times a light one (measured 12.6 and 10.7 ms; 18.6 and 7.9 before) |
 | `lemma-pdf` `perf_first_sync_after_a_rebuild` | on pdf50 (or `LEMMA_PERF_PDF`, a PDF of your own with its SyncTeX file): after a rebuild, a Ctrl+click sent before the Want of the first three pages holds the first page back at most to 1.5 times its time without the click plus 5 ms, while the file is parsed on a helper thread, and the first Forward after a rebuild parsed ahead takes ≤ 5 ms median (§7); on a 500-page build measured 25 against 17 ms (169–230 ms before), and 0.8 ms (126–190 ms before) |
 | `lemma-pdf` `perf_reload_of_a_long_pdf` | a Reload of a generated 3000-page PDF reports `Opened` in under half the time of an Open, which reads every page first, and its first page comes no later; pdf50 and `LEMMA_PERF_PDF` are printed too (a 500-page build: 5.8 against 24 ms, the first page after 23 against 40 ms) |
 | `gtk_pdf_m3` `perf_bookmarks_after_rebuilds` | with the strip's 500 bookmarks shown, the longest main-loop iteration after a rebuild (the window's frames left out and printed: Broadway renders them in software), when the outline is the same or only its destinations moved: ≤ 5 ms median (measured about 1 ms; 57–73 ms before, when every row was replaced); with other titles, printed (46–50 ms) |
+| `gtk_pdf_m3` `perf_bookmark_followed_per_scroll_step` | what following the view costs the strip per scroll step with 500 and 5000 bookmarks shown, against the strip hidden: ≤ 0.25 ms (measured 5.3 and 5.7 µs; 86 µs and 0.94 ms, up to 8 ms, while every step read every row from the tree) |
 | `gtk_math_preview` `perf_math_preview_large_tex` | on `large.tex` with the live preview (needs `pdflatex`): the main loop's work after the card appears or goes away ≤ 20 ms median (measured under 0.5 ms; 1.2 s while its tag was removed from the whole text, which GTK lays out again), and the hover of a rendered formula right after a one-character edit ≤ 2 ms median |
 | `gtk_labels` `perf_equation_numbers_large_tex` | the inline equation numbers of `large.tex` with 5000 labels numbered by the `.aux`: a refresh ≤ 15 ms median (measured 8 ms; 49 ms with a search per label), and the main loop's work after a new undefined reference is underlined ≤ 50 ms |
 | `gtk_review` `perf_review_many_hunks` | 3000 one-line hunks in a 9000-line file: the overlay's sync ≤ 15 ms median (measured 10 ms; 85 ms while every hunk searched the layout cache and every tag was searched for in the text), the recompute after typing ≤ 40 ms, the gutter's marks in a frame ≤ 1 ms, Alt+Y and Alt+N on the middle hunk (`decide_and_advance`) ≤ 50 ms median and the recompute after typing in a hunk ≤ 40 ms (measured 20 ms and 18 ms; 0.43 s and 0.37 s while the overlay re-tagged every added line and changed word, with a tag per hunk that moved for every hunk after a decided one); prints a line break above the hunks and accepting the last one (with the main loop's work after it) |
@@ -577,7 +751,9 @@ Their thresholds come from `docs/ARCHITECTURE.md` §7 and §10.7. They read
 
 ## Golden images
 
-GUI rendering tests compare a PNG from `lemma --snapshot` against a committed golden image:
+GUI rendering tests (`gtk_review`'s `golden_snapshots`) render the editor to a PNG in the test,
+crop it to its top 540 pixels, and compare it against a committed golden image in
+`tests/fixtures/review/golden/`:
 
 - the test passes when the **mean absolute difference is below 2/255** per channel;
 - `UPDATE_GOLDEN=1` rewrites the golden images instead of comparing; check the new PNGs before
@@ -604,6 +780,10 @@ from `--demo templates`. Other GTK tests write review snapshots with `LEMMA_TEST
 too (their module docs name them: `gtk_shell_m3`, `gtk_goto`, `gtk_math_preview`, `gtk_pdf_m3`,
 `gtk_palette`, `gtk_prefs`, `gtk_search`, `gtk_git_gutter`). Look at every image after a change
 that affects the UI.
+
+The README's picture, `docs/images/review.png` (also the screenshot of the AppStream metadata in
+`packaging/`), is the `f-agent-panel` shot: `scripts/shots.sh f-agent-panel`, then copy
+`target/shots/f-agent-panel.png` over it.
 
 One screenshot:
 
@@ -651,6 +831,7 @@ report, snapshot; runs that quit by themselves write no local history or review 
 | `--demo search` | the Search page: "sheaf" with the replace preview "faisceau" (`LEMMA_DEMO_SEARCH`, `LEMMA_DEMO_REPLACE`) |
 | `--demo prefs` | Preferences, first page (needs a writable `LEMMA_CONFIG` to show the controls enabled) |
 | `--demo pairs` | a `\begin`/`\end` pair highlighted (`LEMMA_DEMO_PAIR=needle` puts the cursor elsewhere) |
+| `--demo templates` | the New from Template dialog, the thesis template selected and FILE's folder chosen; nothing is written |
 | `--agent-scenario JSON` | the agent is `lemma-fake-agent` playing this scenario (`tests/fixtures/agent/`), never Claude |
 | `--apply-as-agent JSON` | applies the edits in JSON as agent edits, as the MCP tools would (format in `testmode/review.rs`) |
 | `--build` | builds as F5 does and waits for the result; after TeX errors, the cursor goes to the first error |
@@ -674,6 +855,8 @@ Committed fixtures (`tests/fixtures/`, never written to; TeX builds run in temp 
 | `logs/<variant>/` | `main.log`, `main.79.log` (79-column wrapping), `*.blg`, `run1.log`, `latexmk.out`, and the `.tex`/`.bib` sources of each broken build (pdfLaTeX, LuaLaTeX and XeLaTeX variants). |
 | `pdf/` | `stress.pdf` (23 pages), `test.pdf` (3 pages) and its `test.tex`. |
 | `large.tex` | 60k lines, for performance and memory tests. |
+| `review/` | `main.tex` and one JSON of agent edits per review case (`--apply-as-agent`), and the golden PNGs of `gtk_review` in `golden/`. |
+| `agent/` | the scenarios of `lemma-fake-agent` (see above). |
 
 Crate-local test data (M3): `crates/lemma-build/tests/data/explain/` (error messages for the
 explanation table: one `main.tex` per error and the `main.log` of a real run of
@@ -703,12 +886,12 @@ scripts/rss.sh pdf50      # one scenario
 ```
 
 Each scenario in `scripts/budgets.toml` lists the lemma arguments, a run time, and RSS/PSS
-budgets from §7. The script runs `lemma <args> --mem-report --quit-after-ms <ms>` (release build
-by default; `LEMMA_PROFILE`, `LEMMA_BIN` override it) with `LEMMA_CONFIG=/dev/null` (the
-defaults, spell checking on; set `LEMMA_CONFIG` to measure another configuration) and a
-temporary `XDG_STATE_HOME` and reads the **last `Rss:` and `Pss:`
-lines in kB**, the `/proc/self/smaps_rollup` format, from the app's stdout or stderr. So
-`--mem-report` must print at least:
+budgets (§7's, re-based on measurements; the file says how). The script runs
+`lemma <args> --mem-report --quit-after-ms <ms>` (release build by default; `LEMMA_PROFILE`,
+`LEMMA_BIN` override it) with `LEMMA_CONFIG=/dev/null` (the defaults, spell checking on; set
+`LEMMA_CONFIG` to measure another configuration) and a temporary `XDG_STATE_HOME` and reads the
+**last `Rss:` and `Pss:` lines in kB**, the `/proc/self/smaps_rollup` format, from the app's
+stdout or stderr. So `--mem-report` must print at least:
 
 ```
 Rss:              98500 kB
@@ -720,7 +903,7 @@ It reads `smaps_rollup` before any snapshot, because rendering a texture adds ab
 - **Default (Broadway):** the numbers are printed but not asserted, because Broadway's memory
   profile differs from Wayland's.
 - **`LEMMA_RSS_WAYLAND=1`:** runs on the real Wayland session and fails when a value exceeds
-  budget × `tolerance` (1.15). It opens windows on the desktop, so run it by hand only.
+  budget × `tolerance` (1.10). It opens windows on the desktop, so run it by hand only.
 
 Scenarios that use `target/fixtures/*` need `scripts/build-fixtures.sh` first.
 

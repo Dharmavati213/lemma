@@ -10,7 +10,7 @@
 //! | Thread | Job |
 //! |---|---|
 //! | `lemma-agent` | the ACP client: `futures_executor::block_on` over the SDK connection (no tokio, no reactor) |
-//! | `lemma-agent-out` | reads the agent's stdout lines into the connection |
+//! | `lemma-agent-out` | reads the agent's stdout lines into the connection (a line over 64 MiB is dropped, with a warning) |
 //! | `lemma-agent-in` | writes the connection's lines to the agent's stdin |
 //! | `lemma-agent-err` | keeps the last 64 KiB of the agent's stderr |
 //! | `lemma-agent-wait` | waits for the agent to exit and reaps it |
@@ -26,9 +26,9 @@
 //! In order, on one thread: `Ready` first (updates that arrive during start-up are delivered after
 //! it), then the session's events, and `Exited(code)` last; the channel then closes. Each accepted
 //! `Prompt` gets exactly one `TurnEnded`: the agent's stop reason; `Cancelled` after `Cancel` or
-//! `Shutdown`; `EndTurn` when the turn ends without a stop reason (the agent answered the prompt
-//! with an error, reported first as `Error`, or the agent died). A `Prompt` while a turn runs is
-//! refused with an `Error` and gets no `TurnEnded`.
+//! `Shutdown`, and when the agent died (or the connection failed) before it answered the prompt;
+//! `EndTurn` when the agent answered the prompt with an error (reported first as `Error`). A
+//! `Prompt` while a turn runs is refused with an `Error` and gets no `TurnEnded`.
 //!
 //! # Lemma's policy on modes and permissions (risk §9.6)
 //!
@@ -85,15 +85,16 @@
 //!
 //! - **Death.** When the agent exits, what it wrote last is still delivered (until its stdout
 //!   reaches EOF, at most [`DRAIN_WAIT`] after the exit). Then (or as soon as it closes its
-//!   stdout) a running turn ends, start-up failures are reported as `Error` with the stderr tail,
-//!   the rest of the process group gets SIGTERM and then SIGKILL, the leader is reaped, and
-//!   `Exited(code)` follows (`None` when a signal ended it). Later commands fail: the command
-//!   channel is closed.
+//!   stdout) a running turn ends `Cancelled`, start-up failures are reported as `Error` with the
+//!   stderr tail, the rest of the process group gets SIGTERM and then SIGKILL, the leader is
+//!   reaped, and `Exited(code)` follows (`None` when a signal ended it). Later commands fail: the
+//!   command channel is closed.
 //! - **Shutdown** (also when every command sender is dropped): pending permissions are answered
 //!   `Cancelled`, a running turn gets `session/cancel`, the session gets `session/close` (when the
 //!   agent supports it), stdin is closed; after [`EXIT_GRACE`] the group gets SIGTERM, after
 //!   [`TERM_GRACE`] more SIGKILL; then the threads are joined. This takes well under a second.
 
+use crate::mcp::LineRead;
 use crate::{
     AcpFlavor, AgentCmd, AgentConfig, AgentEvent, AgentHandle, ConfigOpt, EditorRequest,
     PermOption, PromptBlock, StopReason, ToolCall, ToolReply, ToolStatus, mcp,
@@ -104,17 +105,17 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::panic::AssertUnwindSafe;
 use std::pin::{Pin, pin};
-use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -158,6 +159,10 @@ const DRAIN_WAIT: Duration = Duration::from_millis(300);
 const KILL_WAIT: Duration = Duration::from_secs(2);
 /// How long finished I/O threads may take to be joined at the end.
 const JOIN_WAIT: Duration = Duration::from_millis(500);
+/// Longest message (line) read from the agent; a longer one is dropped. Generous, since one
+/// message may carry a whole file (an `fs/write_text_file`, a tool call's input and output):
+/// twice what the MCP server takes ([`mcp::MAX_MESSAGE_BYTES`]).
+const MAX_LINE_BYTES: usize = 64 << 20;
 
 const CLIENT_NAME: &str = "lemma";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -268,11 +273,22 @@ pub(crate) fn spawn(cfg: AgentConfig) -> io::Result<AgentHandle> {
     };
     let stderr_ring = Arc::new(Mutex::new(StderrRing::default()));
     let (line_tx, line_rx) = mpsc::channel::<String>();
+    // The connection's sink holds the only strong reference, so that closing it closes stdin.
+    let line_tx = Arc::new(line_tx);
     let (incoming_tx, incoming_rx) = async_channel::unbounded::<io::Result<String>>();
     let io_threads = vec![
         named("lemma-agent-out", {
             let log = raw_log.clone();
-            move || read_stdout(stdout, &incoming_tx, log.as_ref())
+            let to_agent = Arc::downgrade(&line_tx);
+            move || {
+                read_stdout(
+                    stdout,
+                    MAX_LINE_BYTES,
+                    &incoming_tx,
+                    &to_agent,
+                    log.as_ref(),
+                )
+            }
         })?,
         named("lemma-agent-in", {
             let log = raw_log.clone();
@@ -340,7 +356,7 @@ struct AgentThread {
     session: Session,
     process: AgentProcess,
     io_threads: Vec<JoinHandle<()>>,
-    line_tx: mpsc::Sender<String>,
+    line_tx: Arc<mpsc::Sender<String>>,
     incoming_rx: async_channel::Receiver<io::Result<String>>,
     stderr_ring: Arc<Mutex<StderrRing>>,
     mcp_server: Option<mcp::McpServer>,
@@ -400,13 +416,10 @@ impl AgentThread {
         st.ready = true;
         st.pre_ready.clear();
         let mut final_events = Vec::new();
-        if let Some(turn) = st.turn.take() {
-            let reason = if turn.cancel_requested || matches!(end, End::Shutdown) {
-                StopReason::Cancelled
-            } else {
-                StopReason::EndTurn
-            };
-            final_events.push(AgentEvent::TurnEnded(reason));
+        if st.turn.take().is_some() {
+            // The agent never answered the prompt (it was stopped, it died, or the connection
+            // failed): the turn was cut short, not finished.
+            final_events.push(AgentEvent::TurnEnded(StopReason::Cancelled));
         }
         // Permission responders die with the connection; the UI's cards are moot after Exited.
         st.permissions.clear();
@@ -1074,49 +1087,74 @@ impl FsRouter {
         }
         let timeout = mcp::Timeouts::default().for_request(&request);
         let (reply, answer) = mpsc::sync_channel::<ToolReply>(1);
+        // The waiting thread starts before the editor gets the request: when it cannot start, the
+        // agent is answered at once (an unanswered request waits forever) and the editor never
+        // makes a write the agent would be told had failed. `finish` is in the slot until then.
+        let finish = Arc::new(Mutex::new(Some(finish)));
+        let waiter = Arc::clone(&finish);
+        let spawned = spawn_fs_waiter(move || {
+            let result = match answer.recv_timeout(timeout) {
+                Ok(reply) => {
+                    let text = reply
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            crate::ToolContent::Text(t) => Some(t.as_str()),
+                            crate::ToolContent::Png(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if reply.is_error {
+                        Err(fs_error(&text))
+                    } else {
+                        Ok(text)
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(fs_error(&format!(
+                    "the editor did not answer within {} s",
+                    timeout.as_secs()
+                ))),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(fs_error("the editor dropped the request"))
+                }
+            };
+            if let Some(finish) = lock(&waiter).take() {
+                finish(result);
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("cannot start an fs request thread: {e}");
+            if let Some(finish) = lock(&finish).take() {
+                finish(Err(fs_error(&format!(
+                    "the editor cannot take the request now: {e}"
+                ))));
+            }
+            return;
+        }
         let call = ToolCall {
             call: mcp::next_call_id(),
             req: request,
             reply,
         };
-        if tools.try_send(call).is_err() {
-            finish(Err(fs_error("the editor is not taking requests")));
-            return;
-        }
-        let spawned = thread::Builder::new()
-            .name("lemma-agent-fs".into())
-            .spawn(move || {
-                let result = match answer.recv_timeout(timeout) {
-                    Ok(reply) => {
-                        let text = reply
-                            .content
-                            .iter()
-                            .filter_map(|c| match c {
-                                crate::ToolContent::Text(t) => Some(t.as_str()),
-                                crate::ToolContent::Png(_) => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n\n");
-                        if reply.is_error {
-                            Err(fs_error(&text))
-                        } else {
-                            Ok(text)
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => Err(fs_error(&format!(
-                        "the editor did not answer within {} s",
-                        timeout.as_secs()
-                    ))),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(fs_error("the editor dropped the request"))
-                    }
-                };
-                finish(result);
+        if let Err(e) = tools.try_send(call) {
+            // The waiting thread passes this on.
+            let _ = e.into_inner().reply.send(ToolReply {
+                content: vec![crate::ToolContent::Text(
+                    "the editor is not taking requests".into(),
+                )],
+                is_error: true,
             });
-        if let Err(e) = spawned {
-            tracing::warn!("cannot start an fs request thread: {e}");
         }
     }
+}
+
+/// Starts the thread that waits for the editor's answer to an `fs/*` request.
+fn spawn_fs_waiter(f: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_FS_SPAWN.with(std::cell::Cell::get) {
+        return Err(io::Error::other("no threads left (test)"));
+    }
+    named("lemma-agent-fs", f).map(drop)
 }
 
 /// The JSON-RPC error of a failed `fs/*` request: the editor's message.
@@ -2044,7 +2082,7 @@ impl futures_core::Stream for CooperativeLines {
 /// The outgoing half of the SDK's line transport: lines go to the `lemma-agent-in` thread.
 /// Closing it (or dropping it) closes the agent's stdin once the queued lines are written.
 struct LineSink {
-    tx: Option<mpsc::Sender<String>>,
+    tx: Option<Arc<mpsc::Sender<String>>>,
 }
 
 impl LineSink {
@@ -2105,18 +2143,48 @@ impl RawLog {
 }
 
 fn read_stdout(
-    stdout: ChildStdout,
+    stdout: impl Read,
+    max_line: usize,
     incoming: &async_channel::Sender<io::Result<String>>,
+    to_agent: &Weak<mpsc::Sender<String>>,
     log: Option<&RawLog>,
 ) {
-    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut reader = LineHead {
+        inner: BufReader::with_capacity(64 * 1024, stdout),
+        head: Vec::new(),
+    };
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => return,
-            Ok(_) => {
-                while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        reader.head.clear();
+        match mcp::read_line_capped(&mut reader, &mut buf, max_line) {
+            Ok(LineRead::Eof) => return,
+            Ok(LineRead::TooLong) => {
+                // Holding it would let one runaway message take all of Lemma's memory.
+                tracing::warn!("the agent sent a message longer than {max_line} bytes; dropped it");
+                if let Some(log) = log {
+                    log.line("<<", &format!("(a message over {max_line} bytes, dropped)"));
+                }
+                // A request still gets an answer, an error ("Invalid Request", as the MCP server
+                // gives one), or the agent would wait for it for ever. The SDK never saw it, so
+                // it gives none of its own.
+                if let Some(id) = request_id(&reader.head)
+                    && let Some(to_agent) = to_agent.upgrade()
+                {
+                    let answer = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32600,
+                            "message": format!("Invalid Request: message longer than {max_line} bytes"),
+                        },
+                    });
+                    let _ = to_agent.send(answer.to_string());
+                }
+                // Do not keep the large buffer for the next lines.
+                buf = Vec::new();
+            }
+            Ok(LineRead::Line) => {
+                while buf.last() == Some(&b'\r') {
                     buf.pop();
                 }
                 let line = String::from_utf8(std::mem::take(&mut buf))
@@ -2131,12 +2199,106 @@ fn read_stdout(
                     return;
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
                 let _ = incoming.send_blocking(Err(e));
                 return;
             }
         }
+    }
+}
+
+/// How much of the start of each line [`LineHead`] keeps: a request's id and method come first.
+const HEAD_BYTES: usize = 4096;
+
+/// A reader that keeps the first [`HEAD_BYTES`] bytes read through it since `head` was cleared:
+/// the start of a line too long to keep whole.
+struct LineHead<R> {
+    inner: R,
+    head: Vec<u8>,
+}
+
+impl<R: io::BufRead> Read for LineHead<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = {
+            let buf = io::BufRead::fill_buf(self)?;
+            let n = buf.len().min(out.len());
+            out[..n].copy_from_slice(&buf[..n]);
+            n
+        };
+        io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl<R: io::BufRead> io::BufRead for LineHead<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(amt);
+        // The bytes consumed are the start of what `fill_buf` returned, still in the buffer (so
+        // this `fill_buf` reads nothing).
+        if room > 0
+            && let Ok(buf) = self.inner.fill_buf()
+        {
+            self.head.extend_from_slice(&buf[..room.min(buf.len())]);
+        }
+        self.inner.consume(amt);
+    }
+}
+
+/// The id of the JSON-RPC request whose message starts with `head` (and is cut off), when its
+/// `"id"` (a number or a string) and its `"method"` are both in `head`, at the top level of the
+/// message: not a notification, a response, or an `"id"` inside the params.
+fn request_id(head: &[u8]) -> Option<serde_json::Value> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+
+    #[derive(Default)]
+    struct Fields {
+        id: Option<serde_json::Value>,
+        method: bool,
+    }
+
+    struct Visit<'a>(&'a mut Fields);
+
+    impl<'de> Visitor<'de> for Visit<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON-RPC message")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "id" => self.0.id = Some(map.next_value()?),
+                    "method" => {
+                        map.next_value::<String>()?;
+                        self.0.method = true;
+                    }
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut fields = Fields::default();
+    // It fails where `head` is cut off; the fields read before that are kept.
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(head),
+        Visit(&mut fields),
+    );
+    match fields.id {
+        Some(id @ (serde_json::Value::Number(_) | serde_json::Value::String(_)))
+            if fields.method =>
+        {
+            Some(id)
+        }
+        _ => None,
     }
 }
 
@@ -2592,6 +2754,65 @@ fn is_live_process(pid: libc::pid_t) -> bool {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Makes [`spawn_fs_waiter`] fail on this thread.
+        pub(super) static FAIL_FS_SPAWN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn fs_router(tools: async_channel::Sender<ToolCall>) -> FsRouter {
+        let (events, _) = async_channel::unbounded();
+        FsRouter {
+            tools: Some(tools),
+            shared: Arc::new(Shared::new(events, Arc::default(), AcpFlavor::Generic)),
+        }
+    }
+
+    /// Routes a read and waits for its answer.
+    fn route_read(router: &FsRouter) -> Result<String, agent_client_protocol::Error> {
+        let (tx, rx) = mpsc::channel();
+        let request = EditorRequest::ReadText {
+            path: "/p/main.tex".into(),
+            line: None,
+            limit: None,
+        };
+        router.route(&s::SessionId::new("s"), request, move |answer| {
+            let _ = tx.send(answer);
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the request was answered")
+    }
+
+    #[test]
+    fn an_fs_request_whose_thread_cannot_start_is_answered_with_an_error() {
+        let (tools, calls) = async_channel::unbounded();
+        let router = fs_router(tools);
+        FAIL_FS_SPAWN.with(|f| f.set(true));
+        let answer = route_read(&router);
+        FAIL_FS_SPAWN.with(|f| f.set(false));
+        let e = answer.unwrap_err();
+        assert!(e.message.contains("cannot take the request"), "{e:?}");
+        assert!(
+            calls.try_recv().is_err(),
+            "the editor never got the request"
+        );
+
+        // With the thread running, the editor's answer comes back.
+        let editor = thread::spawn(move || {
+            let call = calls.recv_blocking().unwrap();
+            let _ = call.reply.send(ToolReply {
+                content: vec![crate::ToolContent::Text("text".into())],
+                is_error: false,
+            });
+        });
+        assert_eq!(route_read(&router).unwrap(), "text");
+        editor.join().unwrap();
+        // And an editor that takes no requests is an error too.
+        let e = route_read(&router).unwrap_err();
+        assert!(e.message.contains("not taking requests"), "{e:?}");
+    }
+
     #[test]
     fn stderr_ring_keeps_the_last_64_kib() {
         let mut ring = StderrRing::default();
@@ -2800,6 +3021,84 @@ mod tests {
         assert_eq!(pauses, [LINES_PER_POLL, 2 * LINES_PER_POLL]);
         let expected: Vec<String> = (0..total).map(|i| i.to_string()).collect();
         assert_eq!(got, expected, "every line, in order");
+    }
+
+    #[test]
+    fn stdout_lines_over_the_limit_are_dropped() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut input = b"{\"a\":1}\r\n\n".to_vec();
+        input.extend(b"x".repeat(65));
+        input.extend(b"\n{\"b\":2}\nnot \xff utf-8\n");
+        input.extend(b"y".repeat(100));
+        read_stdout(&input[..], 64, &tx, &Weak::new(), None);
+        drop(tx);
+        let mut got = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            got.push(line.unwrap());
+        }
+        // The long lines (the last one without a newline) are gone; the rest arrive.
+        assert_eq!(got, ["{\"a\":1}", "{\"b\":2}", "not \u{fffd} utf-8"]);
+    }
+
+    /// A request too long to read is answered with an error when its id and method are at its
+    /// start (else the agent would wait for ever); anything else too long is only dropped.
+    #[test]
+    fn a_request_over_the_limit_is_answered_with_an_error() {
+        let (tx, rx) = async_channel::unbounded();
+        let (answer_tx, answers) = mpsc::channel();
+        let answer_tx = Arc::new(answer_tx);
+        let long = "x".repeat(10_000);
+        let mut input = String::new();
+        for line in [
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"fs/write_text_file","params":{{"content":"{long}"}}}}"#
+            ),
+            r#"{"a":1}"#.to_owned(),
+            format!(
+                r#"{{ "jsonrpc" : "2.0" , "method" : "m", "id" : "abc", "params" : ["{long}"] }}"#
+            ),
+            // A notification, a response, an id after what is cut off, an id inside the params,
+            // an id that is not one, and no JSON at all.
+            format!(r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"c":"{long}"}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":8,"result":{{"c":"{long}"}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":"m","params":{{"c":"{long}"}},"id":9}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":"m","params":{{"id":10,"c":"{long}"}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":[11],"method":"m","params":{{"c":"{long}"}}}}"#),
+            long.clone(),
+            r#"{"b":2}"#.to_owned(),
+        ] {
+            input.push_str(&line);
+            input.push('\n');
+        }
+        read_stdout(
+            input.as_bytes(),
+            1000,
+            &tx,
+            &Arc::downgrade(&answer_tx),
+            None,
+        );
+        drop(tx);
+        let mut got = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            got.push(line.unwrap());
+        }
+        assert_eq!(got, [r#"{"a":1}"#, r#"{"b":2}"#]);
+        drop(answer_tx);
+        let answers: Vec<serde_json::Value> = answers
+            .iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let error = serde_json::json!({
+            "code": -32600,
+            "message": "Invalid Request: message longer than 1000 bytes",
+        });
+        assert_eq!(
+            answers,
+            [
+                serde_json::json!({"jsonrpc": "2.0", "id": 7, "error": error}),
+                serde_json::json!({"jsonrpc": "2.0", "id": "abc", "error": error}),
+            ]
+        );
     }
 
     #[cfg(unix)]

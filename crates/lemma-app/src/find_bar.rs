@@ -6,7 +6,8 @@
 //! editor's selection when that is one line (escaped while Regular Expression is on; the match
 //! the open bar selected, and Ctrl+F in the bar, keep the query). The entry searches as you
 //! type: every match in the file is highlighted, the first match at or after the start of the
-//! selection is selected and scrolled into view once the search has counted them, and the label
+//! selection is selected and scrolled into view once the search has counted them (unless the
+//! cursor moved meanwhile, as a click into the editor moves it: the view then stays), and the label
 //! says "3 of 17" while the selection is a match, else "17 matches" or "No matches". Match Case
 //! (Alt+C), Whole Word (Alt+W) and Regular Expression (Alt+R; GLib's, which is PCRE) are
 //! toggles, as on the Search page. **Enter** / **Shift+Enter** in the entry, the arrow buttons,
@@ -178,9 +179,17 @@ impl Target {
         });
         let weak = Rc::downgrade(find);
         let mark_set = buffer.connect_mark_set(move |buffer, _, mark| {
-            if (*mark == buffer.get_insert() || *mark == buffer.selection_bound())
+            let insert = *mark == buffer.get_insert();
+            if (insert || *mark == buffer.selection_bound())
                 && let Some(find) = weak.upgrade()
             {
+                // The cursor moved (a click into the editor, a key, a jump) before a new query's
+                // first match was selected: the user went on from there, and the view stays.
+                // (The bar's own selections take the pending match first, and a selection that
+                // the entry takes away moves only the selection bound.)
+                if insert {
+                    find.cancel_pending();
+                }
                 find.refresh_count();
             }
         });

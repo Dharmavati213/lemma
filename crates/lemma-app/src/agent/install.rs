@@ -835,7 +835,22 @@ fn store_paths(config: &Path, node: &Path, claude: &Path) -> Result<(), String> 
     let dir = config.parent().ok_or("the config file has no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!(".config.toml.lemma-{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    // Private until it has the file's own permissions (the configuration may hold keys in an
+    // agent's `env`), and on the disk before it replaces the file.
+    let written = crate::fsutil::private_file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     if let Some(permissions) = permissions
         && let Err(e) = std::fs::set_permissions(&tmp, permissions)
     {
@@ -1070,17 +1085,39 @@ async fn run_subprocess(
     launcher.setenv("NO_UPDATE_NOTIFIER", "1", true);
     launcher.setenv("npm_config_update_notifier", "false", true);
     launcher.set_cwd(cwd);
+    // A process group of its own: what npm starts (install scripts, git) holds the output pipe
+    // too, and Cancel stops all of it, as the job object does on Windows.
+    launcher.set_child_setup(|| {
+        // SAFETY: setpgid is async-signal-safe (this runs between fork and exec).
+        unsafe {
+            libc::setpgid(0, 0);
+        }
+    });
     let argv: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
     let process = launcher
         .spawn(&argv)
         .map_err(|e| format!("cannot run npm: {e}"))?;
+    let group = process
+        .identifier()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0);
     let killer = process.clone();
-    let handler = cancel.connect_cancelled_local(move |_| killer.force_exit());
+    let handler = cancel.connect_cancelled_local(move |_| {
+        killer.force_exit();
+        if let Some(group) = group {
+            // SAFETY: a plain system call; the group is npm's own (see above).
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    });
     let stdout = process.stdout_pipe().ok_or("npm has no output pipe")?;
     let lines = gio::DataInputStream::new(&stdout);
+    // Read as bytes: a line that is not UTF-8 (a path in another encoding) must not end the
+    // reading, or npm blocks on a full pipe while it is waited for.
     loop {
-        match lines.read_line_utf8_future(glib::Priority::DEFAULT).await {
-            Ok(Some(line)) => on_line(line.trim_end_matches('\r')),
+        match lines.read_line_future(glib::Priority::DEFAULT).await {
+            Ok(Some(line)) => on_line(String::from_utf8_lossy(&line).trim_end_matches('\r')),
             Ok(None) => break,
             Err(e) => {
                 on_line(&format!("(could not read npm's output: {e})"));
@@ -1235,9 +1272,7 @@ mod tests {
 
     impl Home {
         fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("lemma-install-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = crate::fsutil::private_temp_dir(&format!("lemma-install-{name}-")).unwrap();
             std::fs::create_dir_all(dir.join("bin")).unwrap();
             Self { dir }
         }
@@ -1247,17 +1282,21 @@ mod tests {
             Paths::from_vars(move |k| (k == "HOME").then(|| home.clone().into_os_string())).unwrap()
         }
 
+        /// `bin` on `PATH`, then [`Home::system`]: never the host's own directories, whose
+        /// node or claude would be found instead of a missing one.
         fn env(&self) -> Env {
             Env {
-                path: std::env::join_paths([
-                    self.dir.join("bin"),
-                    "/usr/bin".into(),
-                    "/bin".into(),
-                ])
-                .unwrap(),
+                path: std::env::join_paths([self.dir.join("bin"), self.system()]).unwrap(),
                 config_file: Some(self.dir.join("config/lemma/config.toml")),
                 mise_installs: self.dir.join(".local/share/mise/installs"),
             }
+        }
+
+        /// An empty directory standing for the system's program directories on `PATH`.
+        fn system(&self) -> PathBuf {
+            let dir = self.dir.join("usr/bin");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
         }
 
         fn script(&self, rel: &str, body: &str) -> PathBuf {
@@ -1366,7 +1405,7 @@ mod tests {
         env.path = std::env::join_paths([
             home.dir.join(".local/share/mise/shims"),
             home.dir.join(".local/share/mise/installs/node/26.7.0/bin"),
-            "/usr/bin".into(),
+            home.system(),
         ])
         .unwrap();
         let versioned = home.script(".local/share/mise/installs/node/26.7.0/bin/node", "exit 0");

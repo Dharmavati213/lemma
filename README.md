@@ -1,11 +1,13 @@
 # Lemma
 
-Lemma is a LaTeX editor for Linux, macOS and Windows (GTK 4 / libadwaita) built around reviewing an AI agent's
-edits. When the agent changes your document, every change shows up inline as a red/green hunk
-that you accept or reject on its own, like a code review, before anything is final.
+Lemma is a LaTeX editor for Linux, macOS and Windows (GTK 4 / libadwaita) built around reviewing
+an AI agent's edits. When the agent changes your document, every change shows up inline as a
+red/green hunk that you accept or reject on its own, like a code review, before anything is final.
 
 It is also a complete LaTeX editor without the agent: continuous PDF preview with SyncTeX,
 build diagnostics in plain English, completion, snippets, a project outline and more.
+
+![Lemma with two of an agent's edits shown as red and green hunks in the editor, each with Accept and Reject, and the agent pane beside it](docs/images/review.png)
 
 ## Features
 
@@ -17,11 +19,12 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   selection or paragraph.
 - **Attach images and files to a prompt.** Click the paperclip under the agent's prompt box, drop
   files or images on the agent pane, or paste (Ctrl+V) a screenshot or files copied in a file
-  manager. Images (PNG, JPEG, GIF, WebP, and anything else GTK can read; files up to 64 MB) go
-  to the model as images, scaled down when they are too large; PDFs and text files are attached
-  too. The ACP agents take PDFs and text files of any size: large ones are sent as a link
-  that the agent opens itself. With the API backend everything travels inside the request, so
-  PDFs are limited to 20 MB and text files to 512 KB. A message may consist of attachments only.
+  manager. Images (PNG, JPEG, GIF, WebP, and anything else GTK can read; files up to 64 MiB) go
+  to the model as images, scaled down when they are too large; PDFs and text files (SVG images
+  among them) are attached too. The ACP agents take PDFs and text files of any size: large ones
+  are sent as a link that the agent opens itself. With the API backend everything travels inside
+  the request, so PDFs are limited to 20 MiB and text files to 512 KiB. A message may consist of
+  attachments only.
 - **Build and preview.** Saving runs `latexmk` (F5 builds by hand). The PDF pane reloads in
   place when a build writes a new PDF, keeping your place even with a search open. It supports
   dark mode, search, thumbnails and bookmarks, and SyncTeX works both ways: the **Source** and
@@ -34,8 +37,9 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   copies each new PDF next to the main document, so `main.pdf` beside `main.tex` is always the
   latest (`[build] copy_pdf = false` keeps it in `.build` only). With pdflatex, the preamble is
   precompiled after the first build and reused until it changes, so a save's build skips
-  loading the packages again (`[build] fast_preamble`). When a damaged `.aux` or `.bbl` keeps a build failing, **Clean Build Files and
-  Rebuild** in the command palette runs `latexmk -c` (the PDF stays) and builds again.
+  loading the packages again (`[build] fast_preamble`). When a damaged `.aux` or `.bbl` keeps a
+  build failing, **Clean Build Files and Rebuild** in the command palette runs `latexmk -c` (the
+  PDF stays) and builds again.
 - **Diagnostics.** Errors, warnings and bad boxes from the TeX log and `.blg`, with
   explanations and quick fixes for common errors, plus optional `chktex` lint. F4 and Shift+F4
   (`]e` and `[e` in Vim) go to the next and previous build problem, across files.
@@ -43,10 +47,12 @@ build diagnostics in plain English, completion, snippets, a project outline and 
   glyphs from per-package word lists, and for your own macros, also those of a `.sty` or `.cls`
   next to the document. Snippets and autosnippets, bracket pairing, spell
   checking, hover previews of `\ref`, `\cite` and rendered math, and label rename/references.
-  Ctrl+/ comments lines out and back in; Ctrl+B and Ctrl+I put the selection in `\textbf{…}`
-  and `\textit{…}` (`\mathbf`, `\mathit` in math) and take it out again, and Emphasize
+  Ctrl+/ comments lines out and back in (in a `.bib` file only when biber reads it: BibTeX has
+  no comments); Ctrl+B and Ctrl+I put the selection in `\textbf{…}` and `\textit{…}`
+  (`\mathbf`, `\mathit` in math) and take it out again, and Emphasize
   (`\emph`) is in the command palette. In Vim mode, Ctrl+B and Ctrl+I stay Vim's keys.
-  Optionally, `...` typed in text becomes `\dots`.
+  Optionally, `...` typed in text becomes `\dots` (`\dots{}` when a space or a line break
+  follows it, so that the space is printed).
 - **Navigation.** Project outline, command palette (Ctrl+Shift+P), quick open (Ctrl+P), go to
   line (Ctrl+G, or `:42` and `main.tex:42` in quick open), find and replace in the current file
   (Ctrl+F, Ctrl+H; F3 and Shift+F3 for the next and previous match), project search and replace
@@ -74,9 +80,9 @@ Lemma targets current GNOME 50-era libraries:
 To build documents you need a TeX distribution with `latexmk` (e.g. TeX Live).
 
 Optional tools turn features on when they are found: `chktex` (lint), `texcount` (word
-count), `mylatexformat` (faster math previews) and `git` (the git gutter). The Claude, Codex
-and Pi backends need `node` and `npm`, plus the agent itself, logged in (the `claude` or
-`codex` CLI). The other agents only need their own command line tool.
+count), `mylatexformat` (faster builds with pdflatex, and faster math previews) and `git` (the
+git gutter). The Claude, Codex and Pi backends need `node` and `npm`, plus the agent itself,
+logged in (the `claude` or `codex` CLI). The other agents only need their own command line tool.
 
 Arch Linux ships all of these. Other distributions may not have libraries this new yet. On
 macOS, Homebrew has them all (see [macOS](#macos) below). On Windows, MSYS2 has them all, and
@@ -122,9 +128,9 @@ cd lemma/packaging
 makepkg -si
 ```
 
-This installs `lemma` and `lemma-mcp` to `/usr/bin`, a desktop entry that opens `.tex` files, an
-icon, and example configuration under `/usr/share/lemma/`. To make Lemma the default for `.tex`
-files:
+This installs `lemma` and `lemma-mcp` to `/usr/bin`, a desktop entry that opens `.tex` and
+`.bib` files, an icon, and example configuration under `/usr/share/lemma/`. To make Lemma the
+default for `.tex` files:
 
 ```sh
 xdg-mime default io.github.lemma_editor.Lemma.desktop text/x-tex
@@ -353,10 +359,10 @@ Preferences.
 
 Open the agent pane (F10) and choose a backend in its header:
 
-- **Claude** (default): Claude Code through the ACP adapter. It uses your existing Claude Code
-  login. The pane's **Install** button installs the adapter.
-- **API**: the Anthropic Messages API with your own key. Click "Set API Key…" in the pane to
-  store it in the GNOME keyring, or set `ANTHROPIC_API_KEY`.
+- **Claude Code** (default), through the ACP adapter. It uses your existing Claude Code login.
+  The pane's **Install** button installs the adapter.
+- **Anthropic API**: the Anthropic Messages API with your own key. Click "Set API key…" in the
+  pane to store it in the GNOME keyring, or set `ANTHROPIC_API_KEY`.
 - **Pi**: the `pi` coding agent through its ACP adapter. Run `pi` once to log in.
 - **Codex**: OpenAI's Codex CLI through the ACP adapter `@agentclientprotocol/codex-acp`, which
   the pane's **Install** button installs. It runs your own `codex`; log in with `codex login`.
@@ -364,7 +370,7 @@ Open the agent pane (F10) and choose a backend in its header:
   (`opencode acp`) and **GitHub Copilot** (`copilot --acp`) speak ACP themselves: Lemma finds
   the tool on `PATH`, in `~/.local/bin` or in mise's installs. Log in with the tool first
   (`grok login`, …).
-- **Custom**: any other agent that speaks ACP on stdio, from `[agent.custom]` (below).
+- **Custom agent**: any other agent that speaks ACP on stdio, from `[agent.custom]` (below).
 
 Agent edits always arrive as hunks for review. Nothing is accepted for you. Agents that edit
 through ACP's file methods (Pi, Gemini CLI) edit the live buffers; edits that an agent writes to

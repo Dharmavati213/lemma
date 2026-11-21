@@ -9,11 +9,12 @@ use std::time::Duration;
 pub const USAGE: &str = "\
 Usage: lemma [[+LINE] FILE[:LINE[:COLUMN]]]... [OPTIONS]
 
-FILE is a document or a project directory (`.` for the current one). Without it, Lemma
-reopens the project and file it had open last. The first FILE decides the project (its
-directory, or the directory itself); only the first can be a directory. The others open in
-tabs after it, and the first document is shown. +LINE before a FILE, or :LINE after it, puts
-the cursor on that line (:LINE:COLUMN, on that character), counted from 1.
+FILE is a document or a project directory (`.` for the current one); a document that does
+not exist yet is a new one. Without it, Lemma reopens the project and file it had open last.
+The first FILE decides the project (its directory, or the directory itself); only the first
+can be a directory. The others open in tabs after it, and the first document is shown. +LINE
+before a FILE, or :LINE after it, puts the cursor on that line (:LINE:COLUMN, on that
+character), counted from 1.
 
 Options:
   --snapshot PNG          render the window to PNG once the first frame is drawn
@@ -226,6 +227,12 @@ impl Options {
                     file.line = Some(n);
                     file.column = None;
                 }
+                // `newdir/` names a directory: a missing one is not a new document called
+                // `newdir`, nor is a file (`main.tex/`).
+                if ends_in_separator(&file.path) && !file.path.is_dir() {
+                    let shown = file.path.to_string_lossy().into_owned();
+                    return Err(CliError::NoSuchDirectory(shown));
+                }
                 if !opts.files.is_empty() && file.path.is_dir() {
                     let shown = file.path.to_string_lossy().into_owned();
                     return Err(CliError::DirectoryNotFirst(shown));
@@ -286,6 +293,14 @@ impl Options {
         }
         Ok(Parsed::Run(opts))
     }
+}
+
+/// True when `path` ends in a path separator (`/`, and `\` on Windows).
+fn ends_in_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|b| std::path::is_separator(char::from(*b)))
 }
 
 /// The line of a `+LINE` argument (`+42`).
@@ -360,6 +375,8 @@ pub enum CliError {
     LineWithoutFile(String),
     /// A directory as a FILE other than the first.
     DirectoryNotFirst(String),
+    /// A FILE that ends in a path separator but is no directory (`newdir/`).
+    NoSuchDirectory(String),
 }
 
 impl fmt::Display for CliError {
@@ -375,6 +392,7 @@ impl fmt::Display for CliError {
                     "only the first FILE can be a directory (the project): {a}"
                 )
             }
+            Self::NoSuchDirectory(a) => write!(f, "{a}: no such directory"),
         }
     }
 }
@@ -537,8 +555,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn files_on_disk() {
-        let dir = std::env::temp_dir().join(format!("lemma-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-cli-").unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let odd = dir.join("notes.tex:12");
         std::fs::write(&odd, "x\n").unwrap();
@@ -560,6 +577,32 @@ mod tests {
                 .to_string()
                 .starts_with("only the first FILE can be a directory")
         );
+        // A trailing `/` names a directory: one that does not exist (or is a file) is no new
+        // document, wherever it comes.
+        let with_slash = format!("{sub}/");
+        assert_eq!(run(&[&with_slash]).files, [FileArg::new(&with_slash)]);
+        let missing = format!("{}/newdir/", dir.display());
+        assert_eq!(
+            parse(&[&missing]),
+            Err(CliError::NoSuchDirectory(missing.clone()))
+        );
+        assert_eq!(
+            parse(&[main, &missing]),
+            Err(CliError::NoSuchDirectory(missing.clone()))
+        );
+        std::fs::write(main, "x\n").unwrap();
+        let file_slash = format!("{main}/");
+        assert_eq!(
+            parse(&[&file_slash]),
+            Err(CliError::NoSuchDirectory(file_slash.clone()))
+        );
+        assert_eq!(
+            CliError::NoSuchDirectory("newdir/".into()).to_string(),
+            "newdir/: no such directory"
+        );
+        // Without the `/`, a missing name is a new document.
+        let new = format!("{}/newdir", dir.display());
+        assert_eq!(run(&[&new]).files, [FileArg::new(&new)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -646,6 +689,10 @@ mod tests {
         assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
         assert_eq!(parse(&["x.tex", "-h"]), Ok(Parsed::Help));
         assert_eq!(parse(&["-V"]), Ok(Parsed::Version));
+        // The help stays wrapped as it is written, for a terminal.
+        for line in USAGE.lines() {
+            assert!(line.chars().count() <= 92, "too long for --help: {line}");
+        }
     }
 
     #[test]

@@ -78,6 +78,10 @@ fn main() -> ExitCode {
             word_count_large_project,
         ),
         (
+            "word_count_that_fails_says_so_in_the_popover",
+            word_count_fails_in_the_popover,
+        ),
+        (
             "word_count_stops_texcount_with_the_window",
             word_count_stops_with_the_window,
         ),
@@ -1772,6 +1776,64 @@ fn word_count_large_project() {
     assert_eq!(
         wordcount::status_text(&f.state),
         Some(wordcount::words_label(42))
+    );
+    popover.popdown();
+}
+
+/// The popover of a large project counts on a click; when texcount prints no count (a broken
+/// installation), the popover says so instead of "Counting words…" for as long as it is open.
+fn word_count_fails_in_the_popover() {
+    if !cfg!(unix) {
+        return;
+    }
+    let chapter = "Some words of a long chapter.\n".repeat(20_000);
+    let f = fixture_with(
+        "wordcount-fails",
+        &[
+            (
+                "main.tex",
+                "\\documentclass{book}\n\\begin{document}\n\\include{ch1}\n\\include{ch2}\n\
+                 \\end{document}\n",
+            ),
+            ("ch1.tex", &chapter),
+            ("ch2.tex", &chapter),
+        ],
+        |c| c.lint.chktex = false,
+    );
+    let script = f.dir.join("texcount");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'Can'\\''t locate Text/Wrap.pm'\nexit 2\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    wordcount::set_program(&f.state, &script);
+    f.open("main.tex");
+    f.wait_count(1);
+    assert_eq!(
+        wordcount::status_text(&f.state).as_deref(),
+        Some("Count Words")
+    );
+    let popover = wordcount::popover(&f.state).unwrap();
+    popover.popup();
+    common::pump_until(TIMEOUT, || popover.is_visible());
+    f.wait_count(2);
+    let labels = all_labels(&popover);
+    assert!(!labels.iter().any(|l| l == "Counting words…"), "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.starts_with("Could not count the words: texcount failed")),
+        "{labels:?}"
+    );
+    // The item still offers to count.
+    assert_eq!(
+        wordcount::status_text(&f.state).as_deref(),
+        Some("Count Words")
     );
     popover.popdown();
 }

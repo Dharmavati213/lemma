@@ -6,7 +6,8 @@
 //!   neither once zoomed (Ctrl+1 is 100%). Left and Right (h and l) scroll sideways.
 //! - **Zoom:** Ctrl+wheel, pinch ([`gtk::GestureZoom`]) and the toolbar, anchored at the pointer.
 //!   The textures on screen are stretched at once; the pages are re-rendered at
-//!   `scale_q = round(zoom × surface scale × 8)` after [`RERENDER_DELAY`] without zoom changes.
+//!   `scale_q = round(zoom × surface scale × SCALE_STEPS)` ([`lemma_pdf::scale_q`]) after
+//!   [`RERENDER_DELAY`] without zoom changes, and drawn pixel for pixel.
 //!   Pages that come into view meanwhile without a texture to stretch (zooming out) are rendered
 //!   at once at that scale.
 //! - **Render requests:** the visible pages from the centre outward, then the pages just before
@@ -115,6 +116,10 @@ pub type PageRect = (f64, f64, f64, f64);
 type RequestFn = dyn Fn(Vec<RenderReq>);
 type InverseFn = dyn Fn(u32, f64, f64);
 type ChangedFn = dyn Fn(&PdfView);
+
+/// A callback of [`PdfView::connect_changed`], for [`PdfView::disconnect_changed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangedId(u64);
 
 /// The document shown: its generation and page layout.
 struct Doc {
@@ -591,7 +596,9 @@ mod imp {
         adjustment_handlers: RefCell<Vec<(gtk::Adjustment, glib::SignalHandlerId)>>,
         pub(super) request: RefCell<Option<Rc<RequestFn>>>,
         pub(super) inverse: RefCell<Option<Rc<InverseFn>>>,
-        pub(super) changed: RefCell<Vec<Rc<ChangedFn>>>,
+        pub(super) changed: RefCell<Vec<(ChangedId, Rc<ChangedFn>)>>,
+        /// The id of the last callback connected.
+        pub(super) changed_ids: Cell<u64>,
         update_scheduled: Cell<bool>,
         rerender_timer: RefCell<Option<glib::SourceId>>,
         flash_tick: RefCell<Option<gtk::TickCallbackId>>,
@@ -610,6 +617,7 @@ mod imp {
                 request: RefCell::new(None),
                 inverse: RefCell::new(None),
                 changed: RefCell::new(Vec::new()),
+                changed_ids: Cell::new(0),
                 update_scheduled: Cell::new(false),
                 rerender_timer: RefCell::new(None),
                 flash_tick: RefCell::new(None),
@@ -968,7 +976,12 @@ mod imp {
         }
 
         pub(super) fn emit_changed(&self) {
-            let callbacks = self.changed.borrow().clone();
+            let callbacks: Vec<Rc<ChangedFn>> = self
+                .changed
+                .borrow()
+                .iter()
+                .map(|(_, callback)| callback.clone())
+                .collect();
             let obj = self.obj();
             for callback in callbacks {
                 callback(&obj);
@@ -1045,8 +1058,10 @@ mod imp {
                     let Some(texture) = model.cache.get(&key) else {
                         continue;
                     };
-                    let r = geometry::bitmap_view_rect(size, key.scale_q, key.tile, rect, scale);
-                    let r = Rect::new(snap(r.x), snap(r.y), r.width, r.height);
+                    let r = geometry::snap_to_pixels(
+                        geometry::bitmap_view_rect(size, key.scale_q, key.tile, rect, scale),
+                        scale,
+                    );
                     // A texture of the other mode (just after a toggle) is recoloured; the
                     // others are drawn as they are.
                     let recolour = (key.dark != model.dark).then(|| {
@@ -1167,9 +1182,26 @@ impl PdfView {
         self.imp().inverse.replace(Some(Rc::new(f)));
     }
 
-    /// Calls `f` whenever the page shown, the zoom, the document or dark mode changes.
-    pub fn connect_changed(&self, f: impl Fn(&PdfView) + 'static) {
-        self.imp().changed.borrow_mut().push(Rc::new(f));
+    /// Calls `f` whenever the page shown, the zoom, the document or dark mode changes, until
+    /// [`PdfView::disconnect_changed`] with the id returned.
+    pub fn connect_changed(&self, f: impl Fn(&PdfView) + 'static) -> ChangedId {
+        let imp = self.imp();
+        let id = ChangedId(imp.changed_ids.get() + 1);
+        imp.changed_ids.set(id.0);
+        imp.changed.borrow_mut().push((id, Rc::new(f)));
+        id
+    }
+
+    /// Stops calling a callback of [`PdfView::connect_changed`] (and drops it with what it
+    /// holds).
+    pub fn disconnect_changed(&self, id: ChangedId) {
+        self.imp().changed.borrow_mut().retain(|(i, _)| *i != id);
+    }
+
+    /// How many callbacks [`PdfView::connect_changed`] has (tests check that a detached PDF
+    /// window leaves none behind).
+    pub fn changed_callbacks(&self) -> usize {
+        self.imp().changed.borrow().len()
     }
 
     /// Shows another document than the one shown (if any), of `generation` with the given page
@@ -1702,8 +1734,8 @@ impl PdfView {
             .page_complete(page, width, Rect::new(sx, sy, width, height))
     }
 
-    /// The render scale requested for new bitmaps (`round(zoom × device scale × 8)`; 0 before
-    /// the first allocation).
+    /// The render scale requested for new bitmaps ([`lemma_pdf::scale_q`] of the zoom and the
+    /// device scale; 0 before the first allocation).
     pub fn render_scale_q(&self) -> u16 {
         self.imp().model.borrow().target_q
     }

@@ -351,6 +351,56 @@ fn errors_are_parsed_and_the_pdf_is_still_reported() {
     assert!(outcome.pdf.is_some());
 }
 
+/// A program latexmk cannot run (here a biber that is not installed, named by the project's
+/// latexmkrc) is the build's error, by name: latexmk fails with no TeX error, and its own output
+/// ends with advice that says nothing about what failed.
+#[test]
+fn a_program_latexmk_cannot_run_is_named() {
+    if !have_latexmk() {
+        return;
+    }
+    let biblatex = Command::new("kpsewhich")
+        .arg("biblatex.sty")
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !biblatex {
+        eprintln!("SKIP: biblatex not found");
+        return;
+    }
+    let dir = project(&[
+        (
+            "main.tex",
+            "\\documentclass{article}\n\\usepackage{biblatex}\n\\addbibresource{refs.bib}\n\
+             \\begin{document}\nSee \\cite{a}.\n\\printbibliography\n\\end{document}\n",
+        ),
+        ("refs.bib", "@book{a, title={T}, author={A}, year={2000}}\n"),
+        ("latexmkrc", "$biber = 'lemma-no-such-biber %O %S';\n"),
+    ]);
+    let outcome = build(&request(
+        dir.path().join("main.tex"),
+        Duration::from_secs(120),
+    ));
+    assert_eq!(outcome.status, BuildStatus::Errors);
+    let errors = errors(&outcome);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0].ends_with(
+            " lemma-no-such-biber was not found: install it with your TeX distribution \
+             (latexmk could not run it)"
+        ),
+        "{errors:#?}"
+    );
+    let context = outcome
+        .report
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+        .and_then(|d| d.context.clone())
+        .unwrap_or_default();
+    assert!(context.contains("lemma-no-such-biber"), "{context}");
+}
+
 #[test]
 fn runaway_argument_is_located_in_an_input_file() {
     if !have_latexmk() {
@@ -579,4 +629,38 @@ fn a_precompiled_preamble_is_dumped_used_and_renewed() {
     fs::write(&root, text("\\makeindex", "Hello.")).unwrap();
     assert!(matches!(preamble_for(&req), Preamble::Unsupported));
     assert!(!dump_preamble(&req).expect("no dump"));
+}
+
+/// A preamble that writes a file and then loads it (with expl3 here: the dump defers `\openout`,
+/// and `filecontents` fails in it, but not `\iow_open:Nn`): the dump finds the file in its own
+/// output directory, so it is recorded as failed, once. It is not dumped again after every
+/// build, although the dump itself wrote that file while it ran.
+#[cfg(unix)]
+#[test]
+fn a_preamble_that_loads_a_file_it_wrote_is_not_dumped_again() {
+    use lemma_build::preamble::{Preamble, dump_preamble, preamble_for};
+    if !have_latexmk() || !have_mylatexformat() {
+        return;
+    }
+    let text = "\\documentclass{article}\n\\ExplSyntaxOn\n\\iow_new:N \\g_my_iow\n\
+                \\iow_open:Nn \\g_my_iow {mystyle.sty}\n\
+                \\iow_now:Nn \\g_my_iow {\\newcommand\\mine{Mine}}\n\
+                \\iow_close:N \\g_my_iow\n\\ExplSyntaxOff\n\\usepackage{mystyle}\n\
+                \\begin{document}\n\\mine\n\\end{document}\n";
+    let dir = project(&[("main.tex", text)]);
+    let req = request(dir.path().join("main.tex"), Duration::from_secs(120));
+    let first = build(&req);
+    assert_eq!(first.status, BuildStatus::Success, "{:?}", errors(&first));
+    assert!(matches!(preamble_for(&req), Preamble::Stale));
+    assert!(!dump_preamble(&req).expect("dump"), "no usable format");
+    assert!(
+        dir.path()
+            .join(".build/.lemma-preamble/main/mystyle.sty")
+            .is_file(),
+        "the dump wrote the file it loads"
+    );
+    assert!(
+        matches!(preamble_for(&req), Preamble::Unsupported),
+        "the failed dump is recorded"
+    );
 }

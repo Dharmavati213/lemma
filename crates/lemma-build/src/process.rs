@@ -27,11 +27,12 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// How long [`Build::wait`] waits for a cancelled process group to disappear.
 const GROUP_EXIT_LIMIT: Duration = Duration::from_millis(1500);
 /// Larger logs (a runaway `\loop` printing forever) are parsed only up to this size.
-const MAX_LOG_BYTES: u64 = 16 << 20;
+pub(crate) const MAX_LOG_BYTES: u64 = 16 << 20;
 /// Sources larger than this are not searched for runaway arguments.
 const MAX_SOURCE_BYTES: u64 = 4 << 20;
-/// How much of latexmk's own output to show when it fails without a TeX error.
-const LATEXMK_TAIL_BYTES: u64 = 4096;
+/// How much of latexmk's own output is read when it fails without a TeX error (a program it
+/// could not run is named some lines before its end), and how many of its last lines are shown.
+const LATEXMK_OUTPUT_BYTES: u64 = 64 << 10;
 const LATEXMK_TAIL_LINES: usize = 5;
 
 /// The process group of one build: latexmk and every TeX, biber or bibtex it starts. On Windows
@@ -392,7 +393,8 @@ impl Build {
     /// exited, so no TeX process is left writing into the output directory. Runaway arguments
     /// are located in the project files listed in the `.fls`, and relative `.blg` paths are
     /// resolved against the root's directory. If latexmk fails without any error in the log or
-    /// `.blg`, an error on the root file carries the end of latexmk's own output as context.
+    /// `.blg`, an error on the root file names the program latexmk could not run (biber, an
+    /// engine that is not installed), else carries the end of latexmk's own output as context.
     pub fn wait(mut self) -> BuildOutcome {
         let (status, exit_code, elapsed) = self.wait_for_exit();
         self.outcome(status, exit_code, elapsed)
@@ -494,10 +496,12 @@ impl Build {
             .iter()
             .any(|d| d.severity == Severity::Error);
         if status == BuildStatus::Errors && !has_error {
-            let tail = output_tail(&output_file("latexmk.log"));
-            report
-                .diagnostics
-                .push(latexmk_failure(root.clone(), exit_code, tail));
+            let output = output_end(&output_file("latexmk.log"));
+            report.diagnostics.push(latexmk_failure(
+                root.clone(),
+                exit_code,
+                output.as_deref().unwrap_or(""),
+            ));
         }
         let pdf = report
             .output
@@ -644,35 +648,88 @@ fn project_sources(
         .collect()
 }
 
-/// The last few non-empty lines of latexmk's output.
-fn output_tail(path: &Path) -> Option<String> {
+/// The end of latexmk's output (its last [`LATEXMK_OUTPUT_BYTES`]).
+fn output_end(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(LATEXMK_TAIL_BYTES)))
+    file.seek(SeekFrom::Start(len.saturating_sub(LATEXMK_OUTPUT_BYTES)))
         .ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The last few lines of latexmk's `output` that say something: without blank lines, its
+/// `-----` rules, and the advice it closes every failure with ("Sometimes, the -f option can be
+/// used…", the same whatever failed).
+fn output_tail(output: &str) -> Option<String> {
+    let said = output
+        .rfind("Latexmk: Sometimes, the -f option")
+        .map_or(output, |advice| &output[..advice]);
+    let lines: Vec<&str> = said
         .lines()
         .map(str::trim_end)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.trim_start().starts_with("---"))
         .collect();
     let tail = lines[lines.len().saturating_sub(LATEXMK_TAIL_LINES)..].join("\n");
     (!tail.is_empty()).then_some(tail)
 }
 
-fn latexmk_failure(root: PathBuf, exit_code: Option<i32>, tail: Option<String>) -> Diagnostic {
-    let message = match exit_code {
-        Some(code) => format!("latexmk failed with exit code {code}"),
-        None => "latexmk was killed by a signal".to_owned(),
+/// A program latexmk could not run because it is not installed (or not on `PATH`): its name
+/// and the line that says so, which the shell (`sh: 1: biber: not found`, `sh: line 1: biber:
+/// command not found`) or Windows' `cmd` (`'biber' is not recognized as an internal or external
+/// command,`) printed into latexmk's `output`.
+fn missing_program(output: &str) -> Option<(&str, &str)> {
+    output.lines().map(str::trim).find_map(|line| {
+        let name = match line.strip_prefix('\'') {
+            Some(quoted) => {
+                quoted
+                    .split_once("' is not recognized as an internal or external command")?
+                    .0
+            }
+            None => {
+                let said = line
+                    .strip_suffix(": command not found")
+                    .or_else(|| line.strip_suffix(": not found"))?;
+                // `<shell>: [<line>: ]<program>`, the shell's name first.
+                let (shell, rest) = said.split_once(": ")?;
+                if !shell.ends_with("sh") {
+                    return None;
+                }
+                rest.rsplit(": ").next()?
+            }
+        };
+        let plain = !name.is_empty() && !name.contains(char::is_whitespace);
+        plain.then_some((name, line))
+    })
+}
+
+/// The error of a latexmk that failed although TeX reported none, with the end of its `output`:
+/// a program it could not run is named, else its exit code is given with the last lines it
+/// printed.
+fn latexmk_failure(root: PathBuf, exit_code: Option<i32>, output: &str) -> Diagnostic {
+    let (message, context) = match missing_program(output) {
+        Some((program, line)) => (
+            format!(
+                "{program} was not found: install it with your TeX distribution (latexmk could \
+                 not run it)"
+            ),
+            Some(line.to_owned()),
+        ),
+        None => (
+            match exit_code {
+                Some(code) => format!("latexmk failed with exit code {code}"),
+                None => "latexmk was killed by a signal".to_owned(),
+            },
+            output_tail(output),
+        ),
     };
     Diagnostic {
         path: root,
         line: None,
         severity: Severity::Error,
         message,
-        context: tail,
+        context,
         source: DiagSource::Tex,
     }
 }
@@ -831,10 +888,97 @@ mod tests {
         let path = dir.path().join("out.log");
         let text: String = (1..=20).map(|i| format!("line {i}\n\n")).collect();
         fs::write(&path, text).expect("write");
+        let output = output_end(&path).expect("the output");
         assert_eq!(
-            output_tail(&path).as_deref(),
+            output_tail(&output).as_deref(),
             Some("line 16\nline 17\nline 18\nline 19\nline 20")
         );
-        assert_eq!(output_tail(&dir.path().join("missing")), None);
+        assert_eq!(output_end(&dir.path().join("missing")), None);
+        assert_eq!(output_tail(""), None);
+    }
+
+    /// The end of latexmk 4.87's output when biber is not installed (the build wrote a PDF and
+    /// its log has no error).
+    const BIBER_MISSING: &str = "Latexmk: applying rule 'biber .build/main'...
+------------
+Running 'biber  \".build/main.bcf\"'
+------------
+sh: line 1: biber: command not found
+Latexmk: Error return from 'biber .build/main'
+Latexmk: Could not open biber log file '.build/main.blg'
+Latexmk: Errors, so I did not complete making targets
+Collected error summary (may duplicate other messages):
+  biber .build/main: Could not open biber log file '.build/main.blg'
+
+Latexmk: Sometimes, the -f option can be used to get latexmk
+  to try to force complete processing.
+  But normally, you will need to correct the file(s) that caused the
+  error, and then rerun latexmk.
+  In some cases, it is best to clean out generated files before rerunning
+  latexmk after you've corrected the files.
+";
+
+    /// A program latexmk could not run is named, as the shells and Windows' `cmd` say it.
+    #[test]
+    fn a_program_latexmk_could_not_run_is_named() {
+        for (line, program) in [
+            ("sh: line 1: biber: command not found", "biber"),
+            ("sh: 1: lualatex: not found", "lualatex"),
+            ("/bin/sh: 1: makeindex: not found", "makeindex"),
+            ("sh: xelatex: command not found", "xelatex"),
+            (
+                "'pdflatex' is not recognized as an internal or external command,",
+                "pdflatex",
+            ),
+        ] {
+            let output = format!("Running 'x'\n{line}\nLatexmk: Errors\n");
+            assert_eq!(missing_program(&output), Some((program, line)), "{line}");
+        }
+        // TeX's and latexmk's own messages are something else.
+        for output in [
+            "! LaTeX Error: File `tikz-cd.sty' not found.\n",
+            "Latexmk: Missing input file: not found\n",
+            "Package foo Warning: font bar: not found\n",
+        ] {
+            assert_eq!(missing_program(output), None, "{output}");
+        }
+
+        let root = PathBuf::from("/p/main.tex");
+        let failure = latexmk_failure(root.clone(), Some(12), BIBER_MISSING);
+        assert_eq!(
+            failure.message,
+            "biber was not found: install it with your TeX distribution (latexmk could not run \
+             it)"
+        );
+        assert_eq!(
+            failure.context.as_deref(),
+            Some("sh: line 1: biber: command not found")
+        );
+        assert_eq!(
+            (failure.path, failure.line, failure.severity),
+            (root, None, Severity::Error)
+        );
+    }
+
+    /// Other failures show what latexmk said last, without the advice it closes every failure
+    /// with.
+    #[test]
+    fn a_failure_shows_what_latexmk_said_before_its_advice() {
+        let output = BIBER_MISSING.replace("sh: line 1: biber: command not found\n", "");
+        let failure = latexmk_failure(PathBuf::from("/p/main.tex"), Some(12), &output);
+        assert_eq!(failure.message, "latexmk failed with exit code 12");
+        assert_eq!(
+            failure.context.as_deref(),
+            Some(
+                "Latexmk: Error return from 'biber .build/main'\n\
+                 Latexmk: Could not open biber log file '.build/main.blg'\n\
+                 Latexmk: Errors, so I did not complete making targets\n\
+                 Collected error summary (may duplicate other messages):\n  \
+                 biber .build/main: Could not open biber log file '.build/main.blg'"
+            )
+        );
+        let killed = latexmk_failure(PathBuf::from("/p/main.tex"), None, "");
+        assert_eq!(killed.message, "latexmk was killed by a signal");
+        assert_eq!(killed.context, None);
     }
 }

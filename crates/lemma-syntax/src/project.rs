@@ -87,8 +87,19 @@ impl ProjectIndex {
     /// directory (the root's directory at top level), which then becomes the base for that file's
     /// own includes; the root's directory is the fallback.
     pub fn project_files(&self, root: &Path) -> Vec<PathBuf> {
+        self.project_files_with_dirs(root)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// [`ProjectIndex::project_files`], each file with the directory the paths written in it
+    /// (`\input`, `\include`, `\includegraphics`) are relative to when `root` is compiled: the
+    /// root's directory, or for a file reached through `\subfile` or `\import` (and the files it
+    /// includes in turn) that file's import directory.
+    pub fn project_files_with_dirs(&self, root: &Path) -> Vec<(PathBuf, PathBuf)> {
         let root_dir = root.parent().map(normalize).unwrap_or_default();
-        let mut out = vec![root.to_path_buf()];
+        let mut out = vec![(root.to_path_buf(), root_dir.clone())];
         let mut seen = HashSet::from([root.to_path_buf(), normalize(root)]);
         self.visit(root, &root_dir, &root_dir, &mut seen, &mut out, 0);
         out
@@ -100,7 +111,7 @@ impl ProjectIndex {
         base: &Path,
         root_dir: &Path,
         seen: &mut HashSet<PathBuf>,
-        out: &mut Vec<PathBuf>,
+        out: &mut Vec<(PathBuf, PathBuf)>,
         depth: usize,
     ) {
         let Some(idx) = self.files.get(file) else {
@@ -121,7 +132,7 @@ impl ProjectIndex {
                 }
                 _ => base.to_path_buf(),
             };
-            out.push(path.clone());
+            out.push((path.clone(), child_base.clone()));
             self.visit(&path, &child_base, root_dir, seen, out, depth + 1);
         }
     }
@@ -181,8 +192,10 @@ fn candidate_names(inc: &Include) -> Vec<String> {
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
     match (inc.kind, ext.as_deref()) {
-        (IncludeKind::Bibliography, Some("bib")) => vec![t.to_owned()],
+        (IncludeKind::Bibliography | IncludeKind::BibResource, Some("bib")) => vec![t.to_owned()],
         (IncludeKind::Bibliography, _) => vec![format!("{t}.bib"), t.to_owned()],
+        // As written (biber), then as biblatex's BibTeX backend reads it.
+        (IncludeKind::BibResource, _) => vec![t.to_owned(), format!("{t}.bib")],
         (IncludeKind::Package, _) => vec![format!("{t}.sty")],
         (IncludeKind::Graphics, Some(_)) => vec![t.to_owned()],
         (IncludeKind::Graphics, None) => ["pdf", "png", "jpg", "jpeg", "eps"]
@@ -249,6 +262,14 @@ mod tests {
         assert_eq!(
             candidate_names(&inc(IncludeKind::Bibliography, "refs")),
             ["refs.bib", "refs"]
+        );
+        assert_eq!(
+            candidate_names(&inc(IncludeKind::BibResource, "refs")),
+            ["refs", "refs.bib"]
+        );
+        assert_eq!(
+            candidate_names(&inc(IncludeKind::BibResource, "refs.bib")),
+            ["refs.bib"]
         );
         assert_eq!(
             candidate_names(&inc(IncludeKind::Package, "defs")),

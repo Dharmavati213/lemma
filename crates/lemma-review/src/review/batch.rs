@@ -192,8 +192,11 @@ impl FileReview {
         self.batch = None;
         journal.track_all(&applied);
         self.journal = journal;
-        #[cfg(test)]
-        self.check_records(|| format!("{} edits ({origin:?})", edits.len()));
+        if self.checks()
+            && let Err(error) = self.check_records()
+        {
+            panic!("{error} after {} edits ({origin:?})", edits.len());
+        }
     }
 
     /// `unaccept_each` of `regions` (descending), with the same result: O(log hunks) per region
@@ -215,7 +218,7 @@ impl FileReview {
         }
         self.bring_back(&mut aside, moved, usize::MAX);
         self.batch = None;
-        any
+        self.unaccepted(any)
     }
 
     /// Leaves in the review exactly what lies within reach of an edit ending at `b` (see the

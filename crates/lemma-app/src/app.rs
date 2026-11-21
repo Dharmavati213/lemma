@@ -506,6 +506,7 @@ pub fn run(options: Options, started: Instant) -> ExitCode {
     crate::recovery::flush();
     // Only removed while empty.
     let _ = std::fs::remove_dir(no_project_dir());
+    crate::fsutil::remove_dirs_at_exit();
     if shared.failed.get() {
         ExitCode::FAILURE
     } else {

@@ -34,7 +34,8 @@ impl ConfigValue<'_> {
 
 /// Sets `key = "value"` in table `[section]` of the TOML text `src` and returns the new text.
 ///
-/// Everything else (comments, blank lines, key order, other values) stays as written:
+/// Everything else (comments, blank lines, key order, other values, a byte-order mark, `\r\n`
+/// line breaks) stays as written:
 /// - an existing `key = …` line of the section is replaced (a trailing comment goes with it);
 /// - otherwise the key is added after the section's last key;
 /// - a missing section is appended at the end.
@@ -71,8 +72,9 @@ pub fn set_value(
             out.push(line);
         }
     }
-    let mut text = out.join("\n");
-    text.push('\n');
+    let newline = line_break(src);
+    let mut text = out.join(newline);
+    text.push_str(newline);
     check(&text, section, key, Some(&value))?;
     Ok(text)
 }
@@ -90,8 +92,9 @@ pub fn remove_key(src: &str, section: &str, key: &str) -> Result<String, String>
     };
     let mut out: Vec<&str> = lines.clone();
     out.remove(i);
-    let mut text = out.join("\n");
-    text.push('\n');
+    let newline = line_break(src);
+    let mut text = out.join(newline);
+    text.push_str(newline);
     check(&text, section, key, None)?;
     Ok(text)
 }
@@ -114,6 +117,12 @@ fn find_key(lines: &[&str], section: &str, key: &str) -> Found {
     let mut existing = None;
     let mut insert_after = None;
     for (i, raw) in lines.iter().enumerate() {
+        // A byte-order mark may start the file (TOML skips it).
+        let raw = if i == 0 {
+            raw.trim_start_matches('\u{feff}')
+        } else {
+            raw
+        };
         let trimmed = raw.trim();
         if let Some(name) = table_header(trimmed) {
             in_section = name == section;
@@ -135,6 +144,15 @@ fn find_key(lines: &[&str], section: &str, key: &str) -> Found {
         (Some(i), _) => Found::Key(i),
         (None, Some(last)) if section_found => Found::Section { last },
         _ => Found::Nothing,
+    }
+}
+
+/// The line break of `src`: `\r\n` when its first line ends with one (a file saved on
+/// Windows), so an edit does not change every line of it; otherwise `\n`.
+fn line_break(src: &str) -> &'static str {
+    match src.find('\n') {
+        Some(i) if src[..i].ends_with('\r') => "\r\n",
+        _ => "\n",
     }
 }
 
@@ -315,5 +333,42 @@ mod tests {
         let src = "[[prompt]]\nname = \"a\"\n";
         let out = set_string(src, "agent", "node", "/n").unwrap();
         assert!(out.starts_with(src), "{out}");
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_section() {
+        // Windows editors may start the file with one; TOML (and `parse`) skip it.
+        let src = "\u{feff}[editor]\nvim = true\n";
+        assert!(crate::parse(src).unwrap().editor.vim);
+        assert_eq!(
+            set_value(src, "editor", "vim", ConfigValue::Bool(false)).unwrap(),
+            "\u{feff}[editor]\nvim = false\n"
+        );
+        assert_eq!(
+            set_value(src, "editor", "wrap", ConfigValue::Bool(false)).unwrap(),
+            "\u{feff}[editor]\nvim = true\nwrap = false\n"
+        );
+        assert_eq!(
+            remove_key(src, "editor", "vim").unwrap(),
+            "\u{feff}[editor]\n"
+        );
+    }
+
+    #[test]
+    fn crlf_files_keep_their_line_breaks() {
+        let src = "# mine\r\n[editor]\r\nvim = true\r\n\r\n[pdf]\r\nthumbnails = true\r\n";
+        assert_eq!(
+            set_value(src, "editor", "vim", ConfigValue::Bool(false)).unwrap(),
+            "# mine\r\n[editor]\r\nvim = false\r\n\r\n[pdf]\r\nthumbnails = true\r\n"
+        );
+        assert_eq!(
+            set_value(src, "git", "gutter", ConfigValue::Bool(false)).unwrap(),
+            "# mine\r\n[editor]\r\nvim = true\r\n\r\n[pdf]\r\nthumbnails = true\r\n\r\n\
+             [git]\r\ngutter = false\r\n"
+        );
+        assert_eq!(
+            remove_key(src, "pdf", "thumbnails").unwrap(),
+            "# mine\r\n[editor]\r\nvim = true\r\n\r\n[pdf]\r\n"
+        );
     }
 }

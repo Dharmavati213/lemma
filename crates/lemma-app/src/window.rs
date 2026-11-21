@@ -212,6 +212,8 @@ pub struct WindowState {
     /// The keyboard focus is in an editor or the find bar (see [`WindowState::focus_moved`]).
     editor_focused: Cell<bool>,
     close_confirmed: Cell<bool>,
+    /// "Save changes?" dialogs waiting for an answer (see [`WindowState::is_asking`]).
+    asking: Cell<u32>,
     /// `None` until set: the defaults.
     snippets: RefCell<Option<Rc<SnippetSet>>>,
     /// `None` until set: the defaults.
@@ -261,6 +263,49 @@ enum SaveChoice {
     Save,
     Discard,
     Cancel,
+}
+
+/// Counts a "Save changes?" dialog while it waits for an answer and the answer is carried out
+/// (see [`WindowState::is_asking`]), also when the wait is dropped with the window.
+struct Asking<'a>(&'a Cell<u32>);
+
+impl<'a> Asking<'a> {
+    fn begin(count: &'a Cell<u32>) -> Self {
+        count.set(count.get() + 1);
+        Self(count)
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+/// The versions of documents when a save the user asked for in "Save changes?" began.
+struct Versions(Vec<(Weak<Document>, u64)>);
+
+impl Versions {
+    fn of(docs: &[DocRef]) -> Self {
+        Self(
+            docs.iter()
+                .map(|doc| (Rc::downgrade(doc), doc.version()))
+                .collect(),
+        )
+    }
+
+    /// True when one of `docs` has unsaved changes made since: a save writes the text a
+    /// document has when its write starts, so what was typed during the write is not on disk.
+    /// (A document still marked unsaved at the version it had is saved: Vim's insert mode only
+    /// puts the mark off until the insert ends.)
+    fn edited_since(&self, docs: &[DocRef]) -> bool {
+        docs.iter().filter(|doc| doc.is_dirty()).any(|doc| {
+            !self
+                .0
+                .iter()
+                .any(|(d, v)| std::ptr::eq(d.as_ptr(), Rc::as_ptr(doc)) && *v == doc.version())
+        })
+    }
 }
 
 impl WindowState {
@@ -350,6 +395,7 @@ impl WindowState {
             opening: Cell::new(false),
             editor_focused: Cell::new(false),
             close_confirmed: Cell::new(false),
+            asking: Cell::new(0),
             snippets: RefCell::new(settings.map(|s| s.snippets.clone())),
             prompts: RefCell::new(settings.map(|s| s.prompts.clone())),
             config_hooks: Hooks::default(),
@@ -499,11 +545,31 @@ impl WindowState {
     }
 
     /// Loads `path` into the workspace for [`WindowState::open_file`], moving the root first
-    /// when it is the first document.
+    /// when it is the first document. Every document that gets a tab comes this way (the
+    /// command line, the Open dialog, Go to File, the session, files handed over by macOS): a
+    /// named pipe, a socket or a device is refused here, since reading it would wait for another
+    /// program to write to it (or, for `/dev/zero`, never end).
     async fn open_document(self: &Rc<Self>, path: &Path) -> Result<DocRef, String> {
+        let normalized = normalize(path);
+        if self.workspace.get(&normalized).is_none() {
+            let info = gio::File::for_path(path)
+                .query_info_future(
+                    "standard::type",
+                    gio::FileQueryInfoFlags::NONE,
+                    glib::Priority::DEFAULT,
+                )
+                .await;
+            if info.is_ok_and(|info| info.file_type() == gio::FileType::Special) {
+                return Err(format!(
+                    "cannot open {}: it is not a regular file (a named pipe, a socket or a \
+                     device)",
+                    path.display()
+                ));
+            }
+        }
         if !self.root_pinned.get()
             && self.workspace.is_empty()
-            && let Some(dir) = normalize(path).parent()
+            && let Some(dir) = normalized.parent()
             && dir.parent().is_some()
             && let Ok(root) = lemma_core::ProjectRoot::new(dir)
         {
@@ -708,6 +774,7 @@ impl WindowState {
         };
         if let Some(editor) = editor {
             find_bar::detach(self, &editor);
+            agent::inline::detach(self, &editor);
             self.detach_m3(&editor);
             spell::detach(self, &editor);
             keys::detach(self, &editor);
@@ -784,9 +851,17 @@ impl WindowState {
         });
     }
 
-    fn report_save_failures(&self, failures: Vec<(PathBuf, SaveError)>) {
+    /// Reports saves the user asked for that failed; a file another program changed gets the
+    /// Overwrite toast, as Ctrl+S gives it.
+    fn report_save_failures(self: &Rc<Self>, failures: Vec<(PathBuf, SaveError)>) {
         for (path, e) in failures {
-            self.toast(&format!("Could not save {}: {e}", path.display()));
+            match (&e, self.workspace.get(&path)) {
+                (SaveError::ExternallyModified, Some(doc)) => self.offer_overwrite(&doc),
+                (_, Some(doc)) if !doc.unwritable_chars().is_empty() => {
+                    self.offer_utf8(&doc, &e);
+                }
+                _ => self.toast(&format!("Could not save {}: {e}", path.display())),
+            }
         }
     }
 
@@ -828,10 +903,60 @@ impl WindowState {
                 false
             }
             Err(e) => {
-                self.toast(&format!("Could not save “{}”: {e}", doc.display_name()));
+                if doc.unwritable_chars().is_empty() {
+                    self.toast(&format!("Could not save “{}”: {e}", doc.display_name()));
+                } else {
+                    self.offer_utf8(doc, &e);
+                }
                 false
             }
         }
+    }
+
+    /// Says that `doc` could not be saved because its file's encoding (Latin-1, say) cannot hold
+    /// a character typed into it, with a button that saves the file as UTF-8 instead: the one
+    /// way to keep the character. The document is a UTF-8 one from then on. The toast does not
+    /// keep the document alive, and its button saves only the document the workspace still has
+    /// for that path.
+    fn offer_utf8(self: &Rc<Self>, doc: &DocRef, e: &SaveError) {
+        let toast = adw::Toast::builder()
+            .title(format!("Could not save “{}”: {e}", doc.display_name()))
+            .use_markup(false)
+            .button_label("Save as _UTF-8")
+            .timeout(15)
+            .build();
+        let (state, weak_doc) = (Rc::downgrade(self), Rc::downgrade(doc));
+        toast.connect_button_clicked(move |_| {
+            let (Some(state), Some(doc)) = (state.upgrade(), weak_doc.upgrade()) else {
+                return;
+            };
+            let current = state
+                .workspace
+                .get(doc.path())
+                .is_some_and(|d| Rc::ptr_eq(&d, &doc));
+            if !current {
+                return;
+            }
+            // Still needed: the characters may have been taken out again meanwhile.
+            let was = doc.charset().filter(|_| !doc.unwritable_chars().is_empty());
+            if was.is_some() {
+                doc.convert_to_utf8();
+            }
+            glib::spawn_future_local(async move {
+                let result = doc.save().await;
+                if state.report_user_save(&doc, result) {
+                    if let Some(was) = was {
+                        state.toast(&format!(
+                            "“{}” is now saved as UTF-8 (it was {was}). If it loads inputenc \
+                             for that encoding, change its option to utf8.",
+                            doc.display_name()
+                        ));
+                    }
+                    state.after_saves();
+                }
+            });
+        });
+        self.toasts.add_toast(toast);
     }
 
     fn after_saves(&self) {
@@ -2019,6 +2144,10 @@ impl WindowState {
         }
         let (state, view, page) = (self.clone(), view.clone(), page.clone());
         glib::spawn_future_local(async move {
+            // Auto-save waits until the answer is carried out: Discard reloads a document under
+            // review from its file before the tab closes, and it is unsaved until then.
+            let asking = Asking::begin(&state.asking);
+            let mut ask_again = false;
             let confirm = match state.ask_save(std::slice::from_ref(&doc)).await {
                 SaveChoice::Cancel => false,
                 SaveChoice::Discard => {
@@ -2026,17 +2155,39 @@ impl WindowState {
                     state.discard_changes(&doc).await;
                     true
                 }
-                SaveChoice::Save => match doc.save().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        state.toast(&format!("Could not save “{}”: {e}", doc.display_name()));
-                        false
-                    }
-                },
+                SaveChoice::Save => {
+                    let versions = Versions::of(std::slice::from_ref(&doc));
+                    let result = doc.save().await;
+                    let saved = result.is_ok();
+                    // A file another program changed gets the Overwrite toast.
+                    state.report_user_save(&doc, result);
+                    // What was typed while the file was written is not in it.
+                    ask_again = saved && versions.edited_since(std::slice::from_ref(&doc));
+                    saved && !ask_again
+                }
             };
             view.close_page_finish(&page, confirm);
+            if ask_again {
+                view.close_page(&page);
+            }
+            drop(asking);
+            crate::autosave::resume(&state);
         });
         glib::Propagation::Stop
+    }
+
+    /// True once the window closes for good: the user answered "Save changes?" (or threw the
+    /// changes away with `:qa!`), or the system ends the process. Unsaved changes left then were
+    /// discarded on purpose, or are kept in their recovery files.
+    pub fn is_closing(&self) -> bool {
+        self.close_confirmed.get()
+    }
+
+    /// True while a "Save changes?" dialog waits for the user's answer, and until the answer is
+    /// carried out: nothing is saved by itself meanwhile (auto-save waits), since the answer may
+    /// be to discard the changes.
+    pub fn is_asking(&self) -> bool {
+        self.asking.get() > 0
     }
 
     /// Closes the window without asking about unsaved changes: the system is ending the process
@@ -2044,7 +2195,47 @@ impl WindowState {
     /// caller writes first (`recovery::write_now`).
     pub fn close_without_asking(self: &Rc<Self>) {
         self.close_confirmed.set(true);
+        if self.close_under_dialogs() {
+            return;
+        }
+        // A dialog that is still closing kept the window: tried again until it has gone, for a
+        // second at most; then the window goes without its close-request (the session is saved
+        // here instead).
+        let (weak, tries) = (Rc::downgrade(self), Cell::new(0));
+        glib::timeout_add_local(Duration::from_millis(20), move || {
+            let Some(state) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if state.close_under_dialogs() {
+                return glib::ControlFlow::Break;
+            }
+            tries.set(tries.get() + 1);
+            if tries.get() < 50 {
+                return glib::ControlFlow::Continue;
+            }
+            state.save_session_now();
+            state.window.destroy();
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Closes the window's open dialogs, then the window; true once the window has closed. With
+    /// a dialog open, libadwaita gives the window's close to the dialog and keeps the window,
+    /// before the window's own close-request handlers run: the window, and so the process,
+    /// would stay until a second signal.
+    fn close_under_dialogs(&self) -> bool {
+        // Listed first: closing one changes the list.
+        let open: Vec<adw::Dialog> = self
+            .window
+            .dialogs()
+            .iter::<adw::Dialog>()
+            .flatten()
+            .collect();
+        for dialog in open {
+            dialog.force_close();
+        }
         self.window.close();
+        !self.window.is_visible()
     }
 
     fn close_request(self: &Rc<Self>) -> glib::Propagation {
@@ -2059,6 +2250,9 @@ impl WindowState {
         }
         let state = self.clone();
         glib::spawn_future_local(async move {
+            // Auto-save waits until the answer is carried out (see `close_page`).
+            let asking = Asking::begin(&state.asking);
+            let mut ask_again = false;
             let close = match state.ask_save(&dirty).await {
                 SaveChoice::Cancel => false,
                 SaveChoice::Discard => {
@@ -2067,22 +2261,35 @@ impl WindowState {
                     }
                     true
                 }
-                SaveChoice::Save => match state.workspace.save_all_dirty().await {
-                    Ok(()) => true,
-                    Err(failures) => {
-                        state.report_save_failures(failures);
-                        false
+                SaveChoice::Save => {
+                    let versions = Versions::of(&state.workspace.documents());
+                    match state.workspace.save_all_dirty().await {
+                        Ok(()) => {
+                            // What was typed while the files were written is not in them.
+                            ask_again = versions.edited_since(&state.workspace.dirty_documents());
+                            !ask_again
+                        }
+                        Err(failures) => {
+                            state.report_save_failures(failures);
+                            false
+                        }
                     }
-                },
+                }
             };
             if close {
                 state.close_confirmed.set(true);
                 state.window.close();
+            } else if ask_again {
+                state.window.close();
             }
+            drop(asking);
+            crate::autosave::resume(&state);
         });
         glib::Propagation::Stop
     }
 
+    /// Asks "Save changes?" about `docs`. The caller holds back auto-save ([`Asking`]) until it
+    /// has carried out the answer, which may be to throw the changes away.
     async fn ask_save(&self, docs: &[DocRef]) -> SaveChoice {
         let body = match docs {
             [doc] => format!(
@@ -2131,8 +2338,12 @@ const EDITOR_ACTIONS: [&str; 5] = [
 ];
 
 /// Where an edit of the configuration file `path` is written: `path`, or what it points to when
-/// it is a symbolic link. Refuses a path that exists and is not a regular file (`/dev/null`).
-fn writable_config_target(path: &Path) -> Result<PathBuf, String> {
+/// it is a symbolic link. Refuses a path that exists and is not a regular file (`/dev/null`), a
+/// file the user may not write (read-only, another user's, or on a read-only file system a link
+/// leads to), which the rename of [`write_atomically`] would replace all the same, and one in a
+/// folder the user may not write, where that rename fails. Preferences greys its settings out
+/// then (`prefs::is_writable`).
+pub(crate) fn writable_config_target(path: &Path) -> Result<PathBuf, String> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => lemma_core::canonicalize(path).map_err(|e| {
             format!(
@@ -2147,8 +2358,45 @@ fn writable_config_target(path: &Path) -> Result<PathBuf, String> {
             "The configuration is read from {}, which is not a file; nothing was written",
             path.display()
         )),
+        Ok(_) if !can_write(&target) => Err(format!(
+            "The configuration file {} is read-only; nothing was written",
+            target.display()
+        )),
+        _ if !can_create_next_to(&target) => Err(format!(
+            "The configuration file {} is in a folder that cannot be written; nothing was \
+             written",
+            target.display()
+        )),
         _ => Ok(target),
     }
+}
+
+/// Whether this user may write `path`, as the system says (gio's `access::can-write`:
+/// `access(W_OK)` on Unix, which also says no on a read-only file system and for a file whose
+/// mode lets only another user write it; the read-only attribute on Windows). The permission
+/// bits alone only tell whether nobody may.
+fn can_write(path: &Path) -> bool {
+    gio::File::for_path(path)
+        .query_info(
+            gio::FILE_ATTRIBUTE_ACCESS_CAN_WRITE,
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .is_ok_and(|info| info.boolean(gio::FILE_ATTRIBUTE_ACCESS_CAN_WRITE))
+}
+
+/// Whether a file can be created next to `path` (the temporary file of [`write_atomically`]):
+/// its folder, or the nearest one above that exists, may be written. Not checked on Windows,
+/// where a folder's read-only attribute does not keep anyone from creating files in it (and
+/// says nothing about its permissions): a write that fails there says why.
+fn can_create_next_to(path: &Path) -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.is_dir())
+        .is_some_and(can_write)
 }
 
 /// Writes `text` to `path` through a temporary file in the same directory and a rename, so a
@@ -2161,13 +2409,17 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
         |n| n.to_string_lossy().into_owned(),
     );
     let tmp = dir.join(format!(".{name}.lemma-{}", std::process::id()));
-    std::fs::write(&tmp, text)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let written = std::fs::write(&tmp, text).and_then(|()| {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, path)
+    });
+    // A write that failed halfway (a full disk) leaves no temporary file behind either.
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    written
 }
 
 /// True when `LEMMA_WINDOW_SIZE` sets the size of new windows (a testing aid): the app then

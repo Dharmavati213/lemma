@@ -28,7 +28,7 @@ use lemma_app::agent::{AgentState, SentPrompt};
 use lemma_app::agent_edits;
 use lemma_app::diagnostics_panel::Problem;
 use lemma_app::editor::keys::{self, KeyEvent};
-use lemma_app::editor::{Editor, TexView, VimMode, vim};
+use lemma_app::editor::{Editor, TexView, VimMode};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::Workspace;
 use lemma_config::Config;
@@ -112,6 +112,9 @@ fn ctrl_w_deletes_the_word_before_the_cursor() {
         ("x = \\", 5, "x = "),
         ("a_b2 c", 4, " c"),
         ("ab\ncd", 3, "abcd"),
+        // A Windows line break goes whole, and an accent with its letter.
+        ("ab\r\ncd", 4, "abcd"),
+        ("x cafe\u{301}", 7, "x "),
         ("", 0, ""),
     ] {
         buffer.set_text(text);
@@ -266,6 +269,7 @@ impl Fixture {
 
     /// One key press: the key layer, then Vim, then the text view.
     fn press(&self, name: &str) {
+        common::require_keymap();
         let (keyval, state) = key_of(name);
         let display = WidgetExt::display(&self.state.window);
         let key = display
@@ -289,7 +293,7 @@ impl Fixture {
             let consumed = self
                 .editor
                 .vim()
-                .is_some_and(|im| vim::feed_key(&im, self.view(), keyval, state));
+                .is_some_and(|im| common::feed_vim_key(&im, self.view(), keyval, state));
             let modified =
                 state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
             if !consumed && !modified {
@@ -313,7 +317,7 @@ impl Fixture {
         let im = self.editor.vim().expect("Vim is on");
         for name in keys::parse_keys(notation).expect("key notation") {
             let (keyval, state) = key_of(&name);
-            if !vim::feed_key(&im, self.view(), keyval, state)
+            if !common::feed_vim_key(&im, self.view(), keyval, state)
                 && let Some(c) = keyval.to_unicode().filter(|c| !c.is_control())
             {
                 self.editor

@@ -26,7 +26,8 @@
 //! A TeX error inside the formula is the result ([`PreviewError::Tex`], with the formula's own
 //! line); errors before it (a definition that already exists, a package's begin-document hook)
 //! are ignored when a page came out. Nothing here keeps a TeX process alive between renders,
-//! and nothing runs before the first [`Previewer::render`]. TeX never gets shell escape.
+//! and nothing runs before the first [`Previewer::render`]; the application ends the run going
+//! on with [`stop_all`] when it quits. TeX never gets shell escape.
 //!
 //! The in-memory cache of rendered formulas is the app's ([`Lru`], keyed by [`cache_key`]).
 //! Tests pass a temporary cache directory, never the user's.
@@ -54,7 +55,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -229,6 +230,45 @@ pub fn project_key(root: Option<&Path>) -> String {
     format!("{hash:016x}")
 }
 
+/// Renders going on, in every [`Previewer`] of the process (see [`stop_all`]).
+static RENDERING: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a render in [`RENDERING`] while it lives.
+struct Rendering;
+
+impl Rendering {
+    fn enter() -> Self {
+        RENDERING.fetch_add(1, Ordering::SeqCst);
+        Rendering
+    }
+}
+
+impl Drop for Rendering {
+    fn drop(&mut self) {
+        RENDERING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// For the application's end: kills every TeX run going on, with its process group, and
+/// refuses the runs and renders asked for after. A run that never ends by itself (a macro that
+/// expands to itself) would otherwise go on after the application, using a whole processor,
+/// until someone killed it. (On Windows each run's job ends with the application anyway.)
+/// Then waits, at most `wait`, for the renders going on to return, after which nothing writes
+/// in the cache directory any more; true when they did.
+pub fn stop_all(wait: Duration) -> bool {
+    run::stop_all();
+    // A render counted after this load sees the stop (both sequentially consistent), and
+    // returns before it touches the disk.
+    let deadline = Instant::now() + wait;
+    while RENDERING.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    true
+}
+
 /// Renders formulas (see the crate docs). Cheap to create; holds no process or file open.
 #[derive(Debug)]
 pub struct Previewer {
@@ -290,6 +330,21 @@ impl Previewer {
     /// Renders `job` (blocking; see the crate docs).
     pub fn render(&self, job: &Job) -> Outcome {
         let started = Instant::now();
+        let _rendering = Rendering::enter();
+        if run::stopped() {
+            // Not even a directory: the application is ending (see `stop_all`).
+            return Outcome {
+                result: Err(PreviewError::Failed("the application is ending".into())),
+                preamble_hash: 0,
+                route: None,
+                engine: Engine::PdfLatex,
+                format_built: false,
+                format_time: Duration::ZERO,
+                tex_time: Duration::ZERO,
+                raster_time: Duration::ZERO,
+                total_time: Duration::ZERO,
+            };
+        }
         let (preamble, definitions) = self.preamble_of(job);
         let hash = preamble_hash(&preamble);
         let engine = engine_for(&preamble, job.project_dir());
@@ -469,6 +524,11 @@ impl Previewer {
                 ))));
             }
             Err(RunError::Timeout) => return Err(Retry::Error(PreviewError::Timeout(timeout))),
+            Err(RunError::Stopped) => {
+                return Err(Retry::Error(PreviewError::Failed(
+                    "the application is ending".into(),
+                )));
+            }
             Ok(_) => {}
         }
         if route == Route::Format
@@ -510,6 +570,10 @@ impl Previewer {
         self.format_builds.fetch_add(1, Ordering::Relaxed);
         prune(&self.cache_dir, project);
         let built = self.build_format(project, project_dir, preamble);
+        if run::stopped() {
+            // Killed by `stop_all`, not refused by TeX: nothing to remember about the preamble.
+            return (None, true);
+        }
         let (ok, deps) = match built {
             Some(deps) => (true, deps),
             None => (false, Vec::new()),
@@ -549,6 +613,7 @@ impl Previewer {
             .to_vec();
             let texinputs =
                 run::texinputs(Some(project_dir), std::env::var_os("TEXINPUTS").as_deref());
+            let started = SystemTime::now();
             let status = run::run(&self.pdflatex, &args, &dir, &texinputs, self.format_timeout);
             if let Err(e) = &status {
                 tracing::warn!("math preview: building the format failed: {e:?}");
@@ -563,9 +628,17 @@ impl Previewer {
                 tracing::info!("math preview: the preamble cannot be dumped ({first})");
                 return None;
             }
-            let deps = fs::read_to_string(dir.join("lemma-fmt.fls"))
+            let mut deps = fs::read_to_string(dir.join("lemma-fmt.fls"))
                 .map(|fls| dependencies(&fls))
                 .unwrap_or_default();
+            // A file saved while the format was built may be in it as it was before: its stamp
+            // must not call the format current, so the next preview builds it again.
+            let now = SystemTime::now();
+            for dep in &mut deps {
+                if saved_between(dep.mtime, started, now) {
+                    dep.mtime = 0;
+                }
+            }
             fs::rename(&built, project.join(FORMAT_FILE)).ok()?;
             Some(deps)
         })();
@@ -619,7 +692,7 @@ fn read_root(root: &Path) -> Option<String> {
 
 /// The first error of the log at or after line `formula_line` of the preview file.
 fn formula_error(log: &str, dir: &Path, formula_line: u32) -> Option<PreviewError> {
-    let report = parse_log(log, dir, &|p| p.exists());
+    let report = parse_log(log, dir, &|p| dir.join(p).exists());
     report
         .diagnostics
         .iter()
@@ -637,7 +710,7 @@ fn formula_error(log: &str, dir: &Path, formula_line: u32) -> Option<PreviewErro
 
 /// The first error of the log, wherever it is.
 fn first_error(log: &str, dir: &Path) -> Option<PreviewError> {
-    let report = parse_log(log, dir, &|p| p.exists());
+    let report = parse_log(log, dir, &|p| dir.join(p).exists());
     let d = report
         .diagnostics
         .iter()
@@ -713,6 +786,25 @@ impl Dep {
     fn is_current(&self) -> bool {
         Dep::of(&self.path).is_some_and(|now| now == *self)
     }
+}
+
+/// Whether a modification time (in ns, as [`mtime_ns`]) is a save from `from` until `to`. A
+/// whole second may be one up to two seconds later (FAT and HFS+ keep no fractions). A save in
+/// the first milliseconds may have a time just before `from` (the kernel's clock for file times
+/// is coarse) but TeX, which takes longer to start, read it. A time after `to` is a clock that
+/// differs, not a save.
+fn saved_between(mtime: u128, from: SystemTime, to: SystemTime) -> bool {
+    const SECOND: u128 = Duration::from_secs(1).as_nanos();
+    let nanos = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    };
+    let coarse = if mtime.is_multiple_of(SECOND) {
+        2 * SECOND
+    } else {
+        0
+    };
+    (nanos(from).saturating_sub(coarse)..=nanos(to)).contains(&mtime)
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> u128 {
@@ -913,6 +1005,60 @@ mod tests {
         assert!(!read.is_current(0xfeed, 7), "a dependency changed");
         fs::write(&path, "something else\n").unwrap();
         assert_eq!(read_stamp(&path), None);
+    }
+
+    /// A project file saved while the format is built may be in it as it was before: the stamp
+    /// does not call that format current, so the next preview builds it again. (pdflatex is a
+    /// script here that writes what a format build writes, then saves `macros.tex` when told
+    /// to, as an editor would meanwhile, after as long as TeX takes at least to start.)
+    #[cfg(unix)]
+    #[test]
+    fn a_file_saved_while_the_format_is_built_leaves_it_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_dir();
+        let p = lemma_core::canonicalize(dir.path()).unwrap();
+        // Copied into place by `cp`: had this process written it, a child forked meanwhile by a
+        // test on another thread could still hold it open for writing ("Text file busy").
+        let source = p.join("pdflatex.src");
+        fs::write(
+            &source,
+            "#!/bin/sh\nproject=${TEXINPUTS#.:}\nproject=${project%%:*}\necho fmt > lemma-fmt.fmt\n\
+             printf 'PWD %s\\nINPUT %s/macros.tex\\n' \"$(pwd -P)\" \"$project\" > lemma-fmt.fls\n\
+             [ -f \"$project/save-while-built\" ] && sleep 0.1 && \
+             echo '\\def\\x{new}' > \"$project/macros.tex\"\nexit 0\n",
+        )
+        .unwrap();
+        let pdflatex = p.join("pdflatex");
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&pdflatex)
+            .status();
+        assert!(copied.is_ok_and(|s| s.success()));
+        fs::set_permissions(&pdflatex, fs::Permissions::from_mode(0o755)).unwrap();
+        let thesis = p.join("thesis");
+        fs::create_dir(&thesis).unwrap();
+        let macros = thesis.join("macros.tex");
+        fs::write(&macros, "\\def\\x{old}\n").unwrap();
+        // Saved a minute ago.
+        fs::File::options()
+            .write(true)
+            .open(&macros)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let mut previewer = Previewer::new(p.join("cache"));
+        previewer.pdflatex = pdflatex.into_os_string();
+        let project = previewer.project_dir(Some(&thesis.join("main.tex")));
+        fs::create_dir_all(&project).unwrap();
+        let preamble = "\\documentclass{article}\n\\input{macros}\n";
+        let built = |hash| previewer.ensure_format(&project, &thesis, preamble, hash);
+        let (format, first) = built(1);
+        assert!(format.is_some() && first);
+        assert!(!built(1).1, "current");
+        // Another preamble, and macros.tex saved while its format is built.
+        fs::write(thesis.join("save-while-built"), "").unwrap();
+        assert!(built(2).1);
+        assert!(built(2).1, "the format has the old macros.tex");
     }
 
     #[test]

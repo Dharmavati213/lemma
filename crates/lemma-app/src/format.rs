@@ -4,6 +4,9 @@
 //!   unless latexindent is missing (it does not start), `win.format-document` and
 //!   `win.format-selection` are added (and described for the palette). One that starts but
 //!   fails (a Perl module missing, say) keeps them: running one shows its error in a toast.
+//!   They are enabled only while the selected tab is a document latexindent formats
+//!   ([`formattable`]: LaTeX sources and `.bib` files, the kinds its `fileExtensionPreference`
+//!   names), so the palette greys them out in a Markdown or plain text tab.
 //! - **Running:** the document's text (or the whole lines the selection touches) goes to
 //!   latexindent's standard input on the jobs thread (`latexindent -s --cruft=<temp dir>`, in
 //!   that temp dir so nothing lands next to the document), killed after [`TIMEOUT`]. A
@@ -14,7 +17,7 @@
 //!   happens when the text changed while latexindent ran, or when it is already formatted.
 //!
 //! Hooks: [`install`] once per window. Test API: [`set_program`], [`detection_done`],
-//! [`format_in`], [`run_latexindent`], [`line_edits`].
+//! [`format_in`], [`formattable`], [`run_latexindent`], [`line_edits`].
 
 use crate::editor::{Editor, envtools};
 use crate::review_ui;
@@ -37,6 +40,35 @@ const ACTIONS: &[(&str, &str)] = &[
     ("format-document", "Format Document"),
     ("format-selection", "Format Selection"),
 ];
+
+/// Why the actions are disabled, for the palette (and the toast of a run in another document).
+const NOT_FORMATTABLE: &str = "Formatting works in LaTeX and BibTeX documents";
+
+/// Whether latexindent formats the document at `path`: a LaTeX source (`.tex`, `.sty`, `.cls`
+/// and the other files Lemma reads as LaTeX) or a `.bib` file, whose entries it indents as
+/// groups (its default `fileExtensionPreference` lists `.tex`, `.sty`, `.cls` and `.bib`).
+/// Not Markdown, plain text or the other files the editor opens: latexindent would indent
+/// their braces and strip their blanks as if they were LaTeX.
+pub fn formattable(path: &Path) -> bool {
+    crate::document::language_for(path)
+        .is_some_and(|l| matches!(l.id().as_str(), "latex" | "bibtex"))
+}
+
+/// Enables the actions while the selected tab is [`formattable`].
+fn follow_active_tab(state: &WindowState) {
+    let enabled = state
+        .active_editor()
+        .is_some_and(|e| formattable(e.document().path()));
+    for &(name, _) in ACTIONS {
+        if let Some(action) = state
+            .window
+            .lookup_action(name)
+            .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+        {
+            action.set_enabled(enabled);
+        }
+    }
+}
 
 /// The program and timeout to use instead of `latexindent` and [`TIMEOUT`] (tests).
 static OVERRIDE: Mutex<Option<(PathBuf, Duration)>> = Mutex::new(None);
@@ -131,9 +163,16 @@ pub fn install(state: &Rc<WindowState>) {
                 &format!("win.{name}"),
                 label,
                 crate::app::ShortcutGroup::Editing,
-                None,
+                Some(NOT_FORMATTABLE),
             );
         }
+        let weak = Rc::downgrade(&state);
+        state.tab_view.connect_selected_page_notify(move |_| {
+            if let Some(state) = weak.upgrade() {
+                follow_active_tab(&state);
+            }
+        });
+        follow_active_tab(&state);
     });
 }
 
@@ -303,6 +342,9 @@ pub async fn format_in(
     selection: bool,
 ) -> Result<(), String> {
     let doc = editor.document().clone();
+    if !formattable(doc.path()) {
+        return Err(NOT_FORMATTABLE.to_owned());
+    }
     let version = doc.version();
     let text = doc.text();
     let range = if selection {
@@ -334,6 +376,11 @@ pub async fn format_in(
     let output = gio::spawn_blocking(move || run_latexindent(&program, &sent, timeout))
         .await
         .map_err(|_| "latexindent stopped unexpectedly".to_owned())??;
+    // latexindent gives back the whole text it was sent: nothing at all is a failure (an
+    // installation that breaks without saying so), never a text to empty and save.
+    if output.trim().is_empty() && !input.trim().is_empty() {
+        return Err("latexindent gave back no text; nothing was changed".to_owned());
+    }
     if doc.version() != version {
         return Err("The text changed while latexindent ran; format again".to_owned());
     }

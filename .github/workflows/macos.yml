@@ -41,6 +41,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A tag's run restores main's cache; one it saved would serve no other run.
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Build Lemma.app and the DMG
         env:

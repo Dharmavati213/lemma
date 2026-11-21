@@ -45,7 +45,7 @@ use gtk::gdk;
 use lemma_build::PdfStamp;
 use lemma_pdf::{PdfCmd, PdfEvent, PdfHandle, SyncBox, ThumbReq, Thumbnail};
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -53,6 +53,9 @@ use std::time::Duration;
 
 /// Follow-cursor mode searches this long after the cursor stops moving.
 const FOLLOW_DELAY: Duration = Duration::from_millis(200);
+/// At most this many forward searches wait for their answers (more mean the PDF thread is
+/// gone; the oldest are forgotten).
+const MAX_PENDING_FORWARDS: usize = 64;
 /// How long closing the window waits for the PDF thread to let go of its document.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
@@ -146,11 +149,9 @@ struct Inner {
     shown: RefCell<Option<(u64, PathBuf)>>,
     /// Per-document dark-mode choices (Ctrl+Shift+I), overriding the system style.
     dark_overrides: RefCell<HashMap<PathBuf, bool>>,
-    /// How the answer to the pending forward search scrolls; `None` when it was not asked by
-    /// the user (no message when nothing is found).
-    forward_reveal: Cell<Option<Reveal>>,
-    /// The file and 1-based line of the pending forward search.
-    forward_line: RefCell<Option<(PathBuf, u32)>>,
+    /// The forward searches sent and not answered yet, oldest first: the PDF thread answers
+    /// each, in order, saying which file and line it answers (see [`Inner::forward_answer`]).
+    forwards: RefCell<VecDeque<PendingForward>>,
     /// The file and line of the last forward search answered, with the page and first box the
     /// view highlighted for it (see [`Inner::inverse_from_view`]).
     highlighted: RefCell<Option<(PathBuf, u32, u32, PageRect)>>,
@@ -164,6 +165,19 @@ struct Inner {
     /// The thumbnail requests of the preview and of the strip, sent as one list.
     thumb_wants: RefCell<(Vec<ThumbReq>, Vec<ThumbReq>)>,
     launch_hook: RefCell<Option<Box<LaunchHook>>>,
+}
+
+/// A forward search waiting for its answer.
+struct PendingForward {
+    /// The file and 1-based line searched.
+    file: PathBuf,
+    line: u32,
+    /// How the answer scrolls; `None` when the user did not ask for it (follow-cursor mode: no
+    /// message when nothing is found).
+    reveal: Option<Reveal>,
+    /// The PDF searched (the one the latest `Open` named): an answer that comes once another
+    /// PDF is shown (a tab of another document was selected meanwhile) is not for it.
+    pdf: Option<PathBuf>,
 }
 
 struct Toolbar {
@@ -444,8 +458,19 @@ impl Inner {
         {
             state.pdf_pane.set_visible(true);
         }
-        self.forward_reveal.set(reveal);
-        self.forward_line.replace(Some((file.to_path_buf(), line)));
+        let pdf = self.requested.borrow().as_ref().map(|(_, pdf)| pdf.clone());
+        {
+            let mut forwards = self.forwards.borrow_mut();
+            if forwards.len() >= MAX_PENDING_FORWARDS {
+                forwards.pop_front();
+            }
+            forwards.push_back(PendingForward {
+                file: file.to_path_buf(),
+                line,
+                reveal,
+                pdf,
+            });
+        }
         self.send(PdfCmd::Forward {
             file: file.to_path_buf(),
             line,
@@ -520,7 +545,9 @@ impl Inner {
             } => self.page_sizes(generation, page_sizes),
             PdfEvent::OpenFailed { generation, error } => self.open_failed(generation, &error),
             PdfEvent::Rendered(rendered) => self.view.add_rendered(rendered),
-            PdfEvent::Forward { boxes, .. } => self.forward_answer(&boxes),
+            PdfEvent::Forward {
+                file, line, boxes, ..
+            } => self.forward_answer(&file, line, &boxes),
             PdfEvent::Inverse { target } => match target {
                 Some(target) => self.show_source(target.file, target.line),
                 None => {
@@ -620,7 +647,7 @@ impl Inner {
         self.enable_handoff();
         // M3: the modules follow the new document (after the view, which they read).
         if let Some(l) = self.links.get() {
-            l.document_changed(generation);
+            l.document_changed(generation, rebuilt);
         }
         if let Some(s) = self.strip.get() {
             s.document_changed(generation, rebuilt);
@@ -663,9 +690,32 @@ impl Inner {
         }
     }
 
-    fn forward_answer(&self, boxes: &[SyncBox]) {
-        let reveal = self.forward_reveal.take();
-        let searched = self.forward_line.take();
+    /// The answer of the forward search of `file`'s `line`. It goes with the oldest search of
+    /// that line waiting, and the searches before it are dropped: the PDF thread answers in
+    /// order, so their answers were lost (a restart of the thread after a panic). An answer of a
+    /// search no longer waiting (one the queue gave up, past [`MAX_PENDING_FORWARDS`]) is not
+    /// shown. Matched by their order alone, an answer lost put every later answer with the
+    /// search before it, for good.
+    fn forward_answer(&self, file: &Path, line: u32, boxes: &[SyncBox]) {
+        let asked = {
+            let mut forwards = self.forwards.borrow_mut();
+            let Some(at) = forwards
+                .iter()
+                .position(|f| f.file == file && f.line == line)
+            else {
+                return;
+            };
+            forwards.drain(..at);
+            forwards.pop_front()
+        };
+        let Some(asked) = asked else {
+            return;
+        };
+        let shown = self.shown.borrow().as_ref().map(|(_, pdf)| pdf.clone());
+        if asked.pdf.is_some() && asked.pdf != shown {
+            return;
+        }
+        let reveal = asked.reveal;
         let Some(first) = boxes.first() else {
             if reveal.is_some()
                 && let Some(state) = self.state.upgrade()
@@ -692,9 +742,9 @@ impl Inner {
         self.view
             .flash_boxes(page, &rects, reveal.unwrap_or(Reveal::IfHidden));
         self.highlighted.replace(
-            searched
-                .zip(rects.first())
-                .map(|((file, line), rect)| (file, line, page, *rect)),
+            rects
+                .first()
+                .map(|rect| (asked.file, asked.line, page, *rect)),
         );
     }
 
@@ -1086,8 +1136,7 @@ pub fn install(state: &Rc<WindowState>) -> PdfController {
         requested_stamp: Cell::new(None),
         shown: RefCell::new(None),
         dark_overrides: RefCell::new(HashMap::new()),
-        forward_reveal: Cell::new(None),
-        forward_line: RefCell::new(None),
+        forwards: RefCell::new(VecDeque::new()),
         highlighted: RefCell::new(None),
         follow_timer: RefCell::new(None),
         content,

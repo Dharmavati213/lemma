@@ -112,7 +112,9 @@ fn pdftotext_pages(pdf: &Path) -> Option<Vec<String>> {
     if !output.status.success() {
         return None;
     }
+    // On Windows `pdftotext` ends its lines with `\r\n`.
     let text = String::from_utf8_lossy(&output.stdout)
+        .replace("\r\n", "\n")
         .replace('\u{fb00}', "ff")
         .replace('\u{fb01}', "fi")
         .replace('\u{fb02}', "fl")

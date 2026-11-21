@@ -35,8 +35,8 @@ fn main() -> ExitCode {
         return common::run(&[(FOCUS_CHILD, reject_turn_then_space)]);
     }
     // Rejecting a file the agent created moves it to the trash: keep that out of the user's.
-    let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-regress2-d-data-{}", std::process::id()));
+    let data =
+        common::target_tmpdir().join(format!("lemma-regress2-d-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };

@@ -588,21 +588,45 @@ impl Document {
         self.saver.charset()
     }
 
+    /// The characters of the text that the file's charset cannot hold, each once, in the order
+    /// they come: a save fails while there are any. None for a UTF-8 file.
+    pub fn unwritable_chars(&self) -> Vec<char> {
+        match self.charset() {
+            Some(charset) => self.with_text(|text| crate::saver::unwritable(text, &charset)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Makes this a UTF-8 document: its next saves write the file as UTF-8, whatever charset it
+    /// was read in. For a document whose charset cannot hold what was typed into it.
+    pub fn convert_to_utf8(&self) {
+        self.saver.write_as_utf8();
+    }
+
     /// Replaces the text with the file on disk, as one undoable change with `Origin::User` (the
     /// user taking back their unsaved changes: a review folds it into its baseline outside the
     /// hunks), and marks the document clean. The file is decoded with the document's charset.
+    ///
+    /// When the file holds what this document last wrote or read, and the buffer's redo gets back
+    /// to it (the unsaved changes are the undo of saved ones), it goes back that way instead: a
+    /// review takes the buffer's redo of the agent's edits as such, so that their text, which the
+    /// file holds, is a change to review again rather than the user's own (Discard on closing the
+    /// tab or the window, `:q!`, `:e!`).
     pub fn reload(self: &Rc<Self>) -> impl Future<Output = Result<(), String>> + use<> {
         let doc = self.clone();
         async move {
             let name = doc.display_name();
-            let (bytes, etag) = gio::File::for_path(doc.path())
-                .load_contents_future()
+            let (bytes, etag) = crate::workspace::load_file(doc.path())
                 .await
                 .map_err(|e| format!("cannot read {name}: {}", e.message()))?;
             let charset = doc.charset();
             let decoded = saver::decode(&bytes, charset.as_deref())
                 .map_err(|e| format!("cannot read {name}: {e}"))?;
             // No await from here on: the text cannot change in between.
+            let hash = lemma_core::fnv1a64(&[&bytes[..]]);
+            if doc.is_own_write(hash) || doc.saver.disk_hash() == Some(hash) {
+                doc.redo_to(&decoded.text);
+            }
             let edits = doc.with_text(|text| lemma_review::minimal_edits(text, &decoded.text));
             doc.apply_edits(&edits, Origin::User)
                 .map_err(|e| format!("cannot reload {name}: {e}"))?;
@@ -611,6 +635,27 @@ impl Document {
             doc.mark_saved(doc.version());
             Ok(())
         }
+    }
+
+    /// Steps the buffer's redo until the text is `text`; if it does not get there, its undo
+    /// steps back to where it was. Returns whether it got there.
+    fn redo_to(&self, text: &str) -> bool {
+        const MAX_STEPS: usize = 1000;
+        let Some(buffer) = self.buffer() else {
+            return false;
+        };
+        let mut steps = 0;
+        while !self.with_text(|t| t == text) && buffer.can_redo() && steps < MAX_STEPS {
+            buffer.redo();
+            steps += 1;
+        }
+        if self.with_text(|t| t == text) {
+            return true;
+        }
+        for _ in 0..steps {
+            buffer.undo();
+        }
+        false
     }
 
     /// Calls `f(doc, edit, origin)` before every change, with pre-edit byte offsets.
@@ -997,10 +1042,18 @@ impl Document {
         }));
         for signal in ["undo", "redo"] {
             let weak = Rc::downgrade(self);
+            let redo = signal == "redo";
             ids.push(buffer.connect_local(signal, false, move |_| {
                 if let Some(doc) = weak.upgrade() {
                     doc.origin_before_history
                         .set(Some(doc.origin.replace(Origin::History)));
+                    // Which way the History edits that follow step: one of them can be the
+                    // undo of one of Lemma's edits and the redo of another.
+                    if let Ok(mut review) = doc.review.try_borrow_mut()
+                        && let Some(review) = review.as_mut()
+                    {
+                        review.begin_history_step(redo);
+                    }
                 }
                 None
             }));

@@ -30,7 +30,26 @@ impl Input {
     pub(crate) fn new(tag: i32, name: CString) -> Self {
         let bytes = name.as_bytes();
         let recorded = path_from(bytes);
-        let (cwd, rel) = if recorded.is_absolute() {
+        // A name from the root is one TeX recorded with its directory. On Windows that includes
+        // a name without a drive (`/home/u/paper/./main.tex`, of a build on Linux, macOS or in
+        // WSL), which is not an absolute path there: it has a working directory too, so the
+        // project copied to this machine is still matched.
+        //
+        // The other way round, a name with a drive (`C:/Users/u/paper/./main.tex`, of a build
+        // on Windows) is no path from the root on Unix: it is read with `\` as a separator
+        // too, and its working directory, which does not exist here, is kept as recorded.
+        let foreign = cfg!(unix) && has_drive(bytes);
+        let slashed: Vec<u8>;
+        let (bytes, recorded) = if foreign {
+            slashed = bytes
+                .iter()
+                .map(|&b| if b == b'\\' { b'/' } else { b })
+                .collect();
+            (&slashed[..], path_from(&slashed))
+        } else {
+            (bytes, recorded)
+        };
+        let (cwd, rel) = if recorded.has_root() || foreign {
             match find_cwd_mark(bytes) {
                 Some(i) => (
                     Some(normalize(&path_from(&bytes[..i]))),
@@ -49,6 +68,12 @@ impl Input {
             rel,
         }
     }
+}
+
+/// Whether `bytes` start with a drive and a separator (`C:/`, `d:\`), as the names TeX records
+/// on Windows do.
+fn has_drive(bytes: &[u8]) -> bool {
+    matches!(bytes, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 /// The path TeX recorded as `bytes`: any bytes on Unix; UTF-8 on Windows, where TeX Live and
@@ -142,6 +167,16 @@ mod tests {
         // A file found elsewhere.
         let i = input("C:/texlive/2026/texmf-dist/tex/latex/amscls/amsart.cls");
         assert_eq!((i.cwd, i.rel), (None, None));
+        // A build on Linux or macOS (the project was copied here with its PDF): no drive.
+        let i = input("/home/u/paper/./chapters/intro.tex");
+        assert_eq!(i.cwd.as_deref(), Some(Path::new(r"\home\u\paper")));
+        assert_eq!(i.rel.as_deref(), Some(Path::new(r"chapters\intro.tex")));
+        let i = input("/usr/share/texmf-dist/tex/latex/amscls/amsart.cls");
+        assert_eq!((i.cwd, i.rel), (None, None));
+        // A relative name stays one.
+        let i = input("chapters/intro.tex");
+        assert_eq!(i.cwd, None);
+        assert_eq!(i.rel.as_deref(), Some(Path::new(r"chapters\intro.tex")));
         // Not UTF-8 is read leniently rather than dropped.
         let i = Input::new(1, CString::new(b"C:/x/./caf\xe9.tex".to_vec()).unwrap());
         assert_eq!(i.cwd.as_deref(), Some(Path::new(r"C:\x")));
@@ -155,6 +190,36 @@ mod tests {
         assert_eq!(i.cwd.as_deref(), Some(Path::new("/home/u/paper")));
         assert_eq!(i.rel.as_deref(), Some(Path::new("chapters/intro.tex")));
         assert_eq!(i.name.as_bytes(), b"/home/u/paper/./chapters/./intro.tex");
+    }
+
+    /// A build on Windows, read on Linux or macOS (the project was copied here with its PDF).
+    #[cfg(unix)]
+    #[test]
+    fn names_with_a_drive_have_a_working_directory_too() {
+        // TeX Live and MiKTeX: a drive and `/`.
+        let i = input("C:/Users/u/paper/./chapters/./intro.tex");
+        assert_eq!(i.cwd.as_deref(), Some(Path::new("C:/Users/u/paper")));
+        assert_eq!(i.rel.as_deref(), Some(Path::new("chapters/intro.tex")));
+        assert_eq!(i.path, Path::new("C:/Users/u/paper/chapters/intro.tex"));
+        // The name the SyncTeX library is asked with stays as recorded.
+        assert_eq!(
+            i.name.as_bytes(),
+            b"C:/Users/u/paper/./chapters/./intro.tex"
+        );
+        // Backslashes, and both kinds mixed.
+        let i = input(r"d:\Thesis\.\ch\a.tex");
+        assert_eq!(i.cwd.as_deref(), Some(Path::new("d:/Thesis")));
+        assert_eq!(i.rel.as_deref(), Some(Path::new("ch/a.tex")));
+        let i = input(r"D:\Thesis/.\main.tex");
+        assert_eq!(i.rel.as_deref(), Some(Path::new("main.tex")));
+        // A file found elsewhere.
+        let i = input("C:/texlive/2026/texmf-dist/tex/latex/amscls/amsart.cls");
+        assert_eq!((i.cwd, i.rel), (None, None));
+        // No drive: a colon in a relative name, and a backslash in a Unix name, are kept.
+        let i = input("a:b/c.tex");
+        assert_eq!(i.rel.as_deref(), Some(Path::new("a:b/c.tex")));
+        let i = input(r"/home/u/paper/./odd\name.tex");
+        assert_eq!(i.rel.as_deref(), Some(Path::new(r"odd\name.tex")));
     }
 
     #[cfg(unix)]

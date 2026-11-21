@@ -138,7 +138,7 @@ fn fixture_main_refs_cites_includes_macros() {
         non_packages,
         vec![
             Include {
-                kind: IncludeKind::Bibliography,
+                kind: IncludeKind::BibResource,
                 target: "refs.bib".into(),
                 line: 6
             },
@@ -435,7 +435,7 @@ fn every_include_kind() {
             (Graphics, "img/h", 7),
             (Bibliography, "refs", 8),
             (Bibliography, "more", 8),
-            (Bibliography, "bib/i.bib", 9),
+            (BibResource, "bib/i.bib", 9),
             (Package, "inputenc", 10),
             (Package, "amsmath", 11),
             (Package, "amssymb", 11),
@@ -546,6 +546,26 @@ fn macro_definition_forms() {
     assert!(idx.envs.is_empty());
 }
 
+/// An xparse spec as it stands while it is typed (`{O}` before its `{default}`), or with a
+/// default that is one non-ASCII character, is read without a panic.
+#[test]
+fn document_command_specs_being_typed() {
+    let idx = index_file("\\NewDocumentCommand{\\x}{O}{y}\n\\NewDocumentCommand{\\z}{Oé m}{#2}\n");
+    let shapes: Vec<_> = idx
+        .macros
+        .iter()
+        .map(|m| {
+            (
+                m.name.as_str(),
+                m.nargs,
+                m.optional_args,
+                m.optional_default.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(shapes, [("x", 1, 1, Some("")), ("z", 2, 1, Some("é"))]);
+}
+
 #[test]
 fn environment_pair_recovery() {
     let text = r"\begin{document}
@@ -642,7 +662,8 @@ fn comments_verbatim_and_skipped_blocks() {
     let text = r"% \section{Commented}
 \section{Real} % \label{commented}
 \% \label{escaped-percent}
-\verb|\section{Verb}| \verb*+\label{v}+
+\verb|\section{Verb}| \verb*+\label{v}+ \verb |\section{Verb2}|
+\verb*  |\label{v2}| \verb *\section{Verb3}* \Verb |\label{v3}|
 \lstinline[language=TeX]{\section{L}} \mintinline{latex}|\section{M}|
 \begin{verbatim}
 \section{In verbatim}
@@ -670,7 +691,7 @@ fn comments_verbatim_and_skipped_blocks() {
         .iter()
         .map(|e| (e.name.as_str(), e.end_line))
         .collect();
-    assert_eq!(envs, [("verbatim", Some(7)), ("comment", Some(15))]);
+    assert_eq!(envs, [("verbatim", Some(8)), ("comment", Some(16))]);
 }
 
 #[test]

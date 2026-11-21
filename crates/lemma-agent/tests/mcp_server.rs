@@ -5,7 +5,8 @@
 mod mcp_support;
 
 use lemma_agent::mcp::{
-    MAX_IN_FLIGHT, MAX_MESSAGE_BYTES, McpServer, TIMEOUT_TEXT, Timeouts, tool_definitions,
+    MAX_CONNECTIONS, MAX_IN_FLIGHT, MAX_MESSAGE_BYTES, McpServer, TIMEOUT_TEXT, Timeouts,
+    tool_definitions,
 };
 use lemma_agent::{EditorRequest, ToolCall, ToolContent, ToolReply};
 use mcp_support::{
@@ -294,6 +295,76 @@ fn connections_without_the_right_token_are_closed_silently() {
     let mut client =
         RawClient::connect_with(&socket, &format!("  {{ \"lemma_token\" : \"{TOKEN}\" }}  "));
     assert_eq!(client.call(&ping)["result"], json!({}));
+    drop(server);
+}
+
+/// Connections that never send their token (a stuck or hostile local client: on Windows the
+/// socket is a loopback port any local user can reach) take every slot; the agent's bridge must
+/// still get in at once, not after their handshake timeout, and a connected client stays served.
+#[test]
+fn silent_connections_cannot_lock_the_agent_out() {
+    let (dir, server, _rx) = start_server(quick());
+    let socket = dir.socket();
+    let ping = request(1, "ping", json!({}));
+    let mut first = RawClient::connect(&socket);
+    assert_eq!(first.call(&ping)["result"], json!({}));
+    let silent: Vec<_> = (0..MAX_CONNECTIONS + 8)
+        .map(|_| mcp_support::connect(&socket).expect("connect"))
+        .collect();
+    let start = Instant::now();
+    let mut agent = RawClient::connect(&socket);
+    assert_eq!(agent.call(&ping)["result"], json!({}));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(first.call(&ping)["result"], json!({}));
+    drop(silent);
+    drop(server);
+}
+
+/// A program that keeps opening connections and never sends anything on them, as fast as it can
+/// (thousands a second): each new one displaces the oldest that has not sent its token, whose
+/// thread ends at once, and the agent's connection still gets in every time. (On Windows a
+/// displaced thread may take up to `POLL_SLICE` to end, so a flood can make the server turn new
+/// connections away for a moment: the bridge then connects again.)
+#[cfg(unix)]
+#[test]
+fn a_flood_of_silent_connections_cannot_lock_the_agent_out() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (dir, server, _rx) = start_server(quick());
+    let socket = dir.socket();
+    let ping = request(1, "ping", json!({}));
+    let stop = Arc::new(AtomicBool::new(false));
+    let flooders: Vec<_> = (0..4)
+        .map(|_| {
+            let socket = socket.clone();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                // Held open (the most recent ones), so that the server has to displace them.
+                let mut held = std::collections::VecDeque::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(stream) = mcp_support::connect(&socket) {
+                        held.push_back(stream);
+                        if held.len() > 16 * MAX_CONNECTIONS {
+                            held.pop_front();
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(200));
+    for _ in 0..10 {
+        let mut agent = RawClient::connect(&socket);
+        assert_eq!(agent.call(&ping)["result"], json!({}));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for flooder in flooders {
+        flooder.join().unwrap();
+    }
     drop(server);
 }
 

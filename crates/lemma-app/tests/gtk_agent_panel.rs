@@ -11,8 +11,10 @@
 //! `common::require_agent_binaries`).
 //!
 //! The process environment is isolated before GTK starts: `HOME` and the `XDG_*` directories
-//! point into a temporary directory, and `PATH` is a temporary `bin` directory plus `/usr/bin`
-//! and `/bin`, so nothing here can find or run the real node, npm or claude. Text views use
+//! point into a temporary directory, and `PATH` is a temporary `bin` directory plus links to the
+//! programs of `/usr/bin` and `/bin` other than node, npm, claude, the other agents' tools and
+//! `secret-tool` (`common::system_programs_without`), so nothing here can find or run the real
+//! node, npm or claude, or ask the user's keyring (a fake `secret-tool` has no key). Text views use
 //! GTK's own input method (`GTK_IM_MODULE`), never the desktop's input method daemon.
 //!
 //! Run offscreen: `scripts/broadway.sh cargo test -p lemma-app --test gtk_agent_panel`.
@@ -22,6 +24,8 @@
 
 mod broadway_input;
 mod common;
+
+use common::Canonical as _;
 
 use adw::prelude::*;
 use gtk::gdk::{Key, ModifierType};
@@ -60,9 +64,18 @@ fn main() -> ExitCode {
     isolate_environment();
     let mut tests: Vec<common::Test> = vec![
         ("streaming_renders_in_order", streaming_renders_in_order),
+        (
+            "long_sessions_keep_the_last_turns",
+            long_sessions_keep_the_last_turns,
+        ),
+        (
+            "large_turns_leave_the_transcript_sooner",
+            large_turns_leave_sooner,
+        ),
         ("streaming_cost_per_chunk", streaming_cost_per_chunk),
         ("markdown_rows", markdown_rows),
         ("streaming_table_updates_in_place", streaming_table),
+        ("message_links_open_project_files", message_links),
         ("permission_card_keys", permission_card_keys),
         (
             "permission_card_buttons_and_plan_options",
@@ -73,6 +86,10 @@ fn main() -> ExitCode {
             permission_withdrawn,
         ),
         ("stop_gives_a_cancelled_turn", stop_cancels),
+        (
+            "a_tool_left_running_by_a_finished_turn_did_not_fail",
+            tool_left_by_a_finished_turn,
+        ),
         ("pickers_send_mode_and_config", pickers),
         ("usage_ring_updates", usage_ring),
         ("prompt_box_enter_and_shift_enter", prompt_box),
@@ -105,12 +122,24 @@ fn main() -> ExitCode {
             permission_while_typing_wide,
         ),
         ("inline_edit_sends_the_region", inline_edit),
+        (
+            "prompts_name_a_file_in_a_folder_with_a_forward_slash",
+            prompts_name_files_with_slashes,
+        ),
         ("inline_edit_escape_cancels", inline_escape),
+        (
+            "ctrl_k_names_the_agent_that_runs",
+            ctrl_k_names_the_running_agent,
+        ),
         (
             "regress3_inline_popover_of_a_closed_tab_leaves_no_critical",
             inline_closed_tab,
         ),
         ("quick_actions_fill_templates", quick_actions),
+        (
+            "a_busy_agent_refuses_with_one_toast",
+            busy_refusal_is_one_toast,
+        ),
         ("quick_actions_reload_with_prompts_toml", quick_reload),
         ("ask_agent_to_fix_sends_the_diagnostic", ask_agent_to_fix),
         ("lazy_start_and_retry", lazy_start),
@@ -165,8 +194,7 @@ fn env() -> &'static TestEnv {
 /// Points HOME, XDG_* and PATH into a temporary directory (see the module docs). Runs before
 /// GTK starts any thread.
 fn isolate_environment() {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-panel-env-{}", std::process::id()));
+    let root = common::target_tmpdir().join(format!("lemma-panel-env-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
     let bin = root.join("bin");
@@ -174,6 +202,7 @@ fn isolate_environment() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let config = home.join(".config/lemma/config.toml");
+    let path = common::path_without(&bin, &root, common::AGENT_PROGRAMS);
     // SAFETY: single-threaded: GTK is not initialised yet and no thread was spawned.
     unsafe {
         std::env::set_var("HOME", &home);
@@ -181,7 +210,7 @@ fn isolate_environment() {
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", path);
         std::env::set_var("LEMMA_CONFIG", &config);
         std::env::remove_var("MISE_DATA_DIR");
         // GTK's own input method, never the desktop's (IBus or Fcitx, which GTK would pick
@@ -190,10 +219,13 @@ fn isolate_environment() {
         std::env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
     }
     let _ = ENV.set(TestEnv { home, bin, config });
+    // A keyring without a key, never the user's (the API backend's key row looks it up).
+    fake_program("secret-tool", "exit 1");
 }
 
 /// Writes an executable shell script into the temporary `bin`.
 fn fake_program(name: &str, body: &str) -> PathBuf {
+    common::require_shell_scripts();
     let path = env().bin.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     #[cfg(unix)]
@@ -252,6 +284,7 @@ fn fixture_with(
     config.editor.vim = false;
     configure(&mut config);
     let ws = Workspace::new(ProjectRoot::new(&dir).unwrap());
+    common::restore_home(&env().home);
     let paths = Paths::from_env();
     assert!(
         paths.as_ref().is_some_and(|p| p.home == env().home),
@@ -300,7 +333,7 @@ impl Fixture {
     }
 
     fn path(&self, file: &str) -> PathBuf {
-        self.dir.join(file).canonicalize().unwrap()
+        self.dir.join(file).canonical().unwrap()
     }
 
     fn show_panel(&self) {
@@ -446,6 +479,141 @@ fn select(editor: &Editor, from: (i32, i32), to: (i32, i32)) {
 const MAIN: &str = "\\documentclass{article}\n\\begin{document}\nFirst line of text.\n\nA second paragraph\nthat spans two lines.\n\n\\end{document}\n";
 
 // ----- transcript -----
+
+/// Resident memory of this process, in KiB.
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| pages * 4)
+}
+
+/// The prompts of the transcript's entries, in order.
+fn user_texts(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A long session: the transcript keeps its last `TRANSCRIPT_MAX_TURNS` turns, with a note at
+/// its top that counts the others, and its memory stops growing. It kept every entry (and the
+/// text and Markdown blocks of every answer) for the whole session.
+fn long_sessions_keep_the_last_turns() {
+    let f = fixture("long-session", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    let answer = "A paragraph of an answer about $\\mathcal{C}$ and its objects, with *some* \
+                  emphasis and `code`.\n\n"
+        .repeat(8);
+    let turn = |i: usize| {
+        f.begin(&format!("question {i}"), PromptOrigin::Panel);
+        f.event(AgentEvent::MessageChunk(answer.clone()));
+        f.event(AgentEvent::ToolCall {
+            id: format!("tool-{i}"),
+            title: "mcp__lemma__read_file".into(),
+            kind: "read".into(),
+            status: ToolStatus::Completed,
+        });
+        f.end(StopReason::EndTurn);
+        panel.flush();
+        if i.is_multiple_of(10) {
+            f.frames(1);
+        }
+    };
+    let max = panel::TRANSCRIPT_MAX_TURNS;
+    let start = rss_kib();
+    for i in 0..max {
+        turn(i);
+    }
+    let entries = panel.entries();
+    assert_eq!(user_texts(&entries).len(), max);
+    assert_eq!(
+        entries[0],
+        Entry::User {
+            turn: 1,
+            origin: PromptOrigin::Panel,
+            heading: "You".into(),
+            text: "question 0".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        }
+    );
+    let at_cap = rss_kib();
+    for i in max..2 * max + 10 {
+        turn(i);
+    }
+    panel.scroll_to_end();
+    f.frames(3);
+    common::pump_for(Duration::from_millis(600));
+    let after = rss_kib();
+    println!(
+        "    RSS {start} KiB, {at_cap} KiB after {max} turns, {after} KiB after {}",
+        2 * max + 10
+    );
+    let entries = panel.entries();
+    let users = user_texts(&entries);
+    assert_eq!(users.len(), max);
+    assert_eq!(users[0], format!("question {}", max + 10));
+    assert_eq!(users[max - 1], format!("question {}", 2 * max + 9));
+    assert_eq!(
+        entries[0],
+        Entry::Notice(format!(
+            "{} earlier turns are no longer shown here.",
+            max + 10
+        ))
+    );
+    assert_eq!(
+        entries.len(),
+        1 + 3 * max,
+        "the note, then a prompt, an answer, a tool"
+    );
+    // The last turns are shown as before.
+    assert!(
+        panel
+            .row_texts()
+            .iter()
+            .any(|t| t.contains(&format!("question {}", 2 * max + 9)))
+    );
+    // Clear Transcript takes the note too.
+    panel.actions().activate_action("clear", None);
+    common::pump_for(Duration::from_millis(50));
+    assert!(panel.entries().is_empty());
+}
+
+/// Turns with much text leave the transcript before it holds `TRANSCRIPT_MAX_TURNS` of them
+/// (the last one always stays).
+fn large_turns_leave_sooner() {
+    let f = fixture("large-turns", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    // A code block of 1.5 MiB: about 3 MiB with its Markdown block.
+    let code = format!(
+        "```\n{}```\n",
+        "let x = 1; // a line of code here\n".repeat(50_000)
+    );
+    assert!(code.len() > 3 << 19);
+    for i in 0..4 {
+        f.begin(&format!("question {i}"), PromptOrigin::Panel);
+        f.event(AgentEvent::MessageChunk(code.clone()));
+        f.end(StopReason::EndTurn);
+        panel.flush();
+    }
+    let entries = panel.entries();
+    assert_eq!(
+        user_texts(&entries),
+        ["question 1", "question 2", "question 3"],
+        "{:?}",
+        entries.first()
+    );
+    assert_eq!(
+        entries[0],
+        Entry::Notice("An earlier turn is no longer shown here.".into())
+    );
+}
 
 fn streaming_renders_in_order() {
     let f = fixture("stream", &[("main.tex", MAIN)], Hook::Swallow);
@@ -612,6 +780,50 @@ fn markdown_rows() {
         copied.as_deref(),
         Some("\\begin{align}\n  a &< b\n\\end{align}")
     );
+}
+
+/// Links in an answer open project files at their line, in a table cell too: a cell's label had
+/// GtkLabel's own handler, which launches a link of any scheme with the system (`file://`
+/// outside the project, `someapp://`), and a `file://` link with a `#L` line opened nothing.
+fn message_links() {
+    let f = fixture("links", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    f.begin("where is it", PromptOrigin::Panel);
+    let uri = glib::filename_to_uri(f.path("main.tex"), None).unwrap();
+    let message = format!(
+        "See [line 4]({uri}#L4).\n\n| where |\n|---|\n| [line 3](main.tex#L3) |\n\nThat is all."
+    );
+    f.event(AgentEvent::MessageChunk(message));
+    f.end(StopReason::EndTurn);
+    panel.flush();
+    f.frames(2);
+    let labels: Vec<gtk::Label> = descendants(&panel.widget())
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .collect();
+    let at_line = |line: u32| {
+        common::pump_until(TIMEOUT, || {
+            f.state.active_editor().is_some_and(|e| {
+                e.document().path() == f.path("main.tex") && e.cursor_position().0 == line
+            })
+        });
+    };
+    // The table cell's link.
+    let (_, cells) = tables(&panel).remove(0);
+    let cell = cells
+        .iter()
+        .find(|l| l.text() == "line 3")
+        .expect("the cell with the link");
+    let _: bool = cell.emit_by_name("activate-link", &[&"main.tex#L3"]);
+    at_line(3);
+    // A file URI with a line.
+    let paragraph = labels
+        .iter()
+        .find(|l| l.text().starts_with("See line 4"))
+        .expect("the paragraph with the link");
+    let _: bool = paragraph.emit_by_name("activate-link", &[&format!("{uri}#L4")]);
+    at_line(4);
 }
 
 /// An answer with a table of `rows` rows of `columns` cells (with code, bold and math) between
@@ -1050,6 +1262,12 @@ fn stop_cancels() {
     assert!(!panel.stop_button().is_visible());
     f.begin("long task", PromptOrigin::Panel);
     f.event(AgentEvent::MessageChunk("Working…".into()));
+    f.event(AgentEvent::ToolCall {
+        id: "b1".into(),
+        title: "Bash".into(),
+        kind: "execute".into(),
+        status: ToolStatus::InProgress,
+    });
     f.event(bash_permission(5));
     assert!(panel.stop_button().is_visible(), "Stop while running");
     assert!(panel.status_text().ends_with("running"));
@@ -1067,6 +1285,13 @@ fn stop_cancels() {
             .iter()
             .any(|e| matches!(e, Entry::Permission(c) if c.answer == PermissionAnswer::Cancelled))
     );
+    // The tool the agent never reported again stops spinning.
+    assert!(
+        entries
+            .iter()
+            .any(|e| matches!(e, Entry::Tool(c) if c.id == "b1" && c.status == ToolStatus::Failed)),
+        "{entries:#?}"
+    );
     assert!(!panel.stop_button().is_visible());
     assert!(panel.status_text().ends_with("idle"));
     // Stop without a running turn sends nothing to the agent.
@@ -1077,6 +1302,28 @@ fn stop_cancels() {
         [PanelCommand::Cancel],
         "only the hook sees it"
     );
+}
+
+/// A turn that ends normally with a tool whose last report never came (an adapter that does not
+/// send one for some calls): the card stops spinning without claiming that the tool failed.
+fn tool_left_by_a_finished_turn() {
+    let f = fixture("tool-left", &[("main.tex", MAIN)], Hook::Swallow);
+    f.show_panel();
+    let panel = f.panel();
+    f.begin("look around", PromptOrigin::Panel);
+    f.event(AgentEvent::ToolCall {
+        id: "r1".into(),
+        title: "Read".into(),
+        kind: "read".into(),
+        status: ToolStatus::InProgress,
+    });
+    f.event(AgentEvent::MessageChunk("Done.".into()));
+    f.end(StopReason::EndTurn);
+    let status = panel.entries().into_iter().find_map(|e| match e {
+        Entry::Tool(card) if card.id == "r1" => Some(card.status),
+        _ => None,
+    });
+    assert_eq!(status, Some(ToolStatus::Completed));
 }
 
 fn ready_event() -> AgentEvent {
@@ -1649,9 +1896,11 @@ fn suggestions() {
     view.buffer().set_text("Look at @yon");
     view.buffer().place_cursor(&view.buffer().end_iter());
     common::pump_until(TIMEOUT, || !panel.suggestions().is_empty());
-    assert_eq!(panel.suggestions(), ["chapters/yoneda.tex"]);
+    // Written with `/` on every system: the name goes into the prompt, which the agent reads.
+    let yoneda = "chapters/yoneda.tex";
+    assert_eq!(panel.suggestions(), [yoneda]);
     panel.prompt_key(Key::Return, ModifierType::empty());
-    assert_eq!(text(&view), "Look at @chapters/yoneda.tex ");
+    assert_eq!(text(&view), format!("Look at @{yoneda} "));
     type_into(&view, "and @");
     let files = panel.suggestions();
     assert!(files.contains(&"main.tex".to_owned()) && files.contains(&"refs.bib".to_owned()));
@@ -1756,6 +2005,21 @@ fn attachments() {
     ]);
     common::pump_until(TIMEOUT, || !panel.is_attaching());
     assert_eq!(names(&panel), ["fig.png", "notes.txt", "paper.pdf"]);
+    // A FIFO is refused at once: reading it would keep the attachments (and Send) waiting
+    // until another program writes to it.
+    #[cfg(unix)]
+    {
+        let fifo = f.dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo");
+        panel.attach_files(vec![file("pipe")]);
+        common::pump_until(Duration::from_secs(5), || !panel.is_attaching());
+        assert_eq!(names(&panel), ["fig.png", "notes.txt", "paper.pdf"]);
+        std::fs::remove_file(&fifo).unwrap();
+    }
     let details = panel.attachments();
     assert!(
         details[0].1.starts_with("PNG image · 40 × 30 · "),
@@ -2000,6 +2264,26 @@ fn large_attachments() {
     ]);
     common::pump_until(TIMEOUT, || !panel.is_attaching());
     assert_eq!(names(&panel), ["notes.txt"]);
+    // The refusals give the sizes in the units of the limits, as the README states them (the
+    // limit of 20 MiB read "21.0 MB").
+    // (GLib puts a no-break space between a size and its unit.)
+    let refusal = |name: &str| {
+        block_on(lemma_app::agent::attach::from_file(&file(name), true))
+            .unwrap_err()
+            .replace('\u{a0}', " ")
+    };
+    let pdf = refusal("thesis.pdf");
+    assert!(
+        pdf.contains("(300.0 MiB; it takes PDFs up to 20.0 MiB)"),
+        "{pdf}"
+    );
+    let log = refusal("build.log");
+    assert!(
+        log.contains("it takes text files up to 512.0 KiB)"),
+        "{log}"
+    );
+    let png = refusal("scan.png");
+    assert!(png.contains("(100.0 MiB; images up to 64.0 MiB)"), "{png}");
 }
 
 fn selection_chip() {
@@ -2390,12 +2674,142 @@ fn inline_edit() {
     };
     assert_eq!(text, "A second paragraph\nthat spans two lines.");
     assert!(uri.ends_with("#L5-L6"));
+    let sent = origin.clone();
     let PromptOrigin::Inline { range, .. } = origin else {
         panic!()
     };
     assert_eq!(&MAIN[range], "A second paragraph\nthat spans two lines.");
+    // A turn stopped from the pane (or ended by a dying agent) did not make the edit: the
+    // popover says so and stays for another try (it closed as if the edit were done).
+    f.begin("polish", sent);
+    f.end(StopReason::Cancelled);
+    assert_eq!(
+        inline::status(&f.state).as_deref(),
+        Some("Claude stopped before finishing the edit")
+    );
+    assert!(inline::popover(&f.state).is_some());
     inline::cancel(&f.state);
     assert!(inline::popover(&f.state).is_none());
+}
+
+/// `config.toml` selects another agent while one runs (the switch waits for its session to end):
+/// Ctrl+K and the editor's menu speak of the one that runs. Codex was told to use a tool only
+/// Claude Code has, and the menu said "Edit with Claude…", once `config.toml` named Claude.
+fn ctrl_k_names_the_running_agent() {
+    let f = fixture_with(
+        "ctrl-k-running",
+        &[("main.tex", MAIN)],
+        Hook::Swallow,
+        |c| {
+            c.agent.backend = AgentBackend::Codex;
+        },
+    );
+    let editor = f.open("main.tex");
+    let label = |model: &gio::MenuModel| {
+        model
+            .item_attribute_value(0, gio::MENU_ATTRIBUTE_LABEL, None)
+            .and_then(|v| v.get::<String>())
+    };
+    let labels = || {
+        let menu = &f.state.editor_menu;
+        let edit = menu
+            .item_link(0, gio::MENU_LINK_SUBMENU)
+            .and_then(|m| m.item_link(0, gio::MENU_LINK_SECTION))
+            .expect("the Ctrl+K section");
+        (label(menu.upcast_ref()), label(&edit))
+    };
+    // Codex's session is up; config.toml now names Claude.
+    f.agent().set_state(AgentState::Idle);
+    let mut config = (*f.state.config.get()).clone();
+    config.agent.backend = AgentBackend::Claude;
+    f.state.set_config(Rc::new(config));
+    assert_eq!(
+        labels(),
+        (Some("_Codex".into()), Some("_Edit with Codex…".into()))
+    );
+    // So does the desktop notification of its turns.
+    assert_eq!(
+        bridge::notification_text(&f.state, StopReason::EndTurn).0,
+        "Codex finished"
+    );
+    select(&editor, (2, 0), (2, 19));
+    inline::open(&f.state, &editor);
+    inline::submit(&f.state, "make it shorter");
+    let (blocks, _) = prompts(&f.commands()).pop().expect("sent");
+    let text = text_of(&blocks);
+    assert!(
+        !text.contains("mcp__lemma__edit") && text.contains("Lemma's MCP server"),
+        "{text}"
+    );
+    assert_eq!(
+        inline::status(&f.state).as_deref(),
+        Some("Codex is editing…")
+    );
+    inline::cancel(&f.state);
+    // Once Codex's session is over, Claude applies, and the menu says so.
+    f.agent().set_state(AgentState::Stopped);
+    assert_eq!(
+        labels(),
+        (Some("_Claude".into()), Some("_Edit with Claude…".into()))
+    );
+}
+
+/// What goes to the agent names a file in a folder with `/` on every system (an inline edit
+/// tells it which file to edit, a quick action which one the passage is from), while the
+/// transcript, which the user reads, names it as the system does.
+fn prompts_name_files_with_slashes() {
+    let f = fixture(
+        "prompt-paths",
+        &[("main.tex", MAIN), ("chapters/intro.tex", MAIN)],
+        Hook::Swallow,
+    );
+    // The main file first: the project is its directory.
+    f.open("main.tex");
+    let editor = f.open("chapters/intro.tex");
+    select(&editor, (2, 0), (2, 19));
+    inline::open(&f.state, &editor);
+    inline::submit(&f.state, "make it shorter");
+    let (blocks, origin) = prompts(&f.commands()).pop().expect("the inline prompt");
+    let text = text_of(&blocks);
+    assert!(
+        text.starts_with("make it shorter\n\n(Inline edit of line 3 of chapters/intro.tex,"),
+        "{text}"
+    );
+    assert!(
+        text.contains("make the change with mcp__lemma__edit on chapters/intro.tex,"),
+        "{text}"
+    );
+    let PromptBlock::Resource { uri, .. } = &blocks[1] else {
+        panic!("{blocks:?}")
+    };
+    assert!(
+        uri.starts_with("file:///") && uri.ends_with("/chapters/intro.tex#L3-L3"),
+        "{uri}"
+    );
+    assert!(
+        !text.contains("chapters\\") && !uri.contains('\\'),
+        "{text} {uri}"
+    );
+    f.begin(&text, origin);
+    // The transcript is the user's: the path as the system writes it.
+    assert_eq!(
+        panel_user_heading(&f),
+        format!("Inline edit · {}:3", common::shown("chapters/intro.tex"))
+    );
+    f.end(StopReason::EndTurn);
+    common::pump_until(TIMEOUT, || inline::popover(&f.state).is_none());
+
+    // A quick action on the same file.
+    select(&editor, (4, 0), (5, 21));
+    quick::run(&f.state, "proofread").unwrap();
+    let (blocks, _) = prompts(&f.commands())
+        .pop()
+        .expect("the quick action's prompt");
+    let text = text_of(&blocks);
+    assert!(
+        text.starts_with("Proofread the following passage from chapters/intro.tex (from line 5)"),
+        "{text}"
+    );
 }
 
 fn panel_user_heading(f: &Fixture) -> String {
@@ -2498,6 +2912,22 @@ fn inline_closed_tab() {
     }
     drop(editor);
     assert!(inline::popover(&f.state).is_none());
+    // Closed with Esc, and the tab closed before the main loop ran: the popover's unparent still
+    // waits in an idle callback, and no session is left to take it along. It goes with the tab
+    // all the same.
+    let editor = f.open("main.tex");
+    inline::open(&f.state, &editor);
+    let popover = inline::popover(&f.state).unwrap();
+    inline::cancel(&f.state);
+    assert!(inline::popover(&f.state).is_none());
+    assert!(popover.parent().is_some(), "its unparent waits");
+    f.state.close_editor(&editor, true);
+    assert!(f.state.editors().is_empty());
+    assert!(
+        popover.parent().is_none(),
+        "an inline-edit popover is still on the closed tab's view"
+    );
+    drop(editor);
     // Shown and then closed with its tab: no critical when the window goes.
     let editor = f.open("main.tex");
     inline::open(&f.state, &editor);
@@ -2513,6 +2943,73 @@ fn inline_closed_tab() {
 }
 
 // ----- quick actions -----
+
+/// The texts of every toast `state` shows or has waiting, oldest first; each is dismissed (by
+/// its close button) to show the next.
+fn all_toasts(state: &WindowState) -> Vec<String> {
+    let shown = |state: &WindowState| -> Option<gtk::Widget> {
+        let mut child = state.toasts.first_child();
+        while let Some(c) = child {
+            if c.type_().name() == "AdwToastWidget" {
+                return Some(c);
+            }
+            child = c.next_sibling();
+        }
+        None
+    };
+    let mut out = Vec::new();
+    for _ in 0..10 {
+        common::pump_for(Duration::from_millis(50));
+        let Some(toast) = shown(state) else {
+            break;
+        };
+        let widgets = descendants(&toast);
+        let title = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .map(|l| l.label().to_string())
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
+        out.push(title);
+        match widgets
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .last()
+        {
+            Some(close) => close.emit_clicked(),
+            None => break,
+        }
+        common::pump_until(TIMEOUT, || shown(state).is_none_or(|w| w != toast));
+    }
+    out
+}
+
+/// A quick action (its menu item, its key, `:Agent <name>`) while the agent works on another
+/// request: one toast says why nothing was sent. There were two ("Claude is still working …"
+/// and "Claude is busy").
+fn busy_refusal_is_one_toast() {
+    let f = fixture("busy-toast", &[("main.tex", MAIN)], Hook::Swallow);
+    let editor = f.open("main.tex");
+    f.begin("first", PromptOrigin::Panel);
+    let before = prompts(&f.commands()).len();
+    assert!(all_toasts(&f.state).is_empty());
+    select(&editor, (4, 0), (5, 21));
+    WidgetExt::activate_action(&f.state.window, "win.quick-proofread", None).unwrap();
+    assert_eq!(
+        all_toasts(&f.state),
+        ["Claude is still working on the last request; wait for it or press Stop"]
+    );
+    // `:Agent explain`, as the editor's ex command runs it.
+    if let Err(e) = quick::run(&f.state, "explain") {
+        f.state.toast(&e);
+    }
+    assert_eq!(
+        all_toasts(&f.state),
+        ["Claude is still working on the last request; wait for it or press Stop"]
+    );
+    assert_eq!(prompts(&f.commands()).len(), before, "nothing was sent");
+    f.end(StopReason::EndTurn);
+}
 
 fn quick_actions() {
     let f = fixture("quick", &[("main.tex", MAIN)], Hook::Swallow);
@@ -2602,6 +3099,24 @@ fn quick_actions() {
     assert_eq!(f.panel().quick_menu().n_items(), 1);
     // `:Agent fix-this-error` without a build error says so.
     assert!(quick::run(&f.state, "fix-this-error").is_err());
+    // The submenu is named after the agent `config.toml` selects (it said Claude for all).
+    let label = |model: &gio::MenuModel| {
+        model
+            .item_attribute_value(0, gio::MENU_ATTRIBUTE_LABEL, None)
+            .and_then(|v| v.get::<String>())
+    };
+    assert_eq!(label(menu.upcast_ref()).as_deref(), Some("_Claude"));
+    assert_eq!(label(&edit).as_deref(), Some("_Edit with Claude…"));
+    let mut config = (*f.state.config.get()).clone();
+    config.agent.backend = AgentBackend::Codex;
+    f.state.set_config(Rc::new(config));
+    let menu = &f.state.editor_menu;
+    assert_eq!(label(menu.upcast_ref()).as_deref(), Some("_Codex"));
+    let edit = menu
+        .item_link(0, gio::MENU_LINK_SUBMENU)
+        .and_then(|m| m.item_link(0, gio::MENU_LINK_SECTION))
+        .expect("the Ctrl+K section");
+    assert_eq!(label(&edit).as_deref(), Some("_Edit with Codex…"));
 }
 
 fn quick_reload() {
@@ -2705,6 +3220,7 @@ fn ask_agent_to_fix() {
     build.diagnostics().ask_agent(1);
     common::pump_until(TIMEOUT, || prompts(&f.commands()).len() == 2);
     let text = text_of(&prompts(&f.commands()).pop().unwrap().0);
+    // The prompt names the file with `/` on every system.
     assert!(text.contains("in ch/closed.tex at line 3"), "{text}");
     assert!(text.contains(">    3  \\foo\n"), "{text}");
     // `:Agent fix-this-error` takes the problem nearest the cursor in the active file.
@@ -2782,6 +3298,16 @@ fn stop_and_new_session() {
     );
     assert!(panel.entries().is_empty());
     panel.actions().activate_action("clear", None);
+    // An agent that dies once it runs did start: the card says it stopped (it said "could not
+    // start").
+    f.agent().set_state(AgentState::Idle);
+    f.agent().set_state(AgentState::Failed(
+        "Claude exited unexpectedly (exit code 1)".into(),
+    ));
+    assert_eq!(
+        panel.setup().map(|(t, _)| t).as_deref(),
+        Some("Claude stopped unexpectedly")
+    );
 }
 
 // ----- the idle stop -----
@@ -2952,7 +3478,17 @@ fn idle_stop_waits() {
     assert!(bridge.idle_stop_pending());
     let mut config = (*f.state.config.get()).clone();
     config.agent.backend = AgentBackend::Pi;
+    f.state.set_config(Rc::new(config.clone()));
+    // The transcript says so once, not again at every other change of config.toml.
+    config.editor.hover = !config.editor.hover;
     f.state.set_config(Rc::new(config));
+    let notices = f
+        .panel()
+        .entries()
+        .iter()
+        .filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("config.toml now selects")))
+        .count();
+    assert_eq!(notices, 1, "notices of the backend config.toml selects");
     idle_for(3);
     assert_eq!(agent.state(), AgentState::Idle);
     assert!(bridge.has_session());
@@ -3000,6 +3536,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 ver="${pkg##*@}"
+# A line that is not UTF-8, then more output than a pipe holds: all of it is read.
+printf 'npm warn tarball caf\351.tgz\n'
+i=0
+while [ $i -lt 1500 ]; do
+  echo "npm http fetch GET 200 https://registry.npmjs.org/package-number-$i 12ms (cache miss)"
+  i=$((i+1))
+done
 echo "npm notice fake install of $pkg"
 dir="$prefix/node_modules/@agentclientprotocol/claude-agent-acp"
 mkdir -p "$dir/dist"
@@ -3099,8 +3642,9 @@ fn install_failure() {
     assert!(panel.install_log().contains("npm ERR! code ENOTFOUND"));
     assert!(panel.install_button().is_visible(), "try again");
     assert!(!f.commands().contains(&PanelCommand::Start));
-    // An npm that never finishes can be cancelled.
-    fake_program("npm", "echo 'resolving…'\nexec sleep 30");
+    // An npm that never finishes can be cancelled, with what it started (an install script
+    // that holds the output pipe: Cancel waited for it).
+    fake_program("npm", "echo 'resolving…'\nsleep 30\necho done");
     panel.install_button().emit_clicked();
     common::pump_until(TIMEOUT, || panel.install_log().contains("resolving"));
     let started = Instant::now();
@@ -3301,7 +3845,7 @@ fn start_fake_agent(f: &Fixture, scenario: &str) -> Option<()> {
     let path = common::fixtures().join("agent").join(scenario);
     assert!(path.is_file(), "{} is missing", path.display());
     let agent = f.agent();
-    agent.set_scenario(Some(path.canonicalize().unwrap()));
+    agent.set_scenario(Some(path.canonical().unwrap()));
     let result = block_on(async {
         glib::future_with_timeout(Duration::from_secs(15), agent.ensure_started()).await
     });
@@ -3375,7 +3919,11 @@ fn e2e_basic() {
     // Each edit card links to its own call's hunk, in the scenario's order.
     assert_eq!(
         links,
-        ["main.tex:34", "main.tex:41", "chapters/yoneda.tex:2"],
+        [
+            "main.tex:34",
+            "main.tex:41",
+            common::shown("chapters/yoneda.tex:2").as_str()
+        ],
         "{links:?}"
     );
     assert_eq!(panel.usage(), Some((41_250, 200_000)));
@@ -3652,7 +4200,7 @@ fn e2e_idle_stop_resumes() {
     assert_eq!(hunks, 1);
     let scenario = common::fixtures()
         .join("agent/resume.json")
-        .canonicalize()
+        .canonical()
         .unwrap();
     #[cfg(target_os = "linux")]
     assert_eq!(agents_running(&scenario), 1);
@@ -3772,7 +4320,7 @@ fn e2e_idle_stop_elsewhere() {
     // No document is open: the first one opened elsewhere moves the root there. Nothing runs,
     // so nothing is stopped or said yet.
     let other = common::temp_dir("e2e-idle-elsewhere-other")
-        .canonicalize()
+        .canonical()
         .unwrap();
     std::fs::write(other.join("notes.tex"), "Notes.\n").unwrap();
     let before = notices(&panel).len();

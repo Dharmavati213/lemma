@@ -2,6 +2,9 @@
 //! `Write`, used by `--apply-as-agent` and by the MCP tools (M2).
 //!
 //! Every path goes through `ProjectRoot::resolve`; anything outside the project root is refused.
+//! The agent may write a path with `/` or, on Windows, with `\`; the replies name files with `/`
+//! on every system ([`lemma_core::ProjectRoot::agent_name`]), so that a name copied into
+//! `\input{…}` is not read as a command.
 //! An edit runs against the **live** text (the buffer of an open file, the shadow of a closed
 //! one), is applied as one undoable action with `Origin::Agent { call }`, becomes reviewable
 //! hunks right away, and is **on disk before the reply resolves**. Replies quote the changed
@@ -11,6 +14,11 @@
 //! them as Perl at every build, which would let an auto-allowed tool run code before any review)
 //! and every hidden file or file in a hidden directory (`.git/config`, `.envrc`, …), which other
 //! programs read as configuration. Reading them is allowed.
+//!
+//! **Reading** (`read_file`): `limit` lines (2000 by default) from `offset`, each cut at
+//! [`MAX_LINE_CHARS`] characters, and at most [`READ_MAX_BYTES`] in all; the answer ends with
+//! where to read on when it leaves lines out. A file that is not in the workspace and larger than
+//! [`READ_WHOLE_MAX`] is read line by line, keeping only the lines shown.
 //!
 //! **ACP `fs/*`** (WP5.2): `ReadText` returns the live text itself (no line numbers; `line`/`limit`
 //! select whole lines with their terminators) and `WriteText` is `Write` with a short reply; the
@@ -24,11 +32,11 @@
 use crate::document::DocRef;
 use crate::review_ui;
 use crate::saver;
-use crate::workspace::Workspace;
+use crate::workspace::{self, Workspace};
 use gio::prelude::*;
 use gtk::prelude::TextBufferExt;
 use lemma_agent::{EditorRequest, ToolContent, ToolReply};
-use lemma_core::{LineIndex, Origin, PathError, TextEdit, fnv1a64};
+use lemma_core::{LineIndex, Origin, PathError, TextEdit, agent_text, fnv1a64};
 use lemma_review::{EditError, minimal_edits, str_replace};
 use std::borrow::Cow;
 use std::fmt;
@@ -40,6 +48,19 @@ use std::rc::Rc;
 pub const DEFAULT_READ_LIMIT: u32 = 2000;
 /// Lines longer than this (in characters) are cut in `read_file` output.
 pub const MAX_LINE_CHARS: usize = 2000;
+/// Most bytes of a `read_file` answer: the lines after it are left out, and the answer says
+/// where to read on (Claude Code's own Read takes files up to 256 KiB whole).
+pub const READ_MAX_BYTES: usize = 256 << 10;
+/// A file `read_file` reads from the disk (it is not in the workspace) that is larger than this
+/// is read line by line, keeping only the lines the answer shows: it is never in memory whole.
+pub const READ_WHOLE_MAX: u64 = 8 << 20;
+/// The largest file not in the workspace whose text is read whole into memory
+/// (`fs/read_text_file`; `read_file` reads a larger one than [`READ_WHOLE_MAX`] line by line).
+pub const LIVE_TEXT_MAX: u64 = 64 << 20;
+/// A file `read_file` reads line by line is read on after the lines of the answer at most this
+/// far (some milliseconds) to count the lines left; past it the answer says that more lines
+/// follow, without their number. Lines 1–100 of a file of gigabytes took as long as all of it.
+const COUNT_AHEAD: u64 = 16 << 20;
 /// Unchanged lines quoted around each change in an edit reply.
 const CONTEXT_LINES: u32 = 3;
 /// Most lines quoted in an edit reply.
@@ -56,6 +77,9 @@ pub enum ToolError {
     Missing(String),
     /// The path names a directory (relative path).
     NotAFile(String),
+    /// The path names a named pipe, a socket or a device (relative path): reading it would wait
+    /// for another program to write to it, or never end.
+    Special(String),
     /// Reading the file failed.
     Read(String),
     /// Creating the file's directory failed.
@@ -88,6 +112,11 @@ impl fmt::Display for ToolError {
             Self::Path(msg) | Self::Read(msg) | Self::CreateDir(msg) => f.write_str(msg),
             Self::Missing(rel) => write!(f, "file does not exist: {rel}"),
             Self::NotAFile(rel) => write!(f, "{rel} is a directory, not a file"),
+            Self::Special(rel) => write!(
+                f,
+                "{rel} is not a regular file (a named pipe, a socket or a device); it was not \
+                 read or written"
+            ),
             Self::ChangedOnDisk(rel) => write!(
                 f,
                 "{rel} was changed by another program while the editor holds changes to it \
@@ -221,8 +250,26 @@ fn request_name(req: &EditorRequest) -> &'static str {
 struct Target {
     /// Canonical absolute path.
     path: PathBuf,
-    /// Path relative to the project root, for messages.
+    /// Path relative to the project root, for messages: with `/` between its names on every
+    /// system, as the agent is shown every path.
     rel: String,
+}
+
+impl Target {
+    /// `message` of GIO or the system, which names the file as the system spells it, with the
+    /// file named as the agent is shown paths.
+    fn for_agent(&self, message: &str) -> String {
+        agent_text(message, &self.path)
+    }
+
+    /// "cannot read `rel`: `message`", for the agent.
+    fn cannot_read(&self, message: &str) -> ToolError {
+        ToolError::Read(format!(
+            "cannot read {}: {}",
+            self.rel,
+            self.for_agent(message)
+        ))
+    }
 }
 
 fn resolve(ws: &Workspace, path: &Path) -> Result<Target, ToolError> {
@@ -231,7 +278,7 @@ fn resolve(ws: &Workspace, path: &Path) -> Result<Target, ToolError> {
         PathError::OutsideProject(_) => ToolError::OutsideRoot,
         PathError::Io(msg) => ToolError::Path(msg),
     })?;
-    let rel = root.relative(&path).unwrap_or(&path).display().to_string();
+    let rel = root.agent_name(&path);
     Ok(Target { path, rel })
 }
 
@@ -250,10 +297,16 @@ fn resolve_writable(ws: &Workspace, path: &Path) -> Result<Target, ToolError> {
 /// or file in a hidden directory (`.git/config`, `.git/hooks/…`, `.envrc`, …), which git and
 /// other programs read as configuration or run. Writing such a file through an auto-allowed
 /// tool would run code before the user reviewed anything.
+///
+/// A name is compared as Windows opens it: up to a `:` (`latexmkrc::$DATA` is the file's own
+/// data stream) and without trailing dots and spaces (`latexmkrc.` creates `latexmkrc`). Such
+/// names are refused everywhere; nothing legitimate is called that.
 pub fn is_protected(rel: &Path) -> bool {
     rel.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
-        name.starts_with('.') || name.eq_ignore_ascii_case("latexmkrc")
+        let opened = name.split(':').next().unwrap_or_default();
+        let opened = opened.trim_end_matches(['.', ' ']);
+        name.starts_with('.') || opened.eq_ignore_ascii_case("latexmkrc")
     })
 }
 
@@ -280,7 +333,8 @@ fn to_crlf(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// The file's type, or `None` when it does not exist.
+/// The file's type, or `None` when it does not exist. A named pipe, a socket or a device is
+/// refused (as opening it in the editor is).
 async fn file_type(target: &Target) -> Result<Option<gio::FileType>, ToolError> {
     let query = gio::File::for_path(&target.path).query_info_future(
         "standard::type",
@@ -288,13 +342,12 @@ async fn file_type(target: &Target) -> Result<Option<gio::FileType>, ToolError> 
         glib::Priority::DEFAULT,
     );
     match query.await {
+        Ok(info) if info.file_type() == gio::FileType::Special => {
+            Err(ToolError::Special(target.rel.clone()))
+        }
         Ok(info) => Ok(Some(info.file_type())),
         Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Ok(None),
-        Err(e) => Err(ToolError::Read(format!(
-            "cannot read {}: {}",
-            target.rel,
-            e.message()
-        ))),
+        Err(e) => Err(target.cannot_read(e.message())),
     }
 }
 
@@ -374,19 +427,16 @@ async fn current_document(
     Ok(None)
 }
 
-/// The file's bytes, `None` when it does not exist.
+/// The file's bytes, `None` when it does not exist. A named pipe, a socket or a device is
+/// refused ([`workspace::load_file`]).
 async fn read_bytes(target: &Target) -> Result<Option<glib::Slice<u8>>, ToolError> {
-    match gio::File::for_path(&target.path)
-        .load_contents_future()
-        .await
-    {
+    match workspace::load_file(&target.path).await {
         Ok((bytes, _etag)) => Ok(Some(bytes)),
         Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Ok(None),
-        Err(e) => Err(ToolError::Read(format!(
-            "cannot read {}: {}",
-            target.rel,
-            e.message()
-        ))),
+        Err(e) if e.matches(gio::IOErrorEnum::NotRegularFile) => {
+            Err(ToolError::Special(target.rel.clone()))
+        }
+        Err(e) => Err(target.cannot_read(e.message())),
     }
 }
 
@@ -398,7 +448,10 @@ async fn existing_document(ws: &Rc<Workspace>, target: &Target) -> Result<DocRef
     match file_type(target).await? {
         None => Err(ToolError::Missing(target.rel.clone())),
         Some(gio::FileType::Directory) => Err(ToolError::NotAFile(target.rel.clone())),
-        Some(_) => ws.get_or_load(&target.path).await.map_err(ToolError::Read),
+        Some(_) => ws
+            .get_or_load(&target.path)
+            .await
+            .map_err(|e| ToolError::Read(target.for_agent(&e))),
     }
 }
 
@@ -409,8 +462,45 @@ async fn read_file(
     limit: Option<u32>,
 ) -> Result<String, ToolError> {
     let target = resolve(ws, path)?;
-    let text = live_text(ws, &target).await?;
-    numbered(&text, &target.rel, offset, limit)
+    if let Some(doc) = current_document(ws, &target).await? {
+        return doc.with_text(|text| numbered(text, &target.rel, offset, limit));
+    }
+    // Not in the workspace: the file on disk is the live text (it is not added to the
+    // workspace). A large one is read line by line, never whole.
+    let size = match file_size(&target).await? {
+        None => return Err(ToolError::Missing(target.rel.clone())),
+        Some(None) => return Err(ToolError::NotAFile(target.rel.clone())),
+        Some(Some(size)) => size,
+    };
+    if size <= READ_WHOLE_MAX {
+        let text = live_text(ws, &target).await?;
+        return numbered(&text, &target.rel, offset, limit);
+    }
+    let Target { path, rel } = target;
+    let failed = rel.clone();
+    gio::spawn_blocking(move || numbered_file(&path, &rel, offset, limit))
+        .await
+        .unwrap_or_else(|_| Err(ToolError::Read(format!("cannot read {failed}"))))
+}
+
+/// The size of the file of `target`: `None` when it does not exist, `Some(None)` for a
+/// directory. A named pipe, a socket or a device is refused: it says it is empty, and reading
+/// it would wait for another program to write to it.
+async fn file_size(target: &Target) -> Result<Option<Option<u64>>, ToolError> {
+    let query = gio::File::for_path(&target.path).query_info_future(
+        "standard::type,standard::size",
+        gio::FileQueryInfoFlags::NONE,
+        glib::Priority::DEFAULT,
+    );
+    match query.await {
+        Ok(info) if info.file_type() == gio::FileType::Directory => Ok(Some(None)),
+        Ok(info) if info.file_type() == gio::FileType::Special => {
+            Err(ToolError::Special(target.rel.clone()))
+        }
+        Ok(info) => Ok(Some(Some(u64::try_from(info.size()).unwrap_or(0)))),
+        Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Ok(None),
+        Err(e) => Err(target.cannot_read(e.message())),
+    }
 }
 
 /// ACP `fs/read_text_file`: the live text of `path` as it is, or `limit` lines of it from the
@@ -444,18 +534,26 @@ async fn live_text(ws: &Rc<Workspace>, target: &Target) -> Result<String, ToolEr
     Ok(match current_document(ws, target).await? {
         Some(doc) => doc.text(),
         // Not in the workspace: disk is the live text. It is not added to the workspace.
-        None => match file_type(target).await? {
+        None => match file_size(target).await? {
             None => return Err(ToolError::Missing(target.rel.clone())),
-            Some(gio::FileType::Directory) => {
+            Some(None) => {
                 return Err(ToolError::NotAFile(target.rel.clone()));
             }
-            Some(_) => {
+            // Read whole, into memory: not a file of gigabytes (a log, a data set).
+            Some(Some(size)) if size > LIVE_TEXT_MAX => {
+                return Err(ToolError::Read(format!(
+                    "cannot read {}: it is {} MiB, and a file that is not open in the editor is \
+                     read whole only up to {} MiB",
+                    target.rel,
+                    size >> 20,
+                    LIVE_TEXT_MAX >> 20
+                )));
+            }
+            Some(Some(_)) => {
                 let (bytes, _etag) = gio::File::for_path(&target.path)
                     .load_contents_future()
                     .await
-                    .map_err(|e| {
-                        ToolError::Read(format!("cannot read {}: {}", target.rel, e.message()))
-                    })?;
+                    .map_err(|e| target.cannot_read(e.message()))?;
                 // Decoded as the editor would open it (UTF-8, else Latin-9).
                 saver::decode(&bytes, None)
                     .map_err(|e| ToolError::Read(format!("cannot read {}: {e}", target.rel)))?
@@ -465,7 +563,8 @@ async fn live_text(ws: &Rc<Workspace>, target: &Target) -> Result<String, ToolEr
     })
 }
 
-/// `cat -n` output of `limit` lines starting at the 1-based line `offset`.
+/// `cat -n` output of `limit` lines starting at the 1-based line `offset`, at most
+/// [`READ_MAX_BYTES`] of it.
 fn numbered(
     text: &str,
     rel: &str,
@@ -476,27 +575,211 @@ fn numbered(
         return Ok(format!("({rel} is empty)"));
     }
     let lines = split_lines(text);
-    let first = offset.unwrap_or(1).max(1) as usize;
-    if first > lines.len() {
-        return Err(ToolError::OffsetPastEnd {
-            offset: first as u32,
-            lines: lines.len(),
-        });
+    let mut answer = Numbered::new(offset, limit);
+    for (i, line) in lines.iter().enumerate().skip(answer.first - 1) {
+        if !answer.wants(i + 1) {
+            break;
+        }
+        answer.push(i + 1, line);
     }
-    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).max(1) as usize;
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate().skip(first - 1).take(limit) {
-        push_numbered(&mut out, i + 1, line);
+    answer.finish(lines.len())
+}
+
+/// A `read_file` answer being built (see [`numbered`]).
+struct Numbered {
+    /// The first line asked for (1-based).
+    first: usize,
+    /// The line after the last one asked for.
+    end: usize,
+    out: String,
+    /// The first line the answer has no room for ([`READ_MAX_BYTES`]).
+    cut_at: Option<usize>,
+}
+
+impl Numbered {
+    fn new(offset: Option<u32>, limit: Option<u32>) -> Self {
+        let first = offset.unwrap_or(1).max(1) as usize;
+        let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).max(1) as usize;
+        Self {
+            first,
+            end: first.saturating_add(limit),
+            out: String::new(),
+            cut_at: None,
+        }
     }
-    let shown_to = (first - 1 + limit).min(lines.len());
-    if shown_to < lines.len() {
-        out.push_str(&format!(
-            "… {} more lines (read on with offset {})\n",
-            lines.len() - shown_to,
-            shown_to + 1
+
+    /// Whether line `n` goes into the answer: it was asked for, and the answer has room so far.
+    fn wants(&self, n: usize) -> bool {
+        self.cut_at.is_none() && (self.first..self.end).contains(&n)
+    }
+
+    /// Whether the answer has all its lines once line `n` is reached.
+    fn complete_at(&self, n: usize) -> bool {
+        self.cut_at.is_some() || n >= self.end
+    }
+
+    /// Adds line `n`, or ends the answer before it when it has no room for it (the first line
+    /// always fits: lines are cut at [`MAX_LINE_CHARS`]).
+    fn push(&mut self, n: usize, line: &str) {
+        let at = self.out.len();
+        push_numbered(&mut self.out, n, line);
+        if at > 0 && self.out.len() > READ_MAX_BYTES {
+            self.out.truncate(at);
+            self.cut_at = Some(n);
+        }
+    }
+
+    /// The answer, for a text of `total` lines (not empty), saying what it left out.
+    fn finish(mut self, total: usize) -> Result<String, ToolError> {
+        if self.first > total {
+            return Err(ToolError::OffsetPastEnd {
+                offset: u32::try_from(self.first).unwrap_or(u32::MAX),
+                lines: total,
+            });
+        }
+        match self.cut_at {
+            Some(cut) => self.out.push_str(&format!(
+                "… {} more lines, not shown: the answer stops at {} KiB (read on with offset \
+                 {cut})\n",
+                total + 1 - cut,
+                READ_MAX_BYTES >> 10
+            )),
+            None => {
+                let shown_to = (self.end - 1).min(total);
+                if shown_to < total {
+                    self.out.push_str(&format!(
+                        "… {} more lines (read on with offset {})\n",
+                        total - shown_to,
+                        shown_to + 1
+                    ));
+                }
+            }
+        }
+        Ok(self.out)
+    }
+
+    /// The answer, complete, for a text whose lines after it were not all counted (see
+    /// [`COUNT_AHEAD`]): some follow.
+    fn finish_uncounted(mut self) -> String {
+        let (next, why) = match self.cut_at {
+            Some(cut) => (
+                cut,
+                format!(
+                    ", not shown: the answer stops at {} KiB",
+                    READ_MAX_BYTES >> 10
+                ),
+            ),
+            None => (self.end, String::new()),
+        };
+        self.out.push_str(&format!(
+            "… more lines follow{why} (read on with offset {next})\n"
         ));
+        self.out
     }
-    Ok(out)
+}
+
+/// [`numbered`] of the file at `path`, read line by line: only the lines the answer shows are
+/// kept, and of each only as much as it shows, so a file of any size takes little memory. Each
+/// line is decoded by itself (UTF-8, else the editor's fallback charset). Like the editor, it
+/// refuses a file with NUL bytes (a binary file) in what it reads. Once the answer has its lines,
+/// the rest is read only to count its lines, and at most [`COUNT_AHEAD`] of it. Blocking.
+fn numbered_file(
+    path: &Path,
+    rel: &str,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<String, ToolError> {
+    numbered_file_counting(path, rel, offset, limit, COUNT_AHEAD)
+}
+
+/// [`numbered_file`], counting the lines after the answer's in at most `count_ahead` bytes.
+fn numbered_file_counting(
+    path: &Path,
+    rel: &str,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    count_ahead: u64,
+) -> Result<String, ToolError> {
+    use std::io::BufRead as _;
+    /// Bytes of a line kept: enough for [`MAX_LINE_CHARS`] characters and one more, which
+    /// tells that the line is cut.
+    const KEEP: usize = (MAX_LINE_CHARS + 1) * 4;
+    let failed = |e: std::io::Error| ToolError::Read(format!("cannot read {rel}: {e}"));
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let mut reader = std::io::BufReader::with_capacity(64 << 10, file);
+    let mut answer = Numbered::new(offset, limit);
+    // The line being read (1-based), its start as far as it is kept, whether more of it was
+    // left out, and whether it has any byte yet.
+    let (mut n, mut line, mut cut, mut started) = (1, Vec::new(), false, false);
+    let mut empty = true;
+    // Bytes read in all, and when the answer had all its lines.
+    let (mut read, mut complete) = (0u64, None);
+    loop {
+        if answer.complete_at(n) {
+            let since = *complete.get_or_insert(read);
+            if read - since > count_ahead {
+                return Ok(answer.finish_uncounted());
+            }
+        }
+        let chunk = reader.fill_buf().map_err(failed)?;
+        if chunk.is_empty() {
+            break;
+        }
+        if chunk.contains(&0) {
+            return Err(ToolError::Read(format!(
+                "cannot read {rel}: it contains NUL characters (is it a binary file?)"
+            )));
+        }
+        empty = false;
+        let len = chunk.len();
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let end = rest.iter().position(|&b| b == b'\n');
+            let piece = &rest[..end.unwrap_or(rest.len())];
+            if answer.wants(n) {
+                let room = KEEP.saturating_sub(line.len());
+                line.extend_from_slice(&piece[..piece.len().min(room)]);
+                cut |= piece.len() > room;
+            }
+            started |= !piece.is_empty();
+            match end {
+                Some(end) => {
+                    if answer.wants(n) {
+                        answer.push(n, &decode_line(&line, cut));
+                    }
+                    (n, cut, started) = (n + 1, false, false);
+                    line.clear();
+                    rest = &rest[end + 1..];
+                }
+                None => rest = &[],
+            }
+        }
+        reader.consume(len);
+        read += len as u64;
+    }
+    if empty {
+        return Ok(format!("({rel} is empty)"));
+    }
+    // A last line without a line break.
+    if started && answer.wants(n) {
+        answer.push(n, &decode_line(&line, cut));
+    }
+    answer.finish(if started { n } else { n - 1 })
+}
+
+/// The text of a line's bytes (`cut`: only its start, which may end inside a character): UTF-8
+/// when it is, else the editor's fallback charset.
+fn decode_line(bytes: &[u8], cut: bool) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(e) if cut && e.error_len().is_none() => {
+            Cow::Borrowed(std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default())
+        }
+        Err(_) => saver::decode(bytes, None).map_or_else(
+            |_| String::from_utf8_lossy(bytes),
+            |decoded| Cow::Owned(decoded.text),
+        ),
+    }
 }
 
 /// The lines of `text` without their `'\n'` (a final newline does not start another line).
@@ -575,7 +858,7 @@ async fn write(
             Some(_) => Some(
                 ws.get_or_load(&target.path)
                     .await
-                    .map_err(ToolError::Read)?,
+                    .map_err(|e| ToolError::Read(target.for_agent(&e)))?,
             ),
         },
     };
@@ -707,7 +990,11 @@ async fn apply_as_agent(
         };
         (changed, excerpt)
     };
-    let save_error = save.await.err().map(|e| e.to_string());
+    // GIO names the file in its message, as the system spells it.
+    let save_error = save
+        .await
+        .err()
+        .map(|e| agent_text(&e.to_string(), doc.path()));
     Ok(Applied {
         changed,
         excerpt,
@@ -811,6 +1098,120 @@ mod tests {
         assert_eq!(out.chars().filter(|&c| c == 'é').count(), MAX_LINE_CHARS);
     }
 
+    /// A file read from the disk line by line answers as its whole text does, and a long answer
+    /// stops at [`READ_MAX_BYTES`] saying where to read on.
+    #[test]
+    fn files_read_line_by_line_answer_as_whole_texts() {
+        let dir = std::env::temp_dir().join(format!("lemma-read-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.tex");
+        let long = "é".repeat(MAX_LINE_CHARS + 5);
+        let many: String = (1..=5000)
+            .map(|i| format!("line {i} {}\n", "x".repeat(100)))
+            .collect();
+        let texts = [
+            "a\nb\nc\n".to_owned(),
+            "no newline".to_owned(),
+            "\n".to_owned(),
+            "\n\n".to_owned(),
+            String::new(),
+            "alpha\r\nbeta\r\n".to_owned(),
+            format!("a\n{long}\nb"),
+            format!("{long}\r\n"),
+            many.clone(),
+        ];
+        let ranges = [
+            (None, None),
+            (Some(2), Some(1)),
+            (Some(3), None),
+            (Some(9), None),
+            (Some(4000), Some(3000)),
+            (None, Some(5000)),
+        ];
+        for text in &texts {
+            std::fs::write(&file, text).unwrap();
+            for (offset, limit) in ranges {
+                assert_eq!(
+                    numbered_file(&file, "x.tex", offset, limit),
+                    numbered(text, "x.tex", offset, limit),
+                    "{offset:?} {limit:?} of {:?}",
+                    &text[..text.len().min(30)]
+                );
+            }
+        }
+        // 5000 lines of about 110 bytes: the answer stops at the cap and says where to go on.
+        let out = numbered(&many, "x.tex", None, Some(5000)).unwrap();
+        assert!(out.len() <= READ_MAX_BYTES + 200, "{}", out.len());
+        let last = out.lines().last().unwrap();
+        let next: usize = last
+            .strip_suffix(')')
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{last}"));
+        assert!(
+            last.starts_with(&format!(
+                "… {} more lines, not shown: the answer stops at 256 KiB",
+                5001 - next
+            )),
+            "{last}"
+        );
+        let shown = out.lines().nth_back(1).unwrap();
+        assert!(shown.starts_with(&format!("{:>6}\tline {} ", next - 1, next - 1)));
+        // A line in the fallback charset, and a binary file.
+        std::fs::write(&file, b"caf\xe9\nok\n").unwrap();
+        assert_eq!(
+            numbered_file(&file, "x.tex", None, None).unwrap(),
+            "     1\tcafé\n     2\tok\n"
+        );
+        std::fs::write(&file, b"a\nb\0c\n").unwrap();
+        assert!(matches!(
+            numbered_file(&file, "x.tex", None, None),
+            Err(ToolError::Read(e)) if e.contains("NUL")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once the answer has its lines, a file read line by line is read on only so far to count
+    /// the lines after them; past that the answer says that more follow (lines 1–100 of a file
+    /// of gigabytes took as long as all of it).
+    #[test]
+    fn files_read_line_by_line_stop_after_the_answer() {
+        let dir = std::env::temp_dir().join(format!("lemma-read-ahead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.tex");
+        let text: String = (1..=20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&file, &text).unwrap();
+        let read =
+            |offset, limit, ahead| numbered_file_counting(&file, "x.tex", offset, limit, ahead);
+        assert_eq!(
+            read(Some(2), Some(2), u64::MAX),
+            numbered(&text, "x.tex", Some(2), Some(2))
+        );
+        assert_eq!(
+            read(Some(2), Some(2), 0).unwrap(),
+            "     2\tline 2\n     3\tline 3\n… more lines follow (read on with offset 4)\n"
+        );
+        // The end comes with the last lines asked for: counted.
+        assert_eq!(
+            read(Some(19_998), Some(2), 0),
+            numbered(&text, "x.tex", Some(19_998), Some(2))
+        );
+        // An answer cut at its size.
+        let long: String = (1..=5000)
+            .map(|i| format!("line {i} {}\n", "x".repeat(100)))
+            .collect();
+        std::fs::write(&file, &long).unwrap();
+        let out = read(None, Some(5000), 0).unwrap();
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.starts_with(
+                "… more lines follow, not shown: the answer stops at 256 KiB (read on with offset "
+            ),
+            "{last}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn changed_lines_map_edits_to_the_new_text() {
         // "l0\nl1\nl2\nl3\n": replace "l1" by "x\ny" and delete "l3\n" (descending).
@@ -879,6 +1280,13 @@ mod tests {
             ".git/hooks/pre-commit",
             ".envrc",
             "sub/.hidden/file.tex",
+            // Names Windows opens as `latexmkrc` (a trailing dot or space is dropped, and
+            // `::$DATA` is the file's data).
+            "latexmkrc.",
+            "latexmkrc ",
+            "LatexMkRc. .",
+            "latexmkrc::$DATA",
+            "chapters/latexmkrc:x",
         ] {
             assert!(is_protected(Path::new(rel)), "{rel}");
         }
@@ -888,6 +1296,7 @@ mod tests {
             "latexmkrc.tex",
             "refs.bib",
             "my.latexmkrc",
+            "latexmkrc.d/main.tex",
         ] {
             assert!(!is_protected(Path::new(rel)), "{rel}");
         }

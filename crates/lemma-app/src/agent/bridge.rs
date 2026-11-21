@@ -746,11 +746,12 @@ pub fn acp_flavor(backend: AgentBackend) -> lemma_agent::AcpFlavor {
     }
 }
 
-/// [`agent_label`] for `controller`'s window ("The agent" without one).
+/// [`agent_label`] for `controller`'s window ("The agent" without one): the agent that runs
+/// ([`panel::backend`]).
 fn label_of(controller: &AgentController) -> String {
     controller.window().map_or_else(
         || "The agent".to_owned(),
-        |s| agent_label(s.config.agent.backend, &s.config.agent),
+        |s| agent_label(panel::backend(&s), &s.config.agent),
     )
 }
 
@@ -1937,7 +1938,7 @@ fn notify_turn_ended(state: &WindowState, reason: StopReason) {
 /// The title and body of the turn-end notification: the stop reason, and how many changes wait
 /// for review in how many files.
 pub fn notification_text(state: &WindowState, reason: StopReason) -> (String, String) {
-    let name = agent_label(state.config.agent.backend, &state.config.agent);
+    let name = agent_label(panel::backend(state), &state.config.agent);
     let title = match reason {
         StopReason::EndTurn | StopReason::Cancelled => format!("{name} finished"),
         StopReason::MaxTokens => format!("{name} stopped: the reply reached its length limit"),
@@ -2265,8 +2266,7 @@ mod tests {
     #[test]
     fn stale_sockets_of_dead_processes_are_removed() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("lemma-sockets-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-sockets-").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         // A process that has ended.
         let mut child = std::process::Command::new("true").spawn().unwrap();

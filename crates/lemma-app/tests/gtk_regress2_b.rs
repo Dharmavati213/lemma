@@ -8,6 +8,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_agent::{
     AgentEvent, EditorRequest, PromptBlock, StopReason, ToolCall, ToolReply, ToolStatus,
@@ -210,7 +212,7 @@ fn window_on_home(
     common::pump_until(TIMEOUT, || state.window.is_mapped());
     let f = Fixture {
         state,
-        dir: dir.canonicalize().unwrap(),
+        dir: dir.canonical().unwrap(),
         home,
         runtime,
     };
@@ -384,6 +386,9 @@ fn scenario_file(f: &Fixture, json: &str) -> PathBuf {
 
 /// The pids of our child processes named `lemma-fake-agen…` (comm is cut at 15 bytes).
 fn fake_agent_pids() -> Vec<i32> {
+    if !cfg!(target_os = "linux") {
+        common::skip("the agent's processes are counted in Linux's /proc");
+    }
     let me = std::process::id().to_string();
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").unwrap().flatten() {
@@ -423,7 +428,7 @@ fn regress2_late_cancel_does_not_end_the_next_turn() {
     agent.set_scenario(Some(
         common::fixtures()
             .join("agent/cancel.json")
-            .canonicalize()
+            .canonical()
             .unwrap(),
     ));
     let events = f.events();
@@ -927,9 +932,10 @@ fn regress2_history_gc_covers_other_projects() {
                 .unwrap()
                 .as_secs()
                 - 40 * 86_400;
+            // (A `\` of a Windows path is written `\\` in JSON.)
             let line = format!(
                 "{{\"path\":\"{}\",\"hash\":\"{hash:016x}\",\"unix\":{unix},\"reason\":\"save\"}}\n",
-                other_main.display()
+                other_main.display().to_string().replace('\\', "\\\\")
             );
             std::fs::write(other.join("index.jsonl"), line).unwrap();
             slot.replace(other);
@@ -973,6 +979,7 @@ fn regress2_prompt_saves_only_project_buffers() {
 // ----- B-21: markup in the restore dialog -----
 
 fn regress2_restore_dialog_escapes_the_file_name() {
+    common::require_any_file_name();
     let f = fixture_with("restore-markup", &[("a&b <v2>.tex", "x\n")], |c| {
         c.history.enabled = false;
     });
@@ -1006,7 +1013,7 @@ fn regress2_pending_history_save_stays_in_its_project() {
     common::pump_for(Duration::from_millis(100));
     assert!(f.state.workspace.is_empty());
     // The next file opened moves the root to project b.
-    let b_root = base.join("b").canonicalize().unwrap();
+    let b_root = base.join("b").canonical().unwrap();
     block_on(f.state.open_file(&b_root.join("main.tex"))).unwrap();
     assert_eq!(f.state.workspace.root().path(), b_root);
     common::pump_for(Duration::from_millis(2500));
@@ -1052,7 +1059,7 @@ fn regress2_root_move_keeps_the_agent_in_the_project() {
     };
     common::pump_until(AGENT_TIMEOUT, || ended(1));
     // Then the user opens the thesis: the root moves there.
-    let thesis = base.join("thesis").canonicalize().unwrap();
+    let thesis = base.join("thesis").canonical().unwrap();
     block_on(f.state.open_file(&thesis.join("main.tex"))).unwrap();
     assert_eq!(f.state.workspace.root().path(), thesis);
     agent.prompt(

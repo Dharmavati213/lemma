@@ -31,8 +31,9 @@ restore() {
   rm -rf "$work"
 }
 trap restore EXIT
+# Set only once the move has happened: a failed move leaves nothing to move back.
+sudo mv "$BREW" "$BREW.hidden-for-smoke-test"
 hidden="$BREW.hidden-for-smoke-test"
-sudo mv "$BREW" "$hidden"
 echo "Homebrew moved aside: $BREW -> $hidden"
 
 # run_for SECONDS CMD...: CMD, killed after SECONDS (macOS has no `timeout`).

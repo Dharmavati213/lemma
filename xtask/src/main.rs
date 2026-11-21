@@ -3,17 +3,20 @@
 //! ```sh
 //! cargo run -p xtask -- gen-completion           # regenerate generated.rs and packages.zst
 //! cargo run -p xtask -- gen-completion --check   # fail if the committed files are out of date (CI)
+//! cargo run -p xtask -- licenses [--target T]     # the licences of the crates in the programs
 //! ```
 
 mod cwl;
 mod generate;
+mod licenses;
 mod umath;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cargo run -p xtask -- gen-completion [--check]";
+const USAGE: &str = "usage: cargo run -p xtask -- gen-completion [--check]\n       \
+                     cargo run -p xtask -- licenses [--target TRIPLE]";
 
 /// The workspace root (the parent of this crate's directory).
 fn workspace_root() -> PathBuf {
@@ -27,9 +30,29 @@ fn main() -> ExitCode {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["gen-completion"] => gen_completion(false),
         ["gen-completion", "--check"] => gen_completion(true),
+        ["licenses"] => print_licenses(None),
+        ["licenses", "--target", target] => print_licenses(Some(target)),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Prints the licences of the crates in the programs (see [`licenses`]).
+fn print_licenses(target: Option<&str>) -> ExitCode {
+    use std::io::Write as _;
+    match licenses::run(&workspace_root(), target) {
+        Ok(text) => match std::io::stdout().write_all(text.as_bytes()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("licenses: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("licenses: {e}");
+            ExitCode::FAILURE
         }
     }
 }

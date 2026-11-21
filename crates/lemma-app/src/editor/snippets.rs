@@ -20,10 +20,11 @@
 //!   why the key press, and nothing that changes the buffer, is the signal: pastes, IM commits,
 //!   undo/redo, agent, review and reload edits never arrive as a key press of a character.
 //! - **Tab** ([`Driver::tab`]): an exact manual trigger expands; else, inside an active snippet,
-//!   GtkSourceView moves to the next stop; else the cursor steps out past the next `}`, `)`, `]`
-//!   or (inside inline math) `$` on the line, escaped ones (`\}`, `\$`) not counted, and never
-//!   past a `$` that opens a formula; else the view indents. **Shift+Tab** moves back inside an
-//!   active snippet and otherwise does what the view does (unindent).
+//!   GtkSourceView moves to the next stop; else, after some text on the line, the cursor steps
+//!   out past the next `}`, `)`, `]` or (inside inline math) `$` on the line, escaped ones (`\}`,
+//!   `\$`) not counted, and never past a `$` that opens a formula; else the view indents (with
+//!   only white space before the cursor, Tab indents, as in every editor). **Shift+Tab** moves
+//!   back inside an active snippet and otherwise does what the view does (unindent).
 //! - **Expansions inside an active snippet** ([`Driver::expand_chunks`]): GtkSourceView 5.20
 //!   loses track of an outer snippet's text while a nested one runs (typing in the outer's next
 //!   stop then replaced the nested text, and Tab after the nested one wrapped around), and ends
@@ -260,7 +261,7 @@ fn with_line_break(chunks: &[Chunk], line_break: &str) -> Vec<Chunk> {
 }
 
 /// The line break of the document at `at`: its line's own, else the first line's, else `\n`.
-fn line_break_at(buffer: &gtk::TextBuffer, at: &gtk::TextIter) -> &'static str {
+pub(crate) fn line_break_at(buffer: &gtk::TextBuffer, at: &gtk::TextIter) -> &'static str {
     let break_after = |line_end: gtk::TextIter| {
         let mut next = line_end;
         if !next.forward_line() && next == line_end {
@@ -729,11 +730,15 @@ impl Driver {
         if self.is_active() {
             return TabAction::SnippetStop;
         }
-        // 3. Out past the next closing delimiter on the line.
+        // 3. Out past the next closing delimiter on the line (not while the input method
+        // composes: the key is its own, and moving the cursor would cut its text short). Only
+        // after some text: with nothing but white space before the cursor, Tab indents the line.
         let in_inline_math = matches!(ctx, Some(Context::Math { display: false, .. }));
         if !back
             && !selection
+            && !self.preedit.get()
             && let Some((_, before, after)) = &split
+            && !before.trim().is_empty()
             && let Some(n) = {
                 // A backslash right before the cursor escapes the first character after it.
                 let escaped = before.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1;

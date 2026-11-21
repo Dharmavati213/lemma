@@ -7,7 +7,8 @@
 //! directory) since it holds document text.
 //!
 //! - **Saving:** 500 ms after the last change of the review state (every refresh of the review
-//!   controller, and every save of a reviewed file), serialized and written atomically on gio's
+//!   controller, and every save of a reviewed file), and at most [`MAX_DELAY`] after the first
+//!   one while changes keep coming (typing), serialized and written atomically on gio's
 //!   I/O thread pool; synchronously when the window closes (also when a write is still queued).
 //!   A document with unsaved changes keeps the entry it had when its text was last written to
 //!   the file (captured when that save took its snapshot), since only that one matches the file
@@ -22,9 +23,15 @@
 //!   project does not fill its workspace with them). A review comes back through
 //!   [`review_ui::adopt_review`] only when the file's text hashes to the saved `current_hash`
 //!   and the document has no unsaved changes; the banner then reads "Restored N pending changes
-//!   from your last session". An agent edit to a file whose saved review is still waiting
-//!   starts from that review ([`take_saved`], called by [`review_ui::start_review`]), so its
-//!   hunks are never lost. Until the restore has finished nothing is written, so a window
+//!   from your last session". When another program changed the file since, the text the review
+//!   was saved with is looked up in the local history (`agent::history::text_with_hash`): if it
+//!   is there, the review comes back on it and the other program's change goes through the
+//!   review as a reload ([`rebased`]), as it would have had Lemma been running, and a toast says
+//!   so; otherwise the review is lost, and a toast names the file and says why (also for a file
+//!   deleted, unreadable or with unsaved changes), since what the agent changed there would
+//!   otherwise pass for the user's own text. An agent edit to a file whose saved review is still
+//!   waiting starts from that review ([`take_saved`], called by [`review_ui::start_review`]), so
+//!   its hunks are never lost. Until the restore has finished nothing is written, so a window
 //!   closed early never loses the saved state.
 //!
 //! Persistence is off for windows without [`Paths`](lemma_config::Paths) and for runs that quit
@@ -49,6 +56,10 @@ use std::time::Duration;
 
 /// Quiet time after the last change before the state is written.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+/// Changes that keep coming (typing in a reviewed document refreshes the review every keystroke
+/// or so) put the write off at most this long after the first of them: until it is written, a
+/// crash loses the hunks of the agent's edits meanwhile.
+pub const MAX_DELAY: Duration = Duration::from_secs(2);
 /// The format of [`StateFile`].
 const VERSION: u32 = 1;
 
@@ -85,6 +96,9 @@ pub struct SavedTurn {
     /// A named turn's name (`review_ui::begin_named_turn`; M3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A named change made apart from the turns (`review_ui::begin_named_change`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outside: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -153,7 +167,12 @@ struct Persister {
     wanted: Cell<bool>,
     /// Hunks restored so far (for the banner).
     restored: Cell<usize>,
+    /// Files whose saved review [`take_saved`] found no longer applying, with why: the user is
+    /// told once the restore is over.
+    lost: RefCell<Vec<(String, &'static str)>>,
     timer: RefCell<Option<glib::SourceId>>,
+    /// When the first change the timer waits to write came (see [`MAX_DELAY`]).
+    first_change: Cell<Option<std::time::Instant>>,
     /// Per document (absolute path), its entry as of the text last written to its file: what is
     /// saved while it has unsaved changes.
     last: RefCell<HashMap<PathBuf, SavedReview>>,
@@ -234,7 +253,9 @@ pub fn install(state: &Rc<WindowState>) {
         current: RefCell::new(None),
         wanted: Cell::new(false),
         restored: Cell::new(0),
+        lost: RefCell::new(Vec::new()),
         timer: RefCell::new(None),
+        first_change: Cell::new(None),
         last: RefCell::new(HashMap::new()),
         last_changes: Cell::new(0),
         saving: RefCell::new(HashMap::new()),
@@ -336,7 +357,20 @@ pub fn take_saved(doc: &DocRef) -> Option<(FileReview, bool)> {
             Some(saved.remove(i))
         }
     }?;
-    let review = restorable(doc, &entry)?;
+    let Some(review) = restorable(doc, &entry) else {
+        // The new review starts from the text as it is: the saved changes are lost, which the
+        // user hears of (see `apply`).
+        let why = if doc.is_dirty() {
+            Some("it has unsaved changes")
+        } else {
+            let hash = doc.with_text(|text| fnv1a64(&[text.as_bytes()]));
+            (hash != entry.review.current_hash).then_some("it was changed outside Lemma")
+        };
+        if let Some(why) = why.filter(|_| doc.review.borrow().is_none()) {
+            p.lost.borrow_mut().push((rel.display().to_string(), why));
+        }
+        return None;
+    };
     p.restored.set(p.restored.get() + review.hunks().len());
     p.remember(doc.path(), entry.clone());
     Some((review, entry.new_file))
@@ -403,6 +437,7 @@ impl Persister {
         if let Some(timer) = self.timer.take() {
             timer.remove();
         }
+        self.first_change.set(None);
         self.generation.set(self.generation.get() + 1);
         self.saved.borrow_mut().clear();
         self.current.replace(None);
@@ -412,6 +447,7 @@ impl Persister {
         self.scheduled.replace(None);
         self.pending.replace(None);
         self.restored.set(0);
+        self.lost.borrow_mut().clear();
         // The first document of the new root is on its way.
         self.wanted.set(true);
         self.phase.set(Phase::Reading);
@@ -422,10 +458,17 @@ impl Persister {
         if let Some(timer) = self.timer.take() {
             timer.remove();
         }
+        let first = self
+            .first_change
+            .get()
+            .unwrap_or_else(std::time::Instant::now);
+        self.first_change.set(Some(first));
+        let delay = DEBOUNCE.min(MAX_DELAY.saturating_sub(first.elapsed()));
         let weak = Rc::downgrade(self);
-        let timer = glib::timeout_add_local_once(DEBOUNCE, move || {
+        let timer = glib::timeout_add_local_once(delay, move || {
             if let Some(p) = weak.upgrade() {
                 p.timer.replace(None);
+                p.first_change.set(None);
                 p.save(false);
             }
         });
@@ -598,6 +641,7 @@ impl Persister {
         if let Some(timer) = self.timer.take() {
             timer.remove();
         }
+        self.first_change.set(None);
         self.save(true);
     }
 
@@ -658,6 +702,7 @@ impl Persister {
                 label: info.label,
                 started_unix: info.started_unix,
                 name: info.name,
+                outside: info.outside,
             })
             .collect();
         Some(StateFile {
@@ -687,7 +732,8 @@ fn write_snapshot(
     write_state(file, contents.as_deref(), seq, committed)
 }
 
-/// Writes `contents` to `file` atomically (a private temporary file renamed over it), or removes
+/// Writes `contents` to `file` atomically (a private temporary file, flushed to the disk and
+/// renamed over it), or removes
 /// the file for `None`, unless a write with a later `seq` already happened; contents equal to the
 /// last committed ones are not written again.
 fn write_state(
@@ -726,12 +772,18 @@ fn write_state(
                     .map_err(shown)?;
             }
             let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+            // On the disk before the rename: after a crash of the machine the file holds this
+            // state or the one before, never an empty file (it keeps the only copy of the text
+            // the agent's changes replaced).
             let written = crate::fsutil::private_file_options()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&tmp)
-                .and_then(|mut f| f.write_all(contents))
+                .and_then(|mut f| {
+                    f.write_all(contents)?;
+                    f.sync_data()
+                })
                 .and_then(|()| std::fs::rename(&tmp, file));
             if let Err(e) = written {
                 let _ = std::fs::remove_file(&tmp);
@@ -794,6 +846,7 @@ async fn read(p: Rc<Persister>, generation: u64) {
                 started_unix: t.started_unix,
                 this_session: false,
                 name: t.name.clone(),
+                outside: t.outside,
             };
             (t.turn, info)
         })
@@ -814,10 +867,15 @@ async fn read(p: Rc<Persister>, generation: u64) {
 }
 
 /// Restores the saved reviews (see the module docs), then writes the state back (entries that no
-/// longer apply go).
+/// longer apply go). The user is told about the files whose changes could not be restored, and
+/// about those whose file another program changed meanwhile (see [`rebased`]).
 async fn apply(p: Rc<Persister>, generation: u64) {
     let current =
         |p: &Persister| p.generation.get() == generation && p.phase.get() == Phase::Applying;
+    // Files whose saved changes are lost, with why; files restored with another program's
+    // changes under review too.
+    let mut lost: Vec<(String, &str)> = Vec::new();
+    let mut rebased_files: Vec<String> = Vec::new();
     loop {
         let Some(entry) = p.saved.borrow_mut().pop() else {
             break;
@@ -825,7 +883,9 @@ async fn apply(p: Rc<Persister>, generation: u64) {
         let Some(state) = p.state.upgrade() else {
             return;
         };
+        let name = entry.review.path.display().to_string();
         let Ok(path) = state.workspace.root().resolve(&entry.review.path) else {
+            lost.push((name, "it cannot be found"));
             continue;
         };
         p.current.replace(Some(entry));
@@ -838,11 +898,61 @@ async fn apply(p: Rc<Persister>, generation: u64) {
             return;
         }
         // `take_saved` may have restored it meanwhile.
-        let (Some(doc), Some(entry)) = (doc, p.current.take()) else {
+        let Some(entry) = p.current.take() else {
             continue;
         };
-        match restorable(&doc, &entry) {
-            Some(review) => {
+        let Some(doc) = doc else {
+            // A file the agent created that is gone took its changes with it.
+            if path.exists() {
+                lost.push((name, "it cannot be read"));
+            } else if !entry.new_file {
+                lost.push((name, "it was deleted"));
+            }
+            continue;
+        };
+        let mut restored = restorable(&doc, &entry).map(|review| (review, entry.clone()));
+        if restored.is_none() && doc.review.borrow().is_none() {
+            if doc.is_dirty() {
+                lost.push((name, "it has unsaved changes"));
+            } else if doc.with_text(|text| fnv1a64(&[text.as_bytes()])) != entry.review.current_hash
+            {
+                // Another program changed the file since: the text the review was saved with
+                // may still be in the local history.
+                let hash = entry.review.current_hash;
+                let agent_text = crate::agent::history::text_with_hash(&state, hash).await;
+                if !current(&p) {
+                    return;
+                }
+                let still = state
+                    .workspace
+                    .get(&path)
+                    .is_some_and(|d| Rc::ptr_eq(&d, &doc))
+                    && doc.review.borrow().is_none()
+                    && !doc.is_dirty();
+                match agent_text.filter(|_| still) {
+                    Some(agent) => {
+                        // `None`: the other program's change left nothing of the agent's.
+                        restored =
+                            doc.with_text(|disk| rebased(&entry, &agent, disk))
+                                .map(|review| {
+                                    let rel = entry.review.path.clone();
+                                    let review_entry = SavedReview {
+                                        review: doc
+                                            .with_text(|text| review.to_persisted(rel, text)),
+                                        new_file: entry.new_file,
+                                    };
+                                    (review, review_entry)
+                                });
+                        if restored.is_some() {
+                            rebased_files.push(name);
+                        }
+                    }
+                    None => lost.push((name, "it was changed outside Lemma")),
+                }
+            }
+        }
+        match restored {
+            Some((review, entry)) => {
                 p.restored.set(p.restored.get() + review.hunks().len());
                 review_ui::adopt_review(&doc, review);
                 if entry.new_file {
@@ -861,10 +971,12 @@ async fn apply(p: Rc<Persister>, generation: u64) {
         return;
     }
     p.phase.set(Phase::Ready);
-    if let Some(state) = p.state.upgrade()
-        && p.restored.get() > 0
-    {
-        review_ui::announce_restored(&state, p.restored.get());
+    lost.extend(p.lost.take());
+    if let Some(state) = p.state.upgrade() {
+        if p.restored.get() > 0 {
+            review_ui::announce_restored(&state, p.restored.get());
+        }
+        report_restore(&state, &lost, &rebased_files);
     }
     p.schedule();
 }
@@ -877,6 +989,60 @@ fn restorable(doc: &DocRef, entry: &SavedReview) -> Option<FileReview> {
     }
     doc.with_text(|text| FileReview::from_persisted(&entry.review, text))
         .filter(|r| !r.hunks().is_empty())
+}
+
+/// The review of `entry` carried over to `disk`, the file's text now, from `agent`, the text it
+/// was saved with (which another program changed since): what changed in between goes through
+/// the review as a reload, as it does when Lemma sees another program change a file under review
+/// (it shows as changes to review, joining the agent's where they touch). `None` when nothing is
+/// left to review.
+fn rebased(entry: &SavedReview, agent: &str, disk: &str) -> Option<FileReview> {
+    let mut review = FileReview::from_persisted(&entry.review, agent)?;
+    review.on_edits(
+        &lemma_review::minimal_edits(agent, disk),
+        lemma_core::Origin::Reload,
+    );
+    review.recompute(disk);
+    (!review.hunks().is_empty()).then_some(review)
+}
+
+/// Tells the user which files' saved changes could not be restored, and why (what the agent
+/// changed in them is no longer marked, and would otherwise pass for the user's own text), and
+/// which were restored with another program's changes under review too.
+fn report_restore(state: &WindowState, lost: &[(String, &str)], rebased: &[String]) {
+    let mut lines = Vec::new();
+    if !lost.is_empty() {
+        let files: Vec<String> = lost
+            .iter()
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
+        lines.push(format!(
+            "The pending changes to {} could not be restored from your last session: what the \
+             agent changed there is no longer marked for review",
+            files.join(", ")
+        ));
+    }
+    if !rebased.is_empty() {
+        lines.push(format!(
+            "{} changed outside Lemma since your last session: those changes are under review \
+             too",
+            match rebased {
+                [one] => format!("{one} was"),
+                many => format!("{} were", many.join(", ")),
+            }
+        ));
+    }
+    for line in lines {
+        tracing::info!("review state: {line}");
+        // Until it is dismissed: the window may have just opened, with the user looking
+        // elsewhere.
+        let toast = adw::Toast::builder()
+            .title(line)
+            .use_markup(false)
+            .timeout(0)
+            .build();
+        state.toasts.add_toast(toast);
+    }
 }
 
 #[cfg(test)]
@@ -912,8 +1078,7 @@ mod tests {
     #[test]
     fn writes_are_atomic_private_and_ordered() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("lemma-persist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir("lemma-persist-").unwrap();
         let file = dir.join("review").join("x.json");
         let committed = Mutex::new(Committed::default());
         write_state(&file, Some(b"two"), 2, &committed).unwrap();

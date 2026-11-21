@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_app::editor::Editor;
 use lemma_app::editor::goto;
@@ -28,6 +30,10 @@ use std::time::{Duration, Instant};
 fn main() -> ExitCode {
     let mut tests: Vec<common::Test> = vec![
         ("results_are_grouped_in_project_order", grouped_results),
+        (
+            "the_build_directory_is_left_out_however_it_is_spelled",
+            build_dir_left_out,
+        ),
         ("results_equal_the_matcher_with_every_option", options_match),
         ("live_buffer_text_wins_over_the_disk", live_text_wins),
         ("empty_invalid_and_no_results_pages", pages),
@@ -36,6 +42,10 @@ fn main() -> ExitCode {
             activation,
         ),
         ("project_search_action_prefills_the_selection", show_action),
+        (
+            "a_closed_window_leaves_no_search_behind",
+            closed_window_search,
+        ),
         ("replace_preview_shows_old_and_new_text", replace_preview),
         (
             "replace_all_makes_reviewable_hunks_reject_restores",
@@ -53,6 +63,10 @@ fn main() -> ExitCode {
         // Find and replace in the current file.
         ("find_bar_highlights_counts_and_wraps", find_counts),
         ("find_bar_options_and_invalid_expressions", find_options),
+        (
+            "find_bar_leaves_a_click_into_the_editor_alone",
+            find_click_before_the_count,
+        ),
         (
             "find_bar_steps_before_the_count_in_the_background",
             find_steps_before_the_count,
@@ -153,7 +167,7 @@ fn fixture_in(dir: &Path, files: &[(&str, &str)], paths: Option<Paths>) -> Fixtu
     common::pump_until(TIMEOUT, || state.window.is_mapped());
     Fixture {
         state,
-        dir: dir.canonicalize().unwrap(),
+        dir: dir.canonical().unwrap(),
     }
 }
 
@@ -197,11 +211,13 @@ impl Fixture {
         panel
     }
 
+    /// `path` below the project, with `/` between the names on every system.
     fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.dir)
             .unwrap_or(path)
             .display()
             .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
     }
 }
 
@@ -248,6 +264,33 @@ fn expected(file: &str, text: &str, query: &Query) -> Vec<String> {
                 .map(move |r| format!("{file}:{}:{}-{}", h.line + 1, r.start, r.end))
         })
         .collect()
+}
+
+/// A build output directory that is not hidden is left out of the walk, also when
+/// `[build] outdir` spells it `./build` or `build/`.
+fn build_dir_left_out() {
+    let mut files = PROJECT.to_vec();
+    files.push(("build/main.tex", "sheaf in the build directory\n"));
+    let fx = fixture("build-dir", &files);
+    fx.open_project();
+    for (outdir, searched) in [
+        ("build", false),
+        ("./build", false),
+        ("build/", false),
+        ("./out", true),
+        (".", true),
+    ] {
+        let mut config = (*fx.state.config.get()).clone();
+        config.build.outdir = outdir.into();
+        fx.state.set_config(Rc::new(config));
+        let panel = fx.search(&Query::plain("sheaf"));
+        let listed = panel
+            .files()
+            .iter()
+            .any(|f| fx.rel(&f.path) == "build/main.tex");
+        assert_eq!(listed, searched, "outdir {outdir:?}");
+        assert_eq!(panel.files().len(), 6 + usize::from(searched));
+    }
 }
 
 fn grouped_results() {
@@ -381,6 +424,18 @@ fn pages() {
         panel.message(),
         "Nothing matches “no such text anywhere” in 6 files"
     );
+    // The pattern and the error are text in the page's markup.
+    let before = common::logged_problems();
+    let panel = fx.search(&Query::plain("a & b <x>"));
+    assert_eq!(panel.page(), "none");
+    assert!(
+        panel.message().contains("“a &amp; b &lt;x&gt;”"),
+        "{}",
+        panel.message()
+    );
+    let panel = fx.search(&Query::regex("(<i>"));
+    assert_eq!(panel.page(), "error");
+    common::assert_no_new_problems(before);
     panel.query_entry().set_text("");
     panel.search_now();
     assert_eq!(panel.page(), "empty");
@@ -473,6 +528,42 @@ fn show_action() {
     editor.buffer().select_range(&a, &end);
     search_panel::show(&fx.state);
     assert_eq!(panel.query_entry().text(), "presheaf");
+    // With Regular Expression on, the selection is searched as it is: escaped.
+    panel.set_options(true, false, false);
+    let title = "\\title{A Sheaf}";
+    let at = text.find(title).unwrap();
+    editor.buffer().select_range(
+        &doc.iter_at_byte(at).unwrap(),
+        &doc.iter_at_byte(at + title.len()).unwrap(),
+    );
+    search_panel::show(&fx.state);
+    assert_eq!(panel.query_entry().text(), "\\\\title\\{A Sheaf\\}");
+    common::pump_until(TIMEOUT, || {
+        panel.summary().is_some_and(|s| s.matches == 1) && !panel.is_searching()
+    });
+    assert_eq!(panel.page(), "results");
+}
+
+/// A window closed after a project search frees its Search page, and the timer that drops the
+/// page's copies of the open documents later does no harm (it used to be removed again by the
+/// page's destructor after it had run: glib-rs panics on that).
+fn closed_window_search() {
+    search_panel::set_live_cache_lifetime(Duration::from_millis(100));
+    let fx = fixture("closed-search-a", PROJECT);
+    fx.open_project();
+    let panel = Rc::downgrade(&fx.search(&Query::plain("sheaf")));
+    let state = Rc::downgrade(&fx.state);
+    drop(fx);
+    common::pump_until(TIMEOUT, || state.upgrade().is_none());
+    // The copies' timer runs out after the window is gone.
+    common::pump_for(Duration::from_millis(400));
+    let fx = fixture("closed-search-b", PROJECT);
+    fx.panel();
+    search_panel::set_live_cache_lifetime(search_panel::LIVE_CACHE_LIFETIME);
+    assert!(
+        panel.upgrade().is_none(),
+        "the closed window's page is freed"
+    );
 }
 
 fn replace_preview() {
@@ -673,9 +764,14 @@ fn replace_and_agent_turns() {
             "{want}: {labels:?}"
         );
     }
-    // With the agent's changes under review the banner names Claude.
+    // With the agent's changes and the replace's under review the banner names neither: it
+    // said "Claude changed …" of the replace's changes too.
     fx.state.review.get().unwrap().refresh();
-    assert!(fx.state.banner.title().starts_with("Claude changed"));
+    assert!(
+        fx.state.banner.title().starts_with("Changes to review · "),
+        "{}",
+        fx.state.banner.title()
+    );
     // The agent's next turn comes after the replace; `:KeepTurn 1` still means the agent's
     // first turn.
     review_ui::on_turn_started(&fx.state, 2);
@@ -1043,6 +1139,35 @@ fn find_counts() {
     assert_eq!(selected(&editor), Some((0, "sheaf".into())));
     common::pump_for(Duration::from_millis(30));
     assert!(editor.view().has_focus());
+}
+
+/// A click into the editor while a new query's search still counts (it scans in idle steps) is
+/// where the user went on: the first match is not selected after it, and the view stays.
+fn find_click_before_the_count() {
+    let (fx, editor, find) = find_fixture("find-click");
+    run(&fx, "win.find");
+    common::pump_until(TIMEOUT, || has_focus_within(find.entry()));
+    find.search_now("sheaf");
+    assert_eq!(selected(&editor), None);
+    // What a click at "stalk" does: the view takes the focus, the cursor goes there.
+    let stalk = FIND_DOC.find("stalk").unwrap();
+    editor.view().grab_focus();
+    editor.place_cursor_at(stalk);
+    let status = counted(&find);
+    assert_eq!(selected(&editor), None);
+    let buffer = editor.buffer();
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    assert_eq!(editor.document().byte_offset(&cursor), stalk);
+    assert_eq!(
+        (status.total, status.current, status.label.as_str()),
+        (Some(4), None, "4 matches")
+    );
+    assert!(editor.view().has_focus());
+    // A new query selects its first match again.
+    find.search_now("glue");
+    counted(&find);
+    let glue = FIND_DOC.find("glue").unwrap();
+    assert_eq!(selected(&editor), Some((glue, "glue".into())));
 }
 
 fn find_options() {

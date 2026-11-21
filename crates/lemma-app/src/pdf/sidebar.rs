@@ -204,7 +204,16 @@ pub struct Strip {
     outline_seen: Cell<bool>,
     /// Some entry has children (rows then leave room for the expander arrow).
     nested: Cell<bool>,
+    /// Where the tree's rows point, in their order (`None` for a link elsewhere), for
+    /// [`Strip::current_bookmark`]; `None` until the rows or their destinations change.
+    /// Reading every row from the tree at each scroll step took about 1 ms for 5000 entries
+    /// (`gtk_pdf_m3`'s `perf_bookmark_followed_per_scroll_step`).
+    row_dests: RefCell<Option<Vec<RowDest>>>,
 }
+
+/// Where a bookmark row points: the 0-based page and the height on it (bp), `None` for a link
+/// elsewhere.
+type RowDest = Option<(u32, f64)>;
 
 impl Strip {
     fn send(&self, cmd: PdfCmd) {
@@ -562,6 +571,7 @@ impl Strip {
             if *self.outline_items.borrow() != items {
                 set_destinations(&self.root_nodes(), &items);
                 self.outline_items.replace(items);
+                self.row_dests.replace(None);
                 self.refresh_bookmark_rows();
             }
             self.follow_view();
@@ -704,20 +714,22 @@ impl Strip {
         let zoom = self.view.zoom().max(0.01);
         let reach = (f64::from(self.view.height()) / 3.0).max(JUMP_MARGIN + 8.0);
         let here = (anchor.page, anchor.frac * ph + reach / zoom);
-        let mut best = None;
-        for i in 0..self.tree.n_items() {
-            let Some(node) = self.tree.row(i).and_then(|r| row_node(&r)) else {
-                continue;
-            };
-            let LinkDest::Page { page, y_bp } = *node.dest.borrow() else {
-                continue;
-            };
-            let at = (page, y_bp.unwrap_or(0.0));
-            if at.0 < here.0 || (at.0 == here.0 && at.1 <= here.1) {
-                best = Some(i);
-            }
-        }
-        best
+        let mut dests = self.row_dests.borrow_mut();
+        let dests = dests.get_or_insert_with(|| {
+            (0..self.tree.n_items())
+                .map(|i| {
+                    let node = self.tree.row(i).and_then(|r| row_node(&r))?;
+                    let LinkDest::Page { page, y_bp } = *node.dest.borrow() else {
+                        return None;
+                    };
+                    Some((page, y_bp.unwrap_or(0.0)))
+                })
+                .collect()
+        });
+        let best = dests.iter().rposition(|at| {
+            at.is_some_and(|(page, y)| page < here.0 || (page == here.0 && y <= here.1))
+        })?;
+        u32::try_from(best).ok()
     }
 
     /// The user selected thumbnail `page`.
@@ -1107,6 +1119,7 @@ pub fn install(state: &Rc<WindowState>) {
             bookmark_pages: RefCell::new(Vec::new()),
             outline_seen: Cell::new(false),
             nested: Cell::new(false),
+            row_dests: RefCell::new(None),
         }
     });
     let switcher = adw::InlineViewSwitcher::builder()
@@ -1122,6 +1135,13 @@ pub fn install(state: &Rc<WindowState>) {
     state.pdf_sidebar.slot.set_child(Some(&root));
     pdf.set_strip(strip.clone());
 
+    // Rows expanded, collapsed or replaced: where they point is read again.
+    let weak = Rc::downgrade(&strip);
+    strip.tree.connect_items_changed(move |_, _, _, _| {
+        if let Some(strip) = weak.upgrade() {
+            strip.row_dests.replace(None);
+        }
+    });
     let weak = Rc::downgrade(&strip);
     strip
         .thumbs_selection

@@ -252,8 +252,8 @@ pub enum AgentEvent {
         request: u64,
     },
     /// Exactly once per accepted `Prompt`: the agent's stop reason, `Cancelled` after `Cancel` or
-    /// `Shutdown`, `EndTurn` when the turn ended without one (an `Error` comes first when the agent
-    /// answered the prompt with an error).
+    /// `Shutdown` and when the agent died before it answered, `EndTurn` when the turn ended
+    /// without one (an `Error` comes first when the agent answered the prompt with an error).
     TurnEnded(StopReason),
     /// A message for the user (start-up failures carry the agent's stderr tail).
     Error(String),

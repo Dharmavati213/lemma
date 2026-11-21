@@ -25,8 +25,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     // Rejecting a file the agent created moves it to the trash: keep that out of the user's.
-    let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-regress-a-data-{}", std::process::id()));
+    let data = common::target_tmpdir().join(format!("lemma-regress-a-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
@@ -275,6 +274,7 @@ fn alt_u_all_files() {
 // ----- A4: Alt+U silently reverts an older decision when the last one's document is gone -----
 
 fn alt_u_skips_gone_document() {
+    common::require_private_trash();
     // A rejected new file goes to the trash; Alt+U must not re-open an older accept elsewhere.
     let f = fixture("a4", &[("main.tex", &lines(20))]);
     let editor = f.open("main.tex");

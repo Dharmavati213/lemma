@@ -1098,26 +1098,74 @@ fn skip_optional(s: &str) -> &str {
     }
 }
 
-/// Where a new preamble line goes: after the last line holding `\usepackage` (else
-/// `\documentclass`) before `\begin{document}`. The byte offset of the start of the line after
-/// it. `None` without `\documentclass`.
+/// Where a new preamble line goes: after the last command of `after` (else `\documentclass`)
+/// before `\begin{document}`, on the line after the one where its arguments end (options are
+/// often spread over several lines), or right before a `\begin{document}` on that line. The byte
+/// offset of the start of that line. `None` without `\documentclass`.
 fn preamble_insertion_point(text: &str, after: &[&str]) -> Option<usize> {
-    let end = begin_document(text).unwrap_or(text.len());
-    let mut class_line = None;
+    let preamble = &text[..begin_document(text).unwrap_or(text.len())];
+    let mut class_end = None;
     let mut last = None;
-    for (start, line) in lines_with_offsets(&text[..end]) {
+    for (start, line) in lines_with_offsets(preamble) {
         let code = code_part(line);
-        if code.contains("\\documentclass") {
-            class_line = Some(start + line.len());
+        let ends = |name: &str| {
+            let at = code.rfind(name)?;
+            arguments_end(preamble, start + at + name.len())
+        };
+        if let Some(end) = ends("\\documentclass") {
+            class_end = Some(end);
         }
-        if after.iter().any(|a| code.contains(a)) {
-            last = Some(start + line.len());
+        if let Some(end) = after.iter().filter_map(|a| ends(a)).max() {
+            last = Some(end);
         }
     }
-    let line_end = last.or(class_line)?;
-    // A `\documentclass` or `\usepackage` spanning several lines ends where its braces close;
-    // keep it simple and refuse when the line leaves a brace open.
-    Some((line_end + 1).min(text.len()))
+    let end = last.or(class_end)?;
+    Some(
+        preamble[end..]
+            .find('\n')
+            .map_or(preamble.len(), |k| end + k + 1),
+    )
+}
+
+/// The end of the `[…]` and `{…}` arguments (and a `*`) of the command whose name ends at byte
+/// `at` of `text`, across lines and comments. `None` when one of them is not closed in `text`.
+fn arguments_end(text: &str, mut at: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let comment_end = |at: usize| text[at..].find('\n').map_or(b.len(), |k| at + k);
+    if b.get(at) == Some(&b'*') {
+        at += 1;
+    }
+    let mut end = at;
+    loop {
+        while let Some(&c) = b.get(at) {
+            match c {
+                b' ' | b'\t' | b'\r' | b'\n' => at += 1,
+                b'%' => at = comment_end(at),
+                _ => break,
+            }
+        }
+        if !matches!(b.get(at), Some(b'[' | b'{')) {
+            return Some(end);
+        }
+        let mut depth = 0usize;
+        loop {
+            match *b.get(at)? {
+                b'\\' => at += 1,
+                b'%' => at = comment_end(at),
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        at += 1;
+        end = at;
+    }
 }
 
 /// The edit that loads `package` in the preamble of the root document `text`: a
@@ -1553,6 +1601,42 @@ mod tests {
             "\\documentclass{article}\n\\newtheorem{theorem}{Theorem}[section]\n\\newtheorem{lemma}[theorem]{Lemma}\n\\begin{document}\n"
         );
         assert_eq!(usepackage_edit("no class", "x"), None);
+    }
+
+    /// A `\documentclass` or `\usepackage` whose options span several lines: the new line goes
+    /// after the line that closes it, not into its options.
+    #[test]
+    fn preamble_lines_go_after_commands_spanning_lines() {
+        let doc = "\\documentclass[\n  a4paper,\n  12pt\n]{article}\n\\usepackage[\n  colorlinks, % [ blue\n  linkcolor=blue\n]{hyperref}\n\\begin{document}\nx\n\\end{document}\n";
+        assert_eq!(
+            apply(doc, &[usepackage_edit(doc, "bm").unwrap()]),
+            "\\documentclass[\n  a4paper,\n  12pt\n]{article}\n\\usepackage[\n  colorlinks, % [ blue\n  linkcolor=blue\n]{hyperref}\n\\usepackage{bm}\n\\begin{document}\nx\n\\end{document}\n"
+        );
+        let class = "\\documentclass[\n  12pt\n]{article}\n\\begin{document}\n";
+        assert_eq!(
+            apply(class, &[usepackage_edit(class, "xcolor").unwrap()]),
+            "\\documentclass[\n  12pt\n]{article}\n\\usepackage{xcolor}\n\\begin{document}\n"
+        );
+        let thm = "\\documentclass{article}\n\\newtheorem{theorem}{Theorem}[\n  section]\n\\begin{document}\n";
+        assert_eq!(
+            apply(
+                thm,
+                &[newtheorem_edit(thm, "lemma", Some("theorem")).unwrap()]
+            ),
+            "\\documentclass{article}\n\\newtheorem{theorem}{Theorem}[\n  section]\n\\newtheorem{lemma}[theorem]{Lemma}\n\\begin{document}\n"
+        );
+        // `\begin{document}` on the same line: before it.
+        let same = "\\documentclass{article}\n\\usepackage{x}\\begin{document}\nx\n";
+        assert_eq!(
+            apply(same, &[usepackage_edit(same, "bm").unwrap()]),
+            "\\documentclass{article}\n\\usepackage{x}\\usepackage{bm}\n\\begin{document}\nx\n"
+        );
+        // One that never closes: after the line before it.
+        let open = "\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage[draft\n\\begin{document}\n";
+        assert_eq!(
+            apply(open, &[usepackage_edit(open, "bm").unwrap()]),
+            "\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage{bm}\n\\usepackage[draft\n\\begin{document}\n"
+        );
     }
 
     #[test]

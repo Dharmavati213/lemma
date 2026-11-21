@@ -276,16 +276,20 @@ pub fn rank_files(files: &[FileCandidate], query: &str) -> Vec<Ranked> {
     out
 }
 
-/// The last component of a displayed path.
+/// The last component of a displayed path (also after a `\` on Windows, where displayed paths
+/// have them).
 fn file_name(display: &str) -> &str {
-    display.rsplit('/').next().unwrap_or(display)
+    display
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or(display)
 }
 
 /// The picker row of `file`; `positions` are the matched byte offsets of its display path.
 fn file_row(file: &FileCandidate, positions: &[usize]) -> PickerRow {
     let name = file_name(&file.display);
     let dir_len = file.display.len() - name.len();
-    let dir = file.display[..dir_len].trim_end_matches('/');
+    let dir = file.display[..dir_len].trim_end_matches(std::path::is_separator);
     let (dir_positions, name_positions): (Vec<usize>, Vec<usize>) =
         positions.iter().partition(|&&p| p < dir_len);
     PickerRow {
@@ -402,6 +406,19 @@ pub fn line_key(path: &Path, line: u32, column: Option<u32>) -> String {
         column.unwrap_or(0),
         path.to_string_lossy()
     )
+}
+
+/// The file a row's key names (its path, or the path in a [`line_key`]). Keys are text, so the
+/// key of a path that is not UTF-8 (a Latin-1 file name) has replacement characters instead of
+/// its bytes: that path is found again among `files`, else a new file of that name would open.
+fn real_path(files: &[FileCandidate], shown: &Path) -> PathBuf {
+    let text = shown.to_string_lossy();
+    if text.contains(char::REPLACEMENT_CHARACTER)
+        && let Some(file) = files.iter().find(|f| f.path.to_string_lossy() == text)
+    {
+        return file.path.clone();
+    }
+    shown.to_path_buf()
 }
 
 /// The target of a key made by [`line_key`].
@@ -552,7 +569,7 @@ pub fn show(state: &Rc<WindowState>) {
     } else {
         candidates(state)
     }));
-    let shown = files.clone();
+    let (shown, listed) = (files.clone(), files.clone());
     let window: Weak<WindowState> = Rc::downgrade(state);
     let picker = Picker::open(
         state,
@@ -565,10 +582,18 @@ pub fn show(state: &Rc<WindowState>) {
                 Some(state) => rows(&state, &shown.borrow(), query),
                 None => Vec::new(),
             }),
-            choose: Box::new(|state, row| {
+            choose: Box::new(move |state, row| {
                 let state = state.clone();
-                let line = line_target(&row.key);
-                let path = PathBuf::from(&row.key);
+                let real = |shown: &Path| real_path(&listed.borrow(), shown);
+                let line = line_target(&row.key).map(|target| match target {
+                    GotoTarget::LineColumn { path, line, column } => GotoTarget::LineColumn {
+                        path: real(&path),
+                        line,
+                        column,
+                    },
+                    other => other,
+                });
+                let path = real(Path::new(&row.key));
                 glib::spawn_future_local(async move {
                     let result = match line {
                         Some(target) => goto::navigate(&state, target).await,
@@ -670,6 +695,22 @@ mod tests {
         );
         assert!(listed(Path::new("/p/a.tex")) && listed(Path::new("/p/latexmkrc")));
         assert!(!listed(Path::new("/p/fig.png")) && !listed(Path::new("/p/main.pdf")));
+    }
+
+    /// A row shows the file's name and, below it, its folder: on Windows too, whose displayed
+    /// paths have `\`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_rows_show_name_and_folder() {
+        let file = FileCandidate {
+            path: r"C:\p\ch\a.tex".into(),
+            display: display_path(Path::new(r"C:\p\ch\a.tex"), Path::new(r"C:\p"), None),
+            source: Source::Walk,
+            dirty: false,
+        };
+        assert_eq!(file_name(&file.display), "a.tex");
+        let row = file_row(&file, &[]);
+        assert_eq!((row.title.as_str(), row.subtitle.as_str()), ("a.tex", "ch"));
     }
 
     #[test]

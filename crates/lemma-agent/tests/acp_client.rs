@@ -956,10 +956,11 @@ fn death_during_a_turn_ends_it_and_exits() {
         .iter()
         .filter(|e| !matches!(e, AgentEvent::MessageChunk(_) | AgentEvent::Commands(_)))
         .collect();
+    // Cut short, not finished: the agent never answered the prompt.
     assert_eq!(
         tail,
         [
-            &AgentEvent::TurnEnded(StopReason::EndTurn),
+            &AgentEvent::TurnEnded(StopReason::Cancelled),
             &AgentEvent::Exited(Some(7))
         ]
     );
@@ -1298,7 +1299,7 @@ fn an_agent_that_closes_its_stdout_is_killed() {
     assert_eq!(
         tail,
         [
-            &AgentEvent::TurnEnded(StopReason::EndTurn),
+            &AgentEvent::TurnEnded(StopReason::Cancelled),
             &AgentEvent::Exited(None)
         ]
     );

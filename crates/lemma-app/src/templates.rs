@@ -5,8 +5,10 @@
 //!   beamer, a thesis as a book with chapters, and a minimal document; their files are
 //!   `data/templates/<id>/`, compiled in). Create writes the template's files into the chosen
 //!   folder, all or nothing: when any of them exists already nothing is written and the dialog
-//!   says which. Then `main.tex` opens: in this window when it lies in the project (in an
-//!   empty window the folder becomes the project root), else in a new Lemma window.
+//!   says which, and a write that fails part of the way takes back the files and the folders it
+//!   made (never what was there before). Then `main.tex` opens: in this window when it lies in
+//!   the project (in an empty window the folder becomes the project root), else in a new Lemma
+//!   window.
 //! - **Project instructions:** `win.create-project-instructions` ("Create Project
 //!   Instructions") writes `CLAUDE.md` in the project root with the conventions inferred from the
 //!   project ([`infer`]): the main document and its class, the engine, the bibliography tool
@@ -143,22 +145,47 @@ pub fn create(template: &Template, dir: &Path) -> Result<PathBuf, String> {
         ));
     }
     let mut written: Vec<PathBuf> = Vec::new();
+    // The directories this call made, parents first.
+    let mut made: Vec<PathBuf> = Vec::new();
     for (file, text) in template.files {
         let path = dir.join(file);
         let result = path
             .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_or(Ok(()), |parent| create_dirs(parent, &mut made))
             .and_then(|()| write_new(&path, text));
         if let Err(e) = result {
-            // All or nothing: take back what this call wrote.
+            // All or nothing: take back what this call wrote, and the directories it made
+            // (only while they are empty: nothing that was there before, or came meanwhile,
+            // goes).
             for path in written {
                 let _ = std::fs::remove_file(path);
+            }
+            for dir in made.iter().rev() {
+                let _ = std::fs::remove_dir(dir);
             }
             return Err(format!("Cannot write {}: {e}", path.display()));
         }
         written.push(path);
     }
     Ok(dir.join(MAIN_FILE))
+}
+
+/// `create_dir_all(dir)`, adding the directories it made to `made` (parents first), also
+/// when it fails part of the way.
+fn create_dirs(dir: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !d.as_os_str().is_empty() && d.symlink_metadata().is_err())
+        .collect();
+    let created = std::fs::create_dir_all(dir);
+    made.extend(
+        missing
+            .into_iter()
+            .rev()
+            .filter(|d| d.is_dir())
+            .map(Path::to_path_buf),
+    );
+    created
 }
 
 /// Writes `text` into the new file `path`; an existing file is an error.
@@ -168,8 +195,16 @@ fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()
+    // The file this call created holds all of `text`, or goes again (a full disk): a later try
+    // would refuse a file that "exists already", and a cut CLAUDE.md would be opened as it is.
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// The actions' names.
@@ -746,7 +781,10 @@ fn language_name(name: &str) -> String {
 
 /// The `CLAUDE.md` text for `facts`.
 pub fn instructions_text(facts: &ProjectFacts) -> String {
-    let code = |p: &Path| format!("`{}`", p.display());
+    // With `/` between the names on every system, as LaTeX writes them and as the agent is
+    // shown every path: the file belongs to the project, and other systems read it too
+    // (Windows' `lit\refs.bib` is no path there).
+    let code = |p: &Path| format!("`{}`", lemma_core::agent_path(p));
     let list = |paths: &[PathBuf]| paths.iter().map(|p| code(p)).collect::<Vec<_>>().join(", ");
     let mut out = String::from(
         "# Project instructions\n\n\
@@ -882,6 +920,63 @@ mod tests {
         assert!(template("thesis").unwrap().files[0].1.contains("{book}"));
     }
 
+    /// A create that fails part of the way takes back the files and the directories it made,
+    /// and nothing that was there before.
+    #[test]
+    fn a_failed_create_leaves_what_was_there() {
+        // Its second file needs a directory where the first file is.
+        const BROKEN: Template = Template {
+            id: "broken",
+            title: "Broken",
+            description: "",
+            files: &[
+                ("main.tex", "main"),
+                ("sub/a.tex", "a"),
+                ("sub/a.tex/b.tex", "b"),
+            ],
+        };
+        let base = tempfile::tempdir().unwrap();
+        let listing = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = walk(dir)
+                .iter()
+                .map(|p| p.strip_prefix(dir).unwrap().display().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        let dir = base.path().join("new/project");
+        let error = create(&BROKEN, &dir).unwrap_err();
+        assert!(error.starts_with("Cannot write "), "{error}");
+        assert_eq!(listing(base.path()), Vec::<String>::new());
+        // What existed stays: the folder, a file in it, an empty folder.
+        let dir = base.path().join("kept");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "mine").unwrap();
+        let before = listing(base.path());
+        create(&BROKEN, &dir).unwrap_err();
+        assert_eq!(listing(base.path()), before);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "mine"
+        );
+        // Then a template that can be written is.
+        let main = create(template("thesis").unwrap(), &dir).unwrap();
+        assert!(main.is_file() && dir.join("chapters/introduction.tex").is_file());
+    }
+
+    /// Every file and directory under `dir`.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            }
+            out.push(path);
+        }
+        out
+    }
+
     #[test]
     fn helpers_read_the_preamble() {
         let text = "\\documentclass[11pt]{amsart}\n\\usepackage[british, main=ngerman]{babel}\n\
@@ -914,5 +1009,25 @@ mod tests {
             Some("Klingon")
         );
         assert_eq!(language("\\usepackage{amsmath}"), None);
+    }
+
+    /// The instructions are a file of the project: its paths have `/` on every system.
+    #[test]
+    fn instructions_name_files_with_slashes() {
+        let facts = ProjectFacts {
+            main: Some(Path::new("src").join("paper.tex")),
+            bib_files: vec![Path::new("lit").join("refs.bib")],
+            macros: vec![Path::new("tex").join("macros").join("notation.tex")],
+            ..ProjectFacts::default()
+        };
+        let text = instructions_text(&facts);
+        for name in [
+            "`src/paper.tex`",
+            "`lit/refs.bib`",
+            "`tex/macros/notation.tex`",
+        ] {
+            assert!(text.contains(name), "{name} in\n{text}");
+        }
+        assert!(!text.contains('\\'), "{text}");
     }
 }

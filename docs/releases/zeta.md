@@ -60,7 +60,7 @@ Measured in release builds:
 |---|---|---|
 | macOS 15+ (Apple silicon) | `Lemma-zeta-macos-arm64.dmg` | Open it and drag Lemma to Applications (first start: see below) |
 | Windows 10 1903+ and 11 (x86_64) | `Lemma-zeta-windows-x86_64-setup.exe` | Run it (SmartScreen: see below) |
-| Windows, portable | `Lemma-zeta-windows-x86_64.zip` | Unzip anywhere and start `Lemma.exe` |
+| Windows, portable | `Lemma-zeta-windows-x86_64.zip` | Unzip anywhere and start `Lemma\bin\lemma.exe` |
 | Ubuntu 26.04+, Debian sid | `lemma_0.2.0-1_amd64.deb` | `sudo apt install ./lemma_0.2.0-1_amd64.deb` |
 | Fedora 44+ | `lemma-0.2.0-1.fc44.x86_64.rpm` | `sudo dnf install ./lemma-0.2.0-1.fc44.x86_64.rpm` |
 | Arch Linux | `lemma-0.2.0-1-x86_64.pkg.tar.zst` | `sudo pacman -U ./lemma-0.2.0-1-x86_64.pkg.tar.zst` |

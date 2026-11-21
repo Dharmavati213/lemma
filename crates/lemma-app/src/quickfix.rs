@@ -516,7 +516,7 @@ async fn file_not_found(
         .collect();
     let best_stem = explain::closest(&stem, candidates.iter().map(|(s, _)| s.as_str()))?;
     let (_, file) = candidates.iter().find(|(s, _)| s == best_stem)?;
-    let found = dir_part.join(file).to_string_lossy().into_owned();
+    let found = sibling_name(&written, file);
     let replacement = explain::replacement_name(&written, &found);
     // The document may have changed while the directory was read: locate the argument again.
     let (start, text) = line_text(&doc, line)?;
@@ -530,4 +530,27 @@ async fn file_not_found(
             text: replacement,
         }],
     })
+}
+
+/// The name of `file`, in the directory of the name `written` in the document, as LaTeX takes
+/// it: directories separated by `/` on Windows too (`Path::join` would put a `\` there, which
+/// starts a command).
+fn sibling_name(written: &str, file: &str) -> String {
+    match written.rfind('/') {
+        Some(slash) => format!("{}{file}", &written[..=slash]),
+        None => file.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_names_use_forward_slashes() {
+        assert_eq!(sibling_name("plot", "plots.pdf"), "plots.pdf");
+        assert_eq!(sibling_name("figs/plot.png", "plot2.png"), "figs/plot2.png");
+        assert_eq!(sibling_name("./a/b/plot", "plots.pdf"), "./a/b/plots.pdf");
+        assert_eq!(sibling_name("../figs/plot", "plot.pdf"), "../figs/plot.pdf");
+    }
 }

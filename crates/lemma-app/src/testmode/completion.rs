@@ -1,11 +1,11 @@
 //! `--demo completion` (WP2.9a): the completion popup after `\fr` in math.
 //!
 //! [`run_demo`] uses the open document (FILE), or writes a small demo document into a temporary
-//! directory and opens it. It finds a `\fr` in math, or puts one at the first math position
-//! (inserting a display formula when the document has none; the text is not saved), places the
-//! cursor right after it, opens
-//! the completion popup as typing the `r` would, and resolves once the popup shows its
-//! proposals, so `--snapshot` captures it (popovers are drawn into the snapshot, see
+//! directory (removed when the app ends, `super::demo_dir`) and opens it. It finds a `\fr` in
+//! math, or puts one at the first math position (inserting a display formula when the document
+//! has none; the text is not saved), places the cursor right after it, opens the completion
+//! popup as typing the `r` would, and resolves once the popup shows its proposals, so
+//! `--snapshot` captures it (popovers are drawn into the snapshot, see
 //! `testmode::snapshot_png`).
 
 use crate::editor::{Editor, completion};
@@ -121,8 +121,7 @@ fn cursor_on_screen(editor: &Editor) -> bool {
 }
 
 async fn open_demo_document(state: &Rc<WindowState>) -> Result<Rc<Editor>, String> {
-    let dir = glib::tmp_dir().join(format!("lemma-demo-completion-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let dir = super::demo_dir("lemma-demo-completion-")?;
     let path = dir.join("fractions.tex");
     std::fs::write(&path, DEMO_TEX).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     state.open_file(&path).await

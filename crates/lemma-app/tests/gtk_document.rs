@@ -58,6 +58,26 @@ fn main() -> ExitCode {
             workspace_open_missing_and_dedup,
         ),
     ];
+    #[cfg(unix)]
+    tests.push((
+        "saves_keep_links_and_permissions",
+        saves_keep_links_and_permissions,
+    ));
+    #[cfg(unix)]
+    tests.push((
+        "closed_documents_are_never_read_from_a_pipe",
+        closed_documents_never_read_a_pipe,
+    ));
+    #[cfg(unix)]
+    tests.push((
+        "a_save_never_reads_a_pipe_its_file_became",
+        saves_never_read_a_pipe,
+    ));
+    #[cfg(windows)]
+    tests.push((
+        "a_save_that_cannot_replace_the_file_says_so_or_waits",
+        saves_of_a_file_held_open,
+    ));
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_apply_edits_replace_all", perf_replace_all));
     }
@@ -696,6 +716,7 @@ fn save_round_trip() {
         ("crlf.tex", b"\\section{A}\r\nline\r\n".to_vec()),
         ("latin1.tex", b"caf\xe9 au lait\n".to_vec()),
         ("empty.tex", Vec::new()),
+        ("bom.tex", b"\xef\xbb\xbf\\section{A}\nx\n".to_vec()),
     ];
     let ws = workspace(&dir);
     for (name, bytes) in cases {
@@ -801,6 +822,66 @@ fn external_modification_is_refused() {
     block_on(doc.save()).expect("save after overwrite");
 }
 
+/// Windows does not let a file be replaced while a program holds it open without sharing
+/// deletes, as the C library's `open` does (a viewer, a virus scanner, TeX reading the file, or
+/// Lemma's own file monitor reading it after the last save). A save during a short hold waits
+/// for it and writes the file; a save during a long one fails, says so, writes nothing, leaves no
+/// temporary file and keeps the document modified. (GIO's asynchronous replace reported such a
+/// save as written: the document was marked saved while the file held the old text.)
+#[cfg(windows)]
+fn saves_of_a_file_held_open() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    let dir = common::temp_dir("held-open");
+    let path = dir.join("doc.tex");
+    std::fs::write(&path, "old\n").unwrap();
+    let ws = workspace(&dir);
+    let doc = block_on(ws.open(&path)).unwrap();
+    let hold = || {
+        std::fs::File::options()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .expect("open the file as another program would")
+    };
+    let disk = || std::fs::read_to_string(&path).unwrap();
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Held for as long as the save tries.
+    let held = hold();
+    doc.apply_edits(&[TextEdit::insert(0, "new ")], Origin::User)
+        .unwrap();
+    let result = block_on(doc.save());
+    assert!(matches!(result, Err(SaveError::Io(_))), "{result:?}");
+    println!("  the save of a file held open: {result:?}");
+    assert_eq!(disk(), "old\n", "nothing written");
+    assert!(doc.is_dirty(), "the document stays modified");
+    assert_eq!(listing(), ["doc.tex"], "no temporary file is left");
+    drop(held);
+    block_on(doc.save()).expect("save once the file is free");
+    assert_eq!(disk(), "new old\n");
+    assert!(!doc.is_dirty());
+
+    // Held for a moment, as another program's read of the file takes.
+    let held = hold();
+    doc.apply_edits(&[TextEdit::insert(0, "newer ")], Origin::User)
+        .unwrap();
+    let save = doc.save();
+    glib::timeout_add_local_once(Duration::from_millis(200), move || drop(held));
+    block_on(save).expect("the save waits for the file");
+    assert_eq!(disk(), "newer new old\n");
+    assert!(!doc.is_dirty());
+    assert_eq!(listing(), ["doc.tex"]);
+}
+
 fn closed_document_save_and_reopen() {
     let dir = common::temp_dir("closed");
     let path = dir.join("chapter.tex");
@@ -853,4 +934,121 @@ fn workspace_open_missing_and_dedup() {
     assert!(err.contains("cannot open"), "{err}");
     let err = block_on(ws.get_or_load(&dir.join("absent.tex"))).expect_err("missing");
     assert!(err.contains("cannot read"), "{err}");
+}
+
+/// A named pipe is not read as a closed document (`Workspace::get_or_load`, which an agent's
+/// tool calls on a project file go through): opening it would wait for a writer forever, and the
+/// tool call would never be answered. It is refused at once, as a tab refuses it.
+#[cfg(unix)]
+fn closed_documents_never_read_a_pipe() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = common::temp_dir("pipe");
+    let fifo = dir.join("pipe.tex");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a plain system call on a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let ws = workspace(&dir);
+    let read = block_on(glib::future_with_timeout(
+        Duration::from_secs(3),
+        ws.get_or_load(&fifo),
+    ));
+    // A reader blocked in open() goes on (and reads nothing) once a writer opens the pipe.
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo);
+    let read = read.expect("answered at once, without waiting for a writer");
+    let err = read.expect_err("a pipe is no document");
+    assert!(err.contains("not a regular file"), "{err}");
+    assert!(ws.get(&fifo).is_none());
+}
+
+/// A save checks that the file still holds what the document read, and reads it when its time
+/// or size changed. A file that another program replaced by a named pipe meanwhile is not read
+/// (that would wait for a writer forever, and the save with it): the save fails with a message
+/// and the document keeps its changes.
+#[cfg(unix)]
+fn saves_never_read_a_pipe() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = common::temp_dir("save-pipe");
+    let path = dir.join("a.tex");
+    std::fs::write(&path, "one\n").unwrap();
+    let ws = workspace(&dir);
+    let doc = block_on(ws.get_or_load(&path)).expect("load");
+    doc.apply_edits(&[TextEdit::insert(0, "x")], Origin::User)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a plain system call on a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let saved = block_on(glib::future_with_timeout(
+        Duration::from_secs(3),
+        doc.save(),
+    ));
+    // A reader blocked in open() goes on (and reads nothing) once a writer opens the pipe.
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path);
+    let saved = saved.expect("answered at once, without waiting for a writer");
+    let error = saved.expect_err("a pipe is not written over").to_string();
+    assert!(error.contains("not a regular file"), "{error}");
+    assert!(doc.is_dirty());
+    assert_eq!(doc.text(), "xone\n");
+}
+
+/// What a save keeps of the file it writes (Unix): its permissions, and a hard link to it; a file
+/// in a directory where the user may not create files is written in place. A read-only file is
+/// refused, and the document keeps its changes.
+#[cfg(unix)]
+fn saves_keep_links_and_permissions() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let dir = common::temp_dir("links-and-modes");
+    let ws = workspace(&dir);
+    let edit = |doc: &DocRef| {
+        doc.apply_edits(&[TextEdit::insert(0, "% edited\n")], Origin::User)
+            .unwrap();
+    };
+    // Permissions, the execute bit among them.
+    let mode = dir.join("mode.tex");
+    std::fs::write(&mode, "x\n").unwrap();
+    std::fs::set_permissions(&mode, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let doc = block_on(ws.open(&mode)).unwrap();
+    edit(&doc);
+    block_on(doc.save()).expect("save");
+    let meta = std::fs::metadata(&mode).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+    // A hard link sees the new text.
+    let (a, b) = (dir.join("a.tex"), dir.join("b.tex"));
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    let doc = block_on(ws.open(&a)).unwrap();
+    edit(&doc);
+    block_on(doc.save()).expect("save");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "% edited\nx\n");
+    assert_eq!(std::fs::metadata(&b).unwrap().nlink(), 2);
+    // A directory without write permission: written in place.
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let inside = locked.join("c.tex");
+    std::fs::write(&inside, "x\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let doc = block_on(ws.open(&inside)).unwrap();
+    edit(&doc);
+    let saved = block_on(doc.save());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    saved.expect("save in a read-only directory");
+    assert_eq!(std::fs::read_to_string(&inside).unwrap(), "% edited\nx\n");
+    // A read-only file: refused, the changes stay.
+    let readonly = dir.join("ro.tex");
+    std::fs::write(&readonly, "x\n").unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let doc = block_on(ws.open(&readonly)).unwrap();
+    edit(&doc);
+    let saved = block_on(doc.save());
+    assert!(matches!(saved, Err(SaveError::Io(_))), "{saved:?}");
+    assert_eq!(std::fs::read_to_string(&readonly).unwrap(), "x\n");
+    assert!(doc.is_dirty());
 }

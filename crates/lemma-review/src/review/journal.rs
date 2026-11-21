@@ -1,5 +1,6 @@
 //! The Alt+U journal: the last accepts and rejects, newest last.
 
+use super::records::Taken;
 use super::segments::Parked;
 use crate::text::{shift_bytes, shift_range, signed};
 use std::collections::VecDeque;
@@ -23,6 +24,9 @@ pub(super) struct Accepted {
     pub parked: Parked,
     /// No edit has cut into the range since.
     pub valid: bool,
+    /// What the accept changed of the records of the edits whose text it took (see
+    /// `Records::accept_overlapping`): Alt+U makes it a proposal again.
+    pub records: Vec<Taken>,
 }
 
 /// One user decision.

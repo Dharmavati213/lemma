@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         ),
         ("mem_report_prints_rss_and_pss", mem_report),
         ("snapshot_errors_fail_the_run", snapshot_errors),
+        ("demo_documents_go_with_the_run", demo_documents_go),
         ("build_option_builds_the_document", build_succeeds),
         ("build_option_opens_the_first_error", build_with_errors),
         (
@@ -143,6 +144,32 @@ fn snapshot_errors() {
     assert!(!stderr.contains("--demo completion"), "{stderr}");
 }
 
+/// The documents that `--demo completion` and `--demo review` write without a FILE (each in a
+/// new temporary directory) go when the run ends. A run that quits by itself never destroys its
+/// window, and each run used to leave its directory behind.
+fn demo_documents_go() {
+    let tmp = common::temp_dir("demo-tmp");
+    for args in [
+        ["--demo", "completion", "--quit-after-ms", "200"],
+        ["--demo", "review", "--quit-after-ms", "1200"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_lemma"))
+            .args(args)
+            .env("LEMMA_CONFIG", "/dev/null")
+            .env("TMPDIR", &tmp)
+            .output()
+            .expect("run lemma");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+    }
+    let left: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "left in TMPDIR: {left:?}");
+}
+
 /// The root shown at the start is counted (texcount on the jobs thread). Quitting ends the
 /// process without destroying its window, and the count's texcount is killed then: here a
 /// stand-in on `PATH` that writes its process id and sleeps.
@@ -259,7 +286,7 @@ fn build_with_errors() {
     assert!(out.status.success(), "lemma failed: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("build: Build failed: 1 error"), "{stdout}");
-    let main = std::fs::canonicalize(&main).unwrap();
+    let main = lemma_core::canonicalize(&main).unwrap();
     let opened = format!("build: first error at {}:66", main.display());
     assert!(stdout.contains(&opened), "{stdout}");
     assert!(png.is_file());
@@ -285,6 +312,16 @@ fn usage() {
     let out = lemma(&["main.tex", "+5"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("+5 must come before a FILE"));
+    // A missing directory is no new document named like it.
+    let missing = format!("{}/", common::temp_dir("usage").join("newdir").display());
+    let out = lemma(&[&missing]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("{missing}: no such directory")),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!Path::new(&missing).exists());
     let fixtures = common::fixtures();
     let main = fixture_main();
     let out = lemma(&[&main, fixtures.to_str().unwrap()]);
@@ -319,7 +356,11 @@ fn several_files() {
     ]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "lemma failed: {stderr}");
-    assert!(!stderr.contains("lemma:"), "{stderr}");
+    // No complaint of lemma's. (Under Wine GDK warns about the machine, in lines that start
+    // with the program's name: `(lemma:1692): Gdk-WARNING`.)
+    let complaint =
+        |line: &str| line.contains("lemma:") && !(cfg!(windows) && line.starts_with("(lemma:"));
+    assert!(!stderr.lines().any(complaint), "{stderr}");
     assert!(png.is_file());
 }
 
@@ -428,7 +469,14 @@ fn renderer_setting() {
     );
     let auto = stderr(lemma_env("renderer-auto", &args, &log, ""));
     // Under Broadway (the tests' display) `auto` keeps Broadway's renderer.
-    assert!(auto.contains("renderer: Broadway's own"), "{auto}");
+    if cfg!(windows) {
+        assert!(
+            auto.contains("GSK_RENDERER=cairo from [editor] renderer"),
+            "{auto}"
+        );
+    } else {
+        assert!(auto.contains("renderer: Broadway's own"), "{auto}");
+    }
     let env = [log[0], ("GSK_RENDERER", "cairo")];
     let set = stderr(lemma_env(
         "renderer-env",
@@ -445,6 +493,10 @@ fn renderer_setting() {
 /// Lemma starts (latexmk, the agent, a figure opened in an image viewer) do not inherit it. A
 /// `GSK_RENDERER` from the user's own environment stays.
 fn regress5_renderer_not_inherited() {
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        println!("  SKIP: the variable is taken out of the environment only with glibc");
+        return;
+    }
     let log = [("LEMMA_LOG", "lemma_app::app=debug")];
     let args = [fixture_main(), "--quit-after-ms".into(), "1500".into()];
     let args: Vec<&str> = args.iter().map(String::as_str).collect();

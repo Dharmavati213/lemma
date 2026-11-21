@@ -58,7 +58,7 @@ The design is based on the **lean** proposal: no tokio, a hand-written MCP serve
 - **Gutter:** a `GutterRenderer` subclass compiles and inserts. Its wrapper needs `@implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget`, and `gutter()` must be called as `sourceview5::prelude::ViewExt::gutter(&view, …)` because it is ambiguous with `TextViewExt`.
 - **ACP agent thread:** the pattern compiles against agent-client-protocol 3.3.0: a map of pending permission responders, a spawned task per prompt, and Cancel answering every pending permission request.
 - **PDF:** the path poppler on a worker thread → `ImageSurfaceDataOwned` → `glib::Bytes::from_owned` → `MemoryTexture` works, and so does `link_mapping`.
-- **MCP bridge:** `lemma-mcp`, std-only and 369 KB in release, relays JSON-RPC lines and refuses a bad token. Unix socket paths must be **shorter than 108 bytes**, so tests must use relative paths or `$XDG_RUNTIME_DIR`.
+- **MCP bridge:** `lemma-mcp`, std-only and 369 KB in release, relays JSON-RPC lines, refuses a bad token, and connects again while the editor has not answered. Unix socket paths must be **shorter than 108 bytes**, so tests must use relative paths or `$XDG_RUNTIME_DIR`.
 - **Vim commands:** calling `VimIMContext::execute_command(":w")` from code emits neither `write` nor `execute-command`. Whether the interactive command bar emits them is **[U]**; see WP0.2.
 - **Other APIs:** the frizbee and similar (`timeout`, `iter_inline_changes`) APIs, pulldown-cmark without default features, libc `M_MMAP_THRESHOLD`/`M_ARENA_MAX`/`malloc_trim`, `glib::user_state_dir`.
 
@@ -96,14 +96,16 @@ The app then launches `node <prefix>/node_modules/@agentclientprotocol/claude-ag
 
 | Crate | Kind | Responsibility |
 |---|---|---|
-| `lemma-core` | pure | `TextEdit`, `Origin`, `LineIndex`, `LatestSlot`, `Diagnostic`, `ProjectRoot` (path canonicalization), `fnv1a64` |
+| `lemma-core` | pure | `TextEdit`, `Origin`, `LineIndex`, `Diagnostic`, `ProjectRoot` (path canonicalization), `fnv1a64` |
 | `lemma-syntax` | pure | Scanner (`LineStates`, `Token`, `Context`); structure pass (`index_file`, `FileIndex`, `ProjectIndex`); `scan_bib`, `parse_aux`, `parse_magic` |
-| `lemma-snippets` | pure | Snippet TOML, body → `Chunk`s, LuaSnip trigger semantics, 91 default snippets |
+| `lemma-snippets` | pure | Snippet TOML, body → `Chunk`s, LuaSnip trigger semantics, 71 default snippets |
 | `lemma-complete` | pure | L1/L2/L3 data, `Completer` (frizbee + bonuses), `WordList` |
 | `lemma-review` | pure | `FileReview` (baseline, hunks, edit classification, accept/reject/undo, persistence), `str_replace`, `minimal_edits`, `unified_diff` |
 | `lemma-build` | std + libc | Root and engine detection, latexmk runner, `BuildQueue`, `.log`/`.blg` parsers |
 | `lemma-synctex` | FFI | libsynctex `Scanner` |
 | `lemma-pdf` | glib/cairo/poppler, no GTK | PDF thread (render + sync), `PageLayout`, `ByteLru` |
+| `lemma-preview` | glib/cairo/poppler, no GTK | Math hover preview: finds the formula, compiles it with the document's preamble, renders it (§5) |
+| `lemma-search` | pure | Project search and replace (`Query`, `Matcher`), driven by the Search page |
 | `lemma-agent` | no GTK | ACP thread (all ACP code in `acp.rs`), MCP server (`mcp.rs`), message enums |
 | `lemma-mcp` | bin, std only | stdio ↔ unix-socket bridge |
 | `lemma-config` | pure | Config schema and defaults |
@@ -112,9 +114,10 @@ The app then launches `node <prefix>/node_modules/@agentclientprotocol/claude-ag
 | `xtask` | bin | Data generation (cwl, unicode-math) |
 
 Data and test directories:
-- `data/snippets.default.toml`
-- `data/core-extra.toml`: about 70 symbols missing under pdflatex names, such as `\square` and `\lozenge`
-- `data/cwl/` (M4)
+- `data/snippets.default.toml`, `data/prompts.default.toml`, `data/templates/`
+- `data/completion/`: the word lists `xtask` turns into the completion tables (`cwl/`, and
+  `glyphs.tsv`, the hand-checked glyphs of commands such as `\lozenge` and `\blacksquare`)
+- `data/raw/`: the sources of those lists (TeXstudio's cwl files, the unicode-math table)
 - `tests/fixtures/`, copied from the research corpus in M0
 
 ## 3. Threading and async model
@@ -132,7 +135,7 @@ Data and test directories:
 Rules:
 1. Main-thread work per keystroke must be ≤ 2 ms at ≤ 10k lines.
 2. The main thread never calls poppler, never waits on a process, and never reads files synchronously. It uses `FileLoader`/`FileSaver` and gio async.
-3. Structure indexing is sent to workers as an `Arc<str>` copy 150 ms after typing stops, never on every keystroke. Each result carries a version and stale results are dropped.
+3. Structure indexing is sent to workers as an `Arc<str>` copy 300 ms after typing stops, never on every keystroke. Each result carries a version and stale results are dropped.
 4. ACP handlers never await the user. Permission responders go into a `Mutex<HashMap<u64, Responder>>` and are answered from the command loop. `session/prompt` runs in `cx.spawn(...)` so the command loop stays live [V].
 5. MCP threads block on `recv_timeout`; the main thread replies when the work is done. For `compile` it replies only when the build finishes.
 6. Every worker body runs inside `catch_unwind`, and the worker is restarted with its last state if it panics.
@@ -186,7 +189,7 @@ Rules:
    Outside a turn, a clean buffer reloads with `Origin::Reload`, and a dirty one shows an infobar (Reload / Keep mine).
 
 ### 4.3 Inline rendering
-- **Added lines:** the shared tag `review-added` gives a green paragraph background (alpha 0.18). Changed words get `review-added-word` (alpha 0.35).
+- **Added lines:** the shared tag `lemma-review-added` gives a green paragraph background (alpha 0.18). Changed words get `lemma-review-added-word` (alpha 0.35).
 - **Anchor and reserved space.** Each hunk's anchor line gets an anchor tag with the highest priority. It sets `pixels-above-lines = header_h + deleted_h`:
   - `header_h` is about 0.9 of a line height;
   - `deleted_h` is the height of the cached `pango::Layout` of `old_text`, wrapped to the text width when soft-wrap is on.
@@ -206,7 +209,7 @@ Rules:
   Diagnostics use the stock marks renderer.
 - **Other review UI:**
   - A thin accent outline marks the hunk under the cursor.
-  - An `adw::Banner` reads "Claude changed 3 files · 7 hunks" with a "Review" button.
+  - An `adw::Banner` reads "Claude changed 3 files · 7 hunks" (the agent's name) when every hunk is the agent's, "<name> · 3 files · 7 hunks" for one named change (Replace in Project, Restore from History, Add Citation, …), else "Changes to review · …", with a "Review" button.
   - The **Changes** sidebar lists every touched file (open or not) with counts, Accept all / Reject all per file, and a "Plain diff" toggle that shows `unified_diff` in a read-only TextView for screen readers.
   - Alt+D (reading mode) shrinks each band to the header and hides the phantom text.
 
@@ -226,20 +229,23 @@ Rules:
 ### 4.4 Accept, reject and user edits
 - **Accept:** `baseline[base] := current[cur]`. No buffer change and no save. Journalled for Alt+U.
 - **Reject:** returns a `TextEdit` that restores `old_text`. It is applied with `Origin::Review` as one undoable action, then saved, and a `Rejected` event is queued. If the hunk was `user_touched`, a toast says "Rejected — your edits in this hunk were discarded · Undo".
-- **A new file** whose only hunk is rejected is moved to the trash with `gio::File::trash` and dropped. **A deleted file** can be restored from the snapshot.
+- **A new file** whose only hunk is rejected is moved to the trash with `gio::File::trash` and dropped; its text before the reject goes to the local history first ("Before a reject"), and Alt+U brings the file back, with its tab, under review as it was (the Alt+U of the reject that trashed it; one that fails because a file of that name exists, or the trash move still runs, can be tried again). **A deleted file** can be restored from the snapshot.
 - **User or History edits outside every hunk** (exact rule in §10.3) are applied to the baseline at the mapped offset, so the user's own typing never becomes a hunk.
 - **User or History edits inside a hunk** become part of the proposal and set `user_touched`, and one `UserEditedInHunk` event is sent per hunk per turn. Accept then keeps the user's version.
 - **Undo:**
   - Ctrl+Z or Vim `u` is linear over the buffer. Undoing an agent step shrinks or removes its hunk, and an `UndoneByUser` event is sent.
   - **Undoing a Reject:** a History edit inside the restored range of the most recent unconsumed Reject is classified as Agent, so the hunk re-opens with the **same HunkId** instead of being folded into the baseline.
   - Accept is not in the buffer's undo history; Alt+U reverts it from the journal (last 100 actions).
+  - The buffer's `undo` and `redo` handlers tell the review which way the History edits that follow step (`FileReview::begin_history_step`): one History edit can undo one of Lemma's edits and redo another (the agent took back its own edit, or a reject took back the agent's text).
+  - The user's own edits are recorded with where they went (the baseline, or a hunk's proposal), and the buffer's undo and redo of them go the same way, wherever the hunks lie by then (`review/user.rs`); a step the buffer merged (keys typed one by one, Backspace held) is taken apart into those edits.
+  - Of the records a History edit fits, the one whose action the buffer steps first claims it: by when each record's own action, and Alt+U's, was last done or undone, not by age.
 
 ### 4.5 Saving, persistence and what the agent sees
 - **Before acceptance, disk already holds the agent's version.** latexmk, the agent's built-in Read and Grep, and git all see the same state.
   - Reject writes the restored text.
   - Accept writes nothing.
   - An agent edit to an open buffer also saves any unsaved user typing in that buffer. This is documented behaviour.
-- **Persistence.** Reviews are saved as `Vec<PersistedReview>{path, baseline, current_hash}` to `$XDG_STATE_HOME/lemma/review/<fnv(root)>.json`, debounced 500 ms, through gio. On reopen, a review is restored only if `fnv1a64(disk) == current_hash`, and a banner announces it. There is no blocking dialog on quit.
+- **Persistence.** Reviews are saved as `Vec<PersistedReview>{path, baseline, current_hash}` to `$XDG_STATE_HOME/lemma/review/<fnv(root)>.json`, debounced 500 ms (at most 2 s after the first change while changes keep coming), flushed to disk before it replaces the old file, through gio. On reopen, a review is restored only if `fnv1a64(disk) == current_hash`, and a banner announces it. When another program changed the file since, the text the review was saved with is looked up in the local history by that hash: if found, the review comes back on it and the other program's change goes through the review as a reload; otherwise a toast names the file and says why its pending changes are lost (also for a file deleted, unreadable or with unsaved changes). There is no blocking dialog on quit.
 - **What the agent sees:**
   - `read_file` returns the live buffer: pending hunks applied, rejected ones reverted, the user's unsaved text included, with no markers.
   - Feedback arrives on the next tool result, as `<review_feedback>` before the next prompt, and on demand through `get_review_state`.
@@ -261,7 +267,7 @@ Rules:
     - `line_begin`; priority.
   - **When autosnippets fire:** only on a single typed character, never on paste, agent edits or undo, and never in comments or verbatim.
   - **Undo:** each expansion is one undo step, so Ctrl+Z gives back the literal trigger.
-  - **Tab** expands a manual snippet even while the popup is open; otherwise it jumps to the next stop, otherwise it steps out past the next closing delimiter. Shift+Tab jumps back.
+  - **Tab** expands a manual snippet even while the popup is open; otherwise it jumps to the next stop; otherwise, after some text on the line, it steps out past the next closing delimiter; with only white space before the cursor it indents. Shift+Tab jumps back.
 - **Completion** (`CompletionProviderImpl`; triggers on `\`, `{`, and `,` inside ref/cite arguments):
   - **Sources by context:**
     - commands, filtered by math or text mode, with glyphs (`\Z` → ℤ from the user's macros);
@@ -317,12 +323,13 @@ Rules:
   - "File not found" takes its line from the following "Emergency stop";
   - biber's temp-file paths are mapped back to the `.bib`;
   - runaway arguments are located with the search heuristic;
+  - when latexmk fails and neither the log nor the `.blg` has an error, the error names a program latexmk could not run (the shell's `sh: 1: biber: not found`, Windows' `'biber' is not recognized…`), else it carries the last lines latexmk printed before its closing advice;
   - whenever the log has `Output written`, including on exit 12, the PDF is reopened with a new generation;
-  - with `fast_preamble` (the default), a pdflatex build whose preamble was precompiled runs with it (`lemma_build::preamble`): `latexmk -pdf -pdflatex="pdflatex -fmt=lemma-preamble %O %S"` with the format's directory (`.build/.lemma-preamble/<stem>/`) first on `TEXFORMATS`. The format is dumped by `pdftex -ini "&pdflatex" mylatexformat.ltx ./<root>.tex` on the build thread after a build whose preamble had none, once that build's outcome is sent; a record keeps the hash of the root's text up to `\begin{document}` and the size and modification time of every file the dump read (its `.fls`), and the format is used while they are unchanged. On the thesis that asked for it (27 pages, tikz-cd, hyperref, microtype) a save's pdflatex run went from 1.34 s to 0.78 s of CPU, latexmk's from 1.50 s to 0.91 s [V]; the preamble alone was 0.67 s. Pages, text, links, bookmarks and SyncTeX lines are the same [V]. Not used for XeTeX and LuaTeX, on Windows, with a latexmkrc, for a root name that is not plain ASCII, or for a preamble with `\makeindex`, `\immediate`, images and the like; a failed dump is not retried while its inputs stay the same; a format pdflatex cannot load is given up and the build reruns with `-g` (latexmk does not see that the command changed). The dump's log supplies the preamble's warnings;
+  - with `fast_preamble` (the default), a pdflatex build whose preamble was precompiled runs with it (`lemma_build::preamble`): `latexmk -pdf -pdflatex="pdflatex -fmt=lemma-preamble %O %S"` with the format's directory (`.build/.lemma-preamble/<stem>/`) first on `TEXFORMATS`. The format is dumped by `pdflatex -ini "&pdflatex" mylatexformat.ltx ./<root>.tex` (the `pdflatex` of `PATH`, which latexmk runs too, also when `[build] latexmk` is a path: a format loads only in the pdfTeX that dumped it) on the build thread after a build whose preamble had none, once that build's outcome is sent; a record keeps the hash of the root's text up to `\begin{document}` and the size and modification time of every file the dump read (its `.fls`), and the format is used while they are unchanged. The record (`lemma-preamble 2`) names its root; each dump removes the formats in `.lemma-preamble/` whose record names a root that no longer exists (renamed or deleted), never anything without such a record, outside that directory or behind a symbolic link. On the thesis that asked for it (27 pages, tikz-cd, hyperref, microtype) a save's pdflatex run went from 1.34 s to 0.78 s of CPU, latexmk's from 1.50 s to 0.91 s [V]; the preamble alone was 0.67 s. Pages, text, links, bookmarks and SyncTeX lines are the same [V]. Not used for XeTeX and LuaTeX, on Windows, with a latexmkrc, for a root name that is not plain ASCII, or for a preamble with `\makeindex`, `\immediate`, images and the like; a failed dump is not retried while its inputs stay the same; a dump during which the root or a file it read is saved again (its modification time falls within the dump, or within 2 s before it for a whole-second time) is thrown away and done again after the next build; a format pdflatex cannot load (latexmk's output says `I can't find the format file`, `Fatal format file error`, or `Could not undump` for one cut short) is given up and the build reruns with `-g` (latexmk does not see that the command changed). The dump's log supplies the preamble's warnings;
   - with `copy_pdf` (the default), that PDF is also copied next to the root document (`lemma_build::copy_pdf_beside_root`, on the build thread): only when the copy there has another size or modification time (the copy takes the PDF's), written to a hidden temporary file and renamed over the old one, so a viewer never reads half a PDF. A failed copy is toasted after a build that succeeded.
 - **PdfView** is one custom widget implementing `gtk::Scrollable`; there is no widget per page.
   - **Layout:** continuous scrolling, fit-width by default.
-  - **Zoom:** Ctrl+wheel or `GestureZoom`, anchored at the pointer. Existing textures are stretched immediately and re-rendered after 120 ms idle at `scale_q = round(zoom × surface.scale() × 8)`. `Surface::scale()` (v4_12) exists [S]. The user's eDP-1 runs at scale 1; fractional scales are **[U]**.
+  - **Zoom:** Ctrl+wheel or `GestureZoom`, anchored at the pointer. Existing textures are stretched immediately and re-rendered after 120 ms idle at `scale_q = round(zoom × surface.scale() × 1024)` (`lemma_pdf::SCALE_STEPS`); a bitmap of the current zoom is drawn pixel for pixel on the device pixel grid (`geometry::bitmap_view_rect`), and stretched ones have both edges snapped to that grid (`geometry::snap_to_pixels`), so tiles leave no seams. `Surface::scale()` (v4_12) exists [S]. The user's eDP-1 runs at scale 1; fractional scales are **[U]**.
   - **Tiles:** pages larger than 16 MB are rendered in tiles of at most 4 MiB: full-width bands, or squares of about 1024² on a page over 4096 px wide (§11, PDF view, 2026-10-25).
   - **Render queue:** visible pages from the centre outward, then ±1 page. Older generations are dropped.
   - **Thin strokes:** poppler widens a stroke thinner than a device pixel to one pixel, measured along the axes of the stroke's coordinate system, so in a rotated one (the tip of a slanted TikZ arrow) the width comes out too small, nothing at 45°. Below a render scale of 2.6 (0.4 pt is a pixel at 2.51) `lemma_pdf::render` draws the page a second time as for printing, with no stroke widened, and where that has ink the first pass lacks, a third time with every stroke a cairo hairline, and takes the lost strokes' pixels from it (`restore_strokes`). The three passes are on transparent bitmaps (the alpha is the ink), and the white paper is laid under the result.
@@ -352,15 +359,19 @@ Rules:
 | Agent inside the editor process | ≤ 3 MB | Threads and channels only |
 | Agent outside the editor | About 360 MB while running (node 123 MB + claude about 240 MB [V]) | Started when the panel first opens; Stop button; stopped after `agent.idle_stop_min` idle minutes (§11) |
 
+These are the targets set in M0. The budgets checked today, re-based on real-Wayland
+measurements (§11), are in `scripts/budgets.toml`: the memory scenarios of `scripts/rss.sh` and
+the timing budgets (`[perf]`) of `scripts/perf-wayland.sh`.
+
 **Techniques:**
 - System GTK, linked dynamically. No tokio, webview, JS engine or bundled C libraries.
 - Lazy loading: spell check after the first frame, cwl per package, SyncTeX on the first sync (after a rebuild, parsed ahead only when SyncTeX was used since the build before or in the last five minutes), the preview format on the first hover, the agent when its panel opens.
 - `mallopt(M_MMAP_THRESHOLD, 1 MiB)` and `mallopt(M_ARENA_MAX, 2)` at startup. When the PDF pane is hidden, or the window has been inactive for 60 s (unless the PDF is in a window of its own that is active), shrink the cache to the visible pages, free the SyncTeX scanner (`PdfCmd::Trim`, about 85 KiB per page) and call `malloc_trim(0)`, on the PDF thread too after the scanner is freed. (`lemma-app/src/heap.rs` and `lemma-pdf/src/heap.rs`: glibc only; on macOS `heap::trim` is `malloc_zone_pressure_relief`, see §12.)
-- Keep GTK's default Vulkan renderer: `GSK_RENDERER=gl` measured about +75 MB [V]. `cairo` measured −30 MB and is documented as a low-memory option. M5: `[editor] renderer = "auto"|"cairo"|"vulkan"|"gl"` sets `GSK_RENDERER` at start-up unless the environment has it; `auto` (the default) is cairo: measured on the user's machine it saves about 27 MB and 140 ms to the first frame, types as fast, and still scrolls the PDF at 60 fps (docs/STATUS.md, "M5 performance").
+- Keep GTK's default Vulkan renderer: `GSK_RENDERER=gl` measured about +75 MB [V]. `cairo` measured −30 MB and is documented as a low-memory option. M5: `[editor] renderer = "auto"|"cairo"|"vulkan"|"gl"` sets `GSK_RENDERER` at start-up unless the environment has it; `auto` (the default) is cairo: measured on the user's machine it saves about 27 MB and 140 ms to the first frame, types as fast, and still scrolls the PDF at 60 fps (the measurements are in `scripts/budgets.toml` and at `Renderer` in `lemma-config`).
 - Closed documents are kept as `String`s; baselines exist only while hunks exist.
 - **Measurement:**
   - `lemma --mem-report` reads `/proc/self/smaps_rollup` **before** any snapshot, because GSK `render_texture` adds about 60 MB.
-  - `scripts/rss.sh` compares against `scripts/budgets.toml` and fails at more than 15% over budget.
+  - `scripts/rss.sh` compares against `scripts/budgets.toml` and, on real Wayland (`LEMMA_RSS_WAYLAND=1`), fails at more than the file's `tolerance` (10%) over budget; under Broadway it only prints the numbers.
 
 ## 8. Milestones
 
@@ -423,13 +434,15 @@ Each milestone ends in a runnable app.
   | Config | `~/.config/lemma/` |
   | State | `~/.local/state/lemma/{review/,projects.toml}` |
   | Data | `~/.local/share/lemma/acp/` |
-  | Runtime | `$XDG_RUNTIME_DIR/lemma/mcp-<pid>.sock` |
+  | Runtime | `$XDG_RUNTIME_DIR/lemma/mcp-<pid>-<n>.sock` |
   | Cache | `~/.cache/lemma/preview/` |
-  | Inside the project | only `.build/` |
+  | Inside the project | `.build/`, and the PDF beside the root document (`[build] copy_pdf`, §6) |
 
 ### 10.2 Cargo files
 
-These are verified to resolve and pass `cargo check --workspace --all-targets` [V].
+These are verified to resolve and pass `cargo check --workspace --all-targets` [V]. They are
+the M0 contract: later milestones added crates (`lemma-preview`, `lemma-search`) and
+dependencies (`ureq`, `windows-sys`, `cc`, …), so the Cargo files themselves are the reference.
 
 ```toml
 # Cargo.toml (workspace)
@@ -454,7 +467,7 @@ poppler      = { package = "poppler-rs", version = "=0.26.0", features = ["v26_1
 cairo        = { package = "cairo-rs",   version = "=0.22.9", features = ["v1_18", "png"] }
 glib         = { version = "=0.22.10", features = ["v2_88"] }
 gio          = { version = "=0.22.10", features = ["v2_88"] }
-pango        = { version = "=0.22.9",  features = ["v1_58"] }
+pango        = { version = "=0.22.9",  features = ["v1_52"] }
 agent-client-protocol        = { version = "=3.3.0", features = ["process"] }
 agent-client-protocol-schema = "=1.11.0"
 futures-executor = "0.3.34"
@@ -517,7 +530,7 @@ Every crate's `[package]` uses `version.workspace = true`, and the same for `edi
 | lemma-config | serde, toml | — |
 | lemma-app (`[[bin]] name="lemma"`) | all `lemma-*` except lemma-mcp and lemma-synctex; gtk, gdk, adw, sourceview5, libspelling, glib, gio, pango, cairo, async-channel, serde, serde_json, pulldown-cmark, libc, tracing, tracing-subscriber | — |
 | tools/lemma-fake-agent | agent-client-protocol-schema, serde, serde_json | — |
-| xtask | zstd, regex, serde, toml | — |
+| xtask | ruzstd | — |
 
 The synctex build script:
 ```rust
@@ -543,8 +556,6 @@ impl LineIndex { pub fn new(text: &str) -> Self; pub fn line_count(&self) -> u32
     pub fn offset(&self, line: u32, col_byte: u32) -> usize; pub fn position(&self, offset: usize) -> (u32, u32);
     pub fn line_of(&self, offset: usize) -> u32; pub fn apply(&mut self, e: &TextEdit);      // pre-edit offsets
     pub fn line_delta(&self, e: &TextEdit) -> (u32, u32, u32); }                              // (first, removed, added)
-pub struct LatestSlot<T>;  impl<T> LatestSlot<T> { pub fn new() -> Arc<Self>; pub fn put(&self, v: T);
-    pub fn take_blocking(&self) -> Option<T>; pub fn try_take(&self) -> Option<T>; pub fn close(&self); }
 pub enum Severity { Error, Warning, BadBox, Info }   pub enum DiagSource { Tex, Biber, Bibtex, Index }
 pub struct Diagnostic { pub path: PathBuf, pub line: Option<u32> /*1-based*/, pub severity: Severity,
                         pub message: String, pub context: Option<String>, pub source: DiagSource }
@@ -581,7 +592,7 @@ pub struct Label { pub name: String, pub line: u32, pub env: Option<String>, pub
 pub struct Reference { pub cmd: String, pub names: Vec<String>, pub line: u32 }
 pub struct Citation { pub cmd: String, pub keys: Vec<String>, pub line: u32 }
 pub struct EnvPair { pub name: String, pub begin_line: u32, pub end_line: Option<u32> }
-pub enum IncludeKind { Input, Include, Subfile, Import, Graphics, Bibliography, Package }
+pub enum IncludeKind { Input, Include, Subfile, Import, Graphics, Bibliography, BibResource, Package }
 pub struct Include { pub kind: IncludeKind, pub target: String, pub line: u32 }
 pub struct MacroDef { pub name: String, pub nargs: u8, pub body: Option<String>, pub line: u32, pub is_env: bool, pub is_theorem: bool, pub is_math_operator: bool }
 pub struct FileIndex { pub outline: Vec<OutlineItem>, pub labels: Vec<Label>, pub refs: Vec<Reference>, pub cites: Vec<Citation>,
@@ -654,6 +665,7 @@ impl FileReview { pub fn new(baseline: String) -> Self; pub fn baseline(&self) -
     /// Agent/Review/Reload never touch the baseline. A History edit within the restored range of the most recent
     /// unconsumed Reject counts as Agent (undo-of-reject re-opens the same HunkId). Ranges are shifted until recompute.
     pub fn on_edit(&mut self, e: &TextEdit, origin: Origin) -> EditClass;
+    pub fn begin_history_step(&mut self, redo: bool);                                       // before the buffer's undo/redo (§11)
     pub fn recompute(&mut self, current: &str) -> HunkDelta;     // similar Myers, no line-diff deadline (deterministic); word spans with an 8 ms deadline
     pub fn accept(&mut self, id: HunkId, current: &str) -> Result<(), ReviewError>;
     pub fn reject(&mut self, id: HunkId, current: &str) -> Result<TextEdit, ReviewError>;   // caller applies with Origin::Review
@@ -700,12 +712,12 @@ impl Scanner { pub fn open(pdf: &Path) -> Option<Self>;
     pub fn inverse(&mut self, page: u32, x_bp: f32, y_bp: f32) -> Option<SyncTarget>; }
 
 // ===== lemma-pdf =====
-pub struct PageKey { pub generation: u64, pub page: u32, pub scale_q: u16 /* round(zoom*scale*8) */, pub tile: Option<(u16, u16)>, pub dark: bool }
+pub struct PageKey { pub generation: u64, pub page: u32, pub scale_q: u16 /* round(zoom*scale*1024) */, pub tile: Option<(u16, u16)>, pub dark: bool }
 pub struct RenderReq { pub key: PageKey }
 pub struct Link { pub area: (f64, f64, f64, f64), pub dest: LinkDest }  pub enum LinkDest { Page { page: u32, y_bp: Option<f64> }, Uri(String), Other }
 pub struct Rendered { pub key: PageKey, pub width: i32, pub height: i32, pub stride: i32, pub data: cairo::ImageSurfaceDataOwned }
 pub enum PdfEvent { Opened { generation: u64, page_sizes: Vec<(f64, f64)> }, OpenFailed { generation: u64, error: String },
-    Rendered(Rendered), Forward { generation: u64, boxes: Vec<SyncBox> }, Inverse { target: Option<SyncTarget> },
+    Rendered(Rendered), Forward { generation: u64, file: PathBuf, line: u32, boxes: Vec<SyncBox> }, Inverse { target: Option<SyncTarget> },
     Links { generation: u64, page: u32, links: Vec<Link> } }
 pub enum PdfCmd { Open { generation: u64, pdf: PathBuf }, Want(Vec<RenderReq>), Forward { file: PathBuf, line: u32 },
                   Inverse { page: u32, x_bp: f64, y_bp: f64 }, Links { page: u32 }, Shutdown }
@@ -812,7 +824,7 @@ pub struct Paths { pub config_dir: PathBuf, pub state_dir: PathBuf, pub data_dir
 |---|---|---|
 | `main.rs`, `app.rs` | 0.2 | CLI `lemma [FILE] [--snapshot PNG] [--quit-after-ms N] [--mem-report] [--demo review\|pdf\|agent\|completion] [--apply-as-agent JSON]`; mallopt; tracing; `adw::Application` (id `io.github.lemma_editor.Lemma`); actions and accelerators |
 | `window.rs` | 0.2 | `adw::ApplicationWindow`: header bar (build state, review summary), `adw::OverlaySplitView` (left: outline/changes; right: agent), `gtk::Paned` editor\|PDF, status bar, `adw::ToastOverlay`, `adw::Banner` |
-| `workspace.rs` | 0.2 | `Workspace { root: ProjectRoot, docs: RefCell<HashMap<PathBuf, DocRef>>, index: RefCell<ProjectIndex>, … }`; `open(&Path)`, `get_or_load(&Path) -> impl Future<Output=Result<DocRef,String>>`, `save_all_dirty()`; turn snapshot and FileMonitor hooks (bodies added in 2.4) |
+| `workspace.rs` | 0.2 | `Workspace { root: ProjectRoot, docs: RefCell<HashMap<PathBuf, DocRef>>, index: RefCell<ProjectIndex>, … }`; `open(&Path)`, `get_or_load(&Path) -> impl Future<Output=Result<DocRef,String>>`, `save_all_dirty()`; the turn snapshot (`turn_snapshot_with`); the file monitor is `agent::watcher` |
 | `document.rs` | 0.2 | `Document { kind: Open{buffer: sourceview5::Buffer} \| Closed{shadow: String}, line_index, line_states, origin: Cell<Origin>, review: RefCell<Option<FileReview>> }`; `text()`, `with_origin(o, f)`, `apply_edits(&[TextEdit], Origin)` (one user action, descending), `byte_offset(&TextIter)`, `iter_at_byte(usize)`, `save() -> impl Future`, `connect_lines_changed(Fn(first, removed, added))`, `connect_hunks_changed(Fn())`; undo/redo History wiring [V pattern]; `on_edit` calls |
 | `saver.rs` | 0.2 | Per-document coalesced async save (FileSaver; `replace_contents_future` for closed docs); remembers hashes of our own writes |
 | `editor/tex_view.rs` | 0.2 | `TexView` (subclass of `sourceview5::View`); `snapshot_layer(AboveText)` → `review_overlay::paint(self, &snapshot)` |
@@ -851,7 +863,6 @@ The fixtures were copied from the projects built during the design research.
   - `cargo test -p lemma-core` includes:
     - TextEdit `apply`/`delta`, and `apply_all` in descending order;
     - a proptest that `LineIndex` after random `apply` equals `LineIndex::new(text_after)`, plus `line_delta` cases;
-    - LatestSlot: latest wins, and `close` unblocks `take_blocking`;
     - `ProjectRoot::resolve`: relative path, inside absolute path, a `../` escape refused, a symlink escape refused, a non-existent file inside the root accepted;
     - fnv1a64("") = 0xcbf29ce484222325 and fnv1a64("a") = 0xaf63dc4c8601ec8c.
   - The bridge test (Rust integration test, socket at a short relative path) relays two requests and stops relaying after a bad token.
@@ -951,7 +962,7 @@ M1 work packages all depend on WP0.1. The GUI packages (1.2 and 1.6) also depend
 - **Acceptance:**
   - PageLayout round-trips (`to_view`/`to_page` to 1e-6; anchor round-trip; clamping; fit-width);
   - ByteLru never exceeds its cap and evicts in LRU order;
-  - the worker on `stress.pdf`: `Want` of 3 pages at `scale_q = 16` yields 1224×1584 bitmaps with `data.len() == stride × height`;
+  - the worker on `stress.pdf`: `Want` of 3 pages at `scale_q = 2 × SCALE_STEPS` yields 1224×1584 bitmaps with `data.len() == stride × height`;
   - latest wins: after `Want(B)`, at most one page of the earlier A is still rendered;
   - stale generations are dropped; Forward and Inverse go through synctex;
   - `perf_render` < 15 ms per stress page.
@@ -1009,6 +1020,10 @@ they conflict with the sections above, this section wins.
   - `edit`/`write` refuse `latexmkrc`, `.latexmkrc` and hidden paths, because latexmk would run them as Perl without
     a prompt.
   - CRLF files are shown without `\r` and keep CRLF when edited.
+  - `read_file` answers at most 256 KiB (`READ_MAX_BYTES`) and says where to read on; a file not in the
+    workspace larger than 8 MiB is read line by line, each line decoded by itself; it reads on past the answer's lines
+    only up to `COUNT_AHEAD` (16 MiB) to count the lines left (else the answer says more lines follow).
+    The file tools refuse named pipes, sockets and devices (`ToolError::Special`).
   - `render_page` waits for a running build at most `build.timeout_s` + 10 s; its MCP timeout is compile + `RENDER_GRACE`.
   - A lone UTF-16 surrogate in a request is answered under its own id.
   - The token handshake timeout covers the whole first line.
@@ -1038,6 +1053,90 @@ they conflict with the sections above, this section wins.
     made the next one, whose change was not known exactly, look like its turn's alone, so a
     Keep Turn after it kept it whole.
   - `PersistedReview` gains optional `turn_edits` / `unknown_turn_edits`.
+  - Undo and redo (2026-11-20): a History insertion right where the previous user deletion
+    inside a hunk removed text goes back into the proposal (`inside_deletion`, the mirror of
+    `folded_deletion`), even at the hunk's end or at a pure deletion. Alt+U of a reject is an
+    action in the buffer's history: its undo is the record's redo and its redo the record's
+    undo (`records::AltU`), so a new action no longer drops the record.
+    `FileReview::begin_history_step(redo)`, which the document calls from the buffer's `undo`
+    and `redo` handlers, gives the direction the records prefer (without it they take the way
+    the user stepped last); property 10 (`the_buffers_undo_and_redo_never_reach_the_baseline`)
+    checks that the buffer's undo and redo never change the baseline.
+  - The user's edits under undo, and Alt+U (2026-11-21): `FileReview` keeps the user's edits with
+    where each went (`review/user.rs`, at most 1024 of them and 4 MiB). A History edit that is
+    the undo or redo of the newest of them, or of several the buffer merged, goes the same way:
+    into both texts (`fold_both`, merging the hunks around either place when a recompute widened
+    a hunk over it or paired equal lines differently) or into the proposal. Only the history's
+    last-in-first-out order is assumed; an accept, or an Alt+U that reverts one, forgets where they went;
+    a new buffer forgets them. Typing over a selection that ran past the end of a hunk, then Ctrl+Z, used to
+    leave the typed text in the baseline or put the agent's text there. Records: a reject's own
+    edits are its record's, and Alt+U's are those of the rejects it re-applies. The records a
+    step brings back move with its range, and those that no longer fit stay with it for its next
+    step (Alt+U re-applies a reject after later edits). Empty records that come after a moved
+    one move with it. Property 10 now has Alt+U and up to 40 steps, with and without recomputes;
+    property 11 (`the_buffers_undo_and_redo_of_the_users_edits_go_back_where_they_went`) adds
+    the user's edits and a redo of everything.
+  - Reject Turn, Alt+U and the order of empty records (2026-11-21, third pass): of the records a
+    Review action applies (a reject's own, Alt+U's), one in the middle of its step takes the next
+    edit first, then the oldest (of two edits at one place, the one whose record came first is
+    applied first), and such an edit's insertion starts the step only of an empty record, since
+    `Document::apply_edits` deletes each edit's range before it inserts its text: an insertion at
+    the end of another record's range, with that record's text, belongs to the next edit (two of
+    a turn's edits side by side, or text the user deleted right after one of them, which Reject
+    Turn puts back). A pure deletion that leaves records empty (its claimer, the records that
+    took it in, an agent deletion's own record) where empty records already are pins them to
+    those records' ends, as the records it moves from its own end are pinned to the claimer's
+    (`Record::pinned_end`), so that the buffer's undo of the deletion that left the first one
+    empty puts the others after its text: Alt+U's undo leaves a turn's rejects empty at one
+    place, and Reject Turn's undo gave the second one's text to the baseline. At most 64 empty
+    records at one place keep their order that way (`MAX_ORDERED`; 256 pins a record), so that a
+    deletion costs about what the records it meets cost; a pinned record that takes the
+    claimer's insertion in is not moved. Properties 10 and 11 have Reject Turn, the agent's
+    replace_all (one action of several edits, reported at once as an open buffer reports them),
+    agent turns and the Delete key; property 10 also redoes everything; both run the review's
+    checks inside every change and after it (`FileReview::check_every_change`,
+    `check_invariants`: hidden, for tests; a release build tests one flag per change), which
+    `cfg(test)` had kept from the integration tests.
+  - Accepts, reloads and the buffer's undo (2026-11-21, fourth pass): an accept marks the records
+    of the agent's edits whose text it took (`Records::accept_overlapping`: records wholly in
+    the hunk, holding the agent's own text, not deletions of the agent's text
+    (`replaced_agents`), not records changed by other agent-side edits (`mixed`)) instead of
+    forgetting them. Their History steps go where the user's change would, they still bring back
+    what they kept, and the reverse of each step goes the same way (`Went`, by the buffer's
+    direction; Alt+U's steps are proposals). Alt+U of the accept, or Alt+U putting a reject's
+    proposal back, un-marks them. With the direction told, a record going the other way no
+    longer claims an edit. Edits inside hunks whose texts are equal go into both texts. History
+    steps nothing recognizes become user entries (`push_step`). The `folded_deletion` and
+    `inside_deletion` fallbacks hold only within their step or its reverse. Reloads are recorded
+    without a turn and no longer clear the user's entries; the file monitor keeps an open
+    document's decided review across a reload (the change is the user's, `Origin::User`).
+    Properties 12 and 13 drive the review as `review_ui`, `Document` and the file monitor do.
+  - Pieces, and the journal of steps (2026-11-21, fourth pass, replacing the `accepted`, `mixed` and
+    `replaced_agents` marks above): each record keeps piece masks of its texts (`records::Masks`:
+    `ours` and `held` over its current text, `taken` and `kept` over the text its next step puts
+    in), saying what the step takes out of both texts or puts into both and what the baseline holds
+    besides. An accept marks only the pieces it took, also in records kept inside others' cut
+    stacks, and returns them (`Taken`) so that Alt+U of the accept reverts exactly those; a reject
+    clears `kept` of the agent deletions it takes back. A step puts its accepted pieces into both
+    texts only where both hold the same place (`model::edit_placed`: the gaps between hunks, a
+    hunk's common start or end up to 4096 bytes in, or an equal run of characters) and the rest as a
+    proposal, so a piece whose place in the baseline is not known comes back as a change to review,
+    never as the user's text (a byte diff inside the hunk was tried and scrambles the baseline: kept
+    as a test). `FileReview` keeps a journal of where each change of the buffer's history went
+    (`Steps`, `Stepped`, `Went`: a proposal, both texts at an offset, or pieces), and the buffer's
+    undo or redo of it, which are last in first out, reverses it exactly (checked by position,
+    lengths and a hash); accepts, Alt+U of an accept and a new buffer make older entries unusable,
+    and the first step after them goes by the masks. User entries record which pieces of the removed
+    text the baseline held. `Records::reapply_edits` (Alt+U of Reject Turn) orders insertions at one
+    place by the pin chains, as `observe` does, and its edits are claimed in a queue. Properties 12
+    and 13 have no exemption left: the markers are checked in every session and the baseline after
+    redoing everything is compared after accepts too. `Document::reload` (Discard, `:q!`, `:e!`)
+    first steps the buffer's redo back to a file the document wrote or read itself (`redo_to`), so
+    the review sees the agent's edits redone, and only then applies the remaining difference as the
+    user's. `review_ui::decide` records no decision for a reject whose edit is empty.
+  - A dropped review's events (2026-11-20): `review_ui::drop_review` keeps the events the agent
+    has not heard of (at most 500, texts cut to what the feedback quotes), and
+    `drain_feedback` delivers them with the next prompt.
   - A dirty document keeps the entry captured at its last save.
   - `replace_all` with tens of thousands of matches is linear (D-5, fixed 2026-10-25: see
     "Batched review feed" below).
@@ -1048,9 +1147,18 @@ they conflict with the sections above, this section wins.
   - In math, text-leaning commands rank lower (`data/completion/math-ok.txt`).
   - `MacroDef` gains `optional_args` / `optional_default`.
   - `[typing] replacements` (off by default): `...` typed in text becomes `\dots` through the
-    snippet driver, an undo step of its own as an autosnippet is (`typing::replacement`).
+    snippet driver, an undo step of its own as an autosnippet is (`typing::replacement`). A space
+    or line break typed right after that `\dots` (cursor not moved since) gets `{}` before it, an
+    undo step of its own, so that TeX prints the space. When a blank follows already and the
+    paragraph goes on, the replacement is `\dots{}` at once (`typing::dots_need_braces`).
   - Editing commands (`editor/editing.rs`): Toggle Comment, Bold, Italic and Emphasize, each one
-    undo step on the active editor.
+    undo step on the active editor. Toggle Comment works in `.bib` files only when biber reads
+    them (`editing::biber_reads_bibliographies`: BibTeX has no comments there); `scan_bib` skips
+    `%` lines between entries. The format actions are enabled only for `format::formattable`
+    tabs (LaTeX and BibTeX).
+  - Drops and pasted images write paths relative to the directory LaTeX resolves them against
+    (`paste::path_base`: the root document's, or the import directory below `\subfile` and
+    `\import`). Demos and the preview formats of scripted runs use `fsutil::private_temp_dir`.
   - Find and replace in the current file (`find_bar.rs`, GtkSourceView's search): its
     replacements are `Origin::User` edits (a review treats them as typing), unlike the Search
     page's Replace All, which is a named review turn; live environment rename stays out of them.
@@ -1735,21 +1843,30 @@ they conflict with the sections above, this section wins.
 - **Recovery of unsaved changes (§3, §7, 2026-10-25):** auto-save is off by default, and a
   crash, `SIGTERM`, `SIGHUP` or a logout used to end the process without the "Save changes?"
   dialog, losing every unsaved change (`recovery.rs`, `[editor] recovery`, default true).
-  - The file: `Paths::recovery_dir()/<fnv1a64(normalized path) as 16 hex>.json`
+  - The file: `Paths::recovery_dir()/<fnv1a64(normalized path) as 16 hex>.<pid>-<token>.json` (one per
+    process, `recovery::file_of`)
     (`$XDG_STATE_HOME/lemma/recovery/`), 0600 in a 0700 directory, a `RecoveryFile`
-    `{version: 1, path, disk_hash, saved_at, pid, text}`: `disk_hash` is the saver's (`fnv1a64`
+    `{version: 1, path, disk_hash, saved_at, pid, writer, text}`: `disk_hash` is the saver's (`fnv1a64`
     of the bytes the file held when the document last read or wrote it; `null` for a file that
-    did not exist), `saved_at` Unix seconds, `pid` the writing process, `text` the document's
+    did not exist), `saved_at` Unix seconds, `pid` the writing process and `writer` its `recovery::writer_id`,
+    `text` the document's
     text byte for byte (its line breaks; the charset is the file's, read again when the document
     opens). An optional `earlier: [{disk_hash, saved_at, text}]` (newest first, left out when
     empty) holds the texts the bar offered for the document and the user had not answered yet
     when the copy was written; it comes after `text`, or one of them takes the place of `text`
     when the document itself has no unsaved changes (`recovery::Snapshot`: `own`, `offered`).
     Only `path` and `text` are required when it is read. A process that writes recovery
-    files holds an exclusive lock (`File::try_lock`: `flock`, `LockFileEx`) on `<pid>.lock` in
+    files holds an exclusive lock (`File::try_lock`: `flock`, `LockFileEx`) on `<writer>.lock` in
     the directory until it ends (`recovery::lock_file`), so a file whose writer still holds its
     lock is a copy of a document another Lemma (one process per window) has open, not one a
-    crash left (`recovery::is_running`); a reused pid does not hold the lock.
+    crash left (`recovery::is_running`); a reused pid does not hold the lock. Each process writes
+    and removes only its own file of a document, so two Lemmas with the same document open and
+    unsaved keep both copies, and a save in one removes only its own. A document that opens
+    reads every file of its hash (`recovery::files_of`: every process's, also named by a pid alone, and Lemma 0.2's shared
+    `<hash>.json`). Files whose writer still runs are left alone. The texts of the others are
+    offered, merged newest first and each once; this process's file is written with them, and
+    only then are their files removed (the writer's `Pending::replaced`, kept for the next write
+    when one fails), so a crash in between loses nothing.
   - Copies: 5 s (`recovery::DELAY`) after the last change to a document of the window, at the
     latest 30 s (`MAX_DELAY`) after the first change not copied yet, and when the window loses
     the focus, each edited document whose version changed since its last copy is copied on the
@@ -1990,3 +2107,128 @@ their behaviour; the Windows paths are `cfg`-gated. The differences:
   `dist/Lemma`, zips it and makes an Inno Setup installer (`lemma.iss`). On Linux it downloads
   llvm-mingw, MSYS2's packages (`msys2.py`), a portable Wine and Inno Setup, each checked
   against a SHA-256, and Wine runs the Windows tools.
+- **Second improvement pass (2026-11-21):**
+  - lemma-search: a CRLF line's `\r` belongs to the line break unless the pattern names `\r` or
+    `\n` outside a negated class (`[^\n]` and `[^\r\n]` do not name it; nested classes count by
+    how many negations enclose them), as `rg --crlf`; `LineHits.span` excludes it, so a replace never changes line breaks.
+  - lemma-pdf search matches the page text itself (NFKD, GLib case folding, `ß` = `ss`) and draws
+    matches from `poppler_page_get_text_layout`; poppler's `find_text` only when the layout does
+    not fit the text. A word hyphenated across a page break is reported on its first page.
+    `LinkDest::Page.y_bp` is in display space on `/Rotate` pages.
+  - lemma-agent: a turn the agent never answered (it died) ends `Cancelled`, not `EndTurn`. When
+    all `MAX_CONNECTIONS` of the MCP server are taken, a new connection displaces the oldest one
+    still in its handshake. A `fallback` block is echoed in place.
+  - Local history: every process that writes a project's `index.jsonl` (appends, collection,
+    sweep) holds an exclusive `File::try_lock` on `index.lock` in that directory (at most 5 s
+    wait); the sweep removes it with an emptied project. Restore from History and Add Citation
+    are named changes (`review_ui::begin_named_change`, `TurnInfo::outside`, persisted as
+    `SavedTurn.outside`) that Undo Last Turn skips. The agent pane keeps `TRANSCRIPT_MAX_TURNS`
+    (100) turns and about `TRANSCRIPT_MAX_BYTES` (8 MiB).
+  - git runs for at most `git_gutter::GIT_TIMEOUT` (30 s) and is then killed with its process
+    group; the file then has no git information. A PDF forward search is answered in order
+    (a queue, each entry with the PDF it was asked of); the answer names the file and line it
+    answers, and goes with the oldest waiting search of that line (those before it lost their
+    answers; an answer no search waits for is dropped).
+  - The history store's `close` (the window's `destroy`) writes the `Job::Write`s still queued
+    itself, after the job the jobs thread runs (a write or a collection, `Store::busy`) has ended, all
+    within `CLOSE_WAIT` (2 s): the index's lock is not waited for past it, and the entries not
+    written by then are given up. Where the file system has no locks (`try_lock` fails other than
+    with `WouldBlock`), the history is written without one. The live text of a
+    file not in the workspace is read whole only up to `agent_edits::LIVE_TEXT_MAX` (64 MiB).
+    Completion names the project's files from the directory LaTeX resolves the active document's
+    paths against (`completion`'s `name_files_for`, `paste::known_path_base`), checked once per
+    document until the index or the listing changes.
+  - The build thread and the main thread share the running latexmk's canceller
+    (`build_ui::StopSlot`), so a Stop reaches a latexmk whose start the main loop has not handled
+    yet (a window that closes right after a save's build began). Temporary directories of demos
+    and scripted previews go at the end of `app::run` (`fsutil::remove_at_exit`). On Windows,
+    `ProjectRoot::resolve` and `relative` take a `\\?\` path under a plain root as inside it
+    (`project_root::below`). `scripts/check-cross.sh` lints the Windows and macOS code on Linux.
+  - lemma-pdf: link and bookmark destinations take the target page's size and rotation from the
+    worker (`links::PageTurn`, `Doc::turn`), so a quarter turn's direction is read from a page's
+    text once per page and generation, not once per destination.
+  - lemma-mcp: until the editor's first byte, the bridge keeps what it sent (the token line and
+    relayed stdin, at most 1 MiB). If it cannot connect, or the editor closes before answering,
+    it connects again up to 6 times (50 ms doubling, 3.15 s in all) and resends it, but not once
+    the socket is gone (the editor removes it when it stops; on Windows, where it is a file with
+    the listener's address, before it closes the connections, so that a bridge reading it again
+    cannot keep it from going). A wrong token ends the bridge after about 3 s, a missing editor
+    at once.
+  - lemma-agent ACP: an agent line over `MAX_LINE_BYTES` is still dropped. When its first 4 KiB
+    hold a top-level `id` (number or string) and a `method`, the agent gets error -32600 for that
+    id, written through a `Weak` of the stdin sender.
+  - lemma-build: files under the output directory are left out of the dump's saved-meanwhile
+    check. The dump writes there itself (expl3 `\iow_open:Nn` works in a dump; `\openout` and
+    `filecontents` do not), and a dump that read such a file is recorded as failed.
+  - Recovery writer ids: the writer id is the pid and 8 random hex digits chosen at start-up,
+    since processes in PID namespaces of their own (containers, Flatpak sandboxes, where every
+    instance may be pid 2) that share the state directory have the same pid. Files of the builds
+    before it (`<hash>.<pid>.json`, no `writer`) are still read, their writer's lock named by
+    `pid`.
+  - Bibliography names: `\bibliography{refs}` names `refs.bib` (BibTeX adds `.bib`);
+    `\addbibresource`, `\addglobalbib` and `\addsectionbib` (`IncludeKind::BibResource`) name
+    their file as written, as biber reads it (checked with biber: `\addbibresource{refs}` and
+    only `refs.bib` stops with "Cannot find 'refs'!"). `labels::scan::bibliographies` is the one
+    mapping, for the project feed, the citation checks and hovers. Only `.bib` and extension-less
+    files are read as BibTeX (`scan::is_bibtex_file`), and the file monitor follows any file the
+    project index read. Go to file tries `refs`, then `refs.bib`; root detection accepts both.
+  - Every read of a document's file goes through `workspace::load_file`, which refuses a named
+    pipe, a socket or a device (also the save's conflict check, a reload, the file monitor and
+    the agent's tools). A document whose charset cannot hold its text can be made a UTF-8 one
+    (`Document::convert_to_utf8`, offered by the failed save's toast). The packages carry the
+    bundled SyncTeX parser's notice (`packaging/synctex-notice.sh`, taken from the vendored
+    files; `ci.sh` runs it).
+  - `lemma_core::LatestSlot` (M0) is gone: nothing used it any more (the PDF thread drains its
+    command channel and keeps the last render request itself).
+  - When the system ends the process with a dialog open, `WindowState::close_without_asking`
+    force-closes the window's dialogs first (libadwaita gives a window's close to its open
+    dialog, before the window's own close-request handlers), then closes the window.
+  - The packages carry the licences of the Rust crates in the programs: `cargo run -p xtask --
+    licenses [--target T]` (`xtask/src/licenses.rs`) lists what `cargo metadata` resolves for
+    `lemma-app` and `lemma-mcp` on the target over normal dependencies and prints the licence files
+    of each crate's sources, equal texts once; every packaging script writes it as `LICENSE.crates`.
+    `packaging/macos/bundle_dylibs.py` copies the licence files of the Homebrew kegs its libraries,
+    modules and data came from (`Resources/licenses/`).
+  - Tests on a machine that is not the developer's: `.github/workflows/tests.yml` (started by hand)
+    runs `scripts/ci.sh` in an Arch Linux container as a new user. `ci.sh` and `broadway.sh` give
+    the display daemon and the tests one runtime directory where `XDG_RUNTIME_DIR` is not set
+    (GLib's fallback follows `HOME` and `XDG_CACHE_HOME`, which the agent tests change), and `ci.sh`
+    sets `LEMMA_TESTS_NEED_DISPLAY`, with which a GTK test program without a display fails instead
+    of skipping. `scripts/fetch-dictionary.sh` fetches an en_US dictionary into `target/` for
+    machines without one (`broadway.sh` hands it to enchant).
+  - A file the agent created and the user rejected is deleted where the file system has no trash
+    (`review_ui::trash_new_file`: GIO answers `NotSupported` on a container's volume, some network
+    mounts, memory file systems); it stayed on disk with the agent's text, no longer under review.
+    Alt+U brings it back as from the trash, and the text is in the local history.
+  - Saving: `saver::replace_file` writes with GIO's blocking `g_file_replace_contents` on a worker
+    thread, not `replace_contents_future`, whose close callback drops the error of closing the
+    stream, where the temporary file is renamed: a save that could not replace its file was reported
+    as written. On Windows a `PermissionDenied` (the file is held open without `FILE_SHARE_DELETE`)
+    is tried again every `REPLACE_PAUSE` (40 ms) for `REPLACE_PATIENCE` (1 s), then fails the save.
+  - On Windows `settings::monitor` watches the file's directory and keeps the events that name the
+    file: GIO's monitor of one file reports nothing when a file is renamed to its name. lemma-
+    synctex takes an `Input:` name with a root but no drive (a build on another system) as recorded
+    with its working directory (`has_root`). On Unix it does the same for a name with a drive
+    (`C:/…/./main.tex`, a build on Windows; `has_drive`), read with `\` as a separator too.
+    `templates::instructions_text` writes paths with `/`; `attach::guess_mime` tells PNG, JPEG, GIF,
+    WebP and PDF by their first bytes on Windows (`sniffed_mime`).
+  - Spell checking: the task that starts an adapter holds it weakly, and `spell::stop` takes the
+    adapter's underline tag out of the tag table when the adapter is finalized (a weak-reference
+    notify, then an idle), not before: libspelling keeps a plain pointer to the tag, which the table
+    alone owns, and can keep a stopped adapter, still connected to `apply-tag`. Removing it at once
+    (an earlier change of this pass) freed it under the adapter. `inline::detach` (from
+    `page_detached`) closes the tab's inline-edit session and unparents every inline-edit popover
+    still on its view.
+  - Paths for the agent: every path Lemma tells the agent is written with `/` on every system
+    (`lemma_core::agent_path`, `ProjectRoot::agent_name`: `chapters/intro.tex`,
+    `C:/Users/u/paper/main.tex`; only a `\\?\` path stays as it is): the tools' replies and errors,
+    `list_files`' project root, the `render_page` copy, `<review_feedback>`, the prompt's editor
+    resource, `{file}` in quick actions, the inline edit's prompt and the names `@` proposes.
+    Windows' `chapters\intro.tex` was read as a command in `\input{…}`. Paths from the agent are
+    taken with `/` or `\`, relative or absolute (`ProjectRoot::resolve`). What the user sees
+    (`review_ui::relative_name`), Lemma's own files and ACP's `cwd` keep the system's spelling.
+  - `packaging/windows/build.sh --test` runs 41 GUI test programs under Wine, each under `xvfb-run`
+    (`GUI_TESTS`); the test harness does not count the warnings GDK's Win32 backend logs under Wine
+    (`common::is_environment_noise`), and `tests/common` has what makes a test program portable
+    (`native`, `Canonical`, `shown`, `skip` and the `require_*` guards, `path_without`,
+    `restore_home`). docs/testing.md lists what does not pass there and why.

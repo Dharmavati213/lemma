@@ -303,6 +303,11 @@ impl ChangesPanel {
         self.diff.text(&start, &end, false).into()
     }
 
+    /// The page shown: `"list"`, `"diff"` or `"empty"`.
+    pub fn page(&self) -> Option<String> {
+        self.stack.visible_child_name().map(String::from)
+    }
+
     /// Shows `summary` (see [`review_ui::review_summary`]); while the page is hidden, only
     /// remembers it.
     pub fn refresh(&self, state: &Rc<WindowState>, summary: &ReviewSummary) {
@@ -338,7 +343,13 @@ impl ChangesPanel {
                 // Built when the page is shown (every recompute refreshes the panel).
                 self.diff_stale.set(true);
             }
-            self.stack.set_visible_child_name("diff");
+            // Nothing to show as a diff either: the page says so.
+            self.stack
+                .set_visible_child_name(if summary.docs.is_empty() {
+                    "empty"
+                } else {
+                    "diff"
+                });
         } else {
             self.diff_stale.set(false);
             self.diff.set_text("");
@@ -732,7 +743,8 @@ fn file_row(state: &Rc<WindowState>, group: &GroupModel, row: &RowModel) -> adw:
             "Accept all changes in this file",
             "Reject all changes in this file",
         ),
-        Some(GroupKind::Turn(_)) => (
+        // A named turn (Replace in Project, a quick fix) is not one the agent ran.
+        Some(GroupKind::Turn(_)) if !group.named => (
             "Keep this turn's changes in this file",
             "Reject this turn's changes in this file",
         ),

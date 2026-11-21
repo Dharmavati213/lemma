@@ -756,8 +756,15 @@ pub struct KeysCfg {
 ///
 /// The error is a human-readable message that includes the location of the problem.
 pub fn parse(src: &str) -> Result<Config, String> {
-    toml::from_str(src).map_err(|e| e.to_string())
+    let mut config: Config = toml::from_str(src).map_err(|e| e.to_string())?;
+    config.build.timeout_s = config.build.timeout_s.min(MAX_BUILD_TIMEOUT_S);
+    Ok(config)
 }
+
+/// The longest `[build] timeout_s` (a week): a longer one is taken as this. The deadlines of a
+/// build, and of the agent's tools that wait for one, add it to the clock, which panics when
+/// the sum is out of the clock's range (`timeout_s = 9223372036854775807`).
+pub const MAX_BUILD_TIMEOUT_S: u64 = 7 * 24 * 60 * 60;
 
 #[cfg(test)]
 mod tests {
@@ -1106,6 +1113,18 @@ mod tests {
         assert!(e.contains("timeout_s"), "{e}");
         assert!(parse("[editor]\nwrap = 1\n").is_err());
         assert!(parse("not toml at all [").is_err());
+    }
+
+    /// A build timeout too long to add to the clock (TOML's largest integer) is capped: the
+    /// deadlines computed from it (`Instant::now() + timeout`) would panic.
+    #[test]
+    fn a_huge_build_timeout_is_capped() {
+        let c = parse("[build]\ntimeout_s = 9223372036854775807\n").unwrap();
+        assert_eq!(c.build.timeout_s, MAX_BUILD_TIMEOUT_S);
+        let timeout = std::time::Duration::from_secs(c.build.timeout_s + 3600);
+        assert!(std::time::Instant::now().checked_add(timeout).is_some());
+        let c = parse("[build]\ntimeout_s = 600\n").unwrap();
+        assert_eq!(c.build.timeout_s, 600);
     }
 
     #[test]

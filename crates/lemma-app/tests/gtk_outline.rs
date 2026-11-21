@@ -68,6 +68,10 @@ fn main() -> ExitCode {
         ),
         ("edits_of_one_chapter_leave_the_others_alone", chapter_edits),
         (
+            "another_root_of_the_same_name_keeps_its_numbers",
+            another_root_of_the_same_name_keeps_its_numbers,
+        ),
+        (
             "clicks_on_rows_and_arrows_with_a_real_pointer",
             real_clicks::parent,
         ),
@@ -78,6 +82,62 @@ fn main() -> ExitCode {
         tests.push(("perf_outline_big_project", perf_big_project));
     }
     common::run(&tests)
+}
+
+// The outline names a file's row as Lemma shows its path: `[chapters\\a.tex]` on Windows. The
+// tests write `[chapters/a.tex]` everywhere; these stand between the two (each does nothing
+// where the separator is `/`).
+
+/// `row` with `/` in a file's name.
+fn slashed(row: &str) -> String {
+    let name = row.trim();
+    if std::path::MAIN_SEPARATOR != '/' && name.starts_with('[') && name.trim_end().ends_with(']') {
+        row.replace(std::path::MAIN_SEPARATOR, "/")
+    } else {
+        row.to_owned()
+    }
+}
+
+/// `row`, as a test writes it, with the system's separator in a file's name.
+fn native(row: &str) -> String {
+    if row.starts_with('[') && row.ends_with(']') {
+        common::shown(row)
+    } else {
+        row.to_owned()
+    }
+}
+
+/// The outline in the golden format (`outline::tree_text`).
+fn tree_text(state: &WindowState) -> String {
+    outline::tree_text(state)
+        .split_inclusive('\n')
+        .map(slashed)
+        .collect()
+}
+
+fn rows(state: &WindowState) -> Vec<String> {
+    outline::rows(state).iter().map(|r| slashed(r)).collect()
+}
+
+fn selected_row(state: &WindowState) -> Option<String> {
+    outline::selected_row(state).map(|r| slashed(&r))
+}
+
+fn filter_results(state: &WindowState) -> (Vec<String>, Option<usize>) {
+    let (results, selected) = outline::filter_results(state);
+    (results.iter().map(|r| slashed(r)).collect(), selected)
+}
+
+fn activate_row(state: &WindowState, row: &str) -> bool {
+    outline::activate_row(state, &native(row))
+}
+
+fn set_expanded(state: &WindowState, row: &str, expanded: bool) -> bool {
+    outline::set_expanded(state, &native(row), expanded)
+}
+
+fn is_expanded(state: &WindowState, row: &str) -> Option<bool> {
+    outline::is_expanded(state, &native(row))
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -195,7 +255,7 @@ impl Fixture {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             common::pump_for(Duration::from_millis(20));
-            let tree = outline::tree_text(&self.state);
+            let tree = tree_text(&self.state);
             if outline::is_settled(&self.state) && ok(&tree) {
                 return;
             }
@@ -304,7 +364,7 @@ fn golden_proj() {
     f.wait_tree("the whole project", |tree| tree == GOLDEN_PROJ);
     assert_eq!(outline::root(&f.state), Some(f.path("main.tex")));
     // Everything is expanded at first: the rows shown are the whole tree.
-    let shown: Vec<String> = outline::rows(&f.state);
+    let shown: Vec<String> = rows(&f.state);
     let golden: Vec<&str> = GOLDEN_PROJ.lines().collect();
     assert_eq!(shown, golden);
     assert_eq!(outline::page_state(&f.state).as_deref(), Some("tree"));
@@ -314,7 +374,7 @@ fn golden_proj() {
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.settle();
     assert_eq!(outline::root(&f.state), Some(f.path("main.tex")));
-    assert_eq!(outline::tree_text(&f.state), GOLDEN_PROJ);
+    assert_eq!(tree_text(&f.state), GOLDEN_PROJ);
 }
 
 fn chapter_first() {
@@ -332,7 +392,7 @@ fn click_navigation() {
     f.show_outline();
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
     // Into the chapter file: it opens in a tab, the cursor on the `\begin{lemma}`.
-    assert!(outline::activate_row(&f.state, "Lemma 2.1 (Yoneda)"));
+    assert!(activate_row(&f.state, "Lemma 2.1 (Yoneda)"));
     let lemma = f.line_of("chapters/yoneda.tex", "\\begin{lemma}");
     f.wait_cursor("chapters/yoneda.tex", lemma);
     assert_eq!(f.cursor().1, 0);
@@ -343,7 +403,7 @@ fn click_navigation() {
     // A heading in the root: the cursor goes onto the command.
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.settle();
-    assert!(outline::activate_row(&f.state, "4.1 Long computation"));
+    assert!(activate_row(&f.state, "4.1 Long computation"));
     let sub = f.line_of("main.tex", "\\subsection{Long computation}");
     f.wait_cursor("main.tex", sub);
     // Back (Alt+Left / Ctrl+O) returns to the lemma, as every navigation records the jump.
@@ -352,13 +412,13 @@ fn click_navigation() {
     // A file row goes to the file's start.
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.settle();
-    assert!(outline::activate_row(&f.state, "1 Introduction"));
+    assert!(activate_row(&f.state, "1 Introduction"));
     f.wait_cursor("main.tex", f.line_of("main.tex", "\\section{Introduction}"));
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.settle();
-    assert!(outline::activate_row(&f.state, "[chapters/yoneda.tex]"));
+    assert!(activate_row(&f.state, "[chapters/yoneda.tex]"));
     f.wait_cursor("chapters/yoneda.tex", 0);
-    assert!(!outline::activate_row(&f.state, "No such row"));
+    assert!(!activate_row(&f.state, "No such row"));
 }
 
 fn enter_navigation() {
@@ -366,7 +426,7 @@ fn enter_navigation() {
     f.open("main.tex");
     f.show_outline();
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
-    let position = outline::rows(&f.state)
+    let position = rows(&f.state)
         .iter()
         .position(|r| r.trim() == "Theorem 3.2 (fpqc descent)")
         .unwrap();
@@ -390,7 +450,7 @@ fn follow_cursor() {
     // Inside the theorem.
     f.put_cursor(&main, theorem + 2, 3);
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("Theorem 3.2 (fpqc descent)")
     );
     // The editor was not scrolled by the outline.
@@ -400,41 +460,35 @@ fn follow_cursor() {
     // After the theorem, in its section's proof.
     let proof = f.line_of("main.tex", "By~\\cite[Tag 023N]");
     f.put_cursor(&main, proof, 0);
-    assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
-        Some("3 Descent")
-    );
+    assert_eq!(selected_row(&f.state).as_deref(), Some("3 Descent"));
     // On a subsection.
     let filler = f.line_of("main.tex", "Filler subsection 3");
     f.put_cursor(&main, filler + 3, 0);
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("4.4 Filler subsection 3")
     );
     // In the preamble: nothing is selected.
     f.put_cursor(&main, 2, 0);
-    assert_eq!(outline::selected_row(&f.state), None);
+    assert_eq!(selected_row(&f.state), None);
     // A collapsed parent: its row (the deepest one shown) is selected instead.
-    assert!(outline::set_expanded(&f.state, "3 Descent", false));
+    assert!(set_expanded(&f.state, "3 Descent", false));
     f.put_cursor(&main, theorem + 2, 0);
-    assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
-        Some("3 Descent")
-    );
-    assert!(outline::set_expanded(&f.state, "3 Descent", true));
+    assert_eq!(selected_row(&f.state).as_deref(), Some("3 Descent"));
+    assert!(set_expanded(&f.state, "3 Descent", true));
     f.settle_follow();
     // In the chapter file, before and in its section.
     let chapter = f.open("chapters/yoneda.tex");
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.put_cursor(&chapter, 1, 0);
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("2 The Yoneda lemma")
     );
     let lemma = f.line_of("chapters/yoneda.tex", "\\begin{lemma}");
     f.put_cursor(&chapter, lemma + 1, 0);
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("Lemma 2.1 (Yoneda)")
     );
     // Switching tabs follows the other tab's cursor (still in the theorem).
@@ -442,7 +496,7 @@ fn follow_cursor() {
     f.state.sidebar.show_page(PAGE_OUTLINE);
     f.settle_follow();
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("Theorem 3.2 (fpqc descent)")
     );
 }
@@ -456,14 +510,14 @@ fn follow_off() {
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
     let theorem = f.line_of("main.tex", "\\begin{theorem}[fpqc");
     f.put_cursor(&main, theorem + 1, 0);
-    assert_eq!(outline::selected_row(&f.state), None);
+    assert_eq!(selected_row(&f.state), None);
     // Turned on (the page's menu writes the setting; here it is set directly).
     let mut config = (*f.state.config.get()).clone();
     config.outline.follow_cursor = true;
     f.state.set_config(Rc::new(config));
     f.settle_follow();
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("Theorem 3.2 (fpqc descent)")
     );
 }
@@ -500,12 +554,12 @@ fn follow_menu() {
     assert!(text.contains("follow_cursor = false"), "{text}");
     let theorem = f.line_of("main.tex", "\\begin{theorem}[fpqc");
     f.put_cursor(&main, theorem + 1, 0);
-    assert_eq!(outline::selected_row(&f.state), None);
+    assert_eq!(selected_row(&f.state), None);
     // On again.
     assert!(state_of(&page));
     f.settle_follow();
     assert_eq!(
-        outline::selected_row(&f.state).as_deref(),
+        selected_row(&f.state).as_deref(),
         Some("Theorem 3.2 (fpqc descent)")
     );
     assert!(
@@ -529,7 +583,7 @@ fn filter() {
     f.show_outline();
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
     outline::set_filter(&f.state, "fpqc");
-    let (results, selected) = outline::filter_results(&f.state);
+    let (results, selected) = filter_results(&f.state);
     assert_eq!(
         results.first().map(String::as_str),
         Some("Theorem 3.2 (fpqc descent)")
@@ -538,7 +592,7 @@ fn filter() {
     assert_eq!(outline::page_state(&f.state).as_deref(), Some("results"));
     // Fuzzy: letters in order, best first.
     outline::set_filter(&f.state, "yoneda");
-    let (results, _) = outline::filter_results(&f.state);
+    let (results, _) = filter_results(&f.state);
     for row in [
         "Lemma 2.1 (Yoneda)",
         "2 The Yoneda lemma",
@@ -547,14 +601,14 @@ fn filter() {
         assert!(results.iter().any(|r| r == row), "{row} in {results:?}");
     }
     outline::set_filter(&f.state, "lng cmp");
-    let (results, _) = outline::filter_results(&f.state);
+    let (results, _) = filter_results(&f.state);
     assert_eq!(
         results.first().map(String::as_str),
         Some("4.1 Long computation")
     );
     // Numbers and theorem names match too.
     outline::set_filter(&f.state, "Prop");
-    let (results, _) = outline::filter_results(&f.state);
+    let (results, _) = filter_results(&f.state);
     assert_eq!(results.first().map(String::as_str), Some("Proposition 4.1"));
     // Enter goes to the selected result.
     outline::set_filter(&f.state, "fpqc");
@@ -563,10 +617,10 @@ fn filter() {
     // No match; cleared: the tree is back, as it was.
     outline::set_filter(&f.state, "zzzzqqq");
     assert_eq!(outline::page_state(&f.state).as_deref(), Some("none"));
-    assert!(outline::filter_results(&f.state).0.is_empty());
+    assert!(filter_results(&f.state).0.is_empty());
     outline::set_filter(&f.state, "");
     assert_eq!(outline::page_state(&f.state).as_deref(), Some("tree"));
-    assert_eq!(outline::rows(&f.state).len(), GOLDEN_PROJ.lines().count());
+    assert_eq!(rows(&f.state).len(), GOLDEN_PROJ.lines().count());
 }
 
 fn incremental() {
@@ -574,11 +628,8 @@ fn incremental() {
     let main = f.open("main.tex");
     f.show_outline();
     f.wait_tree("the project", |tree| tree == GOLDEN_PROJ);
-    assert!(outline::set_expanded(&f.state, "4 Sheaves on sites", false));
-    assert_eq!(
-        outline::is_expanded(&f.state, "4 Sheaves on sites"),
-        Some(false)
-    );
+    assert!(set_expanded(&f.state, "4 Sheaves on sites", false));
+    assert_eq!(is_expanded(&f.state, "4 Sheaves on sites"), Some(false));
     let before = f.stats();
     // A new section: one row is created, nothing else.
     let sites = f.line_of("main.tex", "\\section{Sheaves on sites}");
@@ -588,10 +639,7 @@ fn incremental() {
     });
     let after = f.stats();
     assert_eq!(after.nodes_created - before.nodes_created, 1, "{after:?}");
-    assert_eq!(
-        outline::is_expanded(&f.state, "4 Sheaves on sites"),
-        Some(false)
-    );
+    assert_eq!(is_expanded(&f.state, "4 Sheaves on sites"), Some(false));
     // An edited title updates its row in place: same number (from its label), same children,
     // still collapsed.
     replace(
@@ -605,10 +653,7 @@ fn incremental() {
     let edited = f.stats();
     assert_eq!(edited.nodes_created, after.nodes_created, "{edited:?}");
     assert!(edited.nodes_updated > after.nodes_updated);
-    assert_eq!(
-        outline::is_expanded(&f.state, "4 Sheaves on big sites"),
-        Some(false)
-    );
+    assert_eq!(is_expanded(&f.state, "4 Sheaves on big sites"), Some(false));
     // A theorem added inside a collapsed section.
     let filler = f.line_of("main.tex", "\\subsection{Filler subsection 1}");
     insert_at_line(&main, filler, "\\begin{lemma}[New]\nx\n\\end{lemma}\n");
@@ -623,13 +668,10 @@ fn incremental() {
     replace(&main, "\\begin{lemma}[New]\nx\n\\end{lemma}\n", "");
     replace(&main, "Sheaves on big sites", "Sheaves on sites");
     f.wait_tree("the original", |tree| tree == GOLDEN_PROJ);
-    assert_eq!(
-        outline::is_expanded(&f.state, "4 Sheaves on sites"),
-        Some(false)
-    );
+    assert_eq!(is_expanded(&f.state, "4 Sheaves on sites"), Some(false));
     // Re-expanding shows the children again.
-    assert!(outline::set_expanded(&f.state, "4 Sheaves on sites", true));
-    assert_eq!(outline::rows(&f.state).len(), GOLDEN_PROJ.lines().count());
+    assert!(set_expanded(&f.state, "4 Sheaves on sites", true));
+    assert_eq!(rows(&f.state).len(), GOLDEN_PROJ.lines().count());
 }
 
 fn line_shifts() {
@@ -649,7 +691,7 @@ fn line_shifts() {
     );
     // A click right away lands on the heading.
     f.state.sidebar.show_page(PAGE_OUTLINE);
-    assert!(outline::activate_row(&f.state, "3 Descent"));
+    assert!(activate_row(&f.state, "3 Descent"));
     let deadline = Instant::now() + TIMEOUT;
     loop {
         common::pump_for(Duration::from_millis(10));
@@ -750,7 +792,7 @@ fn hidden_is_free() {
     common::pump_for(Duration::from_millis(300));
     let hidden = f.stats();
     assert_eq!(hidden.syncs, before.syncs);
-    assert!(!outline::tree_text(&f.state).contains("Hidden"));
+    assert!(!tree_text(&f.state).contains("Hidden"));
     // Shown again: brought up to date.
     f.show_outline();
     f.wait_tree("the edit", |tree| tree.contains("\nHidden\n"));
@@ -797,7 +839,7 @@ fn expand_collapse_all() {
     let page = outline::page(&f.state).unwrap();
     assert!(page.activate_action("outline.collapse-all", None).is_ok());
     assert_eq!(
-        outline::rows(&f.state),
+        rows(&f.state),
         [
             "1 Introduction",
             "[chapters/yoneda.tex]",
@@ -806,18 +848,11 @@ fn expand_collapse_all() {
         ]
     );
     // Expanding a collapsed-all row shows its children collapsed too.
-    assert!(outline::set_expanded(
-        &f.state,
-        "[chapters/yoneda.tex]",
-        true
-    ));
+    assert!(set_expanded(&f.state, "[chapters/yoneda.tex]", true));
     common::pump_for(Duration::from_millis(20));
-    assert_eq!(
-        outline::is_expanded(&f.state, "2 The Yoneda lemma"),
-        Some(false)
-    );
+    assert_eq!(is_expanded(&f.state, "2 The Yoneda lemma"), Some(false));
     assert!(page.activate_action("outline.expand-all", None).is_ok());
-    assert_eq!(outline::rows(&f.state).len(), GOLDEN_PROJ.lines().count());
+    assert_eq!(rows(&f.state).len(), GOLDEN_PROJ.lines().count());
 }
 
 /// A file row first shown before its file was read (no headings: under the open section) moves
@@ -848,13 +883,10 @@ fn file_read_later() {
         t == "Intro\n[chapters/a.tex]\n  A\n    B\nAfter\n"
     });
     assert_eq!(
-        outline::rows(&f.state),
+        rows(&f.state),
         ["Intro", "[chapters/a.tex]", "  A", "    B", "After"]
     );
-    assert_eq!(
-        outline::is_expanded(&f.state, "[chapters/a.tex]"),
-        Some(true)
-    );
+    assert_eq!(is_expanded(&f.state, "[chapters/a.tex]"), Some(true));
 }
 
 const THEOREMS_MAIN: &str = "\\documentclass{article}\n\\input{preamble}\n\\begin{document}\n\
@@ -984,11 +1016,11 @@ fn a_chapter_changed_on_disk() {
     let text = std::fs::read_to_string(&chapter).unwrap() + "\\section{Written elsewhere}\n";
     std::fs::write(&chapter, &text).unwrap();
     let deadline = Instant::now() + TIMEOUT;
-    while !outline::tree_text(&f.state).contains("  Written elsewhere\n") {
+    while !tree_text(&f.state).contains("  Written elsewhere\n") {
         assert!(
             Instant::now() < deadline,
             "the chapter's new section; the tree is:\n{}",
-            outline::tree_text(&f.state)
+            tree_text(&f.state)
         );
         common::pump_for(Duration::from_millis(20));
     }
@@ -1134,9 +1166,9 @@ fn chapter_edits() {
     assert_eq!(outline::row_line(&f.state, "One"), Some(1));
     // The new section's rows are known: the cursor in it is followed.
     f.put_cursor(&b, 5, 0);
-    assert_eq!(outline::selected_row(&f.state).as_deref(), Some("New"));
+    assert_eq!(selected_row(&f.state).as_deref(), Some("New"));
     f.put_cursor(&b, 8, 0);
-    assert_eq!(outline::selected_row(&f.state).as_deref(), Some("Lemma"));
+    assert_eq!(selected_row(&f.state).as_deref(), Some("Lemma"));
     // A line break at the start of a heading's line leaves its row there, at a guess; a look at
     // the index before it has the chapter again (another tab selected) puts the row back on the
     // index's line; once it has, the row is on its new line, though the outline is the same
@@ -1167,6 +1199,78 @@ fn chapter_edits() {
     assert_eq!(outline::row_line(&f.state, "Lemma"), Some(9));
 }
 
+/// Two roots of one project with the same name (`paper/main.tex`, `slides/main.tex`), each with
+/// the `.aux` of its own last build: after a build of the paper, the slides' outline takes its
+/// numbers from the slides' `.aux`, not from the `.aux` beside the paper's new PDF.
+fn another_root_of_the_same_name_keeps_its_numbers() {
+    let doc = "\\documentclass{article}\n\\begin{document}\n\\section{Alpha}\n\\end{document}\n";
+    let aux = |n: u32| {
+        format!(
+            "\\@writefile{{toc}}{{\\contentsline {{section}}{{\\numberline {{{n}}}Alpha}}{{1}}{{}}}}\n"
+        )
+    };
+    let (paper_aux, slides_aux) = (aux(7), aux(1));
+    // A latexmk that "builds" the paper: a PDF in `.build`, and a log naming it.
+    common::require_shell_scripts();
+    let bin = common::temp_dir("same-name-bin");
+    let script = format!(
+        "#!/bin/sh\nmkdir -p .build\ncp '{}' .build/main.pdf\n\
+         printf '(./main.tex)\\nOutput written on .build/main.pdf (1 page, 9 bytes).\\n' \
+         > .build/main.log\nexit 0\n",
+        common::fixtures().join("pdf/test.pdf").display()
+    );
+    let source = bin.join("latexmk.src");
+    std::fs::write(&source, script).unwrap();
+    let latexmk = bin.join("latexmk");
+    // Copied by `cp`, so that no child forked meanwhile holds it open for writing.
+    let copied = std::process::Command::new("cp")
+        .arg(&source)
+        .arg(&latexmk)
+        .status();
+    assert!(copied.is_ok_and(|s| s.success()));
+    let chmod = std::process::Command::new("chmod")
+        .arg("755")
+        .arg(&latexmk)
+        .status();
+    assert!(chmod.is_ok_and(|s| s.success()));
+    let f = fixture_with(
+        "same-name",
+        None,
+        &[
+            ("paper/main.tex", doc),
+            ("paper/.build/main.aux", &paper_aux),
+            ("slides/main.tex", doc),
+            ("slides/.build/main.aux", &slides_aux),
+        ],
+        |config| {
+            config.build.latexmk = latexmk.clone();
+            config.build.copy_pdf = false;
+            config.build.fast_preamble = false;
+        },
+    );
+    f.open("paper/main.tex");
+    f.show_outline();
+    f.wait_tree("the paper's numbers", |tree| tree == "7 Alpha\n");
+    let state = f.state.clone();
+    state.request_build(lemma_app::build_ui::Reason::Manual);
+    let build = state.build.get().unwrap();
+    common::pump_until(TIMEOUT, || {
+        build.last_outcome().is_some() && !build.is_busy()
+    });
+    assert_eq!(
+        build.last_outcome().map(|o| o.status),
+        Some(lemma_build::BuildStatus::Success)
+    );
+    f.settle();
+    f.wait_tree("the paper's numbers after its build", |tree| {
+        tree == "7 Alpha\n"
+    });
+    f.open("slides/main.tex");
+    f.settle();
+    assert_eq!(outline::root(&f.state), Some(f.path("slides/main.tex")));
+    f.wait_tree("the slides' own numbers", |tree| tree == "1 Alpha\n");
+}
+
 fn which(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
@@ -1188,7 +1292,7 @@ fn perf_keystroke() {
     let main = f.open("main.tex");
     f.show_outline();
     f.wait_tree("the large outline", |tree| tree.lines().count() > 800);
-    let rows = outline::tree_text(&f.state).lines().count();
+    let rows = tree_text(&f.state).lines().count();
     let context = glib::MainContext::default();
     let mut rng = common::Rng::new(7);
     let mut per_key = Vec::new();
@@ -1268,7 +1372,7 @@ fn perf_large() {
     f.show_outline();
     f.wait_tree("the large outline", |tree| tree.lines().count() > 7000);
     let first = f.stats();
-    let rows = outline::tree_text(&f.state).lines().count();
+    let rows = tree_text(&f.state).lines().count();
     let line = f.line_of("main.tex", "\\section{Section 1500}");
     insert_at_line(&main, line, "\\section{Inserted}\n");
     f.wait_tree("the inserted section", |tree| tree.contains("\nInserted\n"));
@@ -1335,9 +1439,9 @@ fn perf_big_project() {
     completion::refresh_project(&f.state);
     let state = f.state.clone();
     common::pump_until(Duration::from_secs(300), || {
-        outline::is_settled(&state) && outline::tree_text(&state).contains("[c/c0299.tex]\n  300 ")
+        outline::is_settled(&state) && tree_text(&state).contains("[c/c0299.tex]\n  300 ")
     });
-    let rows = outline::tree_text(&f.state).lines().count();
+    let rows = tree_text(&f.state).lines().count();
     println!(
         "    {big:?}: {rows} rows, first outline {:?}",
         f.stats().max_sync
@@ -1384,7 +1488,7 @@ fn perf_big_project() {
         println!("    after {kind}: {syncs} recomputations, median/max {shown}");
     }
     println!("    load {}", common::big_project::load());
-    assert!(outline::tree_text(&f.state).contains("Perf section 6"));
+    assert!(tree_text(&f.state).contains("Perf section 6"));
     if cfg!(debug_assertions) {
         println!("    (debug build: the budgets are checked in release)");
         return;
@@ -1462,37 +1566,22 @@ mod real_clicks {
             arrow_of(&label_in_outline(&f, "The Yoneda lemma").unwrap()).expect("the row's arrow");
         mouse.click_widget(&window, &arrow);
         common::pump_until(TIMEOUT, || {
-            outline::is_expanded(&f.state, "2 The Yoneda lemma") == Some(false)
+            is_expanded(&f.state, "2 The Yoneda lemma") == Some(false)
         });
         f.settle_follow();
         assert_eq!(f.cursor(), (0, 0));
         assert_eq!(f.active_path(), Some(f.path("main.tex")));
-        assert!(
-            !outline::rows(&f.state)
-                .iter()
-                .any(|r| r.contains("Lemma 2.1"))
-        );
+        assert!(!rows(&f.state).iter().any(|r| r.contains("Lemma 2.1")));
         // Remembered: the file row collapsed and expanded makes the row again, collapsed.
-        assert!(outline::set_expanded(
-            &f.state,
-            "[chapters/yoneda.tex]",
-            false
-        ));
-        assert!(outline::set_expanded(
-            &f.state,
-            "[chapters/yoneda.tex]",
-            true
-        ));
+        assert!(set_expanded(&f.state, "[chapters/yoneda.tex]", false));
+        assert!(set_expanded(&f.state, "[chapters/yoneda.tex]", true));
         f.settle_follow();
-        assert_eq!(
-            outline::is_expanded(&f.state, "2 The Yoneda lemma"),
-            Some(false)
-        );
+        assert_eq!(is_expanded(&f.state, "2 The Yoneda lemma"), Some(false));
         // Its arrow again: expanded, the lemma is back.
         let arrow = arrow_of(&label_in_outline(&f, "The Yoneda lemma").unwrap()).unwrap();
         mouse.click_widget(&window, &arrow);
         common::pump_until(TIMEOUT, || {
-            outline::rows(&f.state)
+            rows(&f.state)
                 .iter()
                 .any(|r| r.trim() == "Lemma 2.1 (Yoneda)")
         });
@@ -1503,19 +1592,17 @@ mod real_clicks {
         common::pump_for(Duration::from_millis(50));
         mouse.key(gdk::Key::Left);
         common::pump_until(TIMEOUT, || {
-            outline::is_expanded(&f.state, "3 Descent") == Some(false)
+            is_expanded(&f.state, "3 Descent") == Some(false)
         });
         mouse.key(gdk::Key::Right);
-        common::pump_until(TIMEOUT, || {
-            outline::is_expanded(&f.state, "3 Descent") == Some(true)
-        });
+        common::pump_until(TIMEOUT, || is_expanded(&f.state, "3 Descent") == Some(true));
         mouse.key(gdk::Key::Right);
         common::pump_until(TIMEOUT, || {
-            outline::selected_row(&f.state).as_deref() == Some("Definition 3.1")
+            selected_row(&f.state).as_deref() == Some("Definition 3.1")
         });
         mouse.key(gdk::Key::Left);
         common::pump_until(TIMEOUT, || {
-            outline::selected_row(&f.state).as_deref() == Some("3 Descent")
+            selected_row(&f.state).as_deref() == Some("3 Descent")
         });
         mouse.key(gdk::Key::Down);
         mouse.key(gdk::Key::Return);
@@ -1529,10 +1616,7 @@ mod real_clicks {
             mouse.key(key);
         }
         common::pump_until(TIMEOUT, || {
-            outline::filter_results(&f.state)
-                .0
-                .first()
-                .map(String::as_str)
+            filter_results(&f.state).0.first().map(String::as_str)
                 == Some("Theorem 3.2 (fpqc descent)")
         });
         mouse.key(gdk::Key::Return);

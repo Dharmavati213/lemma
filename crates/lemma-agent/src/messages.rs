@@ -32,8 +32,9 @@
 //! exceptions, all at the tail:
 //! - a response that was cut off (cancel, a broken connection) is never added;
 //! - empty text blocks and thinking blocks without a signature (cut off) are left out, and so are
-//!   the `fallback` marker and, before the last such marker, the declined model's thinking and
-//!   tool-use blocks (the API's rule for echoing a mid-response fallback);
+//!   the declined model's thinking and tool-use blocks before the last `fallback` marker; the
+//!   markers themselves stay exactly where they arrived (the API's rule for echoing a
+//!   mid-response fallback: it checks the thinking blocks around a marker by its position);
 //! - a `tool_use` whose input is not valid JSON is echoed with input `{}`;
 //! - a refusal is never added; when it answered the user's prompt itself, that prompt is
 //!   dropped too, so that the next prompt starts clean.
@@ -54,10 +55,12 @@
 //!
 //! # Errors
 //!
-//! 429, 5xx (529 included), connection errors and a retryable `error` event before any output
-//! are retried at most [`MAX_RETRIES`] times, honouring `retry-after-ms`/`retry-after`, with a
-//! `Notice` each time; 4xx (401: "API key rejected") are not. A failed turn reports `Error`, then
-//! `TurnEnded(EndTurn)`.
+//! 408, 409, 429, 5xx (529 included), connection errors and a retryable `error` event before any
+//! output are retried at most [`MAX_RETRIES`] times, honouring `retry-after-ms`/`retry-after`,
+//! with a `Notice` each time; other 4xx (401: "API key rejected") are not, nor is a 429 for a
+//! reached spend limit (`error.details.error_code` `enforced_spend_limit_reached`). As in
+//! Anthropic's SDKs, an `x-should-retry: true|false` header decides over the status (but a 401
+//! stays a rejected key). A failed turn reports `Error`, then `TurnEnded(EndTurn)`.
 
 use crate::keys::ApiKey;
 use crate::{
@@ -88,7 +91,7 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// `max_tokens` of every request.
 pub const MAX_TOKENS: u32 = 64_000;
-/// Retries of one request (429, 5xx, connection errors).
+/// Retries of one request (408, 409, 429, 5xx, connection errors).
 pub const MAX_RETRIES: u32 = 3;
 /// The longest wait before a retry, whatever `retry-after` says.
 pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
@@ -166,7 +169,7 @@ pub const MODELS: &[Model] = &[
         prices: Prices {
             input: 2.0,
             output: 10.0,
-            cache_read: 0.20,
+            cache_read: 0.10,
             cache_write: 2.5,
         },
     },
@@ -455,6 +458,9 @@ enum HttpEvent {
     Status {
         code: u16,
         retry_after: Option<Duration>,
+        /// The server says whether to retry: `x-should-retry`, or `false` for a reached spend
+        /// limit.
+        should_retry: Option<bool>,
         message: String,
     },
     Sse {
@@ -1049,8 +1055,9 @@ impl Agent {
                     HttpEvent::Status {
                         code,
                         retry_after,
+                        should_retry,
                         message,
-                    } => break Err(classify_status(code, retry_after, &message)),
+                    } => break Err(classify_status(code, retry_after, should_retry, &message)),
                     HttpEvent::Failed(e) => break Err(broken(&response, &e)),
                     HttpEvent::Eof => {
                         break Err(broken(&response, "the response ended early"));
@@ -1265,28 +1272,31 @@ fn broken(response: &Response, error: &str) -> Attempt {
     }
 }
 
-fn classify_status(code: u16, after: Option<Duration>, message: &str) -> Attempt {
+/// What a non-2xx answer means. As in Anthropic's SDKs, the server's `x-should-retry`
+/// (`should_retry`) decides whether it is retried; without one, 408, 409, 429 and 5xx are.
+fn classify_status(
+    code: u16,
+    after: Option<Duration>,
+    should_retry: Option<bool>,
+    message: &str,
+) -> Attempt {
     let detail = if message.is_empty() {
         String::new()
     } else {
         format!(": {message}")
     };
-    match code {
-        401 => Attempt::Unauthorized(format!("API key rejected (401){detail}")),
-        403 => Attempt::Fatal(format!("Permission denied (403){detail}")),
-        429 => Attempt::Retry {
-            message: format!("Rate limited (429){detail}"),
-            after,
-        },
-        529 => Attempt::Retry {
-            message: format!("The API is overloaded (529){detail}"),
-            after,
-        },
-        500..=599 => Attempt::Retry {
-            message: format!("API error ({code}){detail}"),
-            after,
-        },
-        _ => Attempt::Fatal(format!("The API refused the request ({code}){detail}")),
+    let message = match code {
+        401 => return Attempt::Unauthorized(format!("API key rejected (401){detail}")),
+        403 => format!("Permission denied (403){detail}"),
+        429 => format!("Rate limited (429){detail}"),
+        529 => format!("The API is overloaded (529){detail}"),
+        408 | 409 | 500..=599 => format!("API error ({code}){detail}"),
+        _ => format!("The API refused the request ({code}){detail}"),
+    };
+    if should_retry.unwrap_or(matches!(code, 408 | 409 | 429 | 500..=599)) {
+        Attempt::Retry { message, after }
+    } else {
+        Attempt::Fatal(message)
     }
 }
 
@@ -1353,6 +1363,9 @@ fn assistant_echo(blocks: &BTreeMap<u64, Block>) -> (Vec<Value>, Vec<ToolUse>) {
                     echo.push(v.clone());
                 }
             }
+            // Echoed unchanged and in place: the API validates the thinking blocks on either side
+            // of a switch by the marker's position, and rejects the history if it is omitted.
+            "fallback" => echo.push(v.clone()),
             "thinking" if !declined => {
                 if v["signature"].as_str().is_some_and(|s| !s.is_empty()) {
                     echo.push(v.clone());
@@ -1376,6 +1389,10 @@ fn assistant_echo(blocks: &BTreeMap<u64, Block>) -> (Vec<Value>, Vec<ToolUse>) {
             }
             _ => {}
         }
+    }
+    if echo.iter().all(|v| v["type"] == "fallback") {
+        // Markers alone are no answer: nothing is added, as for an empty response.
+        echo.clear();
     }
     (echo, uses)
 }
@@ -1543,6 +1560,7 @@ impl HttpJob {
         }
         if !(200..300).contains(&code) {
             let retry_after = retry_after(response.headers());
+            let retry_header = should_retry_header(response.headers());
             let mut text = String::new();
             let _ = response
                 .into_body()
@@ -1555,6 +1573,8 @@ impl HttpJob {
             self.send(HttpEvent::Status {
                 code,
                 retry_after,
+                // A reached spend limit stays reached however long the wait.
+                should_retry: retry_header.or_else(|| spend_limit_reached(&text).then_some(false)),
                 message: self.key.redact(&error_message(&text)),
             });
             return;
@@ -1630,10 +1650,26 @@ fn retry_after(headers: &ureq::http::HeaderMap) -> Option<Duration> {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n >= 0.0)
     };
+    // Capped before the conversion, which panics on a number too large for a `Duration`.
+    let wait = |secs: f64| Duration::from_secs_f64(secs.min(MAX_RETRY_WAIT.as_secs_f64()));
     number("retry-after-ms")
-        .map(|ms| Duration::from_secs_f64(ms / 1000.0))
-        .or_else(|| number("retry-after").map(Duration::from_secs_f64))
-        .map(|d| d.min(MAX_RETRY_WAIT))
+        .map(|ms| wait(ms / 1000.0))
+        .or_else(|| number("retry-after").map(wait))
+}
+
+/// The server's `x-should-retry: true|false`, which decides over the status code.
+fn should_retry_header(headers: &ureq::http::HeaderMap) -> Option<bool> {
+    match headers.get("x-should-retry")?.to_str().ok()?.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// An API error answer for a reached spend limit (a 429 that no retry gets past).
+fn spend_limit_reached(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .is_ok_and(|v| v["error"]["details"]["error_code"] == "enforced_spend_limit_reached")
 }
 
 /// The `error.message` of an API error answer, else its first 300 characters.
@@ -1782,6 +1818,11 @@ mod tests {
             cache_write: 0,
         };
         assert_eq!(t.cost(&MODELS[0].prices), Usd(24_200_000));
+        // Sonnet 5.5's cache reads are 0.05 × input, like Opus 5.5's.
+        assert_eq!(
+            t.cost(&model("claude-sonnet-5-5").unwrap().prices),
+            Usd(12_100_000)
+        );
         assert_eq!(
             t.cost(&model("claude-haiku-4-5").unwrap().prices),
             Usd(6_100_000)
@@ -1796,6 +1837,12 @@ mod tests {
         h.insert("retry-after-ms", "250".parse().unwrap());
         assert_eq!(retry_after(&h), Some(Duration::from_millis(250)));
         h.insert("retry-after-ms", "9999999".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(MAX_RETRY_WAIT));
+        // Too large for a `Duration` at all.
+        h.insert("retry-after-ms", "1e300".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(MAX_RETRY_WAIT));
+        h.remove("retry-after-ms");
+        h.insert("retry-after", "1e300".parse().unwrap());
         assert_eq!(retry_after(&h), Some(MAX_RETRY_WAIT));
     }
 
@@ -1847,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_echo_drops_the_declined_models_internal_blocks() {
+    fn fallback_echo_keeps_the_marker_and_drops_the_declined_models_internal_blocks() {
         let mut blocks = BTreeMap::new();
         let mut put = |i: u64, value: Value| {
             blocks.insert(
@@ -1880,8 +1927,31 @@ mod tests {
             echo,
             vec![
                 json!({"type": "text", "text": "partial"}),
+                json!({"type": "fallback", "from": {"model": "x"}, "to": {"model": "y"}}),
                 json!({"type": "thinking", "thinking": "b", "signature": "t"}),
             ]
         );
+    }
+
+    #[test]
+    fn a_response_of_fallback_markers_alone_is_not_echoed() {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            0,
+            Block {
+                value: json!({"type": "fallback", "from": {"model": "x"}, "to": {"model": "y"}}),
+                json: String::new(),
+                invalid: None,
+            },
+        );
+        blocks.insert(
+            1,
+            Block {
+                value: json!({"type": "text", "text": ""}),
+                json: String::new(),
+                invalid: None,
+            },
+        );
+        assert!(assistant_echo(&blocks).0.is_empty());
     }
 }

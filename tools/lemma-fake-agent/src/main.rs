@@ -662,7 +662,7 @@ fn relative_path(path: &str) -> Result<PathBuf, String> {
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
     {
         return Err(format!(
-            "disk_write.path must be a relative path inside the project, got \"{path}\""
+            "path must be a relative path inside the project, got \"{path}\""
         ));
     }
     Ok(p)
@@ -670,10 +670,12 @@ fn relative_path(path: &str) -> Result<PathBuf, String> {
 
 /// An `fs_*` step's path: absolute, or relative inside the project.
 fn fs_path_valid(path: &str) -> Result<(), String> {
-    if Path::new(path).is_absolute() {
+    if Path::new(path).is_absolute() || relative_path(path).is_ok() {
         Ok(())
     } else {
-        relative_path(path).map(|_| ())
+        Err(format!(
+            "path must be absolute, or relative inside the project, got \"{path}\""
+        ))
     }
 }
 
@@ -1788,18 +1790,7 @@ impl TurnCtx<'_> {
             }
         };
         self.tool_done(&id, !is_error, &text);
-        let mismatch = match &expect {
-            Expect::Any => None,
-            Expect::Success if is_error => Some(format!("expected success, got an error: {text}")),
-            Expect::Error(_) if !is_error => {
-                Some(format!("expected an error, got a success: {text}"))
-            }
-            Expect::Error(Some(want)) if !text.contains(want.as_str()) => Some(format!(
-                "expected an error containing \"{want}\", got: {text}"
-            )),
-            _ => None,
-        };
-        if let Some(m) = mismatch {
+        if let Some(m) = mismatch(&expect, is_error, &text) {
             return Err(format!("tool {}: {m}", t.name));
         }
         if let Some(want) = &t.expect_text
@@ -2450,6 +2441,10 @@ mod tests {
             (
                 r#"{"default": [{"disk_write": {"path": "../x", "content": ""}}]}"#,
                 "relative",
+            ),
+            (
+                r#"{"default": [{"fs_read": {"path": "../x"}}]}"#,
+                "absolute, or relative",
             ),
             (r#"{"default": [{"disk_write": {"path": "x"}}]}"#, "content"),
             (

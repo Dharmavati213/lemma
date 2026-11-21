@@ -13,6 +13,8 @@
 
 mod common;
 
+use common::Canonical as _;
+
 use adw::prelude::*;
 use lemma_app::editor::Editor;
 use lemma_app::editor::review_gutter::ReviewGutter;
@@ -29,7 +31,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let tmp = common::target_tmpdir();
     std::fs::create_dir_all(&tmp).expect("create the temporary directory");
     // SAFETY: no other thread exists yet.
     unsafe {
@@ -54,9 +56,21 @@ fn main() -> ExitCode {
         ("line_ends_and_subdirectories", crlf_and_subdirectories),
         ("renderer_sits_left_of_the_review_gutter", renderer_place),
         ("config_switch_and_closing_tabs", config_and_close),
+        ("a_repository_cannot_make_git_run_a_command", no_lazy_fetch),
+        (
+            "new_files_without_a_final_newline_and_odd_folder_names",
+            added_files_and_folder_names,
+        ),
+        #[cfg(unix)]
+        ("a_git_that_hangs_is_stopped", hung_git),
     ];
     if std::env::args().any(|a| a == "--ignored") {
         tests.push(("perf_git_gutter_keystrokes_large_tex", perf_large));
+    }
+    // Every test makes a repository with git.
+    if Command::new("git").arg("--version").output().is_err() {
+        println!("SKIP: git is not installed");
+        return ExitCode::SUCCESS;
     }
     common::run(&tests)
 }
@@ -99,7 +113,7 @@ fn repository(name: &str, files: &[(&str, &str)]) -> PathBuf {
     git(&dir, &["init", "-q", "-b", "main"]);
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "first"]);
-    dir.canonicalize().unwrap()
+    dir.canonical().unwrap()
 }
 
 fn write(dir: &Path, files: &[(&str, &str)]) {
@@ -243,7 +257,7 @@ fn edits() {
         "...C..AA.^...",
         "{marks:?}"
     );
-    // Typing inside an added line keeps it added; the edit back to HEAD clears everything.
+    // The edit back to HEAD clears everything.
     set_text(&editor, TEXT);
     f.wait_marks(&editor, "back to HEAD", Marks::is_empty);
     // Everything deleted: one wedge, at the top.
@@ -251,6 +265,86 @@ fn edits() {
     let marks = f.wait_marks(&editor, "emptied", |m| !m.is_empty());
     assert!(marks.deleted_before(0), "{marks:?}");
     assert!(marks.lines.is_empty() || marks.kind_of(0) == Some(MarkKind::Changed));
+}
+
+/// A project that comes with a `.git` of its own (an archive, a download) is not trusted: git
+/// reads the repository's configuration, and a "partial clone" whose `HEAD` text is missing makes
+/// git fetch it from the remote that configuration names, which may be a command (`ext::`).
+/// Reading `HEAD` must never fetch.
+fn no_lazy_fetch() {
+    let dir = repository("lazy-fetch", &[("main.tex", TEXT)]);
+    let marker = dir.with_extension("fetched");
+    let _ = std::fs::remove_file(&marker);
+    let blob = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "HEAD:main.tex"])
+        .output()
+        .expect("run git");
+    let blob = String::from_utf8(blob.stdout).unwrap().trim().to_owned();
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    for (key, value) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.url", url.as_str()),
+        ("remote.origin.promisor", "true"),
+        ("protocol.ext.allow", "always"),
+    ] {
+        git(&dir, &["config", key, value]);
+    }
+    std::fs::remove_file(dir.join(".git/objects").join(&blob[..2]).join(&blob[2..]))
+        .expect("the HEAD text is a loose object");
+    let f = fixture(&dir);
+    let editor = f.open("main.tex");
+    f.settle();
+    common::pump_for(Duration::from_millis(300));
+    f.settle();
+    assert!(git_gutter::status(&editor).is_some());
+    assert!(
+        !marker.exists(),
+        "git ran the command the repository's configuration names"
+    );
+    // The same for the text the watcher of the agent's writes reads from `HEAD`.
+    assert_eq!(git_gutter::head_bytes(&dir, "main.tex"), None);
+    assert!(
+        !marker.exists(),
+        "reading a file of HEAD ran the command the repository's configuration names"
+    );
+    let intact = repository("head-bytes", &[("ch/a b.tex", "x\n")]);
+    assert_eq!(
+        git_gutter::head_bytes(&intact, "ch/a b.tex").as_deref(),
+        Some(&b"x\n"[..])
+    );
+    assert_eq!(git_gutter::head_bytes(&intact, "missing.tex"), None);
+}
+
+/// Every line of a file that is not in `HEAD` is added, also when the file does not end with a
+/// line break (its first line is not "changed" against nothing). A repository whose folder name
+/// ends in a space is a repository like any other.
+fn added_files_and_folder_names() {
+    let dir = repository("added-no-newline", &[("main.tex", TEXT)]);
+    write(&dir, &[("new.tex", "a\nb"), ("one.tex", "x")]);
+    git(&dir, &["add", "new.tex", "one.tex"]);
+    let f = fixture(&dir);
+    let editor = f.open("new.tex");
+    f.wait_status(&editor, Status::Tracked { in_head: false });
+    let marks = f.wait_marks(&editor, "staged", |m| !m.is_empty());
+    assert_eq!(picture(&marks, line_count(&editor)), "AA.", "{marks:?}");
+    let one = f.open("one.tex");
+    let marks = f.wait_marks(&one, "staged", |m| !m.is_empty());
+    assert_eq!(picture(&marks, line_count(&one)), "A.", "{marks:?}");
+    drop(f);
+
+    let base = common::temp_dir("folder-names");
+    let dir = base.join("thesis ");
+    write(&dir, &[("main.tex", TEXT)]);
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "first"]);
+    let dir = dir.canonical().unwrap();
+    let f = fixture(&dir);
+    let editor = f.open("main.tex");
+    f.wait_status(&editor, Status::Tracked { in_head: true });
 }
 
 fn index_and_commits() {
@@ -288,7 +382,7 @@ fn index_and_commits() {
     write(&empty, &[("a.tex", "x\ny\n"), ("b.tex", "z\n")]);
     git(&empty, &["init", "-q"]);
     git(&empty, &["add", "a.tex"]);
-    let g = fixture(&empty.canonicalize().unwrap());
+    let g = fixture(&empty.canonical().unwrap());
     let a = g.open("a.tex");
     let b = g.open("b.tex");
     g.wait_status(&a, Status::Tracked { in_head: false });
@@ -303,11 +397,75 @@ fn index_and_commits() {
     g.wait_marks(&a, "first commit", Marks::is_empty);
 }
 
+/// A git that hangs (here on a named pipe in the repository that nobody writes, as on a network
+/// file system that does not answer) is stopped after the timeout, with no git information for
+/// what it was asked, and the gutter goes on for the other repositories. The same for the text
+/// the watcher of the agent's writes reads from `HEAD`.
+#[cfg(unix)]
+fn hung_git() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fifo = |path: &Path| {
+        std::fs::remove_file(path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    };
+    // Looking for the repository hangs: its `HEAD` is a pipe.
+    let discovery = repository("hung-discovery", &[("main.tex", TEXT)]);
+    fifo(&discovery.join(".git/HEAD"));
+    // Resolving `HEAD` hangs: the branch it names is a pipe.
+    let head = repository("hung-head", &[("main.tex", TEXT)]);
+    fifo(&head.join(".git/refs/heads/main"));
+    let healthy = repository("not-hung", &[("main.tex", TEXT)]);
+    git_gutter::set_timeout(Some(Duration::from_millis(500)));
+    let started = Instant::now();
+    let f = fixture(&discovery);
+    let editor = f.open("main.tex");
+    f.wait_status(&editor, Status::OutsideRepository);
+    let open = |path: &Path| {
+        let editor = block_on(f.state.open_file(path)).expect("open");
+        f.settle();
+        editor
+    };
+    let unknown = open(&head.join("main.tex"));
+    f.wait_status(&unknown, Status::Untracked);
+    assert!(git_gutter::marks(&unknown).unwrap().is_empty());
+    assert!(!git_gutter::has_renderer(&unknown));
+    // The gutter is still on.
+    let tracked = open(&healthy.join("main.tex"));
+    f.wait_status(&tracked, Status::Tracked { in_head: true });
+    assert_eq!(git_gutter::head_bytes(&discovery, "main.tex"), None);
+    assert_eq!(git_gutter::head_bytes(&head, "main.tex"), None);
+    assert_eq!(
+        git_gutter::head_bytes(&healthy, "main.tex").as_deref(),
+        Some(TEXT.as_bytes())
+    );
+    assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
+    // No git is left waiting on the pipes.
+    #[cfg(target_os = "linux")]
+    {
+        let waiting = |dir: &Path| {
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+                .filter(|cmdline| {
+                    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+                    args.iter().any(|a| a.ends_with(b"git"))
+                        && args.contains(&dir.as_os_str().as_bytes())
+                })
+                .count()
+        };
+        assert_eq!((waiting(&discovery), waiting(&head)), (0, 0));
+    }
+    git_gutter::set_timeout(None);
+}
+
 fn outside() {
     let dir = common::temp_dir("outside");
     write(&dir, &[("main.tex", TEXT)]);
     let runs = git_gutter::git_runs();
-    let f = fixture(&dir.canonicalize().unwrap());
+    let f = fixture(&dir.canonical().unwrap());
     let editor = f.open("main.tex");
     f.wait_status(&editor, Status::OutsideRepository);
     assert!(!git_gutter::has_renderer(&editor));
@@ -342,12 +500,23 @@ fn commit_clears() {
     set_text(&editor, &edited.replace("more\n", "MORE\n"));
     let marks = f.wait_marks(&editor, "edited again", |m| !m.is_empty());
     assert_eq!(picture(&marks, line_count(&editor)), ".....C......");
-    // `git reset --hard HEAD~1` from a terminal: HEAD moves back (the buffer keeps its text).
+    // `git reset --soft HEAD~1` from a terminal: HEAD moves back (the buffer keeps its text).
     git(&dir, &["reset", "-q", "--soft", "HEAD~1"]);
     let marks = f.wait_marks(&editor, "after a reset", |m| {
         m.kind_of(5) == Some(MarkKind::Added)
     });
     assert_eq!(marks.kind_of(5), Some(MarkKind::Added));
+    // The same on a branch in a folder of `refs/heads` (`feature/x`), whose file the monitors
+    // do not see change: the reset leaves the index alone, but HEAD's log changes.
+    git(&dir, &["checkout", "-q", "-b", "feature/x"]);
+    git(&dir, &["commit", "-q", "-m", "more again"]);
+    f.wait_marks(&editor, "committed on feature/x", |m| {
+        m.kind_of(5) == Some(MarkKind::Changed)
+    });
+    git(&dir, &["reset", "-q", "--soft", "HEAD~1"]);
+    f.wait_marks(&editor, "after a reset on feature/x", |m| {
+        m.kind_of(5) == Some(MarkKind::Added)
+    });
 }
 
 fn no_git_per_keystroke() {

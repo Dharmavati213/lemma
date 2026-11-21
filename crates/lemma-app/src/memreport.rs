@@ -116,6 +116,8 @@ Swap:                 0 kB
         assert_eq!(MemReport::parse(&text), MemReport::parse(SAMPLE));
     }
 
+    // Only Linux has `/proc/self/smaps_rollup` (the app's unit tests also run on Windows).
+    #[cfg(target_os = "linux")]
     #[test]
     fn reads_this_process() {
         let r = MemReport::read().expect("smaps_rollup is readable on Linux");

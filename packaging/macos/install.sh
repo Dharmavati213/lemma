@@ -157,10 +157,11 @@ check_mac() {
 
 # ---------- downloads ----------
 
-# fetch URL FILE: downloads with a progress bar; prints the HTTP status (000: no connection).
+# fetch URL FILE: downloads with a progress bar; prints the HTTP status (000: no connection, or
+# the download broke off: curl still reports the status the server answered with).
 fetch() {
   local code
-  code="$(curl -L --retry 3 --retry-delay 2 -C - -# -o "$2" -w '%{http_code}' "$1")" || true
+  code="$(curl -L --retry 3 --retry-delay 2 -C - -# -o "$2" -w '%{http_code}' "$1")" || code=000
   printf '%s\n' "${code:-000}"
 }
 
@@ -229,7 +230,7 @@ download_release() {
   case "$code" in
     200) return 0 ;;
     404) return 1 ;;
-    000) die "no connection to github.com" ;;
+    000) die "downloading Lemma failed (no connection to github.com, or it broke off)" ;;
     *) die "downloading Lemma failed (HTTP $code)" ;;
   esac
 }
@@ -374,7 +375,11 @@ install_texlive_package() { # NAME FILE: BasicTeX.pkg or MacTeX.pkg
   local pkg="$WORK/$2" code
   info "$CTAN/systems/mac/mactex/$2"
   code="$(fetch "$CTAN/systems/mac/mactex/$2" "$pkg")"
-  [ "$code" = 200 ] || die "downloading $2 failed (HTTP $code)"
+  case "$code" in
+    200) ;;
+    000) die "downloading $2 failed (no connection, or it broke off)" ;;
+    *) die "downloading $2 failed (HTTP $code)" ;;
+  esac
   check_package "$pkg"
   need_sudo
   info "Installing $1 (a few minutes)"
@@ -489,6 +494,7 @@ uninstall() {
     ok "removed $COMMAND_PATH"
   fi
   rm -rf "$HOME/Library/Caches/lemma-install"
+  rm -f "$HOME/Library/Logs/lemma-install-cpan.log"
   info "Your settings stay in ~/.config/lemma and ~/.local/state/lemma."
   info "TeX stays too. To remove it: sudo rm -rf /usr/local/texlive /Library/TeX /etc/paths.d/TeX"
 }

@@ -37,8 +37,7 @@ fn main() -> ExitCode {
         return run_child(&probe);
     }
     // Rejecting a file the agent created moves it to the trash: keep that out of the user's.
-    let data = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("lemma-regress-d-data-{}", std::process::id()));
+    let data = common::target_tmpdir().join(format!("lemma-regress-d-data-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("create the data directory");
     // SAFETY: no other thread exists yet.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
@@ -261,6 +260,7 @@ impl Drop for Fixture {
 /// controller on the view's parent, which stops the keys of `Editor::vim_blocks_key`), then goes
 /// to the Vim context with `gtk_im_context_filter_key`.
 fn type_keys(state: &WindowState, editor: &Editor, keys: &str) {
+    common::require_keymap();
     let im = editor.vim().expect("Vim is on");
     let surface = state.window.surface().expect("realized window");
     let display = surface.display();
@@ -747,6 +747,8 @@ fn regress_scripted_flag_without_deadline_keeps_prompts() {
 // ----- D16: Vim J on a whitespace-only last line -----
 
 fn regress_vim_join_whitespace_last_line_returns() {
+    // The child types keys.
+    common::require_keymap();
     let status = child("vim_join", Duration::from_secs(30));
     assert_eq!(
         status,
@@ -769,6 +771,8 @@ fn regress_latin1_trailing_accent_opens() {
 // ----- D19: an editor that outlives its tab -----
 
 fn regress_wq_then_discard_does_not_abort() {
+    // The child types keys.
+    common::require_keymap();
     let status = child("wq_discard", Duration::from_secs(60));
     assert_eq!(
         status,

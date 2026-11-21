@@ -1346,21 +1346,24 @@ pub fn delete_word_before_cursor(view: &TexView) {
     let buffer = view.buffer();
     let mut end = buffer.iter_at_mark(&buffer.get_insert());
     let mut start = end;
+    // Steps go by cursor positions, not characters: a `\r\n` line break goes whole (a lone `\r`
+    // left behind would join the lines for LaTeX), and a letter with its combining accents is
+    // one letter (`e` + U+0301 is a letter, the accent alone is not).
     let before = |at: &gtk::TextIter| {
         let mut p = *at;
-        (!at.starts_line() && p.backward_char()).then(|| p.char())
+        (!at.starts_line() && p.backward_cursor_position()).then(|| p.char())
     };
     if start.starts_line() {
-        start.backward_char();
+        start.backward_cursor_position();
     } else {
         while before(&start).is_some_and(|c| c == ' ' || c == '\t') {
-            start.backward_char();
+            start.backward_cursor_position();
         }
         let word = |c: char| c.is_alphanumeric() || c == '_';
         if let Some(first) = before(&start) {
             let kind = word(first);
             while before(&start).is_some_and(|c| !c.is_whitespace() && word(c) == kind) {
-                start.backward_char();
+                start.backward_cursor_position();
             }
         }
     }

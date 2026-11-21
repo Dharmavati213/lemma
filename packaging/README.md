@@ -3,12 +3,15 @@
 `PKGBUILD` builds Lemma from this checkout as it is (no download of the sources) and packages:
 
 - `/usr/bin/lemma` and `/usr/bin/lemma-mcp` (Lemma finds `lemma-mcp` next to itself);
-- `/usr/share/applications/io.github.lemma_editor.Lemma.desktop`, which opens `.tex` files
-  (`text/x-tex`);
+- `/usr/share/applications/io.github.lemma_editor.Lemma.desktop`, which opens `.tex` and `.bib`
+  files (`text/x-tex`, `text/x-bibtex`);
 - `/usr/share/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg`;
+- `/usr/share/metainfo/io.github.lemma_editor.Lemma.metainfo.xml`, the description that software
+  centres (GNOME Software, KDE Discover) show;
 - `/usr/share/lemma/`: the built-in default snippets, prompts and document templates, as examples
   for `~/.config/lemma/` (Lemma itself uses the copies compiled into it);
-- the licence.
+- the licence, and the licences of the Rust crates compiled into the two programs
+  (`LICENSE.crates`, printed by `cargo run -p xtask -- licenses` from the crates' own sources).
 
 ## Build and install
 
@@ -29,16 +32,17 @@ makepkg -i --nodeps
 `makepkg` runs `cargo build --release --locked` with its target directory in `packaging/src/`, so
 the repository's `target/` is left alone. A release build takes several minutes. `-s` installs
 the missing build and run dependencies with pacman, `-i` installs the package (both ask for your
-password). Without `-i`, `makepkg` only builds `lemma-<version>-x86_64.pkg.tar.zst`, which
-`sudo pacman -U lemma-*.pkg.tar.zst` installs later.
+password). Without `-i`, `makepkg` only builds `lemma-<version>-<rel>-x86_64.pkg.tar.zst`,
+which `sudo pacman -U lemma-*.pkg.tar.zst` installs later.
 
-Optional dependencies: `texlive-binextra` (latexmk and chktex), `hunspell-en_us` (spell
-checking), `nodejs` and `npm` (the Claude Code agent), `git` (the git gutter).
+Optional dependencies: `texlive-binextra` (latexmk and chktex), `texlive-latexextra`,
+`texlive-bibtexextra` and `biber` (LaTeX packages, biblatex), `hunspell-en_us` (spell checking),
+`nodejs` and `npm` (the Claude Code, Codex and Pi agents), `git` (the git gutter).
 
 ## After installing
 
 - `update-desktop-database` and `gtk-update-icon-cache` run through pacman's hooks, so Lemma shows
-  up in the launcher and in "Open With" for `.tex` files.
+  up in the launcher and in "Open With" for `.tex` and `.bib` files.
 - To make Lemma the default for `.tex` files:
   `xdg-mime default io.github.lemma_editor.Lemma.desktop text/x-tex`.
 - Settings live in `~/.config/lemma/config.toml` (Preferences opens it).

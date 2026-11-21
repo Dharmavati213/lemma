@@ -151,6 +151,39 @@ fn moved_project_is_reanchored_at_the_pdf_directory() {
     );
 }
 
+/// A project built on Windows and opened here with its PDF (a shared folder, a download): the
+/// recorded names have a drive, and MiKTeX may write them with backslashes. They were taken for
+/// relative names, so neither direction found anything.
+#[cfg(unix)]
+#[test]
+fn a_project_built_on_windows_is_reanchored_too() {
+    let (_tmp, dir) = tempdir();
+    touch(&dir, &["main.tex", "chapters/intro.tex"]);
+    write_synctex(
+        &dir.join("main.pdf"),
+        &[
+            (1, "C:/Users/u/paper/./main.tex".into()),
+            (2, r"C:\Users\u\paper\.\chapters\intro.tex".into()),
+            (
+                3,
+                "C:/texlive/2026/texmf-dist/tex/latex/base/article.cls".into(),
+            ),
+        ],
+        &[(1, 10), (2, 5)],
+    );
+    let mut s = Scanner::open(&dir.join("main.pdf")).unwrap();
+    assert_eq!(forward(&mut s, &dir.join("main.tex"), 10), [node_box(0)]);
+    assert_eq!(
+        forward(&mut s, &dir.join("chapters/intro.tex"), 5),
+        [node_box(1)]
+    );
+    assert_eq!(inverse(&mut s, 0), target(dir.join("main.tex"), 10));
+    assert_eq!(
+        inverse(&mut s, 1),
+        target(dir.join("chapters/intro.tex"), 5)
+    );
+}
+
 #[test]
 fn moved_project_with_an_output_directory() {
     let (_tmp, dir) = tempdir();

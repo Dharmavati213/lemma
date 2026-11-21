@@ -440,8 +440,12 @@ fn remember(state: &WindowState, name: &str) {
                 }
                 let text = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
                 let tmp = file.with_extension(format!("json.{}", std::process::id()));
-                std::fs::write(&tmp, text)?;
-                std::fs::rename(&tmp, &file)
+                let written =
+                    std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file));
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                written
             })
             .await;
             if let Ok(Err(e)) = written {

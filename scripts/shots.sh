@@ -13,9 +13,9 @@
 # b-review-turns.png comes from tests/gtk_review_persist.rs (two agent turns need two prompts),
 # run with LEMMA_TEST_SNAPSHOTS; so do the t-* shots (into target/shots/tests/: the history
 # timeline, chktex findings, the label tools' popovers and dialogs, unmatched delimiters; M5: the
-# environment tools and align helper, the agent backend picker and API key row). d-demo-pdf.png and the l-pdf-* shots need
-# scripts/build-fixtures.sh (run on demand). p-git-gutter.png commits a copy of proj into a
-# throwaway git repository (no global or system git configuration is read).
+# environment tools and align helper, the agent backend picker and API key row). d-demo-pdf.png
+# and the l-pdf-* shots need scripts/build-fixtures.sh (run on demand). p-git-gutter.png commits
+# a copy of proj into a throwaway git repository (no global or system git configuration is read).
 #
 # Every run gets LEMMA_CONFIG=/dev/null (m-prefs: an empty temporary config.toml) and a temporary
 # XDG_STATE_HOME; the fixture copies and the logs live in a temporary directory under target/.
@@ -31,27 +31,6 @@ OUT="${LEMMA_SHOTS_DIR:-$ROOT/target/shots}"
 case "$OUT" in /*) ;; *) OUT="$ROOT/$OUT" ;; esac
 MS="${LEMMA_SHOT_MS:-1500}"
 [[ "$MS" =~ ^[0-9]+$ ]] || die "LEMMA_SHOT_MS must be a number of milliseconds"
-
-if [ -n "${LEMMA_BIN:-}" ]; then
-  bin="$LEMMA_BIN"
-else
-  target="${CARGO_TARGET_DIR:-$ROOT/target}"
-  case "$target" in /*) ;; *) target="$ROOT/$target" ;; esac
-  if [ "$PROFILE" = dev ] || [ "$PROFILE" = debug ]; then
-    cargo build --quiet -p lemma-app -p lemma-fake-agent -p lemma-mcp
-    bin="$target/debug/lemma"
-  else
-    cargo build --quiet --profile "$PROFILE" -p lemma-app -p lemma-fake-agent -p lemma-mcp
-    bin="$target/$PROFILE/lemma"
-  fi
-fi
-[ -x "$bin" ] || die "lemma binary not found at $bin"
-mkdir -p "$OUT" "$ROOT/target"
-work="$(mktemp -d "$ROOT/target/shots-work.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/state"
-agent="$ROOT/tests/fixtures/agent"
-failures=0
 
 # copy FIXTURE NAME: copies tests/fixtures/FIXTURE to $work/NAME and prints the copy's path.
 copy() {
@@ -111,7 +90,7 @@ shot_b-review-all-changes() {
 shot_c-errors-editor() { local d; d="$(copy logs/undefcs ce)"; shot c-errors-editor -- "$d/main.tex" --build; }
 shot_c-errors-problems() { local d; d="$(copy logs/undefcs cp)"; shot c-errors-problems -- "$d/main.tex" --build --sidebar problems; }
 shot_d-demo-pdf() {
-  [ -f target/fixtures/pdf50.tex ] || scripts/build-fixtures.sh >/dev/null
+  pdf50
   shot d-demo-pdf QUIT_MS=5000 -- --demo pdf "$ROOT/target/fixtures/pdf50.tex"
 }
 shot_e-agent-then-build() {
@@ -157,7 +136,7 @@ shot_f-agent-permission() {
 }
 shot_f-inline-edit() {
   # The popover while the (sleeping) turn runs: the region, the instruction and the progress.
-  local d; d="$(copy proj fi)"
+  local d; d="$(copy proj "fi")"
   shot f-inline-edit LEMMA_DEMO_INLINE="Say that these notes test Lemma" LEMMA_DEMO_LINE=34 \
     LEMMA_DEMO_RETURN_MS=1500 -- "$d/main.tex" --demo agent --agent-scenario "$agent/cancel.json"
 }
@@ -182,7 +161,8 @@ shot_k-math-preview-light() {
   local d; d="$(copy proj kl)"
   shot k-math-preview-light "${light[@]}" QUIT_MS=4000 -- "$d/chapters/yoneda.tex" --demo math-preview
 }
-pdf50() { [ -f target/fixtures/pdf50.tex ] || scripts/build-fixtures.sh >/dev/null; }
+# The PDF, not the .tex: a failed fixture build leaves the .tex without it.
+pdf50() { [ -f target/fixtures/pdf50.pdf ] || scripts/build-fixtures.sh >/dev/null; }
 shot_l-pdf-search() { pdf50; shot l-pdf-search QUIT_MS=4000 -- --demo pdf-search "$ROOT/target/fixtures/pdf50.tex"; }
 shot_l-pdf-thumbs() {
   pdf50
@@ -217,6 +197,8 @@ shot_o-problems-explained() {
 shot_p-git-gutter() {
   local d; d="$(copy proj p)"
   local git_env=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CEILING_DIRECTORIES="$work")
+  # "$1" below is for the inner sh, which gets the directory.
+  # shellcheck disable=SC2016
   if ! env "${git_env[@]}" GIT_AUTHOR_NAME=Lemma GIT_AUTHOR_EMAIL=lemma@example.invalid \
       GIT_COMMITTER_NAME=Lemma GIT_COMMITTER_EMAIL=lemma@example.invalid \
       sh -c 'git -C "$1" init -q -b main && git -C "$1" add . && git -C "$1" commit -q -m fixture' \
@@ -323,10 +305,34 @@ all=(a-build a-build-light b-review-three b-review-all b-review-all-changes c-er
   t-agent-backends)
 names=("$@")
 [ ${#names[@]} -gt 0 ] || names=("${all[@]}")
+# A misspelt name fails here, before the build.
 for n in "${names[@]}"; do
-  n="${n%.png}"
-  declare -F "shot_$n" >/dev/null || die "unknown shot $n (known: ${all[*]})"
-  "shot_$n"
+  declare -F "shot_${n%.png}" >/dev/null || die "unknown shot ${n%.png} (known: ${all[*]})"
+done
+
+if [ -n "${LEMMA_BIN:-}" ]; then
+  bin="$LEMMA_BIN"
+else
+  target="${CARGO_TARGET_DIR:-$ROOT/target}"
+  case "$target" in /*) ;; *) target="$ROOT/$target" ;; esac
+  if [ "$PROFILE" = dev ] || [ "$PROFILE" = debug ]; then
+    cargo build --quiet -p lemma-app -p lemma-fake-agent -p lemma-mcp
+    bin="$target/debug/lemma"
+  else
+    cargo build --quiet --profile "$PROFILE" -p lemma-app -p lemma-fake-agent -p lemma-mcp
+    bin="$target/$PROFILE/lemma"
+  fi
+fi
+[ -x "$bin" ] || die "lemma binary not found at $bin"
+mkdir -p "$OUT" "$ROOT/target"
+work="$(mktemp -d "$ROOT/target/shots-work.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/state"
+agent="$ROOT/tests/fixtures/agent"
+failures=0
+
+for n in "${names[@]}"; do
+  "shot_${n%.png}"
 done
 
 if [ "$failures" -gt 0 ]; then

@@ -18,7 +18,7 @@ mod common;
 
 use adw::prelude::*;
 use gtk::gdk;
-use lemma_app::editor::{Editor, VimMode, vim};
+use lemma_app::editor::{Editor, VimMode};
 use lemma_app::window::WindowState;
 use lemma_app::workspace::{Workspace, normalize};
 use lemma_config::Config;
@@ -170,6 +170,7 @@ fn feed_keys(
     mut skip: impl FnMut(gdk::Key, gdk::ModifierType) -> bool,
     mut through: impl FnMut(char),
 ) {
+    common::require_keymap();
     let display = surface.display();
     let keyboard = display
         .default_seat()
@@ -900,12 +901,12 @@ fn time_substitute(f: &Fixture, command: &str, rounds: usize) -> (Vec<Duration>,
         buffer.place_cursor(&buffer.iter_at_offset(cursor));
         f.type_keys(command);
         let t = Instant::now();
-        vim::feed_key(&im, view, gdk::Key::Return, gdk::ModifierType::empty());
+        common::feed_vim_key(&im, view, gdk::Key::Return, gdk::ModifierType::empty());
         runs.push(t.elapsed());
         assert_ne!(f.text(), original, "{command} replaced nothing");
         common::pump_for(Duration::from_millis(20));
         let t = Instant::now();
-        vim::feed_key(&im, view, gdk::Key::u, gdk::ModifierType::empty());
+        common::feed_vim_key(&im, view, gdk::Key::u, gdk::ModifierType::empty());
         undos.push(t.elapsed());
         assert_eq!(f.text(), original, "undo");
         common::pump_for(Duration::from_millis(20));

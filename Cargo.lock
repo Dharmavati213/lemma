@@ -1352,7 +1352,6 @@ dependencies = [
 name = "lemma-syntax"
 version = "0.2.0"
 dependencies = [
- "insta",
  "lemma-core",
  "memchr",
  "proptest",
@@ -2710,6 +2709,7 @@ name = "xtask"
 version = "0.2.0"
 dependencies = [
  "ruzstd",
+ "serde_json",
 ]
 
 [[package]]

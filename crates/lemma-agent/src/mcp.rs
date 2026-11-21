@@ -9,7 +9,8 @@
 //!
 //! - **`mcp-accept` thread**: a blocking `UnixListener` (on Windows a loopback TCP listener, see
 //!   [`crate::transport`]); one `mcp-conn-<n>` thread per connection (at most
-//!   [`MAX_CONNECTIONS`]).
+//!   [`MAX_CONNECTIONS`]; when all are taken, a new connection displaces the oldest one that has
+//!   not sent its token yet, so clients that never do cannot lock the agent's bridge out).
 //! - **Connection thread**: checks the token line (constant-time compare; anything else closes
 //!   the connection without a reply), then reads one JSON-RPC message per line. Everything but
 //!   `tools/call` is answered by the pure [`handle_basic`]. A `tools/call` is parsed with
@@ -37,7 +38,7 @@
 use super::{EditorRequest, ToolCall, ToolContent, ToolReply};
 use crate::transport::{self, Listener, Stream};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
@@ -85,8 +86,9 @@ pub const TOOL_NAMES: [&str; 10] = [
     "render_page",
     "get_review_state",
 ];
-/// Most simultaneous connections; further ones are closed at once. The CLI opens one per agent
-/// session, so this only bounds misbehaving clients.
+/// Most simultaneous connections. When all are taken, a new one displaces the oldest connection
+/// still in its handshake, or is closed at once when every one has passed it. The CLI opens one
+/// per agent session, so this only bounds misbehaving clients.
 pub const MAX_CONNECTIONS: usize = 64;
 /// Most tool calls in flight on one connection; further ones get an `isError` reply.
 pub const MAX_IN_FLIGHT: usize = 32;
@@ -169,7 +171,10 @@ write, and the user reviews every change you make as red/green hunks.";
 /// says that the user reviews changes as red/green hunks, and the read-only tools carry
 /// `readOnlyHint` so that the CLI also allows them in plan mode and may run them in parallel.
 pub fn tool_definitions() -> Value {
-    let path_rel = "absolute, or relative to the project root";
+    // Lemma's replies write every path with `/`, on Windows too, so that a path copied into
+    // `\input{…}` is not read as a command; from the agent, Windows' `\` is taken as well.
+    let path_rel = "absolute, or relative to the project root, with / between its names on every \
+    system, as in chapters/intro.tex; on Windows \\ is accepted too";
     let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
     let no_args = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     json!([
@@ -296,7 +301,8 @@ pub fn tool_definitions() -> Value {
             "description": format!("Lists the files of the LaTeX project: first the files of \
     the document (the root document, then the files it includes), then the other files under the \
     project root, at most 500 in all. Build output, files TeX generates, .git and hidden directories \
-    are left out. {READ_ONLY_NOTE}"),
+    are left out. Paths are relative to the project root and written with / on every system, ready \
+    for \\input{{…}} and for the other tools. {READ_ONLY_NOTE}"),
             "inputSchema": no_args,
             "annotations": read_only
         },
@@ -834,7 +840,7 @@ fn token_matches(line: &[u8], token: &[u8]) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum LineRead {
+pub(crate) enum LineRead {
     /// A line is in the buffer (without its `'\n'`; a final line without one counts too).
     Line,
     /// The line exceeded the limit; it was consumed and discarded.
@@ -843,7 +849,12 @@ enum LineRead {
 }
 
 /// Reads one `'\n'`-terminated line into `out` (cleared first), keeping at most `max` bytes.
-fn read_line_capped(r: &mut impl BufRead, out: &mut Vec<u8>, max: usize) -> io::Result<LineRead> {
+/// Also reads the ACP agent's stdout (`acp.rs`).
+pub(crate) fn read_line_capped(
+    r: &mut impl BufRead,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<LineRead> {
     out.clear();
     let mut too_long = false;
     loop {
@@ -1029,6 +1040,8 @@ struct Shared {
     stopping: AtomicBool,
     /// A handle on each live connection, so that `stop` can shut it down.
     conns: Mutex<HashMap<u64, Stream>>,
+    /// The connections that have not sent their token line yet, oldest first.
+    pending: Mutex<VecDeque<u64>>,
 }
 
 impl Shared {
@@ -1040,6 +1053,32 @@ impl Shared {
         for stream in lock(&self.conns).values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+
+    fn in_handshake(&self, id: u64) -> bool {
+        lock(&self.pending).contains(&id)
+    }
+
+    /// Ends connection `id`'s handshake; false when a newer connection displaced it first. Both
+    /// happen under the same lock, so a connection that passed its handshake is never displaced.
+    fn end_handshake(&self, id: u64) -> bool {
+        let mut pending = lock(&self.pending);
+        let Some(i) = pending.iter().position(|&p| p == id) else {
+            return false;
+        };
+        pending.remove(i);
+        true
+    }
+
+    /// Closes the oldest connection still in its handshake; false when there is none.
+    fn displace_oldest_pending(&self) -> bool {
+        let Some(id) = lock(&self.pending).pop_front() else {
+            return false;
+        };
+        if let Some(stream) = lock(&self.conns).get(&id) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        true
     }
 }
 
@@ -1081,8 +1120,9 @@ impl McpServer {
     /// - `token` must not be empty.
     /// - The socket's directory is created with mode 0700; an existing one that belongs to the
     ///   user is set to 0700, one that belongs to someone else is refused. The socket itself gets
-    ///   mode 0600. The path must be shorter than 108 bytes (`sun_path`). On Windows the socket is
-    ///   a loopback port named by a file at the path ([`crate::transport`]).
+    ///   mode 0600. The path must be shorter than `sun_path` (108 bytes on Linux, 104 on macOS).
+    ///   On Windows the socket is a loopback port named by a file at the path
+    ///   ([`crate::transport`]).
     /// - A stale socket file at `socket` (nobody listening) is replaced; a live one gives
     ///   `AddrInUse`, any other file `AlreadyExists`.
     pub fn start_with(
@@ -1115,6 +1155,7 @@ impl McpServer {
             timeouts: Mutex::new(timeouts),
             stopping: AtomicBool::new(false),
             conns: Mutex::new(HashMap::new()),
+            pending: Mutex::new(VecDeque::new()),
         });
         let accept = {
             let shared = Arc::clone(&shared);
@@ -1163,6 +1204,11 @@ impl McpServer {
             // SAFETY: the fd belongs to `listener`, which this Arc keeps open.
             unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
         }
+        // On Windows the socket is a file with the listener's address, which a bridge reads each
+        // time it connects: it goes before the connections close, or a bridge that connects
+        // again as it is turned away has the file open and keeps it from going.
+        #[cfg(windows)]
+        self.remove_socket();
         self.shared.close_all_connections();
         let accept = lock(&self.accept).take();
         if let Some(accept) = accept {
@@ -1184,10 +1230,15 @@ impl McpServer {
                 tracing::error!("mcp: the accept thread panicked");
             }
         }
+        self.remove_socket();
+        lock(&self.listener).take();
+    }
+
+    /// Removes the socket file if it is still the one this server bound.
+    fn remove_socket(&self) {
         if self.socket_id.is_some() && file_id(&self.socket) == self.socket_id {
             let _ = fs::remove_file(&self.socket);
         }
-        lock(&self.listener).take();
     }
 }
 
@@ -1231,8 +1282,16 @@ fn accept_loop(shared: &Arc<Shared>, listener: &Listener) {
         }
         threads.retain(|t| !t.is_finished());
         if threads.len() >= MAX_CONNECTIONS {
-            tracing::warn!("mcp: too many connections; closing a new one");
-            continue;
+            // Connections that never send their token would otherwise keep the agent's bridge
+            // out until their handshake times out. A displaced one ends within moments; the
+            // second bound keeps the threads in check while it does. (Windows takes up to
+            // `POLL_SLICE` to end one, so a flood of them can reach that bound: the bridge, turned
+            // away before it is answered, connects again.)
+            if threads.len() >= 2 * MAX_CONNECTIONS || !shared.displace_oldest_pending() {
+                tracing::warn!("mcp: too many connections; closing a new one");
+                continue;
+            }
+            tracing::warn!("mcp: too many connections; closed the oldest one without its token");
         }
         let Ok(handle) = stream.try_clone() else {
             continue;
@@ -1240,6 +1299,7 @@ fn accept_loop(shared: &Arc<Shared>, listener: &Listener) {
         let id = next_conn;
         next_conn += 1;
         lock(&shared.conns).insert(id, handle);
+        lock(&shared.pending).push_back(id);
         // `stop` sets the flag before it shuts the registered connections down, so either it
         // saw this one or we see the flag here.
         if shared.stopping() {
@@ -1249,17 +1309,20 @@ fn accept_loop(shared: &Arc<Shared>, listener: &Listener) {
         let spawned = thread::Builder::new()
             .name(format!("mcp-conn-{id}"))
             .spawn(move || {
-                let result =
-                    catch_unwind(AssertUnwindSafe(|| serve_connection(&conn_shared, stream)));
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    serve_connection(&conn_shared, stream, id)
+                }));
                 if result.is_err() {
                     tracing::error!("mcp: connection {id} panicked");
                 }
+                conn_shared.end_handshake(id);
                 lock(&conn_shared.conns).remove(&id);
             });
         match spawned {
             Ok(t) => threads.push(t),
             Err(e) => {
                 tracing::warn!("mcp: cannot start a connection thread: {e}");
+                shared.end_handshake(id);
                 if let Some(s) = lock(&shared.conns).remove(&id) {
                     let _ = s.shutdown(Shutdown::Both);
                 }
@@ -1313,17 +1376,24 @@ impl Conn {
 struct ConnReader {
     stream: Stream,
     deadline: Option<Instant>,
-    #[cfg(windows)]
+    /// The connection's id in [`Shared::pending`].
+    id: u64,
     shared: Arc<Shared>,
 }
 
 impl ConnReader {
     /// How long the next read may wait: until the handshake's deadline (an error once it has
-    /// passed), else as long as it takes.
+    /// passed, or once a newer connection displaced this one), else as long as it takes.
     fn wait_left(&self) -> io::Result<Option<Duration>> {
         let Some(deadline) = self.deadline else {
             return Ok(None);
         };
+        if !self.shared.in_handshake(self.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "displaced by a newer connection",
+            ));
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(
@@ -1368,7 +1438,8 @@ impl io::Read for ConnReader {
     }
 }
 
-fn serve_connection(shared: &Arc<Shared>, stream: Stream) {
+/// Serves connection `id`, which must be in [`Shared::pending`] until its token line arrives.
+fn serve_connection(shared: &Arc<Shared>, stream: Stream, id: u64) {
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
@@ -1377,17 +1448,18 @@ fn serve_connection(shared: &Arc<Shared>, stream: Stream) {
         ConnReader {
             stream: read_half,
             deadline: Some(Instant::now() + shared.handshake_timeout),
-            #[cfg(windows)]
+            id,
             shared: Arc::clone(shared),
         },
     );
     let mut line = Vec::new();
     let first = read_line_capped(&mut reader, &mut line, MAX_TOKEN_LINE);
     reader.get_mut().deadline = None;
+    let displaced = !shared.end_handshake(id);
     let authorized = matches!(first, Ok(LineRead::Line)) && token_matches(&line, &shared.token);
-    if !authorized {
+    if displaced || !authorized {
         // Closed without a reply: dropping the stream is all the client learns.
-        if shared.stopping() {
+        if shared.stopping() || displaced {
             return;
         }
         if matches!(first, Ok(LineRead::Eof)) {
@@ -1873,6 +1945,8 @@ mod tests {
             timeouts: Mutex::new(Timeouts::default()),
             stopping: AtomicBool::new(false),
             conns: Mutex::new(HashMap::new()),
+            // Connection 0, as the accept loop registers it.
+            pending: Mutex::new(VecDeque::from([0])),
         });
         (shared, rx)
     }
@@ -1883,7 +1957,7 @@ mod tests {
         let (shared, _rx) = test_shared(Duration::from_millis(150));
         let (server_end, mut client) = transport::pair().unwrap();
         let start = Instant::now();
-        let t = thread::spawn(move || serve_connection(&shared, server_end));
+        let t = thread::spawn(move || serve_connection(&shared, server_end, 0));
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -1903,7 +1977,7 @@ mod tests {
         use std::io::BufRead;
         let (shared, _rx) = test_shared(Duration::from_secs(5));
         let (server_end, client) = transport::pair().unwrap();
-        let t = thread::spawn(move || serve_connection(&shared, server_end));
+        let t = thread::spawn(move || serve_connection(&shared, server_end, 0));
         let mut writer = client.try_clone().unwrap();
         // Token and first request in one write: the request must not be lost in the buffer.
         writer
@@ -1915,6 +1989,32 @@ mod tests {
         let reply: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(reply, json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
         writer.shutdown(Shutdown::Write).unwrap();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_displaced_connection_is_refused_even_with_the_right_token() {
+        use std::io::Read;
+        let (shared, _rx) = test_shared(Duration::from_secs(5));
+        assert!(shared.displace_oldest_pending());
+        assert!(
+            !shared.displace_oldest_pending(),
+            "only connection 0 was pending"
+        );
+        let (server_end, mut client) = transport::pair().unwrap();
+        let t = thread::spawn(move || serve_connection(&shared, server_end, 0));
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = client.write_all(
+            b"{\"lemma_token\":\"secret-token\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n",
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            client.read(&mut buf).unwrap_or(0),
+            0,
+            "closed without a reply"
+        );
         t.join().unwrap();
     }
 

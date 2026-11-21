@@ -62,7 +62,11 @@ pub struct Compiled {
 
 impl Compiled {
     /// Validates `def` and parses its bodies.
-    fn new(def: SnippetDef) -> Result<Self, SnippetError> {
+    fn new(mut def: SnippetDef) -> Result<Self, SnippetError> {
+        // TOML keeps a multi-line string's line breaks as the file has them, `\r\n` in a file
+        // saved on Windows. The editor gives each `\n` the document's own line break.
+        def.body = plain_line_breaks(def.body);
+        def.if_undefined = def.if_undefined.map(plain_line_breaks);
         let invalid = |msg: String| SnippetError::Body {
             trigger: def.trigger.clone(),
             msg,
@@ -114,6 +118,15 @@ impl Compiled {
             trigger_len,
             alt_chunks: self.alt.as_deref(),
         }
+    }
+}
+
+/// `s` with its `\r\n` line breaks written `\n`.
+fn plain_line_breaks(s: String) -> String {
+    if s.contains("\r\n") {
+        s.replace("\r\n", "\n")
+    } else {
+        s
     }
 }
 

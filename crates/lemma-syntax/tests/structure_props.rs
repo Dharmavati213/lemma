@@ -165,4 +165,13 @@ proptest! {
         parse_aux(&text);
         parse_magic(&text);
     }
+
+    /// xparse argument specs, complete or being typed, with any characters after the letters.
+    #[test]
+    fn document_command_specs_never_panic(spec in "[smoOdDrRtTeEbluv>+ {}()\\[\\]\\\\é^_]{0,12}") {
+        let idx = index_file(&format!("\\NewDocumentCommand{{\\x}}{{{spec}}}{{b}}"));
+        for m in &idx.macros {
+            prop_assert!(m.nargs <= 9 && m.optional_args <= m.nargs);
+        }
+    }
 }

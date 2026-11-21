@@ -12,9 +12,13 @@
 //! changed is not overwritten (the Overwrite toast offers it), and when `[build] on_save` is set
 //! one build follows, once every document is written. While an agent turn runs nothing is saved;
 //! a save that came due is made when the turn ends (two seconds later for `"idle"`, at once for
-//! `"focus"` if the window is still in the background).
+//! `"focus"` if the window is still in the background). The same holds while "Save changes?"
+//! waits for an answer ([`resume`] when it is answered), and once the window closes for good
+//! nothing is saved at all: the changes left then were discarded on purpose (Discard, `:qa!`),
+//! and the window losing the focus as it goes must not write them after all.
 //!
-//! Hooks: [`install`] once per window; [`attach`] / [`detach`] per editor tab. Tests:
+//! Hooks: [`install`] once per window; [`attach`] / [`detach`] per editor tab; [`resume`] after
+//! "Save changes?". Tests:
 //! [`set_idle_delay`], [`is_scheduled`], [`is_deferred`], [`focus_lost`], [`save_now`].
 
 use crate::document::{DocRef, ObserverId};
@@ -35,7 +39,7 @@ struct Saver {
     state: Weak<WindowState>,
     timer: RefCell<Option<glib::SourceId>>,
     delay: Cell<Duration>,
-    /// A save came due while an agent turn ran.
+    /// A save came due while an agent turn ran, or while "Save changes?" asked.
     deferred: Cell<bool>,
     /// Each attached editor's document and edit observer.
     observers: RefCell<Vec<(Weak<Editor>, DocRef, ObserverId)>>,
@@ -130,13 +134,14 @@ pub fn focus_lost(state: &Rc<WindowState>) {
     }
 }
 
-/// Saves every open document with unsaved changes, unless auto-save is off or an agent turn
-/// runs (then the save is made when the turn ends). Returns how many saves started.
+/// Saves every open document with unsaved changes, unless auto-save is off, the window closes
+/// for good, or an agent turn runs or "Save changes?" asks (then the save is made when the turn
+/// ends or the dialog is answered). Returns how many saves started.
 pub fn save_now(state: &Rc<WindowState>) -> usize {
-    if mode(state) == Autosave::Off {
+    if mode(state) == Autosave::Off || state.is_closing() {
         return 0;
     }
-    if state.agent_controller().is_some_and(|a| a.is_running()) {
+    if state.is_asking() || state.agent_controller().is_some_and(|a| a.is_running()) {
         if let Some(saver) = saver(state) {
             saver.deferred.set(true);
         }
@@ -152,6 +157,16 @@ pub fn save_now(state: &Rc<WindowState>) -> usize {
         state.save_documents(&dirty);
     }
     dirty.len()
+}
+
+/// "Save changes?" was answered (and what the answer asked for is done): a save that came due
+/// while it asked is made now, as after an agent's turn.
+pub fn resume(state: &Rc<WindowState>) {
+    if let Some(saver) = saver(state)
+        && saver.deferred.replace(false)
+    {
+        saver.turn_ended();
+    }
 }
 
 /// Sets the idle delay (tests).

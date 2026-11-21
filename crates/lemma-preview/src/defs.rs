@@ -236,16 +236,12 @@ fn parse(text: &str, i: usize, shape: Shape) -> Option<usize> {
             if b.get(i) != Some(&b'\\') {
                 return None;
             }
-            let (_, mut j) = control_word(text, i);
-            j = skip_space(b, j);
+            let mut j = skip_space(b, control_end(text, i));
             if b.get(j) == Some(&b'=') {
                 j = skip_space(b, j + 1);
             }
             match b.get(j)? {
-                b'\\' => {
-                    let (_, end) = control_word(text, j);
-                    Some(end.max(j + 2).min(b.len()))
-                }
+                b'\\' => Some(control_end(text, j)),
                 b'\n' | b'%' => None,
                 _ => Some(j + text[j..].chars().next()?.len_utf8()),
             }
@@ -263,12 +259,7 @@ fn name_arg(text: &str, i: usize) -> Option<(&str, usize)> {
             name.starts_with('\\').then_some((name, end))
         }
         b'\\' => {
-            let (name, end) = control_word(text, i);
-            let end = if name.is_empty() {
-                (i + 2).min(b.len())
-            } else {
-                end
-            };
+            let end = control_end(text, i);
             Some((&text[i..end], end))
         }
         _ => None,
@@ -344,6 +335,18 @@ fn control_word(text: &str, i: usize) -> (&str, usize) {
         j += 1;
     }
     (&text[i + 1..j], j)
+}
+
+/// The end of the control sequence at the backslash `i`: after its name, or after the one
+/// character of a control symbol, which may take several bytes (`\\`, `\é`).
+fn control_end(text: &str, i: usize) -> usize {
+    match control_word(text, i) {
+        ("", _) => text[i + 1..]
+            .chars()
+            .next()
+            .map_or(text.len(), |c| i + 1 + c.len_utf8()),
+        (_, end) => end,
+    }
 }
 
 /// Skips blanks and single newlines (and comments) from `i`.
@@ -468,12 +471,34 @@ mod tests {
         assert_eq!(defs(&huge), ["\\providecommand{\\k}{K}"]);
     }
 
+    /// A control symbol of a character of several bytes (`\é`, `\€`: one token in XeTeX and
+    /// LuaTeX) as the name or the value of a definition.
+    #[test]
+    fn control_symbols_of_multibyte_characters() {
+        assert_eq!(
+            defs("\\let\\foo\\é\n\\newcommand\\€{E}\n\\DeclareMathOperator\\ß{ss}\n\\let\\\\ü"),
+            [
+                "\\let\\foo\\é",
+                "\\providecommand\\€{E}",
+                "\\providecommand{\\ß}{\\operatorname{ss}}",
+                "\\let\\\\ü",
+            ]
+        );
+        // As the name of a `\let`: the whole character, then the value.
+        assert_eq!(
+            defs("\\let\\é=\\alpha\n\\let\\€\\relax\n\\let\\\\=\\relax\n\\newcommand{\\R}{X}\n"),
+            [
+                "\\let\\é=\\alpha",
+                "\\let\\€\\relax",
+                "\\let\\\\=\\relax",
+                "\\providecommand{\\R}{X}",
+            ]
+        );
+    }
+
     #[test]
     fn utf8_is_kept() {
         let found = defs("\\let\\é=ö \\newcommand{\\R}{ℝ} \\def\\ü{x}");
-        assert_eq!(
-            found.last().map(String::as_str),
-            Some("\\providecommand{\\R}{ℝ}")
-        );
+        assert_eq!(found, ["\\let\\é=ö", "\\providecommand{\\R}{ℝ}"]);
     }
 }

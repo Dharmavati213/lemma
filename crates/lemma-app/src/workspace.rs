@@ -285,7 +285,7 @@ impl Workspace {
             }
             let cannot_open = |e: &str| format!("cannot open {}: {e}", path.display());
             let location = gio::File::for_path(&path);
-            let read = match location.load_contents_future().await {
+            let read = match load_file(&path).await {
                 Ok(read) => Some(read),
                 Err(e) if e.matches(gio::IOErrorEnum::NotFound) => {
                     tracing::info!("{} does not exist yet; opening it empty", path.display());
@@ -329,7 +329,7 @@ impl Workspace {
     /// else (no pending hunks, no unsaved changes), so the file can simply be read again. A
     /// review with nothing left to decide goes with it.
     async fn drop_if_stale(&self, doc: &DocRef) {
-        let disk = match gio::File::for_path(doc.path()).load_contents_future().await {
+        let disk = match load_file(doc.path()).await {
             Ok((bytes, _etag)) => Some(bytes),
             Err(e) if e.matches(gio::IOErrorEnum::NotFound) => None,
             // Unreadable now: keep what we have.
@@ -454,11 +454,6 @@ impl Workspace {
         }
     }
 
-    /// Does nothing: the window's file monitor ([`crate::agent::watcher`], installed with the
-    /// window) watches the project, since what a change means (agent hunks, a reload, a conflict
-    /// bar, a toast) depends on the window's agent turn and its widgets. Kept for API stability.
-    pub fn start_file_monitor(&self) {}
-
     /// Snapshots the project's source files for an agent turn (ARCHITECTURE §4.2 item 1), with
     /// the default cap ([`DEFAULT_SNAPSHOT_CAP`]); see [`Workspace::turn_snapshot_with`].
     pub fn turn_snapshot(&self) -> impl Future<Output = TurnSnapshot> + use<> {
@@ -557,12 +552,34 @@ fn set_candidate_encodings(loader: &sourceview5::FileLoader, encodings: &[&sourc
 
 /// Reads and decodes the file at `path` (see [`saver::decode`]) and records its state on disk.
 async fn read(path: &Path) -> Result<(saver::Decoded, DiskState), String> {
-    let (bytes, etag) = gio::File::for_path(path)
-        .load_contents_future()
-        .await
-        .map_err(|e| e.message().to_owned())?;
+    let (bytes, etag) = load_file(path).await.map_err(|e| e.message().to_owned())?;
     let decoded = saver::decode(&bytes, None)?;
     Ok((decoded, DiskState::of(&bytes, etag)))
+}
+
+/// The bytes of the file at `path` and its entity tag, as GIO's `load_contents` gives them.
+/// A named pipe, a socket or a device is refused without reading it
+/// (`IOErrorEnum::NotRegularFile`): that would wait for another program to write (or, for
+/// `/dev/zero`, never end). Every read of a document's file comes here, also while the
+/// document is held: its file may have been replaced by a pipe since it was read.
+pub(crate) async fn load_file(
+    path: &Path,
+) -> Result<(glib::Slice<u8>, Option<glib::GString>), glib::Error> {
+    let file = gio::File::for_path(path);
+    let info = file
+        .query_info_future(
+            gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+            gio::FileQueryInfoFlags::NONE,
+            glib::Priority::DEFAULT,
+        )
+        .await;
+    if info.is_ok_and(|info| info.file_type() == gio::FileType::Special) {
+        return Err(glib::Error::new(
+            gio::IOErrorEnum::NotRegularFile,
+            "it is not a regular file (a named pipe, a socket or a device)",
+        ));
+    }
+    file.load_contents_future().await
 }
 
 thread_local! {
@@ -610,8 +627,7 @@ mod tests {
     }
 
     fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lemma-ws-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::fsutil::private_temp_dir(&format!("lemma-ws-{name}-")).unwrap();
         for (file, text) in files {
             let path = dir.join(file);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

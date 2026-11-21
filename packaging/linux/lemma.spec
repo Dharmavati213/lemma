@@ -40,6 +40,7 @@ cp -a %{lemma_stage}/. %{buildroot}/
 %{_bindir}/lemma-mcp
 %{_datadir}/applications/io.github.lemma_editor.Lemma.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg
+%{_metainfodir}/io.github.lemma_editor.Lemma.metainfo.xml
 %{_datadir}/lemma/
 %{_datadir}/licenses/lemma/
 %{_docdir}/lemma/

@@ -5,6 +5,7 @@
 #   sudo ./install.sh --system       for everyone, into /usr/local
 #   ./install.sh --prefix DIR        into DIR (bin/, share/)
 #   ./install.sh --uninstall [--system | --prefix DIR]
+#   ./install.sh --force             install even when the libraries below are missing
 #
 # Lemma uses the system's GTK 4.22+, libadwaita 1.9+, GtkSourceView 5.18+, libspelling and
 # poppler-glib 26.01+: it checks for them first and names the packages to install if they are
@@ -33,7 +34,7 @@ while [ $# -gt 0 ]; do
     --uninstall) uninstall=1 ;;
     --force) force=1 ;;
     -h | --help)
-      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -43,6 +44,15 @@ done
 case "$prefix" in /*) ;; *) die "--prefix needs an absolute path" ;; esac
 manifest="$prefix/share/lemma/installed-files"
 
+# The launchers' MIME cache, and the icon cache where the prefix has an icon theme.
+refresh_caches() {
+  command -v update-desktop-database >/dev/null &&
+    update-desktop-database -q "$prefix/share/applications" 2>/dev/null || true
+  if [ -f "$prefix/share/icons/hicolor/index.theme" ] && command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" 2>/dev/null || true
+  fi
+}
+
 if [ -n "$uninstall" ]; then
   [ -f "$manifest" ] || die "Lemma was not installed into $prefix by this script"
   while IFS= read -r file; do
@@ -50,9 +60,9 @@ if [ -n "$uninstall" ]; then
   done <"$manifest"
   rm -f "$manifest"
   rm -rf "$prefix/share/lemma/templates"
-  rmdir "$prefix/share/lemma" 2>/dev/null || true
-  command -v update-desktop-database >/dev/null &&
-    update-desktop-database -q "$prefix/share/applications" 2>/dev/null || true
+  rmdir "$prefix/share/lemma" "$prefix/share/doc/lemma" "$prefix/share/licenses/lemma" \
+    2>/dev/null || true
+  refresh_caches
   echo "Lemma is removed from $prefix (your settings stay in ~/.config/lemma)."
   exit 0
 fi
@@ -98,25 +108,38 @@ put 755 bin/lemma bin/lemma
 put 755 bin/lemma-mcp bin/lemma-mcp
 put 644 share/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg \
   share/icons/hicolor/scalable/apps/io.github.lemma_editor.Lemma.svg
+put 644 share/metainfo/io.github.lemma_editor.Lemma.metainfo.xml \
+  share/metainfo/io.github.lemma_editor.Lemma.metainfo.xml
 put 644 share/lemma/snippets.default.toml share/lemma/snippets.default.toml
 put 644 share/lemma/prompts.default.toml share/lemma/prompts.default.toml
 put 644 share/doc/lemma/README.md share/doc/lemma/README.md
+put 644 LICENSE share/licenses/lemma/LICENSE
+# The notice of the SyncTeX parser that bin/lemma contains.
+[ ! -f "$here/LICENSE.synctex" ] || put 644 LICENSE.synctex share/licenses/lemma/LICENSE.synctex
+# The licences of the Rust crates that bin/lemma and bin/lemma-mcp contain.
+[ ! -f "$here/LICENSE.crates" ] || put 644 LICENSE.crates share/licenses/lemma/LICENSE.crates
 if [ -d "$here/share/lemma/templates" ]; then
   rm -rf "$prefix/share/lemma/templates"
   cp -r "$here/share/lemma/templates" "$prefix/share/lemma/templates"
 fi
 # The launcher entry names the installed binary: ~/.local/bin is not always on a desktop's PATH.
+# The path is quoted as the Desktop Entry Specification asks (a backslash before \ " ` $ inside
+# double quotes, then every backslash doubled as in any string value, and % as %%), so a prefix
+# with a space or another special character still gives a launcher that starts.
 desktop="share/applications/io.github.lemma_editor.Lemma.desktop"
 mkdir -p "$prefix/share/applications"
-sed "s|^Exec=lemma |Exec=$prefix/bin/lemma |" "$here/$desktop" >"$prefix/$desktop"
+exec_path="$(printf '%s\n' "$prefix/bin/lemma" |
+  sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')"
+while IFS= read -r line; do
+  case "$line" in
+    "Exec=lemma "*) printf 'Exec="%s" %s\n' "$exec_path" "${line#Exec=lemma }" ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done <"$here/$desktop" >"$prefix/$desktop"
 echo "$prefix/$desktop" >>"$manifest.new"
 mv "$manifest.new" "$manifest"
 
-command -v update-desktop-database >/dev/null &&
-  update-desktop-database -q "$prefix/share/applications" 2>/dev/null || true
-if [ -f "$prefix/share/icons/hicolor/index.theme" ] && command -v gtk-update-icon-cache >/dev/null; then
-  gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" 2>/dev/null || true
-fi
+refresh_caches
 
 echo "Lemma $("$prefix/bin/lemma" --version 2>/dev/null | cut -d' ' -f2) is installed in $prefix."
 case ":${PATH:-}:" in
