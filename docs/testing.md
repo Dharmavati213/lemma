@@ -42,7 +42,10 @@ focus-dependent tests. `LEMMA_BROADWAY_DISPLAY=:N` makes it use that display ins
 arguments go to `cargo test`, e.g. `scripts/ci.sh --release`. Where `XDG_RUNTIME_DIR` is not set (a
 container, a `su` session), `ci.sh` and `broadway.sh` set it to `/tmp/lemma-runtime-<uid>`: GLib
 would put the daemon's socket in the cache directory, which follows `HOME` and `XDG_CACHE_HOME`, and
-a test that changes those would find no display.
+a test that changes those would find no display. `ci.sh` also raises its limit of open files to 8192
+when it is lower: lemma-agent's flood tests open a few thousand sockets at once, and with the usual
+1024 the tests running beside them fail to open theirs (`ulimit -n 8192` before a plain `cargo test
+-p lemma-agent` does the same).
 
 On Linux, `.cargo/config.toml` keeps the debug information beside the object files
 (`-C split-debuginfo=unpacked`) instead of copying it into every program. The 46 GUI test

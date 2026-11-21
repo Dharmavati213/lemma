@@ -756,7 +756,7 @@ fn tool_dispatch() {
 }
 
 fn sibling_binaries() {
-    // This test runs from `target/<profile>/deps/`; the `lemma` binary is one level up.
+    // This test runs from below `target/<profile>/`, where the `lemma` binary is.
     let lemma = testmode::sibling_binary("lemma").expect("lemma next to the test's directory");
     let name = format!("lemma{}", std::env::consts::EXE_SUFFIX);
     assert_eq!(lemma.file_name().unwrap(), name.as_str());

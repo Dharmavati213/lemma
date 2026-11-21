@@ -120,19 +120,35 @@ pub fn demo_dir(prefix: &str) -> Result<PathBuf, String> {
 pub const FAKE_AGENT_ENV: &str = "LEMMA_FAKE_AGENT";
 
 /// The helper binary `name` (`lemma-mcp`, `lemma-fake-agent`) built next to the running
-/// executable: in its directory, or in the directory above when the executable is a test in
-/// cargo's `deps/` (`target/debug/deps/gtk_x-…` → `target/debug/lemma-mcp`). `None` when it is
-/// not there.
+/// executable: in its directory, or, when the executable is a test that cargo built, in the
+/// directory of the profile's programs (`target/debug/deps/gtk_x-…` → `target/debug/lemma-mcp`;
+/// see [`cargo_profile_dir`]). `None` when it is not there.
 pub fn sibling_binary(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     sibling_of(&exe, name)
+}
+
+/// The directory cargo puts a profile's programs into (`target/debug`), for an executable it
+/// built somewhere below: a test program is in `deps/` there, and since Cargo 1.100 in
+/// `build/<package>/<hash>/out/`. It is the nearest directory above the executable with one of
+/// cargo's lock files.
+pub fn cargo_profile_dir(exe: &Path) -> Option<PathBuf> {
+    const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock"];
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| LOCKS.iter().any(|lock| dir.join(lock).is_file()))
+        .map(Path::to_path_buf)
 }
 
 fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {
     let dir = exe.parent()?;
     // `lemma-mcp.exe` on Windows.
     let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    let candidates = [Some(dir.join(&name)), dir.parent().map(|d| d.join(&name))];
+    let candidates = [
+        Some(dir.join(&name)),
+        dir.parent().map(|d| d.join(&name)),
+        cargo_profile_dir(exe).map(|d| d.join(&name)),
+    ];
     candidates
         .into_iter()
         .flatten()
@@ -378,8 +394,18 @@ mod tests {
         );
         assert_eq!(
             sibling_of(&deps.join("gtk_test-1234"), "lemma-mcp"),
-            Some(tool)
+            Some(tool.clone())
         );
+        // Cargo 1.100: `target/debug/build/lemma-app/0123abcd/out/gtk_test-0123abcd`, found
+        // from the lock file cargo keeps in `target/debug`.
+        let out = dir.join("build/lemma-app/0123abcd/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let test = out.join("gtk_test-0123abcd");
+        assert_eq!(sibling_of(&test, "lemma-mcp"), None);
+        assert_eq!(cargo_profile_dir(&test), None);
+        std::fs::write(dir.join(".cargo-lock"), "").unwrap();
+        assert_eq!(cargo_profile_dir(&test).as_deref(), Some(dir.as_path()));
+        assert_eq!(sibling_of(&test, "lemma-mcp"), Some(tool));
         assert_eq!(sibling_of(&dir.join("lemma"), "not-executable"), None);
         assert_eq!(sibling_of(&dir.join("lemma"), "missing"), None);
         std::fs::remove_dir_all(&dir).unwrap();

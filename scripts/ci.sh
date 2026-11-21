@@ -16,6 +16,13 @@ cd "$ROOT"
 
 step() { printf '\n==> %s\n' "$*"; }
 
+# lemma-agent's flood tests open a few thousand sockets at once, and the tests of one program
+# run side by side: with the usual limit of 1024 open files the others then fail to open theirs.
+open_files="$(ulimit -Sn)"
+if [ "$open_files" != unlimited ] && [ "$open_files" -lt 8192 ]; then
+  ulimit -Sn 8192 2>/dev/null || ulimit -Sn "$(ulimit -Hn)"
+fi
+
 # The packaging scripts too: nothing here runs them, and the release would be the first to.
 step "bash -n scripts/*.sh packaging/*.sh packaging/*/*.sh"
 for script in scripts/*.sh packaging/*.sh packaging/*/*.sh; do

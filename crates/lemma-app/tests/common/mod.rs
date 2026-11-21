@@ -631,8 +631,9 @@ pub fn require_agent_binaries() {
         return;
     }
     let exe = std::env::current_exe().unwrap();
-    // <target>/<profile>/deps/<test>
-    let profile_dir = exe.parent().and_then(Path::parent).unwrap().to_path_buf();
+    // <target>/<profile>, wherever below it cargo put this test program.
+    let profile_dir = lemma_app::testmode::cargo_profile_dir(&exe)
+        .expect("the test program is below cargo's <target>/<profile>");
     let target_dir = profile_dir.parent().unwrap();
     let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo

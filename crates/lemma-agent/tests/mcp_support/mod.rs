@@ -273,6 +273,19 @@ pub fn raw_exchange(socket: &Path, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The directory cargo puts the profile's programs into (`target/debug`), for a test program it
+/// built somewhere below: in `deps/` there, and since Cargo 1.100 in
+/// `build/<package>/<hash>/out/`. It is the nearest directory above with one of cargo's lock
+/// files.
+fn cargo_profile_dir(exe: &Path) -> PathBuf {
+    const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock"];
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| LOCKS.iter().any(|lock| dir.join(lock).is_file()))
+        .expect("the test program is below cargo's <target>/<profile>")
+        .to_path_buf()
+}
+
 /// The real `lemma-mcp` bridge. `cargo test -p lemma-agent` does not build other packages'
 /// binaries, so this builds it once per test process with `cargo build -p lemma-mcp` into the
 /// target directory of the running test (cargo releases its build lock while tests run), with
@@ -284,11 +297,7 @@ pub fn bridge_binary() -> &'static Path {
             return PathBuf::from(path);
         }
         let exe = std::env::current_exe().expect("test executable");
-        // <target>/<profile>/deps/<test>
-        let profile_dir = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("test executable in <target>/<profile>/deps");
+        let profile_dir = cargo_profile_dir(&exe);
         let target_dir = profile_dir.parent().expect("target directory");
         let profile = profile_dir
             .file_name()

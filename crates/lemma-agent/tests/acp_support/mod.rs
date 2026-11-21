@@ -55,6 +55,19 @@ pub struct Bins {
     pub mcp_bridge: PathBuf,
 }
 
+/// The directory cargo puts the profile's programs into (`target/debug`), for a test program it
+/// built somewhere below: in `deps/` there, and since Cargo 1.100 in
+/// `build/<package>/<hash>/out/`. It is the nearest directory above with one of cargo's lock
+/// files.
+fn cargo_profile_dir(exe: &Path) -> PathBuf {
+    const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock"];
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| LOCKS.iter().any(|lock| dir.join(lock).is_file()))
+        .expect("the test program is below cargo's <target>/<profile>")
+        .to_path_buf()
+}
+
 /// `lemma-fake-agent` and `lemma-mcp`: `$LEMMA_FAKE_AGENT` / `$LEMMA_MCP_BRIDGE` when set, else
 /// built (once per test binary) into this test's own target directory and profile, so they are
 /// never stale. Cargo does not build other packages' binaries for `cargo test -p lemma-agent`.
@@ -62,12 +75,7 @@ pub fn bins() -> &'static Bins {
     static BINS: OnceLock<Bins> = OnceLock::new();
     BINS.get_or_init(|| {
         let exe = std::env::current_exe().expect("current_exe");
-        // <target>/<profile>/deps/<test>
-        let profile_dir = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("test binary under <target>/<profile>/deps")
-            .to_path_buf();
+        let profile_dir = cargo_profile_dir(&exe);
         let fake = std::env::var_os("LEMMA_FAKE_AGENT").map(PathBuf::from);
         let bridge = std::env::var_os("LEMMA_MCP_BRIDGE").map(PathBuf::from);
         if fake.is_none() || bridge.is_none() {

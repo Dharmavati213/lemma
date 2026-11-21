@@ -23,7 +23,12 @@ jobs:
   linux:
     name: scripts/ci.sh on Arch Linux
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container:
+      image: archlinux:latest
+      # An init process, as every desktop has: without one a process whose parent has ended is
+      # never reaped, and a test that waits for a killed child to be gone waits for ever. And
+      # room for the tests that open thousands of sockets (ci.sh raises its own limit to it).
+      options: --init --ulimit nofile=65536:65536
     timeout-minutes: 150
     steps:
       # The libraries of packaging/PKGBUILD, then what the tests run or look at: TeX (latexmk,
