@@ -721,6 +721,10 @@ fn check_fix(f: &Fixture, problem: Problem, label: &str, file: &str, fixed: &str
     common::pump_until(TIMEOUT, || {
         std::fs::read_to_string(&path).unwrap() == original
     });
+    // And until the reject's save is over here too: the file has its text a moment before the
+    // document is marked saved, and a fix applied in between finds unsaved changes and so is
+    // not saved (a second `check_fix` then waited for that save in vain, on a slow machine).
+    common::pump_until(TIMEOUT, || !doc.is_dirty());
     assert_eq!(review_ui::hunk_count(&doc), 0);
 }
 

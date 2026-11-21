@@ -551,8 +551,23 @@ fn a_call_the_editor_does_not_answer_times_out() {
     assert_eq!(result_text(&reply), (TIMEOUT_TEXT.into(), true));
     assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
-    // The late reply is dropped quietly, and the connection keeps working.
-    assert!(held.reply.send(text_reply("too late")).is_err());
+    // The late reply is dropped quietly, and the connection keeps working. (The server lets go
+    // of the call right after it has answered, which on a slow machine is not always before
+    // the answer is read here.)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match held.reply.try_send(text_reply("too late")) {
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            // Still held, with or without room for a reply.
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the call that timed out is still waited for"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
     assert_eq!(
         bridge.call(&request(2, "ping", json!({})))["result"],
         json!({})
