@@ -301,6 +301,7 @@ pub fn remember_window_size(state: &Rc<WindowState>, saved: Option<WindowGeometr
         state.window.set_default_size(width, height);
         if saved.maximized {
             state.window.maximize();
+            restore_size_when_unmaximized(&state.window, (width, height));
         }
     }
     session_for(state).window_size.replace(WindowSize::Recorded);
@@ -314,6 +315,53 @@ pub fn remember_window_size(state: &Rc<WindowState>, saved: Option<WindowGeometr
                 }
             });
     }
+}
+
+/// How long after a window was unmaximized [`restore_size_when_unmaximized`] looks at the size
+/// the system gave it, and how often.
+const UNMAXIMIZED_WATCH: Duration = Duration::from_secs(1);
+const UNMAXIMIZED_LOOK: Duration = Duration::from_millis(50);
+
+/// On Windows, gives `window`, which starts maximized, the remembered `size` again when it is
+/// first unmaximized. Nothing to do on the other systems.
+///
+/// A window first shown maximized has had no size of its own on screen, and GTK 4.24 on
+/// Windows restores it to a window of `size` with its shadows inside, which leaves the window
+/// itself smaller by them (850 × 600 of a remembered 900 × 650). That size was then the
+/// remembered one, and the window shrank with every start. The system's size comes with the
+/// events after the change, so the window is looked at for [`UNMAXIMIZED_WATCH`] and set right
+/// once.
+fn restore_size_when_unmaximized(window: &adw::ApplicationWindow, size: (i32, i32)) {
+    if !cfg!(windows) {
+        return;
+    }
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let id = window.connect_maximized_notify({
+        let handler = handler.clone();
+        move |window| {
+            if window.is_maximized() {
+                return;
+            }
+            if let Some(id) = handler.take() {
+                window.disconnect(id);
+            }
+            let (window, started) = (window.downgrade(), std::time::Instant::now());
+            glib::timeout_add_local(UNMAXIMIZED_LOOK, move || {
+                let Some(window) = window.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if window.is_maximized() || started.elapsed() > UNMAXIMIZED_WATCH {
+                    return glib::ControlFlow::Break;
+                }
+                if window.default_size() == size {
+                    return glib::ControlFlow::Continue;
+                }
+                window.set_default_size(size.0, size.1);
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    handler.replace(Some(id));
 }
 
 /// Makes the `last.json` that `state`'s window writes carry `saved` (the last session's window
@@ -1522,13 +1570,38 @@ impl Writer {
             .truncate(true)
             .open(&tmp)
             .and_then(|mut f| f.write_all(bytes))
-            .and_then(|()| std::fs::rename(&tmp, file));
+            .and_then(|()| rename_over(&tmp, file));
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(shown(e));
         }
         *committed = (seq, Some((file.to_path_buf(), hash)));
         Ok(())
+    }
+}
+
+/// How long [`rename_over`] tries again on Windows, and its pause between two tries.
+const RENAME_PATIENCE: Duration = Duration::from_millis(500);
+const RENAME_PAUSE: Duration = Duration::from_millis(20);
+
+/// Renames `tmp` over `file`. On Windows no file is replaced while a program holds it open (a
+/// virus scanner, a backup, another Lemma reading the session): such a hold mostly lasts
+/// milliseconds, so there the rename is tried again for [`RENAME_PATIENCE`] before it fails, as
+/// the save of a document is (`saver`). A session that was not written is written again only
+/// with the next change, and not at all when the window was closing. Blocking.
+fn rename_over(tmp: &Path, file: &Path) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::rename(tmp, file) {
+            Err(e)
+                if cfg!(windows)
+                    && e.kind() == std::io::ErrorKind::PermissionDenied
+                    && started.elapsed() < RENAME_PATIENCE =>
+            {
+                std::thread::sleep(RENAME_PAUSE);
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1687,6 +1760,28 @@ mod tests {
             b"three",
             "older than the last write"
         );
+        let leftovers = std::fs::read_dir(file.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary files are left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session file that a program holds open for a moment (on Windows a virus scanner, a
+    /// backup, a test reading it: no file is replaced there meanwhile) is written once it is
+    /// let go.
+    #[test]
+    fn a_write_waits_for_a_file_held_open() {
+        let dir = crate::fsutil::private_temp_dir("lemma-session-held-").unwrap();
+        let file = dir.join("sessions").join("x.json");
+        let writer = Writer::default();
+        writer.write(&file, b"one", 1).unwrap();
+        let held = std::fs::File::open(&file).unwrap();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            drop(held);
+        });
+        writer.write(&file, b"two", 2).unwrap();
+        reader.join().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
         let leftovers = std::fs::read_dir(file.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "no temporary files are left");
         let _ = std::fs::remove_dir_all(&dir);

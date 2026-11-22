@@ -920,6 +920,9 @@ fn bars_pool() {
             f.frames(2);
         }
         common::pump_for(Duration::from_millis(30));
+        // The placement's idle callback comes after GTK's own work on the lines scrolled to,
+        // which can take longer than that (as a Windows program under Wine: 40 ms).
+        common::pump_until(TIMEOUT, || !review.relayout_pending());
 
         let bar_widgets = descendants(&view)
             .iter()

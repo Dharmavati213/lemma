@@ -2227,8 +2227,24 @@ their behaviour; the Windows paths are `cfg`-gated. The differences:
     Windows' `chapters\intro.tex` was read as a command in `\input{…}`. Paths from the agent are
     taken with `/` or `\`, relative or absolute (`ProjectRoot::resolve`). What the user sees
     (`review_ui::relative_name`), Lemma's own files and ACP's `cwd` keep the system's spelling.
-  - `packaging/windows/build.sh --test` runs 41 GUI test programs under Wine, each under `xvfb-run`
-    (`GUI_TESTS`); the test harness does not count the warnings GDK's Win32 backend logs under Wine
-    (`common::is_environment_noise`), and `tests/common` has what makes a test program portable
-    (`native`, `Canonical`, `shown`, `skip` and the `require_*` guards, `path_without`,
-    `restore_home`). docs/testing.md lists what does not pass there and why.
+  - `packaging/windows/build.sh --test` runs all 46 GUI test programs under Wine, each under
+    `xvfb-run` (`GUI_TESTS`); the test harness does not count the warnings GDK's Win32 backend logs
+    under Wine (`common::is_environment_noise`), and `tests/common` has what makes a test program
+    portable (`native`, `Canonical`, `shown`, `skip` and the `require_*` guards, `path_without`,
+    `restore_home`). docs/testing.md has what that run found and why.
+  - Workarounds for GTK 4.24.1, most of them for Windows: `TexView` sends its scroll
+    adjustment's value again after an allocation that leaves a view that cannot scroll apart
+    from it (`follow_adjustment`). On Windows the hover's popover is unrealized before each
+    popup (`hover::forget_surface_size`); the text widget with a window's focus tells its input
+    method that the focus has left before it is unrealized (`editor::guard_input_methods`,
+    installed by the first window: GTK's `GtkIMContextIME` is otherwise called after it was
+    freed); a window that started maximized gets its remembered size again when it is first
+    unmaximized (`session::restore_size_when_unmaximized`); and the session writer tries its
+    rename again for half a second while the file is held open (`session::rename_over`).
+  - Spelling never waits for the dictionary on the main loop beyond `spell::EDGE_WAIT` (4 ms):
+    libspelling's job holds the dictionary's lock for a whole stretch of text. `EdgeWords` asks
+    about its words on a jobs thread, through the checker's own `SpellingDictionary` (the
+    provider keeps one per language and hands it out; `SharedDictionary` is its `Send` wrapper),
+    and applies answers that come later to the words that are still what was asked about; the
+    user's word lists are given to the dictionary on a jobs thread too. Where a provider does
+    not share its dictionary, both ask the checker on the main loop as before.

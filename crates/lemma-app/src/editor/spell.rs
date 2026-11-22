@@ -41,6 +41,14 @@
 //! starts. It runs before the next frame, so libspelling's recheck of a range never makes such
 //! an underline flicker.
 //!
+//! The dictionary is asked on a jobs thread, and the pass waits [`EDGE_WAIT`] for the answers,
+//! which is long enough whenever the dictionary is free. It is not while libspelling checks a
+//! long text: its job holds the dictionary's lock for a whole stretch of text, and a question
+//! from the main loop then waited as long as the job took: about a second on a text of 60,000
+//! lines, and half a minute where every word costs enchant a slow look at the personal word
+//! list's file (as a Windows program under Wine), with the window not answering. Answers that
+//! come later are applied when they come, to the words that are still what was asked about.
+//!
 //! # Text that is not prose
 //!
 //! libspelling checks the whole buffer in the background, also lines the highlighter never
@@ -86,7 +94,7 @@
 //! [`detach`] removes everything from an editor when its tab closes (the buffer may live on as a
 //! closed document's text); the window's `destroy` does the same for all of its editors.
 //! Tests use [`adapter`], [`misspelled`], [`is_checking`], [`language`],
-//! [`prepare_context_menu`] and [`menu_key_pressed`].
+//! [`prepare_context_menu`], [`menu_key_pressed`], [`edge_words_pending`] and [`set_edge_wait`].
 
 use super::highlight::{self, NO_SPELL_TAG};
 use super::{Editor, TexView};
@@ -103,6 +111,58 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
+
+/// How long a pass of [`EdgeWords`] waits, on the main loop, for the dictionary's answers.
+const EDGE_WAIT: Duration = Duration::from_millis(4);
+
+thread_local! {
+    /// [`EDGE_WAIT`], or what a test put in its place ([`set_edge_wait`]).
+    static EDGE_WAIT_NOW: Cell<Duration> = const { Cell::new(EDGE_WAIT) };
+}
+
+/// A word [`EdgeWords`] asks the dictionary about.
+struct Asked {
+    start: gtk::TextIter,
+    end: gtk::TextIter,
+    word: String,
+}
+
+/// Words whose answers did not come within [`EDGE_WAIT`]: their places and what was asked.
+type Late = Vec<(gtk::TextMark, gtk::TextMark, String)>;
+
+/// A checker's dictionary, for a jobs thread that asks it about words or gives it words to
+/// ignore: neither then waits on the main loop for libspelling's own check, which holds the
+/// dictionary's lock for a whole stretch of a text.
+struct SharedDictionary(libspelling::Dictionary);
+
+// SAFETY: a `SpellingDictionary` is made to be used from several threads: libspelling's own
+// checks run on its jobs threads, and `spelling_dictionary_contains_word` and
+// `spelling_dictionary_ignore_word`, the two things this type does with it, work under the
+// dictionary's mutex. The reference count is atomic, and the reference dropped on the other
+// thread is never the last one: the provider keeps every dictionary it loaded for as long as
+// the process lives ([`shared_dictionary`] hands out only such a dictionary).
+unsafe impl Send for SharedDictionary {}
+
+impl SharedDictionary {
+    fn misspelled(&self, word: &str) -> bool {
+        !self.0.contains_word(word)
+    }
+
+    fn ignore(&self, word: &str) {
+        self.0.ignore_word(word);
+    }
+}
+
+/// `checker`'s own dictionary, when the provider hands it out: it keeps one object per
+/// language, which is how the checker got its own, and then two requests give the same one.
+/// `None` when it does not (the checker alone reaches its dictionary then), or has none.
+fn shared_dictionary(checker: &libspelling::Checker) -> Option<libspelling::Dictionary> {
+    let language = checker.language()?;
+    let provider = checker.provider();
+    provider
+        .load_dictionary(&language)
+        .filter(|dictionary| provider.load_dictionary(&language).as_ref() == Some(dictionary))
+}
 
 /// The window action that switches spell checking.
 pub const TOGGLE_ACTION: &str = "toggle-spell";
@@ -198,12 +258,31 @@ async fn load_lists(checker: libspelling::Checker, language: String, lists: Vec<
     let read = gio::spawn_blocking(move || read_lists(wanted))
         .await
         .unwrap_or_default();
-    let mut added = 0;
-    for (path, stamp, words) in read {
-        for word in &words {
-            checker.ignore_word(word);
+    let words: Vec<String> = read
+        .iter()
+        .flat_map(|(_, _, words)| words.iter().cloned())
+        .collect();
+    let added = words.len();
+    match shared_dictionary(&checker).map(SharedDictionary) {
+        _ if words.is_empty() => {}
+        // On a jobs thread: libspelling's check of another document may hold the dictionary.
+        Some(dictionary) => {
+            let ignored = gio::spawn_blocking(move || {
+                for word in &words {
+                    dictionary.ignore(word);
+                }
+            });
+            if ignored.await.is_err() {
+                tracing::warn!("the spelling word lists were not all taken");
+            }
         }
-        added += words.len();
+        None => {
+            for word in &words {
+                checker.ignore_word(word);
+            }
+        }
+    }
+    for (path, stamp, _) in read {
         LOADED.with_borrow_mut(|loaded| {
             loaded
                 .entry(language.clone())
@@ -320,6 +399,12 @@ struct EdgeWords {
     ends: RefCell<Vec<gtk::TextMark>>,
     /// The end of the word left alone because the cursor was in it.
     skipped: RefCell<Option<gtk::TextMark>>,
+    /// The checker's dictionary of a language, or that the provider does not share it
+    /// ([`EdgeWords::shared_dictionary`]).
+    dictionary: RefCell<Option<(String, Option<libspelling::Dictionary>)>>,
+    /// The words whose answers are still to come, by the number of their pass.
+    late: RefCell<HashMap<u64, Late>>,
+    passes: Cell<u64>,
     handlers: RefCell<Vec<glib::SignalHandlerId>>,
 }
 
@@ -339,6 +424,9 @@ impl EdgeWords {
             busy: Cell::new(false),
             ends: RefCell::default(),
             skipped: RefCell::new(None),
+            dictionary: RefCell::new(None),
+            late: RefCell::default(),
+            passes: Cell::new(0),
             handlers: RefCell::default(),
         });
         let mut handlers = Vec::new();
@@ -445,7 +533,7 @@ impl EdgeWords {
     }
 
     /// Checks the words right before the no-spell ranges that start on the dirty lines.
-    fn run(&self) {
+    fn run(self: &Rc<Self>) {
         let Some((first, last)) = self.dirty.take() else {
             return;
         };
@@ -471,34 +559,142 @@ impl EdgeWords {
             self.buffer.end_iter()
         };
         let cursor = self.buffer.cursor_position();
+        let mut asked = Vec::new();
         self.busy.set(true);
         if first <= 0 {
-            self.check_first(no_spell.as_ref(), &checker, cursor);
+            self.check_first(no_spell.as_ref(), cursor, &mut asked);
         }
         for mark in self.ends.take() {
             if !mark.is_deleted() {
                 let (start, end) = self.word_around(&self.buffer.iter_at_mark(&mark));
                 self.buffer.delete_mark(&mark);
-                self.check_range(&start, &end, &checker, cursor);
+                self.check_range(&start, &end, cursor, &mut asked);
             }
         }
-        let Some(no_spell) = no_spell else {
-            self.busy.set(false);
-            return;
-        };
-        while it < end {
-            if !it.starts_tag(Some(&no_spell)) {
+        if let Some(no_spell) = no_spell {
+            while it < end {
+                if !it.starts_tag(Some(&no_spell)) {
+                    if !it.forward_to_tag_toggle(Some(&no_spell)) {
+                        break;
+                    }
+                    continue;
+                }
+                self.check_before(&it, &no_spell, cursor, &mut asked);
                 if !it.forward_to_tag_toggle(Some(&no_spell)) {
                     break;
                 }
-                continue;
-            }
-            self.check_before(&it, &no_spell, &checker, cursor);
-            if !it.forward_to_tag_toggle(Some(&no_spell)) {
-                break;
             }
         }
+        self.decide(asked, &checker);
         self.busy.set(false);
+    }
+
+    /// Asks the dictionary about the words `asked` and underlines the misspelled ones: at once
+    /// when the answers come within [`EDGE_WAIT`], else when they come ([`EdgeWords::late`]).
+    fn decide(self: &Rc<Self>, asked: Vec<Asked>, checker: &libspelling::Checker) {
+        if asked.is_empty() {
+            return;
+        }
+        let Some(dictionary) = self.shared_dictionary(checker) else {
+            // Only the checker reaches its dictionary: asked here, as long as that takes.
+            for word in &asked {
+                self.flag(&word.start, &word.end, !checker.check_word(&word.word));
+            }
+            return;
+        };
+        let dictionary = SharedDictionary(dictionary);
+        let words: Vec<String> = asked.iter().map(|word| word.word.clone()).collect();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let answers = gio::spawn_blocking(move || {
+            let misspelled: Vec<bool> = words
+                .iter()
+                .map(|word| dictionary.misspelled(word))
+                .collect();
+            // (Nobody waits any more: the future below has the answers.)
+            let _ = sender.send(misspelled.clone());
+            misspelled
+        });
+        if let Ok(misspelled) = receiver.recv_timeout(EDGE_WAIT_NOW.get()) {
+            for (word, misspelled) in asked.iter().zip(misspelled) {
+                self.flag(&word.start, &word.end, misspelled);
+            }
+            return;
+        }
+        let pass = self.passes.get() + 1;
+        self.passes.set(pass);
+        let late = asked
+            .into_iter()
+            .map(|word| {
+                (
+                    self.buffer.create_mark(None, &word.start, true),
+                    self.buffer.create_mark(None, &word.end, false),
+                    word.word,
+                )
+            })
+            .collect();
+        self.late.borrow_mut().insert(pass, late);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let misspelled = answers.await.unwrap_or_default();
+            if let Some(edges) = weak.upgrade() {
+                edges.decide_late(pass, &misspelled);
+            }
+        });
+    }
+
+    /// The answers of pass `pass` came after its wait: underlines the words that are still
+    /// what was asked about (an edit to one of them had its own pass).
+    fn decide_late(&self, pass: u64, misspelled: &[bool]) {
+        let Some(late) = self.late.borrow_mut().remove(&pass) else {
+            return;
+        };
+        let checking = self.adapter.upgrade().is_some_and(|a| a.is_enabled());
+        let cursor = self.buffer.cursor_position();
+        let busy = self.busy.replace(true);
+        for (at, (start, end, word)) in late.into_iter().enumerate() {
+            if checking
+                && !start.is_deleted()
+                && !end.is_deleted()
+                && let Some(misspelled) = misspelled.get(at)
+            {
+                let (from, to) = (
+                    self.buffer.iter_at_mark(&start),
+                    self.buffer.iter_at_mark(&end),
+                );
+                if self.buffer.text(&from, &to, false) == word {
+                    if (from.offset()..=to.offset()).contains(&cursor) {
+                        self.skip(&to);
+                    } else {
+                        self.flag(&from, &to, *misspelled);
+                    }
+                }
+            }
+            for mark in [start, end] {
+                if !mark.is_deleted() {
+                    self.buffer.delete_mark(&mark);
+                }
+            }
+        }
+        self.busy.set(busy);
+    }
+
+    /// [`shared_dictionary`] of `checker`, looked up once per language.
+    fn shared_dictionary(&self, checker: &libspelling::Checker) -> Option<libspelling::Dictionary> {
+        let language = checker.language()?.to_string();
+        if let Some((known, dictionary)) = &*self.dictionary.borrow()
+            && *known == language
+        {
+            return dictionary.clone();
+        }
+        let dictionary = shared_dictionary(checker);
+        self.dictionary
+            .replace(Some((language, dictionary.clone())));
+        dictionary
+    }
+
+    /// Whether a pass or answers of one are still to come (tests).
+    fn pending(&self) -> bool {
+        self.idle.borrow().is_some() || !self.late.borrow().is_empty()
     }
 
     /// The word around `at` (touching it on either side): letters, digits and `’`, without
@@ -532,13 +728,13 @@ impl EdgeWords {
         }
     }
 
-    /// Checks the word that ends at `run` (where a no-spell range starts), if any.
+    /// Asks about the word that ends at `run` (where a no-spell range starts), if any.
     fn check_before(
         &self,
         run: &gtk::TextIter,
         no_spell: &gtk::TextTag,
-        checker: &libspelling::Checker,
         cursor: i32,
+        asked: &mut Vec<Asked>,
     ) {
         let end = *run;
         let mut start = end;
@@ -549,16 +745,11 @@ impl EdgeWords {
             }
             start = prev;
         }
-        self.check_range(&start, &end, checker, cursor);
+        self.check_range(&start, &end, cursor, asked);
     }
 
-    /// Checks the first word of the buffer.
-    fn check_first(
-        &self,
-        no_spell: Option<&gtk::TextTag>,
-        checker: &libspelling::Checker,
-        cursor: i32,
-    ) {
+    /// Asks about the first word of the buffer.
+    fn check_first(&self, no_spell: Option<&gtk::TextTag>, cursor: i32, asked: &mut Vec<Asked>) {
         let start = self.buffer.start_iter();
         let mut end = start;
         while !end.is_end()
@@ -567,18 +758,19 @@ impl EdgeWords {
         {
             end.forward_char();
         }
-        self.check_range(&start, &end, checker, cursor);
+        self.check_range(&start, &end, cursor, asked);
     }
 
-    /// Underlines `start..end` (one word) when it is misspelled, and removes the underline when
-    /// it is not. Words of one character or with digits are left alone, and so is the word at
-    /// the cursor (until the cursor moves away).
+    /// Puts `start..end` (one word) among the words `asked` about, which [`EdgeWords::decide`]
+    /// underlines when they are misspelled. Words of one character are left alone, words with
+    /// digits are never underlined, and the word at the cursor waits (until the cursor moves
+    /// away).
     fn check_range(
         &self,
         start: &gtk::TextIter,
         end: &gtk::TextIter,
-        checker: &libspelling::Checker,
         cursor: i32,
+        asked: &mut Vec<Asked>,
     ) {
         // A `’` only inside a word.
         let mut start = *start;
@@ -597,29 +789,42 @@ impl EdgeWords {
             return;
         }
         if (start.offset()..=end.offset()).contains(&cursor) {
-            // Being typed: left alone until the cursor moves away, as libspelling does.
-            let mark = self.buffer.create_mark(None, &end, true);
-            if let Some(old) = self.skipped.replace(Some(mark))
-                && !old.is_deleted()
-            {
-                self.buffer.delete_mark(&old);
-            }
+            self.skip(&end);
             return;
         }
-        let word = self.buffer.text(&start, &end, false);
-        let misspelled =
-            !word.chars().any(|c| c.is_numeric()) && !checker.check_word(word.as_str());
-        let mut toggle = start;
+        let word = self.buffer.text(&start, &end, false).to_string();
+        if word.chars().any(|c| c.is_numeric()) {
+            self.flag(&start, &end, false);
+        } else {
+            asked.push(Asked { start, end, word });
+        }
+    }
+
+    /// The word that ends at `end` is being typed: left alone until the cursor moves away, as
+    /// libspelling does.
+    fn skip(&self, end: &gtk::TextIter) {
+        let mark = self.buffer.create_mark(None, end, true);
+        if let Some(old) = self.skipped.replace(Some(mark))
+            && !old.is_deleted()
+        {
+            self.buffer.delete_mark(&old);
+        }
+    }
+
+    /// Underlines the word `start..end` when it is `misspelled`, and removes its underline
+    /// when it is not.
+    fn flag(&self, start: &gtk::TextIter, end: &gtk::TextIter, misspelled: bool) {
+        let mut toggle = *start;
         let fully = start.has_tag(&self.tag)
-            && (!toggle.forward_to_tag_toggle(Some(&self.tag)) || toggle >= end);
+            && (!toggle.forward_to_tag_toggle(Some(&self.tag)) || toggle >= *end);
         let partly = fully || {
-            let mut t = start;
-            t.forward_to_tag_toggle(Some(&self.tag)) && t < end
+            let mut t = *start;
+            t.forward_to_tag_toggle(Some(&self.tag)) && t < *end
         };
         if misspelled && !fully {
-            self.buffer.apply_tag(&self.tag, &start, &end);
+            self.buffer.apply_tag(&self.tag, start, end);
         } else if !misspelled && partly {
-            self.buffer.remove_tag(&self.tag, &start, &end);
+            self.buffer.remove_tag(&self.tag, start, end);
         }
     }
 
@@ -629,6 +834,13 @@ impl EdgeWords {
         }
         if let Some(id) = self.idle.take() {
             id.remove();
+        }
+        for (start, end, _) in self.late.take().into_values().flatten() {
+            for mark in [start, end] {
+                if !mark.is_deleted() {
+                    self.buffer.delete_mark(&mark);
+                }
+            }
         }
         self.forget_ends();
         if let Some(mark) = self.skipped.take()
@@ -1331,6 +1543,19 @@ pub fn adapter(editor: &Editor) -> Option<libspelling::TextBufferAdapter> {
 /// Whether `editor`'s adapter exists and is checking (its word lists are loaded).
 pub fn is_checking(editor: &Editor) -> bool {
     adapter(editor).is_some_and(|a| a.is_enabled())
+}
+
+/// Whether the words libspelling skips still wait in `editor` for a pass or for the
+/// dictionary's answers (tests).
+pub fn edge_words_pending(editor: &Editor) -> bool {
+    checking_of(editor, |c| c.edges.as_ref().is_some_and(|e| e.pending())).unwrap_or(false)
+}
+
+/// Makes the passes over the words libspelling skips wait `wait` for the dictionary's answers
+/// on this thread, in place of [`EDGE_WAIT`]; `None` for that again. Tests: without a wait
+/// every answer comes late, as it does while libspelling's own check holds the dictionary.
+pub fn set_edge_wait(wait: Option<Duration>) {
+    EDGE_WAIT_NOW.set(wait.unwrap_or(EDGE_WAIT));
 }
 
 /// The language `editor` is checked in.

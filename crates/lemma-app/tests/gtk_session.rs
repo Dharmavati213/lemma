@@ -307,6 +307,23 @@ fn wait_pdf(state: &WindowState) {
 
 // ----- session -----
 
+/// The share of the panes' width the round trip gives the editor: one that the panes of the
+/// tests' window have room for with any system's fonts. (`GtkPaned` moves a divider that
+/// leaves a pane less than its smallest width at the next frame: 0.62 became 0.52 on Linux and
+/// 0.58 as a Windows program under Wine, and only a test that read the position before that
+/// frame saw 0.62.)
+const DIVIDER: f64 = 0.45;
+
+/// The share of the panes' width `state`'s divider has, a frame after the last change, so that
+/// it is the share `GtkPaned` could give.
+fn divider(state: &WindowState) -> f64 {
+    common::pump_for(Duration::from_millis(30));
+    assert!(block_on(testmode::wait_for_frames(&state.window, 1)));
+    let width = state.paned.width();
+    assert!(width > 0);
+    f64::from(state.paned.position()) / f64::from(width)
+}
+
 fn round_trip() {
     let (dir, paths) = project("round-trip");
     let a = window(&dir, &paths, |_| {});
@@ -326,8 +343,9 @@ fn round_trip() {
     a.pdf_sidebar.split.set_show_sidebar(true);
     let width = a.paned.width();
     assert!(width > 0);
-    a.paned.set_position((f64::from(width) * 0.62) as i32);
-    common::pump_for(Duration::from_millis(30));
+    a.paned.set_position((f64::from(width) * DIVIDER) as i32);
+    let share = divider(&a);
+    assert!((share - DIVIDER).abs() < 0.01, "the divider is at {share}");
     a.save_session_now();
     session::flush(&a);
     let saved = session_file(&a);
@@ -344,7 +362,7 @@ fn round_trip() {
     assert_eq!(saved.pdf.strip, Some(true));
     assert_eq!(saved.pdf.visible, Some(true));
     let split = saved.pdf.split.unwrap();
-    assert!((split - 0.62).abs() < 0.01, "split {split}");
+    assert!((split - DIVIDER).abs() < 0.01, "split {split}");
     assert_eq!(saved.root, dir.to_string_lossy());
     // Private: the file names the user's documents.
     #[cfg(unix)]
@@ -382,9 +400,8 @@ fn round_trip() {
     );
     assert!(b.sidebar.split.shows_sidebar());
     assert!(b.pdf_sidebar.split.shows_sidebar());
-    common::pump_for(Duration::from_millis(30));
-    let share = f64::from(b.paned.position()) / f64::from(b.paned.width());
-    assert!((share - 0.62).abs() < 0.01, "split {share}");
+    let share = divider(&b);
+    assert!((share - DIVIDER).abs() < 0.01, "split {share}");
     // A background tab scrolls once it is shown.
     b.select_editor(&main);
     let deadline = Instant::now() + TIMEOUT;
@@ -983,8 +1000,20 @@ fn window_size() {
     assert_eq!(b.window.default_size(), (900, 650));
     let main = show(&b);
     common::pump_until(TIMEOUT, || b.window.is_maximized());
+    let logged = common::logged_problems();
     b.window.unmaximize();
-    common::pump_until(TIMEOUT, || remembered() == Some(expected));
+    // Back at the remembered size. (On Windows by way of another: GTK 4.24 restores a window
+    // first shown maximized to a smaller one, which Lemma sets right, and under Wine through a
+    // window without width, which GTK warns about for each widget it cannot place.)
+    common::pump_until(TIMEOUT, || {
+        remembered() == Some(expected) && b.window.default_size() == (900, 650)
+    });
+    if cfg!(windows) {
+        common::pump_for(Duration::from_millis(1200));
+        common::expect_logged_problems(common::logged_problems() - logged);
+        assert_eq!(b.window.default_size(), (900, 650));
+        assert_eq!(remembered(), Some(expected));
+    }
     drop(main);
     close(b);
 
@@ -2136,7 +2165,12 @@ fn recovery_new_file() {
     let w = window(&dir, &paths, |_| {});
     block_on(session::restore(&w)).unwrap();
     assert_eq!(tab_paths(&w, &dir), ["main.tex"], "recovery is off");
+    let closed = w.window.downgrade();
     close(w);
+    // A save that the window's debounce queued meanwhile is written when the window goes (its
+    // `destroy` signal), which is when the last reference to it does: after `close` returned,
+    // where destroying a window takes longer than the debounce (under Wine).
+    common::pump_until(TIMEOUT, || closed.upgrade().is_none());
 
     // The closed window saved its session: the saved one again.
     write_session(&paths, &dir, &saved);

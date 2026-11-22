@@ -12,7 +12,7 @@ use gtk::subclass::prelude::*;
 use lemma_config::EditorCfg;
 use sourceview5::prelude::*;
 use sourceview5::subclass::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 mod imp {
@@ -27,6 +27,9 @@ mod imp {
         pub keys: RefCell<Option<Rc<KeyLayer>>>,
         /// Lemma's popovers on the view ([`super::TexView::adopt_popover`]).
         pub popovers: RefCell<Vec<glib::WeakRef<gtk::Popover>>>,
+        /// [`super::TexView::follow_adjustment`] did not bring the view back to its adjustment:
+        /// it does not try again.
+        pub offset_stuck: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -51,7 +54,12 @@ mod imp {
             }
         }
     }
-    impl WidgetImpl for TexView {}
+    impl WidgetImpl for TexView {
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            self.obj().follow_adjustment();
+        }
+    }
 
     impl TextViewImpl for TexView {
         fn snapshot_layer(&self, layer: gtk::TextViewLayer, snapshot: gtk::Snapshot) {
@@ -122,6 +130,43 @@ impl TexView {
                 .is_some_and(|p| p.parent().as_ref() == Some(view))
         });
         popovers.push(popover.downgrade());
+    }
+
+    /// Puts the view back where its scroll adjustment says, when GTK moved the view alone.
+    ///
+    /// GtkTextView keeps the first paragraph on screen in its place while the lines above it
+    /// get their heights. A view scrolled before it had a size (a file opened at a line) can
+    /// take the last line of a text not laid out yet for that paragraph; once the lines are
+    /// measured it moves its offset down by the whole text and asks the adjustment to follow.
+    /// When the text fits the view, the adjustment has no range and stays at 0: the view shows
+    /// the empty space past the end, and no scroll brings the text back, since none changes
+    /// the adjustment's value (GTK 4.24; seen where the view gets its size before the lines
+    /// are measured: as a Windows program under Wine). Sending the adjustment's value again
+    /// makes the view take it. Called after each allocation: the text view asks for one when
+    /// it moves its offset.
+    fn follow_adjustment(&self) {
+        let imp = self.imp();
+        let Some(adjustment) = self.vadjustment() else {
+            return;
+        };
+        // Only a view that cannot scroll is stuck: with a range, the adjustment follows the
+        // view, or the view the adjustment, within the same allocation.
+        if adjustment.upper() - adjustment.page_size() >= 1.0 {
+            return;
+        }
+        // The view's offset is its adjustment's value less the top margin, in whole pixels.
+        let apart = |view: &Self| {
+            let shown = f64::from(view.visible_rect().y() + view.top_margin());
+            (shown - adjustment.value()).abs() >= 1.0
+        };
+        if imp.offset_stuck.get() || !apart(self) {
+            return;
+        }
+        adjustment.emit_by_name::<()>("value-changed", &[]);
+        if apart(self) {
+            imp.offset_stuck.set(true);
+            tracing::warn!("the editor's view does not follow its scroll adjustment");
+        }
     }
 
     /// Applies the editor settings: monospace font (CSS class `lemma-editor`, see

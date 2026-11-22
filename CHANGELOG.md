@@ -85,6 +85,29 @@ notes, with its downloads, are in [`docs/releases/`](docs/releases/) and on the
 - On Windows, settings are read again when a program saves `config.toml`, `snippets.toml` or
   `prompts.toml` by writing a new file in its place, as many editors and tools do. Only a file
   written in place was noticed.
+- On Windows, a hover over a reference appears again after the one before it was closed at the
+  moment its picture of the PDF arrived. The popup had just been given the picture's size, and
+  the next hover, with its lines of source, was hidden as soon as it was shown.
+- On Windows, the session (the open tabs, their places, the panes) is saved also when another
+  program has the session's file open at that moment, as a virus scanner or a backup does:
+  Lemma waits half a second for the file, as a document's save waits. It used to say "Could not
+  save the session" and keep the older state until the next change, and the state of a window
+  that was closing was lost.
+- A short file opened at a line (the next change to review in another file, a definition, a
+  search result) no longer shows the empty space below its text, with the text out of reach of
+  the scroll bar and the keys. It happened where the window laid the new tab out before its
+  lines were measured, as on Windows.
+- On Windows, closing a tab, a dialog or a window with the cursor in it no longer leaves Lemma
+  open to a crash at any later moment: GTK's input method for Windows went on being called
+  after the text field was gone.
+- On Windows, a window that started maximized comes back to its remembered size when it is
+  unmaximized. It came back smaller by its shadows (850 × 600 of a remembered 900 × 650), and
+  that smaller size was remembered: the window shrank with every such start.
+- The window no longer stops answering while the spelling of a long text is checked. Lemma's
+  own look at the words before `}`, `~`, `$` or a command waited for libspelling's check of the
+  whole text: hardly noticeable on Linux, but half a minute on a text of 60,000 lines where
+  every word costs a slow look at a file, as on Windows. The user's word lists are taken in
+  without that wait too.
 - On Linux and macOS, Ctrl+click in the PDF, the Source and PDF buttons and Show in PDF work with a
   PDF that was built on Windows (a project opened from a shared folder or a download, with its
   `.pdf` and `.synctex.gz`), before the first build here. The source files named in such a SyncTeX

@@ -56,12 +56,12 @@ For the installer, install Inno Setup 6 (or pass `--no-installer`).
 
 - the tests of the crates without GTK windows and the app's unit tests (`lemma-app --lib`): on
   Windows natively, on Linux under Wine;
-- on Linux, the GUI test programs of `crates/lemma-app/tests` that pass under Wine (`GUI_TESTS`
-  in `build.sh`; [docs/testing.md](../../docs/testing.md) says which and why not the others).
-  Each runs under `xvfb-run`, on an X display of its own, so no window opens on your desktop,
-  and with a time limit of 20 minutes; its output goes to
-  `target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Without `xvfb-run` a line says that
-  they were skipped.
+- on Linux, the 46 GUI test programs of `crates/lemma-app/tests` (`GUI_TESTS` in `build.sh`),
+  under Wine. A test that cannot run there skips itself and prints why;
+  [docs/testing.md](../../docs/testing.md) lists those. Each program runs under `xvfb-run`, on
+  an X display of its own, so no window opens on your desktop, and with a time limit of 20
+  minutes; its output goes to `target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Without
+  `xvfb-run` a line says that they were skipped.
 
 On Windows itself the GUI tests are left out: they have only been run under Wine, in a prefix
 of their own. They keep what they write out of your own files with `HOME` and `XDG_*`

@@ -620,6 +620,86 @@ pub fn style_scheme(cfg: &EditorCfg, dark: bool) -> Option<sourceview5::StyleSch
     })
 }
 
+/// On Windows, makes every window of the process tell a text widget's input method that the
+/// keyboard focus has left it when the widget goes with the focus in it (a closed tab, a closed
+/// dialog, a closed window), so that the input method lets go of the window while it can. Does
+/// nothing on the other systems, and nothing the second time. The window calls it; the tests'
+/// harness too.
+///
+/// GTK takes the focus from a widget that is removed only at the next frame, and from the
+/// widgets of a window that is destroyed not at all. By then a text widget has taken itself
+/// from its input method (`gtk_text_view_unrealize`, `gtk_text_unrealize`), and Windows' input
+/// method (`GtkIMContextIME`), which stops listening to the window's messages only when it
+/// loses the focus with its widget still in a window, never does: GTK 4.24.1 then calls it for
+/// every message after it was freed. That printed `GTK_IS_IM_CONTEXT_IME (data)` assertions
+/// without end and crashed now and then (a page fault, a window that could not be created).
+/// GTK's later versions stop listening when the context goes.
+///
+/// The input method is told, and the window's focus is left alone: moving the focus of a
+/// window that is being destroyed stopped the assertions too, but after some thirty windows
+/// destroyed that way new windows were not drawn any more (as a Windows program under Wine).
+pub fn guard_input_methods() {
+    thread_local! {
+        static GUARDED: Cell<bool> = const { Cell::new(false) };
+    }
+    if !cfg!(windows) || GUARDED.replace(true) {
+        return;
+    }
+    let guard = |windows: &gtk::gio::ListModel, range: Range<u32>| {
+        for at in range {
+            if let Some(window) = windows.item(at).and_downcast::<gtk::Window>() {
+                guard_focus_of(&window);
+            }
+        }
+    };
+    let windows = gtk::Window::toplevels();
+    guard(&windows, 0..windows.n_items());
+    windows.connect_items_changed(move |windows, position, _removed, added| {
+        guard(windows, position..position + added);
+    });
+}
+
+/// See [`guard_input_methods`]: the text widget (an entry's text, a text view: the widgets with
+/// an input method) that has `window`'s focus tells its input method that the focus has left
+/// when it is unrealized, before its class does its own unrealizing.
+fn guard_focus_of(window: &gtk::Window) {
+    type Guarded = (glib::WeakRef<gtk::Widget>, glib::SignalHandlerId);
+    let guarded: Rc<RefCell<Option<Guarded>>> = Rc::default();
+    let follow = move |window: &gtk::Window| {
+        if let Some((widget, handler)) = guarded.take()
+            && let Some(widget) = widget.upgrade()
+        {
+            widget.disconnect(handler);
+        }
+        let Some(focus) = GtkWindowExt::focus(window)
+            .filter(|focus| focus.is::<gtk::Text>() || focus.is::<gtk::TextView>())
+        else {
+            return;
+        };
+        let handler = focus.connect_unrealize(leave_input_method);
+        guarded.replace(Some((focus.downgrade(), handler)));
+    };
+    follow(window);
+    window.connect_focus_widget_notify(follow);
+}
+
+/// Tells the input method of the text widget `widget` that the keyboard focus has left it. A
+/// text widget gives its input method (a `GtkIMMulticontext`) to its own key controller, which
+/// is where it is found; Vim's, on a controller of Lemma's, is not one of those.
+fn leave_input_method(widget: &gtk::Widget) {
+    let controllers = widget.observe_controllers();
+    for at in 0..controllers.n_items() {
+        let method = controllers
+            .item(at)
+            .and_downcast::<gtk::EventControllerKey>()
+            .and_then(|keys| keys.im_context())
+            .filter(|method| method.is::<gtk::IMMulticontext>());
+        if let Some(method) = method {
+            method.focus_out();
+        }
+    }
+}
+
 /// Installs the app's CSS on `display`: the editor font from `cfg.font` (applied to views with
 /// the `lemma-editor` class) and the shell styles (status bar, sidebar). Calling it again (a
 /// config reload) replaces the font instead of adding another provider.

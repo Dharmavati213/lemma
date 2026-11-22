@@ -62,6 +62,10 @@ fn main() -> ExitCode {
             "checking_stopped_at_work_or_while_starting_is_quiet",
             stopped_at_work_or_starting,
         ),
+        (
+            "edge_words_are_underlined_when_the_answers_come_late",
+            late_answers,
+        ),
     ];
     test_dictionary();
     // The words flagged are English ones: without an English dictionary nothing is checked.
@@ -398,6 +402,24 @@ fn text_and_latex() {
         ],
         "after an edit before a misspelled word",
     );
+}
+
+/// Puts the usual wait for the dictionary's answers back when a test that changed it ends.
+struct UsualEdgeWait;
+
+impl Drop for UsualEdgeWait {
+    fn drop(&mut self) {
+        spell::set_edge_wait(None);
+    }
+}
+
+/// The words libspelling skips are underlined as well when the dictionary's answers come after
+/// the pass that asked for them, as they do while libspelling's own check of a long text holds
+/// the dictionary: everything `text_and_latex` checks, with no wait for the answers at all.
+fn late_answers() {
+    spell::set_edge_wait(Some(Duration::ZERO));
+    let _usual = UsualEdgeWait;
+    text_and_latex();
 }
 
 /// Words of `spell.word_lists` are accepted: split on blanks and hyphens, with `'s` (and `’s`)

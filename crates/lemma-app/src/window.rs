@@ -349,6 +349,7 @@ impl WindowState {
         scripted: bool,
     ) -> Rc<Self> {
         workspace.set_scan_config(settings::scan_config(&config.editor));
+        editor::guard_input_methods();
         let layout::Layout {
             window,
             toasts,

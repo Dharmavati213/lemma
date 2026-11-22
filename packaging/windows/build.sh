@@ -19,7 +19,7 @@
 #   --skip-build    package the existing release build
 #   --no-installer  only the folder and the zip
 #   --test          run the tests: the crates without GTK windows and, on Linux with xvfb-run
-#                   installed, the GUI tests that pass under Wine, on displays of their own
+#                   installed, the GUI tests under Wine, on displays of their own
 #   --smoke         start the packaged app on a test project and save a snapshot of its
 #                   window in dist/smoke (on Linux under Wine, on your desktop's display)
 #
@@ -167,17 +167,16 @@ fi
 [ -f "$RELEASE/lemma.exe" ] && [ -f "$RELEASE/lemma-mcp.exe" ] \
   || die "no release build in $RELEASE"
 
-# The GUI test programs of lemma-app that pass under Wine (--test, on Linux), in the order of
-# crates/lemma-app/Cargo.toml. Not here: gtk_review, gtk_goto, gtk_session and gtk_qol, each
-# with a test or two that fail under Wine, and gtk_git_gutter, which finds no git there;
-# docs/testing.md says why.
-GUI_TESTS=(gtk_document gtk_vim gtk_app gtk_window gtk_snippets gtk_pdf gtk_regress_d
+# The GUI test programs of lemma-app (--test, on Linux under Wine): all of them, in the order
+# of crates/lemma-app/Cargo.toml. A test that cannot run under Wine skips itself and says why
+# (docs/testing.md); gtk_git_gutter finds no git there and skips all of its tests.
+GUI_TESTS=(gtk_document gtk_vim gtk_app gtk_window gtk_snippets gtk_pdf gtk_review gtk_regress_d
   gtk_regress_a gtk_regress_b gtk_regress_c gtk_line_states gtk_shell_m2 gtk_agent_tools
   gtk_agent_panel gtk_agent_backends gtk_review_persist gtk_highlight gtk_completion
   gtk_autosnippets gtk_typing gtk_spell gtk_keys gtk_e2e_agent gtk_regress2_f gtk_regress2_e2
-  gtk_regress2_b gtk_regress2_c gtk_regress2_e1 gtk_regress2_d gtk_shell_m3 gtk_outline
-  gtk_labels gtk_math_preview gtk_pdf_m3 gtk_palette gtk_prefs gtk_search gtk_lint gtk_pairs
-  gtk_envtools gtk_improve_editor)
+  gtk_regress2_b gtk_regress2_c gtk_regress2_e1 gtk_regress2_d gtk_shell_m3 gtk_outline gtk_goto
+  gtk_labels gtk_math_preview gtk_pdf_m3 gtk_palette gtk_prefs gtk_search gtk_lint gtk_session
+  gtk_git_gutter gtk_pairs gtk_qol gtk_envtools gtk_improve_editor)
 
 TESTS_FAILED=0
 if [ "$TEST" = 1 ]; then
@@ -204,9 +203,9 @@ if [ "$TEST" = 1 ]; then
   cargo test --locked --no-fail-fast "${CARGO_TARGET[@]}" -p lemma-app --lib "${THREADS[@]}" \
     || TESTS_FAILED=1
 
-  # The GUI test programs (crates/lemma-app/tests/gtk_*.rs) that pass under Wine: each opens
-  # windows, so each runs on an Xvfb display of its own, never on the desktop's, and with a
-  # time limit (a Wine dialog nobody answers would wait for ever).
+  # The GUI test programs (crates/lemma-app/tests/gtk_*.rs): each opens windows, so each runs
+  # on an Xvfb display of its own, never on the desktop's, and with a time limit (a Wine dialog
+  # nobody answers would wait for ever).
   if [ -n "${MSYSTEM:-}" ]; then
     echo "The GUI tests (gtk_*) are not run on Windows: they are unverified there."
   elif ! command -v xvfb-run >/dev/null; then
@@ -221,6 +220,9 @@ if [ "$TEST" = 1 ]; then
         timeout -k 10 1200 cargo test --locked "${CARGO_TARGET[@]}" -p lemma-app --test "$name" \
         > "$TARGET_DIR/$TRIPLE/gui-test-$name.log" 2>&1 || status=$?
       result="$(grep -a '^test result' "$TARGET_DIR/$TRIPLE/gui-test-$name.log" | tail -n 1 || true)"
+      # A program that can run none of its tests says why instead (gtk_git_gutter without git).
+      [ -n "$result" ] \
+        || result="$(grep -a -m 1 '^SKIP' "$TARGET_DIR/$TRIPLE/gui-test-$name.log" || true)"
       if [ "$status" = 0 ]; then
         echo "ok   $name: ${result#test result: }"
       else

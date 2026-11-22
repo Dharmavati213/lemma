@@ -1278,6 +1278,12 @@ impl ViewReview {
         marks
     }
 
+    /// Whether a placement of the bars is waiting for its idle callback (tests: the callback
+    /// comes after GTK has measured the lines a scroll brought into view).
+    pub fn relayout_pending(&self) -> bool {
+        self.relayout_queued.get()
+    }
+
     fn queue_relayout(&self) {
         if self.relayout_queued.replace(true) {
             return;

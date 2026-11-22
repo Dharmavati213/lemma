@@ -457,7 +457,22 @@ fn present(vh: &Rc<ViewHover>, child: gtk::Widget) {
     }
     popover.popover.set_pointing_to(Some(&rect));
     if !popover.popover.is_visible() {
+        forget_surface_size(&popover.popover);
         popover.popover.popup();
+    }
+}
+
+/// Before a hidden `popover` is shown again on Windows: its surface goes, so that it gets a new
+/// one. GDK's Win32 backend sizes a popup's window only when the size asked for differs from
+/// the size the surface had at its last frame (`gdk_win32_surface_layout_popup`), and a popover
+/// resized and hidden before another frame (a crop of the PDF that arrives as the hover goes,
+/// `labels::crop`) keeps a window of that newer size behind an older size on record. The next
+/// content as large as the older one then left the window as it was, and GTK hides a popover
+/// whose surface is smaller than its content at once (`gtk_popover_native_layout`): the hover
+/// did not appear. (GTK 4.24; nothing to do on the other systems.)
+fn forget_surface_size(popover: &gtk::Popover) {
+    if cfg!(windows) && popover.is_realized() {
+        WidgetExt::unrealize(popover);
     }
 }
 

@@ -35,6 +35,9 @@ pub fn run(tests: &[Test]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     sourceview5::init();
+    // As every window of the app has it (the first `WindowState` asks for it): a test's own
+    // windows too.
+    lemma_app::editor::guard_input_methods();
     count_logged_problems();
     let filters: Vec<String> = std::env::args()
         .skip(1)
@@ -211,11 +214,15 @@ fn count_logged_problems() {
 ///   to gdk_frame_timings_submitted() with different values`, `… called on submitted frame`),
 ///   about once a second while frames are drawn. The function is internal to GDK, so nothing
 ///   Lemma does can cause it;
-/// - on Windows under Wine (`packaging/windows/build.sh --test`), GDK's Win32 backend and GTK's
-///   input method warn about what Wine lacks: no presentation time for a frame, no blur behind
-///   a window, no properties of the input devices, no keyboard layout DLL, no list of the
-///   clipboard's formats; GIO finds no settings schemas beside a test program, and enchant's
-///   Windows spelling provider does not load.
+/// - on Windows under Wine (`packaging/windows/build.sh --test`), GDK's Win32 backend warns
+///   about what Wine lacks: no presentation time for a frame, no blur behind a window, no
+///   properties of the input devices, no keyboard layout DLL, no list of the clipboard's
+///   formats; GIO finds no settings schemas beside a test program, and enchant's Windows
+///   spelling provider does not load.
+///
+/// GTK 4.24.1's `gtk_im_context_ime_message_filter: assertion 'GTK_IS_IM_CONTEXT_IME (data)'
+/// failed` is not among them: it is not Wine's (Windows' input method is called after it was
+/// freed), and `lemma_app::editor::guard_input_methods` prevents it.
 pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
     let field = |key: &str| {
         fields
@@ -236,7 +243,6 @@ pub fn is_environment_noise(fields: &[glib::LogField<'_>]) -> bool {
                 "Could not open registry key 'Keyboard Layout",
                 "GetUpdatedClipboardFormats() failed",
             ],
-            Some("Gtk") => &["gtk_im_context_ime_message_filter: assertion"],
             Some("GLib-GIO") => &["g_settings_schema_source_lookup: assertion 'source != NULL'"],
             Some("libenchant") => &["EnchantProvider cannot be NULL"],
             _ => &[],

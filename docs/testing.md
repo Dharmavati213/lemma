@@ -78,13 +78,12 @@ programs.
 
 `--test` runs the tests as Windows programs: natively in MSYS2, and on Linux under the Wine that
 `build.sh` downloads (`packaging/windows/README.md`). It runs the crates without GTK windows,
-the app's unit tests and, on Linux only, the GUI test programs listed in `GUI_TESTS` in
-`build.sh`: those that pass under Wine. Each GUI program runs under `xvfb-run` (an X display of
-its own; a Wine window never opens on the desktop) with `WAYLAND_DISPLAY` and `GDK_BACKEND`
-unset and a limit of 20 minutes, and logs to
-`target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Where `xvfb-run` is not installed they
-are skipped with a line that says so. On Windows itself they are not run: nobody has run them
-there yet.
+the app's unit tests and, on Linux only, the 46 GUI test programs (`GUI_TESTS` in `build.sh`
+lists them all). Each GUI program runs under `xvfb-run` (an X display of its own; a Wine window
+never opens on the desktop) with `WAYLAND_DISPLAY` and `GDK_BACKEND` unset and a limit of 20
+minutes, and logs to `target/x86_64-pc-windows-gnullvm/gui-test-<name>.log`. Where `xvfb-run`
+is not installed they are skipped with a line that says so. On Windows itself they are not
+run: nobody has run them there yet.
 
 To run one program by hand (never without `xvfb-run`: Wine would open its windows on your
 desktop), set the variables `build.sh` sets for the cross build (its "cross, from Linux" part:
@@ -129,27 +128,36 @@ is long (GDK warns about what Wine lacks at every frame): send it to a file unde
 - With `LEMMA_TEST_BACKTRACE` set (on any system), the harness prints a backtrace before each
   GLib warning or critical it counts: the Rust frames show who made the C library log it.
 
-**What runs.** 41 of the 46 programs are in `GUI_TESTS` and pass under Wine (wine 11.20, GTK
-4.24 from MSYS2, November 2026): about 700 tests, of which about 90 skip themselves with the
-helpers above (52 of them for the missing keymap: nearly all of `gtk_vim`, `gtk_keys` and the
-Vim tests elsewhere) and about 45 because Wine has no latexmk, pdflatex, chktex, texcount or
-git, as they do on a Linux machine without them. Two of the listed programs have a test that
-has failed once on a loaded machine and passes otherwise: `gtk_pdf`
+**What runs.** All 46 programs are in `GUI_TESTS` (wine 11.20, GTK 4.24.1 from MSYS2, November
+2026): about 800 tests in 45 programs, and `gtk_git_gutter`, which skips all of its own. About
+90 tests skip themselves with the helpers above (53 for the missing keymap: nearly all of
+`gtk_vim`, `gtk_keys` and the Vim tests elsewhere; 21 for a stand-in shell script) and about 45
+because Wine has no latexmk, pdflatex, chktex, texcount or git, as they do on a Linux machine
+without them; five more measure with Linux's `/proc`, glibc or `/dev/shm`. Two programs have a
+test that has failed once on a loaded machine and passes otherwise: `gtk_pdf`
 (`zoom_out_in_notches_keeps_one_scale_of_bands`) and `gtk_regress2_f`
 (`regress2_inactive_window_gives_memory_back`).
 
-**What does not pass under Wine**, and why (these five programs are not in `GUI_TESTS`):
+**What the run under Wine found**, in the programs that did not pass there at first. None of
+the first six is Wine's: four are faults of GTK 4.24.1 that show on Windows and that Lemma now
+works around, one is how Windows treats a file that is open, and one is a wait of Lemma's own
+that only became long there (`CHANGELOG.md` has them as the user meets them). The last three
+were in the tests:
 
-| Program | Test | Why |
+| Program, test | Cause | Now |
 |---|---|---|
-| `gtk_review` | `decisions_advance_to_the_next_hunk` | Not understood. The tab opened for the next file stays scrolled past its text: the view's offset is beyond the range of its scroll adjustment, and the scroll after the first frame (`review_ui::show_line`) does not bring it back. Whether Windows itself does the same needs a Windows machine. |
-| `gtk_review` | `bars_stay_pooled_and_off_the_text` | Fails only after the test above (it passes alone). |
-| `gtk_goto` | `hover_reference_shows_the_pdf_crop` | Not understood. The first hover shows its crop of the PDF; after the crop's worker was stopped and started again, the hover gets the SyncTeX boxes but no crop appears. Needs a Windows machine. |
-| `gtk_session` | `session_remembers_the_window_size` | Wine only: a window is never maximized on an Xvfb display without a window manager. |
-| `gtk_session` | `session_round_trip_tabs_positions_and_panes` | Wine only: with Wine's fonts the panes' smallest widths put the editor/PDF divider at 58% where the test sets 62%. |
-| `gtk_session` | `recovery_restores_tabs_never_saved` | Wine's timing: the session that the closed window's worker writes arrives after the one the test wrote in its place. |
-| `gtk_qol` | (the program) | Wine only, now and then: GDK fails to create a window (`CreateWindowExW failed with code 1400`), which is fatal, and Wine's crash dialog then waits until the time limit. About every second run. |
-| `gtk_git_gutter` | (all) | Wine runs no Linux git and has none of its own: the program prints `SKIP` and runs nothing. |
+| `gtk_goto` `hover_reference_shows_the_pdf_crop` | GDK's Win32 backend sizes a popup's window only when the size asked for differs from the size the surface had at its last frame (`gdk_win32_surface_layout_popup`). A hover popover resized for its crop and hidden before another frame kept a window of the crop's size (481 × 161) with the older size (330 × 165) on record; the next hover asked for 330 × 165, the window was left alone, and GTK hides a popover whose surface is smaller than its content (`gtk_popover_native_layout`). | On Windows the hover's popover gets a new surface each time it is shown (`hover::forget_surface_size`). |
+| `gtk_review` `decisions_advance_to_the_next_hunk` | GtkTextView keeps "the first paragraph on screen" in place while lines are measured. A view scrolled before it had a size takes the last line of the unmeasured text for that paragraph; when the window gives the view its size before the lines are measured (under Wine; on Linux the lines came first), the view moves its offset down by the whole text (311 px) and asks the adjustment to follow, which a text that fits the view cannot do (its value stays 0). No later scroll changes that value, so none moves the view back. | `TexView` sends the adjustment's value again after an allocation that leaves the two apart in a view that cannot scroll (`follow_adjustment`). |
+| `gtk_qol` (the program crashed in about every second run), and assertions in `gtk_vim` and `gtk_shell_m3` | Windows' input method in GTK (`GtkIMContextIME`) stops listening to the window's messages only when it loses the focus while its widget is still in a window. A focused text widget that leaves its window (a closed tab or dialog) or whose window is destroyed is taken from its input method first (`gtk_text_view_unrealize`) and loses the focus later or never, so the freed context was called for every message from then on: over a thousand `GTK_IS_IM_CONTEXT_IME (data)` assertions in a run of `gtk_qol`, and a page fault (or a failed `CreateWindowExW`) when the freed memory had been reused. | On Windows a text widget with the focus tells its input method that the focus has left before it is unrealized (`editor::guard_input_methods`, which the first window and the harness ask for). The assertion is counted like any other now, and no test logs it. |
+| `gtk_session` `session_remembers_the_window_size` | A window first shown maximized is restored, when it is unmaximized, to a window of the remembered size with its shadows inside: 850 × 600 for the window itself of a remembered 900 × 650 (under Wine by way of a window without width, which GTK warns about for each widget it cannot place). That size was then the remembered one. | On Windows a window that started maximized gets its remembered size again when it is first unmaximized (`session::restore_size_when_unmaximized`). The test excuses the warnings of the way there, on Windows only. |
+| `gtk_session` (a session write lost, in any test that reads the file while Lemma writes it) | Wine, like Windows without POSIX renames, replaces no file that a program has open: the session writer's rename failed with "Access denied" when the test (or a virus scanner) read the file at that moment, and the session was written again only with the next change. | The writer tries again for half a second (`session::rename_over`; `session::tests::a_write_waits_for_a_file_held_open`). |
+| `gtk_highlight` `large_documents_are_coloured_while_their_states_build` (the states of `large.tex` came 30.3 s after a scroll, past the test's 30 s) | The main loop did not run for those 30 s: the pass over the words libspelling skips asked the dictionary about one word and waited for the dictionary's lock, which libspelling's own check of the 60,000 lines held on its jobs thread (seen with `winedbg`'s `bt all`: the main thread in `spelling_dictionary_contains_word`, a jobs thread in `enchant_pwl_check`, which looks at the personal word list's file for every word; that look is slow under Wine). On Linux the same wait is there and short. | The dictionary is asked on a jobs thread, and the pass waits 4 ms for the answers (`spell::EDGE_WAIT`); the user's word lists go to the dictionary on a jobs thread too. The test takes 8 s under Wine. `gtk_spell` `edge_words_are_underlined_when_the_answers_come_late` runs the main spelling test with no wait at all. |
+| `gtk_review` `bars_stay_pooled_and_off_the_text` | The test gave the bars' placement 30 ms after each scroll, and the placement's idle callback comes after GTK's measuring of the lines scrolled to, 40 ms under Wine. | It waits for the placement (`ViewReview::relayout_pending`). |
+| `gtk_session` `recovery_restores_tabs_never_saved` | The test's own order. It destroys its first window while the session's debounce (60 ms) is running and writes the session file it wants next. Where destroying the window takes longer than the debounce (under Wine), the save comes due while the test still pumps the main loop for the closed window, and it is written when the window's `destroy` signal comes: when the last reference to the window goes, after the test wrote its file. The second window then restored the first one's tabs. | The test waits until the closed window is gone before it writes its file. |
+| `gtk_session` `session_round_trip_tabs_positions_and_panes` | The test put the editor/PDF divider at 62% of a window whose panes have no room for that: `GtkPaned` moved it at the next frame, to 58% under Wine and to 52% on Linux, where the test passed only because it read the position before that frame. | The test sets a share the panes have room for on every system (45%) and reads it a frame later. |
+
+One program depends on Wine: `gtk_git_gutter` finds no git there (Wine runs no Linux git and
+has none of its own), prints `SKIP: git is not installed` and runs none of its tests.
 
 The golden images of `gtk_review` are skipped on Windows (other fonts). `gtk_pdf_m3`'s
 `detach_and_reattach_keep_the_anchor` needs a `target/fixtures/pdf50.pdf` built in the same
